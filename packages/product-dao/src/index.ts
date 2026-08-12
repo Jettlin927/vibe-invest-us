@@ -1,6 +1,6 @@
 import { Pool } from 'pg'
 
-export const schemaVersion = 1
+export const schemaVersion = 2
 
 const migrationSql = `
 CREATE TABLE IF NOT EXISTS product_schema_migrations (
@@ -36,14 +36,25 @@ CREATE TABLE IF NOT EXISTS portfolio_equity_snapshots (
   after_close boolean NOT NULL DEFAULT false
 );
 
+CREATE TABLE IF NOT EXISTS legacy_portfolio_migrations (
+  source_sha256 text PRIMARY KEY,
+  source_path text NOT NULL,
+  migrated_at timestamptz NOT NULL DEFAULT now()
+);
+
 INSERT INTO product_schema_migrations (version)
 VALUES (1)
+ON CONFLICT (version) DO NOTHING;
+
+INSERT INTO product_schema_migrations (version)
+VALUES (2)
 ON CONFLICT (version) DO NOTHING;
 
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM vibe_invest_app;
 REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM vibe_invest_app;
 GRANT SELECT ON product_schema_migrations TO vibe_invest_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON positions, portfolio_settings, portfolio_equity_snapshots TO vibe_invest_app;
+GRANT SELECT, INSERT ON legacy_portfolio_migrations TO vibe_invest_app;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO vibe_invest_app;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM vibe_invest_app;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON SEQUENCES FROM vibe_invest_app;

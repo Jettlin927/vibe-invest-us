@@ -17,7 +17,7 @@ test('聚合健康状态包含 Analysis API、PostgreSQL schema、SQLite 和 Fin
   const app = buildApp({
     databasePath: join(dataDir, 'app.db'),
     productDatabase: {
-      checkSchema: async () => { schemaChecks += 1; return { status: 'ok', version: 1 } },
+      checkSchema: async () => { schemaChecks += 1; return { status: 'ok', version: 2 } },
       close: async () => {},
     },
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
@@ -31,7 +31,7 @@ test('聚合健康状态包含 Analysis API、PostgreSQL schema、SQLite 和 Fin
     status: 'ok',
     dependencies: {
       database: { status: 'ok', engine: 'sqlite' },
-      productDatabase: { status: 'ok', engine: 'postgresql', schemaVersion: 1 },
+      productDatabase: { status: 'ok', engine: 'postgresql', schemaVersion: 2 },
       financialData: { service: 'financial-data', status: 'ok' },
     },
   })
