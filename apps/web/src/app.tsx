@@ -18,7 +18,7 @@ type PortfolioEquitySnapshot = {
   holdingsCount: number; pricedCount: number; observedAt: string; afterClose: boolean
   dailyChange: number | null; dailyReturn: number | null
 }
-type ResearchSummary = { id: string; symbol: string; status: string; error?: string | null; starred?: boolean; note?: string; report?: { title?: string; trend?: string } }
+type ResearchSummary = { id: string; symbol: string; status: string; createdAt?: string; error?: string | null; starred?: boolean; note?: string; report?: { title?: string; trend?: string } }
 type Fact = { id: string; type: string; value: unknown; observedAt: string; source: string; sourceReference: string }
 type Report = {
   title?: string; marketState?: string; trend?: string; drivers?: string[]
@@ -205,7 +205,7 @@ export function App() {
     <main className="page-main">
       {error && <p role="alert" className="error-banner">{error}</p>}
       {page === 'overview' && <Overview records={records} selected={selectedResearch} positions={positions} health={health} modelConfigured={modelConfigured} onNavigate={navigate} onOpen={async (id) => { await openResearch(id); navigate('research') }} />}
-      {page === 'analysis' && <AnalysisPage symbol={analysisSymbol} setSymbol={setAnalysisSymbol} status={analysisStatus} stages={analysisStages} active={Boolean(activeAnalysisId)} onStart={startAnalysis} onCancel={cancelAnalysis} health={health} modelConfigured={modelConfigured} />}
+      {page === 'analysis' && <AnalysisPage symbol={analysisSymbol} setSymbol={setAnalysisSymbol} status={analysisStatus} stages={analysisStages} active={Boolean(activeAnalysisId)} onStart={startAnalysis} onCancel={cancelAnalysis} health={health} modelConfigured={modelConfigured} records={records} onOpen={async (id) => { await openResearch(id); navigate('research') }} />}
       {page === 'research' && <ResearchPage records={records} record={selectedResearch} onOpen={openResearch} onUpdate={updateResearch} onDelete={removeResearch} />}
       {page === 'portfolio' && <PortfolioPage portfolio={portfolio} history={portfolioHistory} onSave={savePosition} onSaveCash={saveCash} onReduce={reducePosition} onDelete={removePosition} />}
       {page === 'settings' && <SettingsPage health={health} modelConfigured={modelConfigured} />}
@@ -236,9 +236,10 @@ function Overview({ records, selected, positions, health, modelConfigured, onNav
   </>
 }
 
-function AnalysisPage({ symbol, setSymbol, status, stages, active, onStart, onCancel, health, modelConfigured }: {
+function AnalysisPage({ symbol, setSymbol, status, stages, active, onStart, onCancel, health, modelConfigured, records, onOpen }: {
   symbol: string; setSymbol: (value: string) => void; status: string; stages: string[]; active: boolean
   onStart: (event: React.FormEvent) => Promise<void>; onCancel: () => Promise<void>; health: SystemHealth | null; modelConfigured: boolean
+  records: ResearchSummary[]; onOpen: (id: string) => Promise<void>
 }) {
   const pipeline = ['queued', 'running', 'financial_context', 'model_event', 'model_completed', 'completed']
   const current = pipelineIndex(status, stages)
@@ -248,6 +249,7 @@ function AnalysisPage({ symbol, setSymbol, status, stages, active, onStart, onCa
       <section className="analysis-start"><p className="micro">01 / 选择研究对象</p><form onSubmit={(event) => void onStart(event)}><label>美股代码<div className="symbol-field"><input aria-label="分析标的" value={symbol} onChange={(event) => setSymbol(event.target.value.toUpperCase())} required /><button type="submit" disabled={active}>{active ? '分析进行中' : '开始分析'}</button></div></label></form><p className="hint">默认周期：未来 1—4 周 · 自动匹配当前持仓</p>{active && <button className="quiet danger" onClick={() => void onCancel()}>取消本次分析</button>}</section>
       <section className="pipeline"><p className="micro">02 / 分析进度</p>{pipeline.map((stage, index) => <div className={index < current ? 'done' : index === current ? 'active' : ''} key={stage}><i>{index + 1}</i><span>{pipelineLabel(stage)}</span><small>{index < current ? '完成' : index === current ? statusLabel(status) : '等待'}</small></div>)}</section>
       <section className="capabilities"><p className="micro">本次所需能力</p><StatusRow label="行情与历史数据" ready={health?.dependencies.financialData.status === 'ok'} /><StatusRow label="新闻与财报材料" ready={health?.dependencies.financialData.status === 'ok'} /><StatusRow label="确定性指标与估值" ready={health?.dependencies.financialData.status === 'ok'} /><StatusRow label="AI 综合分析" ready={modelConfigured} /><p className="callout">数据缺失时，依赖该数据的结论会关闭，并在报告中明确说明。</p></section>
+      <section className="analysis-history" aria-label="分析历史"><header><div><p className="micro">分析历史</p><h2>继续之前的研究</h2></div><span>{records.length} 份记录</span></header>{records.length ? <div className="analysis-history-list">{records.map((record) => { const title = record.report?.title ?? `${record.symbol} · ${statusLabel(record.status)}`; return <button key={record.id} aria-label={`打开 ${title}`} onClick={() => void onOpen(record.id)}><strong>{record.symbol}</strong><span>{title}</span><small>{formatAnalysisDate(record.createdAt)} · {statusLabel(record.status)}</small><i aria-hidden="true">→</i></button> })}</div> : <p className="analysis-history-empty">还没有分析记录。完成第一份分析后，可从这里重新打开。</p>}</section>
     </div>
   </>
 }
@@ -375,11 +377,10 @@ function PriceChart({ facts, compact = false }: { facts: Fact[]; compact?: boole
 function ValuationView({ fact, explanation }: { fact: Fact; explanation?: string | null }) {
   const canvas = useRef<HTMLCanvasElement>(null)
   const value = asRecord(fact.value)
-  const methods = asRecord(value.methods)
-  const pe = asRecord(methods.pe)
+  const currentMultiples = asRecord(value.current_multiples)
   const ranges = asRecord(value.historical_ranges)
   const historical = Array.isArray(ranges.pe) ? ranges.pe.map(Number) : []
-  const multiple = Number(pe.multiple)
+  const multiple = Number(currentMultiples.pe)
   useEffect(() => { if (canvas.current) drawValuation(canvas.current, multiple, historical) }, [multiple, historical.join(',')])
   return <div className="valuation-view"><div><strong>{Number.isFinite(multiple) ? `${multiple.toFixed(1)}×` : '不可用'}</strong><span>当前 PE</span><p>{explanation ?? '估值仅作为区间参考，不单独构成买卖依据。'}</p></div>{Number.isFinite(multiple) && historical.length === 2 ? <figure><canvas ref={canvas} role="img" aria-label={`当前 PE ${multiple.toFixed(1)} 倍，历史区间 ${historical[0].toFixed(1)} 至 ${historical[1].toFixed(1)} 倍`} /><figcaption>当前 PE 与自身历史区间</figcaption></figure> : <p className="chart-empty">历史估值区间不可用</p>}</div>
 }
@@ -398,7 +399,28 @@ function TraceSummary({ trace }: { trace: Array<Record<string, unknown>> }) {
     ['system_prompt', '载入分析规则'], ['financial_context', '冻结金融上下文'], ['tool_call', '调用只读工具'],
     ['tool_result', '工具返回事实'], ['model_completed', '生成结构化报告'], ['status', '保存任务状态'],
   ] as const
-  return <aside className="trace-panel"><p className="micro">分析轨迹</p>{stages.map(([type, label], index) => { const count = trace.filter((entry) => entry.type === type).length; return <div key={type}><i>{index + 1}</i><span>{label}</span><small>{count ? `${count} 次` : '无'}</small></div> })}<details><summary>开发者信息</summary><p>底层共保存 {trace.length} 条原始事件，用于排查和审计；此处不逐条渲染模型 token。</p></details></aside>
+  const financialContext = trace.find((entry) => entry.type === 'financial_context')
+  const capabilities = Array.isArray(financialContext?.capabilities)
+    ? financialContext.capabilities.map(asRecord)
+    : []
+  return <aside className="trace-panel"><p className="micro">分析轨迹</p>{stages.map(([type, label], index) => { const entries = trace.filter((entry) => entry.type === type); const count = entries.length; const expandable = type === 'financial_context' && capabilities.length > 0; return expandable ? <details className="trace-stage" key={type}><summary><i>{index + 1}</i><span>{label}</span><small>{count} 次</small></summary><div className="source-diagnostics">{capabilities.map((capability) => <CapabilityTrace key={String(capability.capability)} capability={capability} />)}</div></details> : <div key={type}><i>{index + 1}</i><span>{label}</span><small>{count ? `${count} 次` : '无'}</small></div> })}<details><summary>开发者信息</summary><p>底层共保存 {trace.length} 条原始事件，用于排查和审计；此处不逐条渲染模型 token。</p></details></aside>
+}
+
+function CapabilityTrace({ capability }: { capability: Record<string, unknown> }) {
+  const sources = Array.isArray(capability.sources) ? capability.sources.map(asRecord) : []
+  const acceptedCount = Number(capability.acceptedCount ?? 0)
+  const adopted = typeof capability.adoptedSource === 'string' ? capability.adoptedSource : null
+  return <details><summary><span>{capabilityLabel(String(capability.capability))}</span><small>{adopted ? `采用 ${adopted}` : '未采用来源'} · {acceptedCount} 条</small></summary><ul>{sources.map((source) => { const status = String(source.status ?? 'unknown'); const count = Number(source.item_count ?? 0); return <li key={String(source.source)}><strong>{String(source.source)}</strong><span className={`source-${status}`}>{sourceStatusLabel(status)}</span><small>{status === 'failed' ? String(source.error ?? '未知错误') : `${count} 条`}</small></li> })}</ul></details>
+}
+
+function capabilityLabel(value: string) { return ({ quote: '当前行情', history: '历史行情', news: '近期新闻', fundamentals: '财报基本面', valuation: '估值数据' } as Record<string, string>)[value] ?? value }
+function sourceStatusLabel(value: string) { return ({ ok: '成功', empty: '空结果', failed: '失败' } as Record<string, string>)[value] ?? value }
+
+function formatAnalysisDate(value?: string) {
+  if (!value) return '时间未知'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return '时间未知'
+  return new Intl.DateTimeFormat('zh-CN', { year: 'numeric', month: 'long', day: 'numeric' }).format(date)
 }
 
 function ReportBlock({ number, title, children }: { number: string; title: string; children: ReactNode }) { return <section className="report-block"><header><span>{number}</span><h3>{title}</h3></header><div>{children}</div></section> }
@@ -470,7 +492,7 @@ function factHeadline(fact: Fact) {
   if (fact.type === 'daily_bar') return `${String(value.date ?? fact.observedAt).slice(0, 10)} · 收 ${formatMoney(Number(value.close))} · 成交量 ${formatCompact(Number(value.volume))}`
   if (fact.type === 'news') return String(value.title ?? value.summary ?? '新闻条目')
   if (fact.type === 'indicators') return `MA5 ${formatMaybeMoney(value.ma_5)} · MA20 ${formatMaybeMoney(value.ma_20)} · RSI ${formatMaybeNumber(value.rsi_14)}`
-  if (fact.type === 'valuation') { const pe = asRecord(asRecord(value.methods).pe); return `当前 PE ${formatMaybeNumber(pe.multiple)}× · 可比公司 ${Array.isArray(value.comparable_symbols) ? value.comparable_symbols.join('、') : '不可用'}` }
+  if (fact.type === 'valuation') { const multiples = asRecord(value.current_multiples); return `当前 PE ${formatMaybeNumber(multiples.pe)}× · 可比公司 ${Array.isArray(value.comparable_symbols) && value.comparable_symbols.length ? value.comparable_symbols.join('、') : '不适用'}` }
   if (typeof fact.value === 'number') return formatCompact(fact.value)
   return String(value.title ?? value.name ?? value.status ?? '结构化事实')
 }

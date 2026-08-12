@@ -5,6 +5,7 @@ import { App } from './app.js'
 import { WorkbenchPrototype } from './prototype/workbench-prototype.js'
 import './prototype/workbench-prototype.css'
 import './styles.css'
+import './trace.css'
 
 const prototypeRoute = import.meta.env.DEV && window.location.pathname === '/prototype/workbench'
 

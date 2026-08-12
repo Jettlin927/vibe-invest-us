@@ -18,6 +18,7 @@
     "test": "npm run test --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "verify:self-hosted": "sh scripts/verify-self-hosted.sh",
-    "verify:real-analysis": "sh scripts/verify-real-analysis.sh"
+    "verify:real-analysis": "sh scripts/verify-real-analysis.sh",
+    "test:data-sources": "services/market-data/.venv/bin/python scripts/test-data-sources.py"
   }
 }

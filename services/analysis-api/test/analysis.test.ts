@@ -330,6 +330,59 @@ test('完整历史写入冻结快照但只向模型提供最近十条日线', as
   await app.close()
 })
 
+test('完整多期财报写入快照但模型只收到决策窗口和可追溯依据', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'vibe-analysis-financial-window-'))
+  const periods = ['CY2026Q1', 'CY2025Q4', 'CY2025Q3', 'CY2025Q2', 'CY2025Q1', 'CY2024Q4']
+  const financialFacts = periods.map((period) => ({
+    ...fact, id: `fact:NVDA:reported:quarter:${period}:revenue`, type: 'reported_financial',
+    value: { classification: 'reported', metric: 'revenue', period, value: 100 }, observedAt: period,
+  }))
+  const derived = {
+    ...fact, id: 'fact:NVDA:derived:quarter:CY2026Q1:revenue_yoy', type: 'derived_financial_metric',
+    value: {
+      classification: 'derived', metric: 'revenue_yoy', period: 'CY2026Q1', value: 0.25,
+      inputFactIds: [financialFacts[0].id, financialFacts[4].id],
+    },
+  }
+  const quarters = periods.map((period, index) => ({
+    period, values: { revenue: { value: 100 + index, fact_id: financialFacts[index].id } },
+  }))
+  let modelContext: any
+  const app = buildApp({
+    databasePath: join(dir, 'app.db'),
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({
+      symbol, facts: [fact, ...financialFacts, derived], gaps: [],
+      fundamentals: { value: {
+        quarters, annuals: [{ period: 'CY2025' }, { period: 'CY2024' }, { period: 'CY2023' }, { period: 'CY2022' }],
+        ttm: { status: 'available', values: {} },
+        derived_metrics: [{
+          fact_id: derived.id, metric: 'revenue_yoy', scope: 'quarter', period: 'CY2026Q1', value: 0.25,
+          input_fact_ids: [financialFacts[0].id, financialFacts[4].id],
+        }], quality_flags: [],
+      } },
+    }),
+    model: {
+      async *analyze({ fetchFinancialContext }: any) {
+        modelContext = await fetchFinancialContext()
+        yield { type: 'completed' as const, report }
+      },
+    },
+  })
+  await app.ready()
+  const created = await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' } })
+  await waitForStatus(app as any, created.json().analysisId, 'completed')
+  const research = (await app.inject({ method: 'GET', url: `/api/research/${created.json().analysisId}` })).json()
+
+  assert.equal(research.snapshot.fundamentals.value.quarters.length, 6)
+  assert.deepEqual(modelContext.financials.quarters.map((item: any) => item.period), ['CY2026Q1', 'CY2025Q4', 'CY2025Q1'])
+  assert.deepEqual(modelContext.financials.annuals.map((item: any) => item.period), ['CY2025', 'CY2024', 'CY2023'])
+  assert.ok(modelContext.facts.some((item: any) => item.id === derived.id))
+  assert.ok(modelContext.facts.some((item: any) => item.id === financialFacts[4].id))
+  assert.equal(modelContext.facts.some((item: any) => item.id === financialFacts[2].id), false)
+  await app.close()
+})
+
 test('金融上下文事件包含主备来源切换信息', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'vibe-analysis-degraded-event-'))
   const app = buildApp({
@@ -348,6 +401,10 @@ test('金融上下文事件包含主备来源切换信息', async () => {
   const contextEvent = research.trace.find((entry: { type: string }) => entry.type === 'financial_context')
   assert.deepEqual(contextEvent.degradedSources, [{
     capability: 'quote', sources: [{ source: 'primary', status: 'failed' }, { source: 'backup', status: 'ok' }],
+  }])
+  assert.deepEqual(contextEvent.capabilities, [{
+    capability: 'quote', adoptedSource: null, acceptedCount: 0,
+    sources: [{ source: 'primary', status: 'failed' }, { source: 'backup', status: 'ok' }],
   }])
   await app.close()
 })
@@ -372,6 +429,7 @@ test('系统指令要求先取冻结上下文、逐项引用依据并按缺口�
   assert.match(systemPrompt, /fetch_financial_context/)
   assert.match(systemPrompt, /keyJudgments/)
   assert.match(systemPrompt, /缺行情不得判断走势/)
+  assert.match(systemPrompt, /财报增长率.*由宿主程序计算/)
   assert.match(systemPrompt, /不重新计算/)
   await app.close()
 })

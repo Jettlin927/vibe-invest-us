@@ -33,6 +33,7 @@ class SourceStatus(BaseModel):
     source: str
     status: Literal["ok", "failed", "empty"]
     error: Optional[str] = None
+    item_count: Optional[int] = None
 
 
 class SourceObservation(BaseModel):
@@ -80,6 +81,11 @@ class AtomicFact(BaseModel):
     sourceReference: str
 
 
+class FactQueryResult(BaseModel):
+    facts: List[AtomicFact]
+    sources: List[SourceStatus] = []
+
+
 class FinancialContext(BaseModel):
     symbol: str
     fetched_at: datetime
@@ -89,6 +95,7 @@ class FinancialContext(BaseModel):
     fundamentals: CapabilityResult
     indicators: Optional[Indicators]
     valuation: Optional[Any] = None
+    valuation_sources: List[SourceStatus] = []
     facts: List[AtomicFact]
     gaps: List[DataGap]
 

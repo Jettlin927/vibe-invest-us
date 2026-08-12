@@ -1,3 +1,4 @@
+import re
 from datetime import datetime, timedelta
 from hashlib import sha256
 from typing import Any, Iterable, List, Optional
@@ -33,12 +34,27 @@ def build_financial_context(
         [] if fundamentals_source is None else [fundamentals_source], normalized_symbol,
     )
     valuation = None
+    valuation_sources = []
     valuation_gap = DataGap(capability="valuation", reason="source_disabled") if valuation_source is None else None
     if valuation_source is not None:
         try:
-            valuation = valuation_source.fetch(normalized_symbol)
-        except Exception:
+            quote_value = quote.value if isinstance(quote.value, Quote) else None
+            if hasattr(valuation_source, "fetch_with_market_price"):
+                valuation = valuation_source.fetch_with_market_price(
+                    normalized_symbol,
+                    quote_value.price if quote_value else None,
+                    quote_value.observed_at.isoformat() if quote_value else None,
+                )
+            else:
+                valuation = valuation_source.fetch(normalized_symbol)
+            valuation_sources.append(SourceStatus(
+                source=valuation_source.name, status="ok", item_count=1,
+            ))
+        except Exception as error:
             valuation_gap = DataGap(capability="valuation", reason="source_unavailable")
+            valuation_sources.append(SourceStatus(
+                source=valuation_source.name, status="failed", error=_safe_error(error), item_count=0,
+            ))
     gaps = []
     for capability, result in (("quote", quote), ("history", history), ("news", news), ("fundamentals", fundamentals)):
         if result.value is None and not result.items:
@@ -74,8 +90,86 @@ def build_financial_context(
         fundamentals=fundamentals,
         indicators=indicators,
         valuation=valuation,
+        valuation_sources=valuation_sources,
         facts=facts,
         gaps=gaps,
+    )
+
+
+def search_news_facts(keyword: str, now: datetime, news_sources: Iterable[Any]):
+    normalized_keyword = " ".join(keyword.strip().split())
+    statuses, collected = [], []
+    for source in news_sources:
+        try:
+            items = source.fetch(normalized_keyword)
+            statuses.append(SourceStatus(
+                source=source.name, status="ok" if items else "empty", item_count=len(items or []),
+            ))
+            collected.extend(items or [])
+        except Exception as error:
+            statuses.append(SourceStatus(source=source.name, status="failed", error=_safe_error(error), item_count=0))
+    facts, seen = [], set()
+    for candidate in sorted(collected, key=lambda item: item.published_at, reverse=True):
+        item = candidate if isinstance(candidate, NewsItem) else NewsItem(**candidate)
+        key = " ".join(item.title.lower().split())
+        if key in seen:
+            continue
+        seen.add(key)
+        facts.append(AtomicFact(
+            id=f"fact:news-search:{sha256(normalized_keyword.lower().encode()).hexdigest()[:12]}:{item.published_at.isoformat()}:{sha256(item.url.encode()).hexdigest()[:16]}",
+            type="news", value={"keyword": normalized_keyword, "title": item.title, "summary": item.summary, "url": item.url},
+            observedAt=item.published_at.isoformat(), fetchedAt=now.isoformat(),
+            source=item.source, sourceReference=item.url,
+        ))
+    return facts[:30], statuses
+
+
+def technical_indicator_facts(symbol: str, start_date: str, end_date: str, now: datetime, history_sources: Iterable[Any]):
+    normalized_symbol = symbol.strip().upper()
+    history = _first_available_history_range(history_sources, normalized_symbol, start_date, end_date)
+    bars = [
+        bar if isinstance(bar, DailyBar) else DailyBar(**bar)
+        for bar in (history.value or [])
+        if start_date <= (bar.date if isinstance(bar, DailyBar) else bar["date"]) <= end_date
+    ]
+    if len(bars) < 20:
+        return [], history.sources
+    indicators = calculate_indicators(bars)
+    fingerprint = sha256("|".join(f"{bar.date}:{bar.close}:{bar.volume}" for bar in bars).encode()).hexdigest()[:16]
+    source = history.adopted_source or "unknown"
+    fact = AtomicFact(
+        id=f"fact:{normalized_symbol}:technical-indicators:{start_date}:{end_date}:{fingerprint}",
+        type="indicators",
+        value={
+            **indicators.model_dump(), "symbol": normalized_symbol,
+            "startDate": start_date, "endDate": end_date, "barCount": len(bars),
+        },
+        observedAt=bars[-1].date, fetchedAt=now.isoformat(), source="deterministic-calculation",
+        sourceReference=f"source://{source}/{normalized_symbol}/history?start={start_date}&end={end_date}",
+    )
+    return [fact], history.sources
+
+
+def _first_available_history_range(sources: Iterable[Any], symbol: str, start_date: str, end_date: str):
+    statuses, observations, adopted, value = [], [], None, None
+    for source in sources:
+        try:
+            candidate = source.fetch_range(symbol, start_date, end_date) if hasattr(source, "fetch_range") else [
+                bar for bar in source.fetch(symbol)
+                if start_date <= (bar.date if isinstance(bar, DailyBar) else bar["date"]) <= end_date
+            ]
+            if not candidate:
+                statuses.append(SourceStatus(source=source.name, status="empty", item_count=0))
+                continue
+            statuses.append(SourceStatus(source=source.name, status="ok", item_count=len(candidate)))
+            observations.append(SourceObservation(source=source.name, value=candidate))
+            if adopted is None:
+                adopted, value = source.name, candidate
+        except Exception as error:
+            statuses.append(SourceStatus(source=source.name, status="failed", error=_safe_error(error), item_count=0))
+    return CapabilityResult(
+        value=value, adopted_source=adopted, degraded=bool(adopted and statuses[0].status != "ok"),
+        sources=statuses, observations=observations,
     )
 
 
@@ -109,16 +203,81 @@ def _atomic_facts(symbol, now, quote, history, news, fundamentals):
             source=news_item.source, sourceReference=news_item.url,
         ))
     if isinstance(fundamentals.value, dict):
-        for field in ("dilutedEps", "revenue", "netIncome", "operatingCashFlow"):
-            value = fundamentals.value.get(field)
-            if value:
-                facts.append(AtomicFact(
-                    id=f"fact:{symbol}:fundamental:{field}:{value['observedAt']}", type=field,
-                    value=value["value"], observedAt=value["observedAt"], fetchedAt=now.isoformat(),
-                    source=fundamentals.adopted_source,
-                    sourceReference=fundamentals.value["sourceReference"],
-                ))
+        _append_financial_facts(facts, symbol, now, fundamentals)
     return facts
+
+
+def _append_financial_facts(facts, symbol, now, fundamentals):
+    value = fundamentals.value
+    source = fundamentals.adopted_source or "sec"
+    source_reference = value.get("sourceReference", "https://www.sec.gov/")
+    reported_fact_ids = set()
+    for reported in value.get("reported_facts", []):
+        facts.append(AtomicFact(
+            id=reported["fact_id"], type="reported_financial",
+            value={
+                "classification": "reported", "metric": reported["metric"],
+                "scope": reported["scope"], "period": reported["period"], "value": reported["value"],
+            },
+            observedAt=reported.get("observed_at") or reported["period"], fetchedAt=now.isoformat(),
+            source=source, sourceReference=source_reference,
+        ))
+        reported_fact_ids.add(reported["fact_id"])
+    emitted_fact_ids = set(reported_fact_ids)
+    for period in [*value.get("quarters", []), *value.get("annuals", [])]:
+        for metric, cell in period.get("values", {}).items():
+            if cell.get("status") != "available" or not cell.get("fact_id") or cell["fact_id"] in reported_fact_ids:
+                continue
+            facts.append(AtomicFact(
+                id=cell["fact_id"], type="derived_financial_metric",
+                value={
+                    "classification": "derived", "metric": metric, "period": period["period"],
+                    "value": cell["value"], "inputFactIds": cell.get("input_fact_ids", []),
+                },
+                observedAt=cell.get("observed_at") or period.get("observed_at") or now.isoformat(),
+                fetchedAt=now.isoformat(), source="deterministic-calculation", sourceReference=source_reference,
+            ))
+            emitted_fact_ids.add(cell["fact_id"])
+    for metric in value.get("derived_metrics", []):
+        if metric["fact_id"] in emitted_fact_ids:
+            continue
+        facts.append(AtomicFact(
+            id=metric["fact_id"], type="derived_financial_metric",
+            value={
+                "classification": "derived", "metric": metric["metric"], "scope": metric["scope"],
+                "period": metric["period"], "value": metric["value"],
+                "inputFactIds": metric["input_fact_ids"],
+            },
+            observedAt=metric["period"], fetchedAt=now.isoformat(), source="deterministic-calculation",
+            sourceReference=source_reference,
+        ))
+        emitted_fact_ids.add(metric["fact_id"])
+    for flag in value.get("quality_flags", []):
+        facts.append(AtomicFact(
+            id=flag["fact_id"], type="financial_quality_flag",
+            value={
+                "classification": "derived", "flagType": flag["flag_type"], "severity": flag["severity"],
+                "period": flag["period"], "evidenceFactIds": flag["evidence_fact_ids"],
+            },
+            observedAt=flag["period"], fetchedAt=now.isoformat(), source="deterministic-calculation",
+            sourceReference=source_reference,
+        ))
+
+    # Preserve the four original annual fact types for stored-report and UI compatibility.
+    latest_annual = next(iter(value.get("annuals", [])), None)
+    legacy_fields = {
+        "eps_diluted": "dilutedEps", "revenue": "revenue",
+        "net_income": "netIncome", "operating_cash_flow": "operatingCashFlow",
+    }
+    if latest_annual:
+        for metric, fact_type in legacy_fields.items():
+            cell = latest_annual.get("values", {}).get(metric, {})
+            if cell.get("status") == "available":
+                facts.append(AtomicFact(
+                    id=f"fact:{symbol}:fundamental:{fact_type}:{cell.get('observed_at')}", type=fact_type,
+                    value=cell["value"], observedAt=cell.get("observed_at") or latest_annual["period"],
+                    fetchedAt=now.isoformat(), source=source, sourceReference=source_reference,
+                ))
 
 
 def _first_available(sources: Iterable[Any], symbol: str) -> CapabilityResult:
@@ -130,14 +289,14 @@ def _first_available(sources: Iterable[Any], symbol: str) -> CapabilityResult:
         try:
             candidate = source.fetch(symbol)
             if candidate is None or candidate == [] or candidate == {}:
-                statuses.append(SourceStatus(source=source.name, status="empty"))
+                statuses.append(SourceStatus(source=source.name, status="empty", item_count=0))
                 continue
-            statuses.append(SourceStatus(source=source.name, status="ok"))
+            statuses.append(SourceStatus(source=source.name, status="ok", item_count=_item_count(candidate)))
             observations.append(SourceObservation(source=source.name, value=candidate))
             if adopted is None:
                 adopted, value = source.name, candidate
         except Exception as error:
-            statuses.append(SourceStatus(source=source.name, status="failed", error=type(error).__name__))
+            statuses.append(SourceStatus(source=source.name, status="failed", error=_safe_error(error), item_count=0))
     return CapabilityResult(
         value=value,
         adopted_source=adopted,
@@ -152,10 +311,12 @@ def _collect_news(sources: Iterable[Any], symbol: str, now: datetime) -> Capabil
     for source in sources:
         try:
             items = source.fetch(symbol)
-            statuses.append(SourceStatus(source=source.name, status="ok" if items else "empty"))
+            statuses.append(SourceStatus(
+                source=source.name, status="ok" if items else "empty", item_count=len(items or []),
+            ))
             collected.extend(items or [])
         except Exception as error:
-            statuses.append(SourceStatus(source=source.name, status="failed", error=type(error).__name__))
+            statuses.append(SourceStatus(source=source.name, status="failed", error=_safe_error(error), item_count=0))
 
     accepted, seen = [], set()
     for candidate in collected:
@@ -178,3 +339,16 @@ def _collect_news(sources: Iterable[Any], symbol: str, now: datetime) -> Capabil
         degraded=bool(statuses and any(status.status != "ok" for status in statuses)),
         sources=statuses,
     )
+
+
+def _item_count(value: Any) -> int:
+    return len(value) if isinstance(value, list) else 1
+
+
+def _safe_error(error: Exception) -> str:
+    message = str(error)
+    if message and re.match(r"^[A-Za-z0-9_.:-]+$", message):
+        return message[:120]
+    if hasattr(error, "code"):
+        return f"{type(error).__name__}:{getattr(error, 'code')}"
+    return type(error).__name__

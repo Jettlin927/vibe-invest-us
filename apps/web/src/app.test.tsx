@@ -180,6 +180,33 @@ test('用户创建分析并打开研究记录后能看到报告依据', async ()
   await waitFor(() => assert.ok(view.getByText('偏强震荡')))
 })
 
+test('新建分析页展示分析历史并能重新打开报告', async () => {
+  setupDom()
+  const summary = {
+    id: 'history-1', symbol: 'AAPL', status: 'completed', createdAt: '2026-08-11T08:30:00Z',
+    report: { title: 'AAPL 综合分析', trend: '中性偏强' },
+  }
+  globalThis.fetch = async (input) => {
+    const url = String(input)
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { database: { status: 'ok' }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/settings') return Response.json({ model: { configured: true } })
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+    if (url === '/api/portfolio') return Response.json(portfolioResponse([]))
+    if (url === '/api/research') return Response.json({ records: [summary] })
+    if (url === '/api/research/history-1') return Response.json({ ...summary, facts: [], trace: [] })
+    throw new Error(`unexpected_fetch:${url}`)
+  }
+  const view = render(React.createElement(App))
+  const user = userEvent.setup({ document: window.document })
+  await user.click(await view.findByRole('button', { name: '新建分析' }))
+  const history = await view.findByRole('region', { name: '分析历史' })
+  assert.match(history.textContent ?? '', /AAPL 综合分析/)
+  assert.match(history.textContent ?? '', /2026年8月11日/)
+  await user.click(view.getByRole('button', { name: /打开 AAPL 综合分析/ }))
+  await view.findByRole('heading', { name: '研究记录' })
+  await view.findByRole('heading', { name: 'AAPL 综合分析' })
+})
+
 test('坏报告依据被拒绝时用户看到可理解的失败原因', async () => {
   setupDom()
   let statusCalls = 0
@@ -238,4 +265,43 @@ test('研究报告把结构化事实翻译成人话且不渲染原始事件流',
   await view.findAllByText('MA5 US$219.44 · MA20 US$207.80 · RSI 54.26')
   assert.equal(view.container.textContent?.includes('{"raw":"token"}'), false)
   await view.findByText(/底层共保存 121 条原始事件/)
+})
+
+test('分析轨迹可展开查看各能力的数据源状态与错误', async () => {
+  setupDom()
+  const record = {
+    id: 'research-sources', symbol: 'AAPL', status: 'partial', report: {
+      title: 'AAPL 研究简报', trend: '中性', marketState: '行情可用', drivers: [],
+      supportingEvidence: [], contraryEvidence: [], keyJudgments: [], scenarios: [],
+      invalidationConditions: [], limitations: ['财报缺失'],
+    }, facts: [], trace: [{
+      type: 'financial_context', gaps: [{ capability: 'fundamentals', reason: 'all_sources_unavailable' }],
+      capabilities: [
+        { capability: 'news', adoptedSource: 'multiple', acceptedCount: 20, sources: [
+          { source: 'yahoo', status: 'ok', item_count: 10 },
+          { source: 'google-news', status: 'ok', item_count: 100 },
+        ] },
+        { capability: 'fundamentals', adoptedSource: null, acceptedCount: 0, sources: [
+          { source: 'sec', status: 'failed', error: 'UnicodeDecodeError', item_count: 0 },
+        ] },
+      ],
+    }],
+  }
+  globalThis.fetch = async (input) => {
+    const url = String(input)
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { database: { status: 'ok' }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/settings') return Response.json({ model: { configured: true } })
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+    if (url === '/api/portfolio') return Response.json(portfolioResponse([]))
+    if (url === '/api/research') return Response.json({ records: [{ id: record.id, symbol: record.symbol, status: record.status, report: record.report }] })
+    if (url === '/api/research/research-sources') return Response.json(record)
+    throw new Error(`unexpected_fetch:${url}`)
+  }
+  const view = render(React.createElement(App))
+  const user = userEvent.setup({ document: window.document })
+  await user.click(await view.findByRole('button', { name: '研究记录' }))
+  await user.click(await view.findByText('冻结金融上下文'))
+  await user.click(await view.findByText('财报基本面'))
+  await view.findByText('UnicodeDecodeError')
+  await view.findByText('采用 multiple · 20 条')
 })

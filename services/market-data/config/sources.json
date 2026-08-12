@@ -5,19 +5,19 @@
     "retention_hours": 24
   },
   "quote": [
-    { "name": "alpaca", "enabled": true, "priority": 10, "timeout_seconds": 8 },
+    { "name": "tencent", "enabled": true, "priority": 10, "timeout_seconds": 8 },
     { "name": "sina", "enabled": true, "priority": 20, "timeout_seconds": 8 },
-    { "name": "tencent", "enabled": true, "priority": 30, "timeout_seconds": 8 }
+    { "name": "alpaca", "enabled": true, "priority": 30, "timeout_seconds": 8 }
   ],
   "history": [
-    { "name": "alpaca", "enabled": true, "priority": 10, "timeout_seconds": 12 },
+    { "name": "yahoo", "enabled": true, "priority": 10, "timeout_seconds": 12 },
     { "name": "sina", "enabled": true, "priority": 20, "timeout_seconds": 12 },
-    { "name": "yahoo", "enabled": true, "priority": 30, "timeout_seconds": 12 }
+    { "name": "alpaca", "enabled": true, "priority": 30, "timeout_seconds": 12 }
   ],
   "news": [
-    { "name": "alpaca", "enabled": true, "priority": 10, "timeout_seconds": 10 },
-    { "name": "yahoo", "enabled": true, "priority": 20, "timeout_seconds": 10 },
-    { "name": "google-news", "enabled": true, "priority": 30, "timeout_seconds": 10 }
+    { "name": "yahoo", "enabled": true, "priority": 10, "timeout_seconds": 10 },
+    { "name": "google-news", "enabled": true, "priority": 20, "timeout_seconds": 10 },
+    { "name": "alpaca", "enabled": true, "priority": 30, "timeout_seconds": 10 }
   ],
   "fundamentals": [
     { "name": "sec", "enabled": true, "priority": 10, "timeout_seconds": 15 }

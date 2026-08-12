@@ -1,11 +1,12 @@
+import gzip
 import json
 import os
 import re
 import time
 from hashlib import sha256
-from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
+from pathlib import Path
 from typing import List
 from urllib.parse import urlencode
 from urllib.error import HTTPError
@@ -14,6 +15,7 @@ from xml.etree import ElementTree
 from zoneinfo import ZoneInfo
 
 from app.models import DailyBar, NewsItem, Quote
+from app.financials import build_financials
 from app.valuation import ValuationInput, calculate_valuation
 
 
@@ -33,6 +35,8 @@ def _read(url: str, params=None, headers=None, timeout=15) -> bytes:
     request = Request(target, headers={"User-Agent": USER_AGENT, **(headers or {})})
     with urlopen(request, timeout=timeout) as response:
         payload = response.read()
+        if response.headers.get("Content-Encoding", "").lower() == "gzip":
+            payload = gzip.decompress(payload)
     _diagnose(target, payload)
     return payload
 
@@ -109,7 +113,7 @@ class AlpacaQuoteSource(AlpacaSource):
         trade = data.get("trade") if isinstance(data, dict) else None
         if not isinstance(data, dict) or data.get("symbol") != symbol or not isinstance(trade, dict):
             raise ValueError("invalid_alpaca_trade")
-        observed_at = datetime.fromisoformat(str(trade["t"]).replace("Z", "+00:00"))
+        observed_at = _parse_provider_datetime(trade["t"])
         return Quote(
             price=float(trade["p"]), observed_at=observed_at,
             source_reference=f"https://data.alpaca.markets/v2/stocks/{symbol}/trades/latest?feed={self.feed}",
@@ -119,9 +123,12 @@ class AlpacaQuoteSource(AlpacaSource):
 class AlpacaHistorySource(AlpacaSource):
     def fetch(self, symbol: str) -> List[DailyBar]:
         now = datetime.now(timezone.utc)
+        return self.fetch_range(symbol, (now.date() - timedelta(days=365)).isoformat(), now.date().isoformat())
+
+    def fetch_range(self, symbol: str, start_date: str, end_date: str) -> List[DailyBar]:
         params = {
-            "timeframe": "1Day", "start": (now.date() - timedelta(days=365)).isoformat(),
-            "end": now.date().isoformat(), "limit": 10000, "adjustment": "all",
+            "timeframe": "1Day", "start": start_date,
+            "end": end_date, "limit": 10000, "adjustment": "all",
             "feed": self.feed, "sort": "asc",
         }
         result, page_tokens = [], set()
@@ -134,7 +141,7 @@ class AlpacaHistorySource(AlpacaSource):
                 if not isinstance(item, dict):
                     raise ValueError("invalid_alpaca_history")
                 result.append(DailyBar(
-                    date=datetime.fromisoformat(str(item["t"]).replace("Z", "+00:00")).date().isoformat(),
+                    date=_parse_provider_datetime(item["t"]).date().isoformat(),
                     open=float(item["o"]), high=float(item["h"]), low=float(item["l"]),
                     close=float(item["c"]), volume=float(item["v"]),
                 ))
@@ -172,7 +179,7 @@ class AlpacaNewsSource(AlpacaSource):
                     raise ValueError("invalid_alpaca_news")
                 result.append(NewsItem(
                     title=item["headline"], source=item.get("source") or "Alpaca News",
-                    published_at=datetime.fromisoformat(str(item["created_at"]).replace("Z", "+00:00")),
+                    published_at=_parse_provider_datetime(item["created_at"]),
                     fetched_at=now, url=item["url"], summary=str(item.get("summary") or item["headline"])[:500],
                     symbols=symbols,
                 ))
@@ -242,14 +249,23 @@ class SinaHistorySource(TimedSource):
                          low=float(item["l"]), close=float(item["c"]), volume=float(item["v"]))
                 for item in json.loads(match.group(1))[-180:]]
 
+    def fetch_range(self, symbol: str, start_date: str, end_date: str) -> List[DailyBar]:
+        return [bar for bar in self.fetch(symbol) if start_date <= bar.date <= end_date]
+
 
 class YahooHistorySource(TimedSource):
     name = "yahoo"
 
     def fetch(self, symbol: str) -> List[DailyBar]:
+        now = datetime.now(timezone.utc)
+        return self.fetch_range(symbol, (now.date() - timedelta(days=365)).isoformat(), now.date().isoformat())
+
+    def fetch_range(self, symbol: str, start_date: str, end_date: str) -> List[DailyBar]:
+        period1 = int(datetime.fromisoformat(start_date).replace(tzinfo=timezone.utc).timestamp())
+        period2 = int((datetime.fromisoformat(end_date).replace(tzinfo=timezone.utc) + timedelta(days=1)).timestamp())
         data = json.loads(_read(
             f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}",
-            params={"interval": "1d", "range": "1y"},
+            params={"interval": "1d", "period1": period1, "period2": period2},
             timeout=self.timeout,
         ))
         chart = data["chart"]["result"][0]
@@ -265,7 +281,7 @@ class YahooHistorySource(TimedSource):
             ))
         if not result:
             raise ValueError("empty_yahoo_history")
-        return result[-180:]
+        return result
 
 
 class YahooNewsSource(TimedSource):
@@ -325,12 +341,9 @@ class SecFundamentalsSource(TimedSource):
         gaap = facts.get("facts", {}).get("us-gaap", {})
         return {
             "company": facts.get("entityName"), "cik": cik,
-            "period": _latest_period(gaap),
-            "dilutedEps": _latest_fact(gaap, ["EarningsPerShareDiluted"], "USD/shares"),
-            "revenue": _latest_fact(gaap, ["RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues"], "USD"),
-            "netIncome": _latest_fact(gaap, ["NetIncomeLoss"], "USD"),
-            "operatingCashFlow": _latest_fact(gaap, ["NetCashProvidedByUsedInOperatingActivities", "NetCashProvidedByOperatingActivities"], "USD"),
-            "sourceReference": f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json",
+            **build_financials(
+                symbol, gaap, f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json",
+            ),
         }
 
 
@@ -339,6 +352,7 @@ COMPARABLES = {
     "AMD": ("semiconductor", ["NVDA", "AVGO", "QCOM"]),
     "AVGO": ("semiconductor", ["NVDA", "AMD", "QCOM"]),
     "QCOM": ("semiconductor", ["NVDA", "AMD", "AVGO"]),
+    "SNDK": ("semiconductor", ["MU", "WDC", "STX"]),
     "CRM": ("saas", ["NOW", "ADBE", "ORCL"]),
     "NOW": ("saas", ["CRM", "ADBE", "ORCL"]),
     "ADBE": ("saas", ["CRM", "NOW", "ORCL"]),
@@ -350,11 +364,18 @@ class YahooValuationSource(TimedSource):
     name = "yahoo-timeseries"
 
     def fetch(self, symbol: str):
+        return self.fetch_with_market_price(symbol, None, None)
+
+    def fetch_with_market_price(self, symbol: str, market_price, market_price_observed_at):
         industry_and_peers = COMPARABLES.get(symbol)
         if not industry_and_peers:
+            company = self._metrics(symbol)
             return calculate_valuation(ValuationInput(
-                symbol=symbol, industry="unsupported", current_price=0, diluted_eps=None,
-                enterprise_value=None, ebitda=None, revenue=None, comparables=[],
+                symbol=symbol, industry="unsupported", current_price=market_price or 0,
+                diluted_eps=company.get("dilutedEps"), enterprise_value=company.get("enterpriseValue"),
+                ebitda=company.get("ebitda"), revenue=company.get("revenue"), comparables=[],
+                historical_multiples={"pe": company.get("historicalPe", [])},
+                source=self.name, as_of=market_price_observed_at,
             ))
         industry, peers = industry_and_peers
         company = self._metrics(symbol)
@@ -366,16 +387,15 @@ class YahooValuationSource(TimedSource):
                 "evToEbitda": _ratio(values.get("enterpriseValue"), values.get("ebitda")),
                 "evToRevenue": _ratio(values.get("enterpriseValue"), values.get("revenue")),
             })
-        eps, pe = company.get("dilutedEps"), company.get("pe")
         return calculate_valuation(ValuationInput(
             symbol=symbol, industry=industry,
-            current_price=(eps * pe) if eps and pe else 0,
-            diluted_eps=eps, enterprise_value=company.get("enterpriseValue"),
+            current_price=market_price or 0,
+            diluted_eps=company.get("dilutedEps"), enterprise_value=company.get("enterpriseValue"),
             ebitda=company.get("ebitda"), revenue=company.get("revenue"),
             comparables=comparables,
             historical_multiples={"pe": company.get("historicalPe", [])},
             source=self.name,
-            as_of=datetime.now(timezone.utc).isoformat(),
+            as_of=market_price_observed_at,
         ))
 
     def _metrics(self, symbol: str):
@@ -409,17 +429,10 @@ def _ratio(numerator, denominator):
     return numerator / denominator if numerator and denominator else None
 
 
-def _latest_fact(gaap, tags, unit):
-    candidates = []
-    for tag in tags:
-        candidates.extend(gaap.get(tag, {}).get("units", {}).get(unit, []))
-    annual = [item for item in candidates if item.get("form") == "10-K" and item.get("fp") == "FY"]
-    if not annual:
-        return None
-    latest = max(annual, key=lambda item: (item.get("filed", ""), item.get("end", "")))
-    return {"value": latest.get("val"), "observedAt": latest.get("end"), "filedAt": latest.get("filed")}
-
-
-def _latest_period(gaap):
-    facts = _latest_fact(gaap, ["NetIncomeLoss"], "USD")
-    return facts.get("observedAt") if facts else None
+def _parse_provider_datetime(value) -> datetime:
+    """Parse RFC 3339 timestamps while truncating provider nanoseconds to Python microseconds."""
+    text = str(value).replace("Z", "+00:00")
+    match = re.match(r"^(.*\.)(\d+)([+-]\d\d:\d\d)$", text)
+    if match:
+        text = f"{match.group(1)}{match.group(2)[:6]}{match.group(3)}"
+    return datetime.fromisoformat(text)

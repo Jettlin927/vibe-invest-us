@@ -33,6 +33,7 @@ class ValuationResult(BaseModel):
     comparable_symbols: List[str]
     methods: Dict[str, MethodResult]
     historical_ranges: Dict[str, List[float]]
+    current_multiples: Dict[str, float] = Field(default_factory=dict)
     source: str
     as_of: Optional[str]
 
@@ -61,6 +62,11 @@ def calculate_valuation(inputs: ValuationInput) -> ValuationResult:
         comparable_symbols=[item["symbol"] for item in inputs.comparables if item.get("symbol")],
         methods=methods,
         historical_ranges=historical_ranges,
+        current_multiples={
+            "pe": round(inputs.current_price / inputs.diluted_eps, 4)
+            for _ in [0]
+            if inputs.current_price > 0 and inputs.diluted_eps is not None and inputs.diluted_eps > 0
+        },
         source=inputs.source,
         as_of=inputs.as_of,
     )

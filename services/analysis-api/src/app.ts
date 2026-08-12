@@ -6,7 +6,7 @@ import type { FinancialDataHealth } from '@vibe-invest/contracts'
 import { createAnalysisService } from './analysis.js'
 import { openDatabase } from './database.js'
 import type { ModelEvent } from './model.js'
-import type { FinancialContext } from './financial-data-client.js'
+import type { FactQueryResult, FinancialContext } from './financial-data-client.js'
 import { createPortfolio, isValidSymbol, normalizeSymbol } from './portfolio.js'
 
 type AppDependencies = {
@@ -14,6 +14,10 @@ type AppDependencies = {
   financialDataHealth: () => Promise<FinancialDataHealth>
   staticDir?: string
   fetchFinancialContext?: (symbol: string, signal: AbortSignal) => Promise<FinancialContext>
+  searchNews?: (keyword: string, signal: AbortSignal) => Promise<FactQueryResult>
+  fetchTechnicalIndicators?: (
+    symbol: string, startDate: string, endDate: string, signal: AbortSignal,
+  ) => Promise<FactQueryResult>
   fetchMarketPrices?: (symbols: string[], signal: AbortSignal) => Promise<Record<string, number>>
   model?: { analyze(input: Record<string, unknown>): AsyncIterable<ModelEvent> }
   analysisConcurrency?: number
@@ -29,6 +33,8 @@ export function buildApp(dependencies: AppDependencies) {
     ? createAnalysisService({
         database,
         fetchFinancialContext: dependencies.fetchFinancialContext,
+        searchNews: dependencies.searchNews,
+        fetchTechnicalIndicators: dependencies.fetchTechnicalIndicators,
         fetchMarketPrices: dependencies.fetchMarketPrices,
         listPortfolioSymbols: () => portfolio.list().map((position) => position.symbol),
         model: dependencies.model,

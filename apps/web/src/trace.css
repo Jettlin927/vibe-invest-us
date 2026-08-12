@@ -1,0 +1,22 @@
+.trace-panel > div,
+.trace-stage > summary {
+  display: grid;
+  grid-template-columns: 22px 1fr auto;
+  gap: 7px;
+  padding: 10px 0;
+  border-bottom: 1px solid #d8d1c4;
+  font: 10px Inter, sans-serif;
+}
+
+.trace-stage { margin-top: 0 !important; }
+.trace-stage > summary { list-style: none; }
+.trace-stage > summary::-webkit-details-marker { display: none; }
+.source-diagnostics { padding: 8px 0 12px 22px; border-bottom: 1px solid #d8d1c4; }
+.source-diagnostics details { margin: 5px 0; }
+.source-diagnostics summary { display: flex; justify-content: space-between; gap: 8px; }
+.source-diagnostics ul { margin: 5px 0 10px; padding: 0; list-style: none; }
+.source-diagnostics li { display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; padding: 5px 0; border-top: 1px dotted #d8d1c4; }
+.source-diagnostics li small { grid-column: 1 / -1; overflow-wrap: anywhere; }
+.source-ok { color: #3a7c49; }
+.source-empty,
+.source-failed { color: #9b3e31; }

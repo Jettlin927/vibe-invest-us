@@ -1,11 +1,11 @@
-from datetime import datetime, timezone
-from typing import Literal, List
+from datetime import date, datetime, timedelta, timezone
+from typing import Literal, List, Optional
 
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-from app.context import build_financial_context
-from app.models import FinancialContext, QuoteBatch, QuoteSnapshot, SourceStatus
+from app.context import build_financial_context, search_news_facts, technical_indicator_facts
+from app.models import FactQueryResult, FinancialContext, QuoteBatch, QuoteSnapshot, SourceStatus
 from app.source_config import build_sources, load_source_config
 
 
@@ -36,6 +36,29 @@ def financial_context(symbol: str) -> FinancialContext:
     )
 
 
+@app.post("/v1/news-search", operation_id="searchNews", response_model=FactQueryResult)
+def news_search(keyword: str) -> FactQueryResult:
+    facts, sources = search_news_facts(
+        keyword, datetime.now(timezone.utc), build_sources(source_config, "news"),
+    )
+    return FactQueryResult(facts=facts, sources=sources)
+
+
+@app.post("/v1/technical-indicators", operation_id="getTechnicalIndicators", response_model=FactQueryResult)
+def technical_indicators(
+    symbol: str,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+) -> FactQueryResult:
+    end = end_date or datetime.now(timezone.utc).date()
+    start = start_date or end - timedelta(days=365)
+    facts, sources = technical_indicator_facts(
+        symbol, start.isoformat(), end.isoformat(), datetime.now(timezone.utc),
+        build_sources(source_config, "history"),
+    )
+    return FactQueryResult(facts=facts, sources=sources)
+
+
 @app.post("/v1/quotes", operation_id="createQuoteBatch", response_model=QuoteBatch)
 def quotes(symbols: List[str]) -> QuoteBatch:
     result = []
@@ -46,12 +69,12 @@ def quotes(symbols: List[str]) -> QuoteBatch:
         for source in build_sources(source_config, "quote"):
             try:
                 quote = source.fetch(symbol)
-                statuses.append(SourceStatus(source=source.name, status="ok"))
+                statuses.append(SourceStatus(source=source.name, status="ok", item_count=1))
                 if adopted is None:
                     adopted = (source.name, quote)
             except Exception as error:
                 statuses.append(SourceStatus(
-                    source=source.name, status="failed", error=type(error).__name__,
+                    source=source.name, status="failed", error=type(error).__name__, item_count=0,
                 ))
         result.append(QuoteSnapshot(
             symbol=symbol,

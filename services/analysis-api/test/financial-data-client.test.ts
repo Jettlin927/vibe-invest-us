@@ -63,3 +63,27 @@ test('TS 客户端拒绝缺少来源或时间的金融事实', async () => {
   await assert.rejects(() => client.context('NVDA'), /financial_context_contract_invalid/)
   server.close()
 })
+
+test('TS 客户端查询关键词新闻和日期范围技术指标', async () => {
+  const requests: string[] = []
+  const resultFact = {
+    id: 'fact:query:1', type: 'indicators', value: { ma_20: 100 },
+    observedAt: '2026-08-12', fetchedAt: '2026-08-12T12:00:00Z',
+    source: 'deterministic-calculation', sourceReference: 'source://history',
+  }
+  const server = createServer((request, response) => {
+    requests.push(request.url ?? '')
+    response.writeHead(200, { 'content-type': 'application/json' })
+    response.end(JSON.stringify({ facts: [resultFact], sources: [] }))
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  assert.ok(address && typeof address !== 'string')
+  const client = createFinancialDataClient(`http://127.0.0.1:${address.port}`)
+
+  assert.equal((await client.searchNews('NAND pricing')).facts[0]?.id, resultFact.id)
+  assert.equal((await client.technicalIndicators('SNDK', '2026-01-01', '2026-08-12')).facts[0]?.id, resultFact.id)
+  assert.match(requests[0] ?? '', /keyword=NAND(?:\+|%20)pricing/)
+  assert.match(requests[1] ?? '', /symbol=SNDK.*start_date=2026-01-01.*end_date=2026-08-12/)
+  await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+})

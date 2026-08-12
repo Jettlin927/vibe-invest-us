@@ -61,8 +61,8 @@ def test_quote_batch_uses_fallback_without_exposing_provider_payload(monkeypatch
         "observed_at": "2026-08-12T00:00:00Z", "source": "backup",
         "degraded": True,
         "sources": [
-            {"source": "primary", "status": "failed", "error": "RuntimeError"},
-            {"source": "backup", "status": "ok", "error": None},
+            {"source": "primary", "status": "failed", "error": "RuntimeError", "item_count": 0},
+            {"source": "backup", "status": "ok", "error": None, "item_count": 1},
         ],
     }
 

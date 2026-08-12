@@ -6,12 +6,12 @@ from app.adapters import AlpacaHistorySource, AlpacaNewsSource, AlpacaQuoteSourc
 from app.source_config import build_sources, load_source_config
 
 
-def test_alpaca_is_the_default_source_for_market_data_capabilities():
+def test_highest_success_rate_sources_are_first_by_default():
     config = load_source_config()
 
-    assert [source.name for source in build_sources(config, "quote")][:2] == ["alpaca", "sina"]
-    assert [source.name for source in build_sources(config, "history")][:2] == ["alpaca", "sina"]
-    assert [source.name for source in build_sources(config, "news")][:2] == ["alpaca", "yahoo"]
+    assert [source.name for source in build_sources(config, "quote")][:2] == ["tencent", "sina"]
+    assert [source.name for source in build_sources(config, "history")][:2] == ["yahoo", "sina"]
+    assert [source.name for source in build_sources(config, "news")][:2] == ["yahoo", "google-news"]
 
 
 def test_alpaca_quote_uses_latest_trade_and_iex_by_default(monkeypatch):
@@ -29,6 +29,16 @@ def test_alpaca_quote_uses_latest_trade_and_iex_by_default(monkeypatch):
     assert quote.observed_at.tzinfo == timezone.utc
     assert calls == [("/v2/stocks/NVDA/trades/latest", {"feed": "iex"})]
     assert "feed=iex" in quote.source_reference
+
+
+def test_alpaca_quote_accepts_nanosecond_timestamp(monkeypatch):
+    monkeypatch.setattr(AlpacaQuoteSource, "read", lambda self, path, params=None: {
+        "symbol": "NVDA", "trade": {"p": 181.42, "t": "2026-08-11T19:59:57.900326649Z"},
+    })
+
+    quote = AlpacaQuoteSource().fetch("NVDA")
+
+    assert quote.observed_at.isoformat() == "2026-08-11T19:59:57.900326+00:00"
 
 
 def test_alpaca_credentials_are_only_sent_as_headers(monkeypatch):

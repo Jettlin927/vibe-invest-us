@@ -28,6 +28,10 @@ const app = buildApp({
   staticDir,
   financialDataHealth: () => financialData.health(),
   fetchFinancialContext: (symbol, signal) => financialData.context(symbol, signal),
+  searchNews: (keyword, signal) => financialData.searchNews(keyword, signal),
+  fetchTechnicalIndicators: (symbol, startDate, endDate, signal) => (
+    financialData.technicalIndicators(symbol, startDate, endDate, signal)
+  ),
   fetchMarketPrices: (symbols, signal) => financialData.quotes(symbols, signal),
   model,
   analysisConcurrency: Number(process.env.ANALYSIS_CONCURRENCY ?? 2),

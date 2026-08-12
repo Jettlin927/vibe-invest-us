@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from app.context import build_financial_context
+from app.context import build_financial_context, search_news_facts, technical_indicator_facts
 from app.models import DailyBar, NewsItem, Quote
 
 
@@ -106,6 +106,8 @@ def test_one_news_source_failure_keeps_news_with_degradation():
     )
     assert len(context.news.items) == 1
     assert context.news.degraded is True
+    assert context.news.sources[0].error == "down"
+    assert context.news.sources[1].item_count == 1
 
 
 def test_all_news_sources_failure_creates_news_gap():
@@ -114,6 +116,34 @@ def test_all_news_sources_failure_creates_news_gap():
         "NVDA", NOW, quote_sources=[], history_sources=[], news_sources=down, fundamentals_source=None,
     )
     assert "news" in {gap.capability for gap in context.gaps}
+
+
+def test_keyword_news_query_returns_traceable_facts_without_symbol_filter():
+    item = NewsItem(title="NAND pricing improves", source="Google", published_at=NOW,
+                    fetched_at=NOW, url="https://example.com/nand", summary="Memory prices rose", symbols=[])
+    facts, sources = search_news_facts("NAND pricing", NOW, [Source("google", [item])])
+
+    assert len(facts) == 1
+    assert facts[0].value["keyword"] == "NAND pricing"
+    assert facts[0].sourceReference == item.url
+    assert sources[0].status == "ok"
+
+
+def test_technical_query_filters_requested_range_and_returns_indicator_fact():
+    class RangeSource(Source):
+        def fetch_range(self, _symbol, start_date, end_date):
+            assert (start_date, end_date) == ("2026-07-01", "2026-07-30")
+            return bars()
+
+    facts, sources = technical_indicator_facts(
+        "nvda", "2026-07-01", "2026-07-30", NOW, [RangeSource("history")],
+    )
+
+    assert len(facts) == 1
+    assert facts[0].value["barCount"] == 30
+    assert facts[0].value["startDate"] == "2026-07-01"
+    assert facts[0].value["ma_20"] == 21.5
+    assert sources[0].status == "ok"
 
 
 def test_news_material_is_bounded_for_snapshot_and_model_context():
@@ -134,3 +164,59 @@ def test_disabled_valuation_source_is_an_explicit_gap():
         fundamentals_source=None, valuation_source=None,
     )
     assert {gap.capability: gap.reason for gap in context.gaps}["valuation"] == "source_disabled"
+
+
+def test_financial_context_preserves_reported_and_derived_evidence_chain():
+    fundamentals = {
+        "sourceReference": "https://sec.example/NVDA",
+        "reported_facts": [{
+            "fact_id": "fact:NVDA:reported:quarter:CY2026Q1:revenue",
+            "metric": "revenue", "scope": "quarter", "period": "CY2026Q1", "value": 125,
+            "observed_at": "2026-03-31", "filed_at": "2026-05-01",
+        }],
+        "quarters": [], "annuals": [], "ttm": {"status": "unavailable", "values": {}},
+        "derived_metrics": [{
+            "fact_id": "fact:NVDA:derived:quarter:CY2026Q1:revenue_yoy",
+            "metric": "revenue_yoy", "scope": "quarter", "period": "CY2026Q1", "value": 0.25,
+            "input_fact_ids": ["fact:NVDA:reported:quarter:CY2026Q1:revenue"],
+        }],
+        "quality_flags": [{
+            "fact_id": "fact:NVDA:derived:quality:CY2026Q1:receivables_outpace_revenue",
+            "flag_type": "receivables_outpace_revenue", "severity": "warning", "period": "CY2026Q1",
+            "evidence_fact_ids": ["fact:NVDA:reported:quarter:CY2026Q1:revenue"],
+        }],
+    }
+    context = build_financial_context(
+        "NVDA", NOW, quote_sources=[], history_sources=[], news_sources=[],
+        fundamentals_source=Source("sec", fundamentals), valuation_source=None,
+    )
+
+    facts = {fact.id: fact for fact in context.facts}
+    assert facts["fact:NVDA:reported:quarter:CY2026Q1:revenue"].value["classification"] == "reported"
+    derived = facts["fact:NVDA:derived:quarter:CY2026Q1:revenue_yoy"]
+    assert derived.value["inputFactIds"] == ["fact:NVDA:reported:quarter:CY2026Q1:revenue"]
+    flag = facts["fact:NVDA:derived:quality:CY2026Q1:receivables_outpace_revenue"]
+    assert flag.value["evidenceFactIds"] == ["fact:NVDA:reported:quarter:CY2026Q1:revenue"]
+
+
+def test_valuation_receives_adopted_quote_price_and_timestamp():
+    captured = {}
+
+    class ValuationSource:
+        name = "valuation"
+
+        def fetch_with_market_price(self, symbol, price, observed_at):
+            captured.update(symbol=symbol, price=price, observed_at=observed_at)
+            return type("Valuation", (), {
+                "model_dump": lambda self: {"current_multiples": {"pe": 30}},
+                "as_of": observed_at, "source": "valuation",
+            })()
+
+    context = build_financial_context(
+        "NVDA", NOW,
+        quote_sources=[Source("quote", Quote(price=150, observed_at=NOW, source_reference="quote://NVDA"))],
+        history_sources=[], news_sources=[], fundamentals_source=None, valuation_source=ValuationSource(),
+    )
+
+    assert captured == {"symbol": "NVDA", "price": 150, "observed_at": NOW.isoformat()}
+    assert context.valuation.model_dump()["current_multiples"] == {"pe": 30}

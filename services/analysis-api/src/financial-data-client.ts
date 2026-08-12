@@ -19,6 +19,11 @@ export type FinancialContext = {
   [key: string]: unknown
 }
 
+export type FactQueryResult = {
+  facts: FinancialFact[]
+  sources?: unknown[]
+}
+
 export function createFinancialDataClient(baseUrl: string) {
   return {
     async health(): Promise<FinancialDataHealth> {
@@ -44,6 +49,15 @@ export function createFinancialDataClient(baseUrl: string) {
       }
       return value
     },
+    async searchNews(keyword: string, signal?: AbortSignal): Promise<FactQueryResult> {
+      return factQuery(`/v1/news-search?keyword=${encodeURIComponent(keyword)}`, signal)
+    },
+    async technicalIndicators(
+      symbol: string, startDate: string, endDate: string, signal?: AbortSignal,
+    ): Promise<FactQueryResult> {
+      const query = new URLSearchParams({ symbol, start_date: startDate, end_date: endDate })
+      return factQuery(`/v1/technical-indicators?${query}`, signal)
+    },
     async quotes(symbols: string[], signal?: AbortSignal): Promise<Record<string, number>> {
       const response = await fetch(new URL('/v1/quotes', baseUrl), {
         method: 'POST',
@@ -60,6 +74,19 @@ export function createFinancialDataClient(baseUrl: string) {
           : []
       )))
     },
+  }
+
+  async function factQuery(path: string, signal?: AbortSignal): Promise<FactQueryResult> {
+    const response = await fetch(new URL(path, baseUrl), {
+      method: 'POST',
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(30_000)]) : AbortSignal.timeout(30_000),
+    })
+    if (!response.ok) throw new Error(`financial_data_fact_query_http_${response.status}`)
+    const value = await response.json() as { facts?: unknown; sources?: unknown[] }
+    if (!Array.isArray(value.facts) || !value.facts.every(isFinancialFact)) {
+      throw new Error('financial_data_fact_query_contract_invalid')
+    }
+    return { facts: value.facts, sources: Array.isArray(value.sources) ? value.sources : [] }
   }
 }
 

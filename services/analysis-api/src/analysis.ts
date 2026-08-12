@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import type { DatabaseSync } from 'node:sqlite'
 
 import type { AnalysisReport, ModelEvent } from './model.js'
-import type { FinancialContext, FinancialFact } from './financial-data-client.js'
+import type { FactQueryResult, FinancialContext, FinancialFact } from './financial-data-client.js'
 
 type Fact = FinancialFact
 type Model = { analyze(input: Record<string, unknown>): AsyncIterable<ModelEvent> }
@@ -11,6 +11,10 @@ export function createAnalysisService(options: {
   database: DatabaseSync
   model: Model
   fetchFinancialContext: (symbol: string, signal: AbortSignal) => Promise<FinancialContext>
+  searchNews?: (keyword: string, signal: AbortSignal) => Promise<FactQueryResult>
+  fetchTechnicalIndicators?: (
+    symbol: string, startDate: string, endDate: string, signal: AbortSignal,
+  ) => Promise<FactQueryResult>
   fetchMarketPrices?: (symbols: string[], signal: AbortSignal) => Promise<Record<string, number>>
   listPortfolioSymbols?: () => string[]
   getPortfolioContext?: (symbol: string, marketPrices: Record<string, number>) => unknown
@@ -108,6 +112,7 @@ export function createAnalysisService(options: {
       appendTrace(id, {
         type: 'financial_context',
         gaps,
+        capabilities: sourceDiagnostics(context),
         degradedSources: sourceDegradations(context),
       })
       const modelContext = createModelContext(snapshot)
@@ -117,6 +122,8 @@ export function createAnalysisService(options: {
         userPrompt: `分析 ${job.symbol}。个人语境：${JSON.stringify(portfolioContext)}`,
         knownFacts: modelContext.facts,
         fetchFinancialContext: async () => modelContext, signal: controller.signal,
+        searchNews: options.searchNews,
+        fetchTechnicalIndicators: options.fetchTechnicalIndicators,
       })) {
         if (event.type === 'trace') {
           if (event.entry.type === 'tool_result') {
@@ -238,10 +245,12 @@ export function createAnalysisService(options: {
 }
 
 const ANALYSIS_SYSTEM_PROMPT = `你是个人美股研究助手，分析周期为未来一至四周。
-先调用 fetch_financial_context 读取本次已冻结的金融上下文，再调用 submit_analysis_report 提交最终报告。
+你可以自主规划分析路径。建议先确认本次冻结的金融上下文；按需调用 fetch_financial_context，遇到需要深入解释财报时可调用 analyze_financials。财报专家可通过受控工具补查关键词新闻和指定日期范围的技术指标。只能使用提供的只读工具，最终必须调用 submit_analysis_report 提交报告。
 不得编造行情、新闻、财报、估值或持仓；所有事实判断只能引用工具结果中真实存在的事实 ID。
 每条 keyJudgments 都必须关联一个或多个事实 ID；supportingEvidence 和 contraryEvidence 也必须引用事实 ID。
-技术指标与估值结果由宿主程序计算，你只负责解释，不重新计算或改写输入数字。
+财报增长率、利润率、TTM、自由现金流、质量标记、技术指标与估值结果由宿主程序计算，你只负责解释，不重新计算或改写输入数字。
+必须区分“当前估值倍数”和“目标价估值方法”：目标价方法不可用不等于当前 PE 等倍数不可用。
+模型上下文中的日线是冻结快照的裁剪样本，不得据此声称数据源只有这些交易日；以 contextScope 中的数量说明裁剪范围。
 数据不足时明确写入 limitations；缺行情不得判断走势，缺财报或估值输入不得给目标价，缺新闻不得推断新闻驱动。
 操作建议只能是带前提的方向建议，不给具体股数或无条件买卖指令。`
 
@@ -251,6 +260,28 @@ function sourceDegradations(context: FinancialContext) {
     const sources = 'sources' in value && Array.isArray(value.sources) ? value.sources : []
     return [{ capability, sources }]
   })
+}
+
+function sourceDiagnostics(context: FinancialContext) {
+  const capabilities = Object.entries(context).flatMap(([capability, value]) => {
+    if (!value || typeof value !== 'object' || !('sources' in value) || !Array.isArray(value.sources)) return []
+    const record = value as Record<string, unknown>
+    const acceptedCount = Array.isArray(record.items)
+      ? record.items.length
+      : record.value === null || record.value === undefined ? 0 : 1
+    return [{
+      capability,
+      adoptedSource: typeof record.adopted_source === 'string' ? record.adopted_source : null,
+      acceptedCount,
+      sources: value.sources,
+    }]
+  })
+  const valuationSources = Array.isArray(context.valuation_sources) ? context.valuation_sources : []
+  if (valuationSources.length) capabilities.push({
+    capability: 'valuation', adoptedSource: context.valuation ? valuationSources[0]?.source ?? null : null,
+    acceptedCount: context.valuation ? 1 : 0, sources: valuationSources,
+  })
+  return capabilities
 }
 
 function isTerminal(status: string) {
@@ -282,17 +313,97 @@ function enforceDataGaps(report: AnalysisReport, gaps: unknown[]) {
 function createModelContext(snapshot: FinancialContext & Record<string, unknown>) {
   const dailyBars = snapshot.facts.filter((fact) => fact.type === 'daily_bar')
   const news = snapshot.facts.filter((fact) => fact.type === 'news').slice(0, 8)
-  const relevantFacts = snapshot.facts.filter((fact) => fact.type !== 'daily_bar' && fact.type !== 'news')
+  const financialSummary = createFinancialSummary(snapshot.fundamentals)
+  const financialFactIds = collectFinancialFactIds(financialSummary, snapshot.facts)
+  const relevantFacts = snapshot.facts.filter((fact) => (
+    fact.type !== 'daily_bar'
+    && fact.type !== 'news'
+    && (!isFinancialFact(fact) || financialFactIds.has(fact.id))
+  ))
   const sampledHistory = [...dailyBars.slice(-10)]
   return {
     symbol: snapshot.symbol,
     facts: [...relevantFacts, ...news, ...sampledHistory],
     gaps: snapshot.gaps ?? [],
     indicators: snapshot.indicators,
+    financials: financialSummary,
     valuation: snapshot.valuation,
     portfolioContext: snapshot.portfolioContext,
+    contextScope: {
+      snapshotDailyBarCount: dailyBars.length,
+      providedDailyBarCount: sampledHistory.length,
+      note: '日线仅为冻结快照的上下文裁剪样本，不代表数据源总历史长度。',
+    },
     createdAt: snapshot.createdAt,
   }
+}
+
+function createFinancialSummary(fundamentals: unknown) {
+  if (!fundamentals || typeof fundamentals !== 'object') return null
+  const value = (fundamentals as { value?: unknown }).value
+  if (!value || typeof value !== 'object') return null
+  const financials = value as Record<string, unknown>
+  const quarters = Array.isArray(financials.quarters) ? financials.quarters : []
+  const annuals = Array.isArray(financials.annuals) ? financials.annuals : []
+  const latestPeriod = periodName(quarters[0])
+  const priorYearPeriod = latestPeriod?.replace(/^(CY|FY)(\d{4})/, (_match, prefix, year) => `${prefix}${Number(year) - 1}`)
+  const selectedQuarters = [quarters[0], quarters[1], quarters.find((period) => periodName(period) === priorYearPeriod)]
+    .filter((period, index, selected) => period && selected.indexOf(period) === index)
+  const derivedMetrics = Array.isArray(financials.derived_metrics)
+    ? financials.derived_metrics.filter((metric) => {
+        if (!metric || typeof metric !== 'object') return false
+        const candidate = metric as Record<string, unknown>
+        return candidate.scope === 'ttm' || candidate.period === latestPeriod
+      })
+    : []
+  return {
+    quarters: selectedQuarters,
+    ttm: financials.ttm ?? null,
+    annuals: annuals.slice(0, 3),
+    derivedMetrics,
+    qualityFlags: financials.quality_flags ?? [],
+  }
+}
+
+function collectFinancialFactIds(summary: unknown, facts: FinancialFact[]) {
+  const selected = new Set<string>()
+  collectIds(summary, selected)
+  const byId = new Map(facts.map((fact) => [fact.id, fact]))
+  const queue = [...selected]
+  while (queue.length) {
+    const fact = byId.get(queue.shift()!)
+    if (!fact || !fact.value || typeof fact.value !== 'object') continue
+    const record = fact.value as Record<string, unknown>
+    for (const input of [...asStrings(record.inputFactIds), ...asStrings(record.evidenceFactIds)]) {
+      if (!selected.has(input)) { selected.add(input); queue.push(input) }
+    }
+  }
+  return selected
+}
+
+function collectIds(value: unknown, ids: Set<string>) {
+  if (Array.isArray(value)) { for (const item of value) collectIds(item, ids); return }
+  if (!value || typeof value !== 'object') return
+  for (const [key, item] of Object.entries(value)) {
+    if ((key === 'fact_id' || key === 'factId') && typeof item === 'string') ids.add(item)
+    else if ((key === 'input_fact_ids' || key === 'evidence_fact_ids') && Array.isArray(item)) {
+      for (const id of item) if (typeof id === 'string') ids.add(id)
+    } else collectIds(item, ids)
+  }
+}
+
+function isFinancialFact(fact: FinancialFact) {
+  return ['reported_financial', 'derived_financial_metric', 'financial_quality_flag'].includes(fact.type)
+}
+
+function periodName(value: unknown) {
+  return value && typeof value === 'object' && typeof (value as { period?: unknown }).period === 'string'
+    ? (value as { period: string }).period
+    : null
+}
+
+function asStrings(value: unknown) {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
 }
 
 function mapAnalysis(row: Record<string, unknown>) {

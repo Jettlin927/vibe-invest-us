@@ -1,4 +1,5 @@
 from app.valuation import ValuationInput, calculate_valuation
+from app.adapters import COMPARABLES
 
 
 def test_semiconductor_uses_pe_and_ev_to_ebitda_comparables():
@@ -64,3 +65,19 @@ def test_unsupported_industry_does_not_guess_a_method():
     ))
     assert result.methods["industry"] .status == "unavailable"
     assert result.methods["industry"].reason == "unsupported_industry"
+
+
+def test_sndk_uses_a_declared_semiconductor_comparable_set():
+    assert COMPARABLES["SNDK"] == ("semiconductor", ["MU", "WDC", "STX"])
+
+
+def test_current_pe_uses_the_market_snapshot_price():
+    result = calculate_valuation(ValuationInput(
+        symbol="NVDA", industry="semiconductor", current_price=150,
+        diluted_eps=5, enterprise_value=None, ebitda=None, revenue=None,
+        comparables=[{"symbol": "AMD", "pe": 20}],
+        as_of="2026-08-12T14:30:00Z",
+    ))
+
+    assert result.current_multiples["pe"] == 30
+    assert result.as_of == "2026-08-12T14:30:00Z"
