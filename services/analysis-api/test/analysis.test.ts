@@ -173,6 +173,31 @@ test('并发调度在队列 claim 阻塞时仍不会超出实例上限', async (
   await app.close()
 })
 
+test('队列 claim 瞬时失败会归还槽位且后续创建可恢复调度', async () => {
+  const database = createTestProductDatabase()
+  const repository = database.analysisRepository
+  const originalClaim = repository.claimNextQueued
+  let failOnce = true
+  repository.claimNextQueued = async (updatedAt) => {
+    if (failOnce) { failOnce = false; throw new Error('temporary_claim_failure') }
+    return originalClaim(updatedAt)
+  }
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [], indicators: {} }),
+    model: fakeModel(),
+    analysisConcurrency: 1,
+  })
+  await app.ready()
+  const first = await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'FAILONCE' } })
+  await new Promise((resolve) => setTimeout(resolve, 10))
+  const second = await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'RECOVER' } })
+  await waitForStatus(app as any, first.json().analysisId, 'completed')
+  await waitForStatus(app as any, second.json().analysisId, 'completed')
+  await app.close()
+})
+
 test('取消运行任务会停止模型并保存取消轨迹', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'vibe-analysis-cancel-'))
   const app = await makeApp(join(dir, 'storage'), fakeModel(1000), 1)
