@@ -24,13 +24,16 @@ test('生产存储只使用 Product DAO 和 PostgreSQL', async () => {
     'packages/product-dao/src',
   ].map((path) => join(repositoryRoot, path))
   const files = (await Promise.all(productionRoots.map(sourceFiles))).flat()
-  const runtimeFiles = files.filter((path) => !path.endsWith('/sqlite-migration.ts') && !path.endsWith('/sqlite-migration-cli.ts'))
-  const contents = await Promise.all(runtimeFiles.map(async (path) => ({ path, text: await readFile(path, 'utf8') })))
+  const contents = await Promise.all(files.map(async (path) => ({ path, text: await readFile(path, 'utf8') })))
 
   for (const { path, text } of contents) {
-    assert.doesNotMatch(text, /sqlite|DatabaseSync|DATABASE_PATH|\.db\b/i, path)
+    const controlledMigrationFile = path.endsWith('/sqlite-migration.ts') || path.endsWith('/sqlite-migration-cli.ts')
+    if (!controlledMigrationFile) assert.doesNotMatch(text, /sqlite|DatabaseSync|DATABASE_PATH|\.db\b/i, path)
     if (!path.includes('/packages/product-dao/')) {
       assert.doesNotMatch(text, /from ['"]pg['"]|\.query\s*\(/, path)
+    }
+    if (controlledMigrationFile) {
+      assert.doesNotMatch(text, /\bcreatePool\b|\.query\s*\(|\bBEGIN\b|\bCOMMIT\b|\bROLLBACK\b/, path)
     }
   }
 })

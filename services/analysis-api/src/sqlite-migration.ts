@@ -2,7 +2,12 @@ import { createHash } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
 import { DatabaseSync } from 'node:sqlite'
 
-import { createPool } from '@vibe-invest/product-dao'
+import {
+  executeLegacyPortfolioMigration,
+  verifyLegacyPortfolioMigration,
+  type LegacyPortfolioMigration,
+  type MigrationVerificationState,
+} from '@vibe-invest/product-dao'
 
 type LegacyPosition = { symbol: string; quantity: string; average_cost: string; updated_at: string }
 type LegacyCash = { cash: string; updated_at: string }
@@ -48,60 +53,13 @@ export async function executeMigration(options: {
   await assertApiStopped(options.apiHealthUrl)
   const sourceHash = sha256(options.source)
   const source = readLegacy(options.source)
-  const pool = createPool(options.databaseUrl)
-  const client = await pool.connect()
-  try {
-    await client.query('BEGIN')
-    const receipt = await client.query(
-      'SELECT source_sha256 FROM legacy_portfolio_migrations WHERE source_sha256 = $1',
-      [sourceHash],
-    )
-    if (receipt.rowCount) throw new Error('legacy_migration_already_executed')
-    const target = await client.query<{ positions: number; snapshots: number; cash: string }>(
-      `SELECT (SELECT count(*)::integer FROM positions) AS positions,
-              (SELECT count(*)::integer FROM portfolio_equity_snapshots) AS snapshots,
-              (SELECT cash::text FROM portfolio_settings WHERE id = 1 FOR UPDATE) AS cash`,
-    )
-    const current = target.rows[0]
-    if (!current || current.positions > 0 || current.snapshots > 0 || current.cash !== '0') {
-      throw new Error('legacy_migration_target_conflict')
-    }
-    for (const position of source.positions) {
-      await client.query(
-        `INSERT INTO positions (symbol, quantity, average_cost, updated_at)
-         VALUES ($1, $2, $3, $4)`,
-        [position.symbol, decimal(position.quantity), decimal(position.average_cost), position.updated_at],
-      )
-    }
-    await client.query(
-      'UPDATE portfolio_settings SET cash = $1, updated_at = $2 WHERE id = 1',
-      [decimal(source.cash.cash), source.cash.updated_at],
-    )
-    for (const snapshot of source.snapshots) {
-      await client.query(
-        `INSERT INTO portfolio_equity_snapshots (
-           market_day, total_equity, total_market_value, cash,
-           holdings_count, priced_count, observed_at, after_close
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-        [snapshot.market_day, decimal(snapshot.total_equity), decimal(snapshot.total_market_value),
-          decimal(snapshot.cash), snapshot.holdings_count, snapshot.priced_count,
-          snapshot.observed_at, snapshot.after_close === 1],
-      )
-    }
-    await client.query(
-      `INSERT INTO legacy_portfolio_migrations (source_sha256, source_path)
-       VALUES ($1, $2)`,
-      [sourceHash, options.source],
-    )
-    await client.query('COMMIT')
-    return { sourceSha256: sourceHash, positions: source.positions.length, equitySnapshots: source.snapshots.length }
-  } catch (error) {
-    await client.query('ROLLBACK')
-    throw error
-  } finally {
-    client.release()
-    await pool.end()
-  }
+  await executeLegacyPortfolioMigration({
+    connectionString: options.databaseUrl,
+    sourceSha256: sourceHash,
+    sourcePath: options.source,
+    data: migrationData(source),
+  })
+  return { sourceSha256: sourceHash, positions: source.positions.length, equitySnapshots: source.snapshots.length }
 }
 
 export async function verifyMigration(options: {
@@ -111,55 +69,21 @@ export async function verifyMigration(options: {
   apiToken: string
 }) {
   const source = readLegacy(options.source)
-  const pool = createPool(options.databaseUrl)
-  try {
-    const positions = await pool.query<{ symbol: string; quantity: string; average_cost: string }>(
-      'SELECT symbol, quantity::text, average_cost::text FROM positions ORDER BY symbol',
-    )
-    const cash = await pool.query<{ cash: string }>(
-      'SELECT cash::text FROM portfolio_settings WHERE id = 1',
-    )
-    const snapshots = await pool.query<{
-      market_day: string; total_equity: string; total_market_value: string; cash: string
-    }>(
-      `SELECT market_day::text, total_equity::text, total_market_value::text, cash::text
-       FROM portfolio_equity_snapshots ORDER BY market_day`,
-    )
-    const expectedPositions = source.positions.map((row) => ({
-      symbol: row.symbol, quantity: decimal(row.quantity), average_cost: decimal(row.average_cost),
-    })).sort((left, right) => left.symbol.localeCompare(right.symbol))
-    const expectedSnapshots = source.snapshots.map((row) => ({
-      market_day: row.market_day, total_equity: decimal(row.total_equity),
-      total_market_value: decimal(row.total_market_value), cash: decimal(row.cash),
-    })).sort((left, right) => left.market_day.localeCompare(right.market_day))
-    if (
-      JSON.stringify(positions.rows) !== JSON.stringify(expectedPositions)
-      || cash.rows[0]?.cash !== decimal(source.cash.cash)
-      || JSON.stringify(snapshots.rows) !== JSON.stringify(expectedSnapshots)
-    ) throw new Error('legacy_migration_verification_failed')
-    await verifyApiReadback(
-      options.apiBaseUrl, options.apiToken, expectedPositions,
-      expectedSnapshots, decimal(source.cash.cash),
-    )
-    return {
-      positions: expectedPositions.length,
-      cash: true,
-      equitySnapshots: expectedSnapshots.length,
-      database: 'verified' as const,
-    }
-  } finally {
-    await pool.end()
+  const expected = verificationState(source)
+  await verifyLegacyPortfolioMigration(options.databaseUrl, expected)
+  await verifyApiReadback(options.apiBaseUrl, options.apiToken, expected)
+  return {
+    positions: expected.positions.length,
+    cash: true,
+    equitySnapshots: expected.snapshots.length,
+    database: 'verified' as const,
   }
 }
 
 async function verifyApiReadback(
   apiBaseUrl: string,
   apiToken: string,
-  positions: Array<{ symbol: string; quantity: string; average_cost: string }>,
-  snapshots: Array<{
-    market_day: string; total_equity: string; total_market_value: string; cash: string
-  }>,
-  cash: string,
+  expected: MigrationVerificationState,
 ) {
   const state = await fetch(`${apiBaseUrl}/api/migration-verification`, {
     headers: { authorization: `Bearer ${apiToken}` },
@@ -170,20 +94,8 @@ async function verifyApiReadback(
       marketDay: string; totalEquity: string; totalMarketValue: string; cash: string
     }>
   }
-  const actualPositions = state.positions.map((row) => ({
-    symbol: row.symbol, quantity: decimal(row.quantity), average_cost: decimal(row.averageCost),
-  }))
-  if (JSON.stringify(actualPositions) !== JSON.stringify(positions)) {
-    throw new Error('legacy_migration_api_verification_failed')
-  }
-  const actualSnapshots = state.snapshots.map((row) => ({
-    market_day: row.marketDay, total_equity: decimal(row.totalEquity),
-    total_market_value: decimal(row.totalMarketValue), cash: decimal(row.cash),
-  })).sort((left, right) => left.market_day.localeCompare(right.market_day))
-  if (JSON.stringify(actualSnapshots) !== JSON.stringify(snapshots)) {
-    throw new Error('legacy_migration_api_verification_failed')
-  }
-  if (decimal(state.cash) !== cash) throw new Error('legacy_migration_api_verification_failed')
+  const actual = normalizeVerificationState(state)
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) throw new Error('legacy_migration_api_verification_failed')
 }
 
 async function requireOk(response: Response) {
@@ -223,6 +135,50 @@ function readLegacy(sourcePath: string) {
     }
   } finally {
     database.close()
+  }
+}
+
+type LegacyData = ReturnType<typeof readLegacy>
+
+function migrationData(source: LegacyData): LegacyPortfolioMigration {
+  return {
+    positions: source.positions.map((row) => ({
+      symbol: row.symbol, quantity: decimal(row.quantity),
+      averageCost: decimal(row.average_cost), updatedAt: row.updated_at,
+    })),
+    cash: { value: decimal(source.cash.cash), updatedAt: source.cash.updated_at },
+    snapshots: source.snapshots.map((row) => ({
+      marketDay: row.market_day, totalEquity: decimal(row.total_equity),
+      totalMarketValue: decimal(row.total_market_value), cash: decimal(row.cash),
+      holdingsCount: row.holdings_count, pricedCount: row.priced_count,
+      observedAt: row.observed_at, afterClose: row.after_close === 1,
+    })),
+  }
+}
+
+function verificationState(source: LegacyData): MigrationVerificationState {
+  return {
+    positions: source.positions.map((row) => ({
+      symbol: row.symbol, quantity: decimal(row.quantity), averageCost: decimal(row.average_cost),
+    })).sort((left, right) => left.symbol.localeCompare(right.symbol)),
+    cash: decimal(source.cash.cash),
+    snapshots: source.snapshots.map((row) => ({
+      marketDay: row.market_day, totalEquity: decimal(row.total_equity),
+      totalMarketValue: decimal(row.total_market_value), cash: decimal(row.cash),
+    })).sort((left, right) => left.marketDay.localeCompare(right.marketDay)),
+  }
+}
+
+function normalizeVerificationState(state: MigrationVerificationState): MigrationVerificationState {
+  return {
+    positions: state.positions.map((row) => ({
+      symbol: row.symbol, quantity: decimal(row.quantity), averageCost: decimal(row.averageCost),
+    })).sort((left, right) => left.symbol.localeCompare(right.symbol)),
+    cash: decimal(state.cash),
+    snapshots: state.snapshots.map((row) => ({
+      marketDay: row.marketDay, totalEquity: decimal(row.totalEquity),
+      totalMarketValue: decimal(row.totalMarketValue), cash: decimal(row.cash),
+    })).sort((left, right) => left.marketDay.localeCompare(right.marketDay)),
   }
 }
 

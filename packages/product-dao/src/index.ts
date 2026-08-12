@@ -174,6 +174,96 @@ export type MigrationVerificationState = {
   }>
 }
 
+export type LegacyPortfolioMigration = {
+  positions: Array<{ symbol: string; quantity: string; averageCost: string; updatedAt: string }>
+  cash: { value: string; updatedAt: string }
+  snapshots: Array<{
+    marketDay: string
+    totalEquity: string
+    totalMarketValue: string
+    cash: string
+    holdingsCount: number
+    pricedCount: number
+    observedAt: string
+    afterClose: boolean
+  }>
+}
+
+export async function executeLegacyPortfolioMigration(options: {
+  connectionString: string
+  sourceSha256: string
+  sourcePath: string
+  data: LegacyPortfolioMigration
+}) {
+  const pool = createPool(options.connectionString)
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const receipt = await client.query(
+      'SELECT source_sha256 FROM legacy_portfolio_migrations WHERE source_sha256 = $1',
+      [options.sourceSha256],
+    )
+    if (receipt.rowCount) throw new Error('legacy_migration_already_executed')
+    const target = await client.query<{ positions: number; snapshots: number; cash: string }>(
+      `SELECT (SELECT count(*)::integer FROM positions) AS positions,
+              (SELECT count(*)::integer FROM portfolio_equity_snapshots) AS snapshots,
+              (SELECT cash::text FROM portfolio_settings WHERE id = 1 FOR UPDATE) AS cash`,
+    )
+    const current = target.rows[0]
+    if (!current || current.positions > 0 || current.snapshots > 0 || current.cash !== '0') {
+      throw new Error('legacy_migration_target_conflict')
+    }
+    for (const position of options.data.positions) {
+      await client.query(
+        `INSERT INTO positions (symbol, quantity, average_cost, updated_at)
+         VALUES ($1, $2, $3, $4)`,
+        [position.symbol, position.quantity, position.averageCost, position.updatedAt],
+      )
+    }
+    await client.query(
+      'UPDATE portfolio_settings SET cash = $1, updated_at = $2 WHERE id = 1',
+      [options.data.cash.value, options.data.cash.updatedAt],
+    )
+    for (const snapshot of options.data.snapshots) {
+      await client.query(
+        `INSERT INTO portfolio_equity_snapshots (
+           market_day, total_equity, total_market_value, cash,
+           holdings_count, priced_count, observed_at, after_close
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [snapshot.marketDay, snapshot.totalEquity, snapshot.totalMarketValue, snapshot.cash,
+          snapshot.holdingsCount, snapshot.pricedCount, snapshot.observedAt, snapshot.afterClose],
+      )
+    }
+    await client.query(
+      `INSERT INTO legacy_portfolio_migrations (source_sha256, source_path)
+       VALUES ($1, $2)`,
+      [options.sourceSha256, options.sourcePath],
+    )
+    await client.query('COMMIT')
+  } catch (error) {
+    await client.query('ROLLBACK')
+    throw error
+  } finally {
+    client.release()
+    await pool.end()
+  }
+}
+
+export async function verifyLegacyPortfolioMigration(
+  connectionString: string,
+  expected: MigrationVerificationState,
+) {
+  const pool = createPool(connectionString)
+  try {
+    const actual = await createPortfolioRepository(pool).migrationVerificationState()
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+      throw new Error('legacy_migration_verification_failed')
+    }
+  } finally {
+    await pool.end()
+  }
+}
+
 type PositionRow = { symbol: string; quantity: string; average_cost: string }
 type SnapshotRow = {
   market_day: string

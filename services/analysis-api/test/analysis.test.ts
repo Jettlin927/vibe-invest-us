@@ -198,6 +198,37 @@ test('队列 claim 瞬时失败会归还槽位且后续创建可恢复调度', a
   await app.close()
 })
 
+test('running 轨迹写入失败会中断已领取任务并恢复后续调度', async () => {
+  const database = createTestProductDatabase()
+  const repository = database.analysisRepository
+  const originalAppendTrace = repository.appendTrace
+  let failOnce = true
+  repository.appendTrace = async (analysisId, payload) => {
+    if (failOnce && (payload as { status?: string }).status === 'running') {
+      failOnce = false
+      throw new Error('running_trace_write_failed')
+    }
+    return originalAppendTrace(analysisId, payload)
+  }
+  let modelCalls = 0
+  const model = fakeModel()
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [], indicators: {} }),
+    model: { analyze(input: Parameters<typeof model.analyze>[0]) { modelCalls += 1; return model.analyze(input) } },
+    analysisConcurrency: 1,
+  })
+  await app.ready()
+  const first = await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'TRACEFAIL' } })
+  const second = await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'AFTERFAIL' } })
+  const interrupted = await waitForStatus(app as any, first.json().analysisId, 'interrupted')
+  assert.equal(interrupted.error, 'analysis_running_trace_failed')
+  await waitForStatus(app as any, second.json().analysisId, 'completed')
+  assert.equal(modelCalls, 1)
+  await app.close()
+})
+
 test('取消运行任务会停止模型并保存取消轨迹', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'vibe-analysis-cancel-'))
   const app = await makeApp(join(dir, 'storage'), fakeModel(1000), 1)

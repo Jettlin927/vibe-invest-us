@@ -69,7 +69,17 @@ export function createAnalysisService(options: {
         return
       }
       if (!next) { running -= 1; return }
-      await appendTrace(next, { type: 'status', status: 'running', at: now })
+      try {
+        await appendTrace(next, { type: 'status', status: 'running', at: now })
+      } catch {
+        try {
+          await setStatus(next, 'interrupted', { error: 'analysis_running_trace_failed' })
+        } catch {
+          // The claimed task must never proceed when its critical audit write failed.
+        }
+        running -= 1
+        continue
+      }
       const task = run(next).finally(() => { running -= 1; void schedule() })
       tasks.add(task)
       void task.then(() => tasks.delete(task), () => tasks.delete(task))
