@@ -198,6 +198,13 @@ export function createTestProductDatabase() {
         latestSequence: 1, createdAt: input.createdAt, updatedAt: input.createdAt,
       })
       agentEvents.set(input.id, [event])
+      const current = runtimeSettingsRevisions.at(-1)!
+      executionSettingsSnapshots.set(input.executionId, {
+        executionId: input.executionId,
+        id: current.id,
+        values: { ...current.values },
+        createdAt: input.createdAt,
+      })
       return { sequence: 1, created: true, event }
     },
     async append(input) {

@@ -376,6 +376,9 @@ function SettingsPage({ health, modelConfigured, settings, onReload }: {
   health: SystemHealth | null; modelConfigured: boolean; settings: RuntimeSettingsResponse | null
   onReload: () => Promise<void>
 }) {
+  const [writeError, setWriteError] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  const submittingRef = useRef(false)
   const fields: Array<{ key: keyof RuntimeSettings; label: string }> = [
     { key: 'mainAgentToolRounds', label: '主 Agent 轮次' },
     { key: 'specialistAgentToolRounds', label: '专项 Agent 轮次' },
@@ -392,26 +395,40 @@ function SettingsPage({ health, modelConfigured, settings, onReload }: {
     event.preventDefault()
     const data = new FormData(event.currentTarget)
     const body = Object.fromEntries(fields.map(({ key }) => [key, Number(data.get(key))]))
-    const response = await fetch('/api/settings', {
+    await writeSettings('Runtime 设置保存失败', '/api/settings', {
       method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
     })
-    if (!response.ok) throw new Error('Runtime 设置保存失败')
-    await onReload()
   }
   async function restoreDefaults() {
-    const response = await fetch('/api/settings/defaults', { method: 'POST' })
-    if (!response.ok) throw new Error('Runtime 设置恢复失败')
-    await onReload()
+    await writeSettings('Runtime 设置恢复失败', '/api/settings/defaults', { method: 'POST' })
   }
   async function restoreField(key: keyof RuntimeSettings) {
-    const response = await fetch('/api/settings', {
+    await writeSettings('Runtime 设置恢复失败', '/api/settings', {
       method: 'PUT', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ [key]: settings!.defaults[key] }),
     })
-    if (!response.ok) throw new Error('Runtime 设置恢复失败')
-    await onReload()
   }
-  return <><PageHeader eyebrow="INSTANCE SETTINGS" title="系统设置" description="普通 Runtime 设置保存在 PostgreSQL；密钥值永远不会返回浏览器。" /><div className="settings-grid"><Setting title="Analysis API" description="分析任务、研究记录与持仓管理" ready={health?.status === 'ok'} /><Setting title="Financial Data" description="行情、新闻、财报与确定性计算" ready={health?.dependencies.financialData.status === 'ok'} /><Setting title="AI Model" description="由 .env 指定的兼容模型端点" ready={modelConfigured} /><Setting title="PostgreSQL" description="持仓、权益历史、事实与研究轨迹" ready={health?.dependencies.productDatabase.status === 'ok'} /></div>{settings?.current && settings.defaults && <section className="runtime-settings"><header><div><p className="micro">AGENT RUNTIME</p><h2>当前 revision #{settings.current.id}</h2><p>上次修改：{formatTime(settings.current.createdAt)}</p></div><button type="button" className="quiet" onClick={() => void restoreDefaults()}>恢复全部默认值</button></header><form key={settings.current.id} onSubmit={(event) => void save(event)}>{fields.map(({ key, label }) => <label key={key}>{label}<input aria-label={label} name={key} type="number" min={runtimeSettingLimits[key][0]} max={runtimeSettingLimits[key][1]} defaultValue={settings.current!.values[key]} required /><small>默认 {settings.defaults![key].toLocaleString('zh-CN')} <button type="button" className="text-button" onClick={() => void restoreField(key)}>恢复此项</button></small></label>)}<button type="submit">保存 Runtime 设置</button></form>{settings.activeExecutions.length > 0 && <div className="frozen-settings"><h3>运行中的冻结值</h3>{settings.activeExecutions.map((snapshot) => <article key={snapshot.executionId}><strong>运行 execution {snapshot.executionId}</strong><span>{formatFrozenSettings(snapshot.values)}</span></article>)}</div>}</section>}</>
+  async function writeSettings(message: string, url: string, init: RequestInit) {
+    if (submittingRef.current) return
+    submittingRef.current = true
+    setSubmitting(true)
+    setWriteError('')
+    try {
+      const response = await fetch(url, init)
+      if (!response.ok) {
+        const body = await response.json().catch(() => null) as { error?: unknown } | null
+        const detail = typeof body?.error === 'string' ? `：${body.error}` : ''
+        throw new Error(`${message}（HTTP ${response.status}）${detail}`)
+      }
+      await onReload()
+    } catch (cause) {
+      setWriteError(cause instanceof Error ? cause.message : message)
+    } finally {
+      submittingRef.current = false
+      setSubmitting(false)
+    }
+  }
+  return <><PageHeader eyebrow="INSTANCE SETTINGS" title="系统设置" description="普通 Runtime 设置保存在 PostgreSQL；密钥值永远不会返回浏览器。" /><div className="settings-grid"><Setting title="Analysis API" description="分析任务、研究记录与持仓管理" ready={health?.status === 'ok'} /><Setting title="Financial Data" description="行情、新闻、财报与确定性计算" ready={health?.dependencies.financialData.status === 'ok'} /><Setting title="AI Model" description="由 .env 指定的兼容模型端点" ready={modelConfigured} /><Setting title="PostgreSQL" description="持仓、权益历史、事实与研究轨迹" ready={health?.dependencies.productDatabase.status === 'ok'} /></div>{settings?.current && settings.defaults && <section className="runtime-settings" aria-busy={submitting}><header><div><p className="micro">AGENT RUNTIME</p><h2>当前 revision #{settings.current.id}</h2><p>上次修改：{formatTime(settings.current.createdAt)}</p></div><button type="button" className="quiet" disabled={submitting} onClick={() => void restoreDefaults()}>恢复全部默认值</button></header>{writeError && <p role="alert" className="error-banner">{writeError}</p>}<form key={settings.current.id} onSubmit={(event) => void save(event)}>{fields.map(({ key, label }) => <label key={key}>{label}<input aria-label={label} name={key} type="number" min={runtimeSettingLimits[key][0]} max={runtimeSettingLimits[key][1]} defaultValue={settings.current!.values[key]} disabled={submitting} required /><small>默认 {settings.defaults![key].toLocaleString('zh-CN')} <button type="button" className="text-button" disabled={submitting} onClick={() => void restoreField(key)}>恢复此项</button></small></label>)}<button type="submit" disabled={submitting}>{submitting ? '保存中…' : '保存 Runtime 设置'}</button></form>{settings.activeExecutions.length > 0 && <div className="frozen-settings"><h3>运行中的冻结值</h3>{settings.activeExecutions.map((snapshot) => <article key={snapshot.executionId}><strong>运行 execution {snapshot.executionId}</strong><span>{formatFrozenSettings(snapshot.values)}</span></article>)}</div>}</section>}</>
 }
 
 function formatFrozenSettings(settings: RuntimeSettings) {

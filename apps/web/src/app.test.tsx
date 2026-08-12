@@ -374,6 +374,55 @@ test('设置页展示当前、默认、修改时间与运行 execution 冻结值
   assert.deepEqual(requests[2], { url: '/api/settings/defaults', method: 'POST' })
 })
 
+test('设置写入失败可见且提交期间禁用并防止重复请求', async () => {
+  setupDom()
+  let putCalls = 0
+  let putResponse: (response: Response) => void = () => {}
+  let operation: 'save' | 'field' | 'defaults' = 'save'
+  globalThis.fetch = async (input, init) => {
+    const url = String(input)
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok', engine: 'postgresql', schemaVersion: 8 }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/settings' && (!init?.method || init.method === 'GET')) return Response.json({
+      model: { configured: true },
+      current: { id: 2, createdAt: '2026-08-13T03:00:00.000Z', values: runtimeSettings() },
+      defaults: runtimeSettings(),
+      activeExecutions: [],
+    })
+    if (url === '/api/settings' && init?.method === 'PUT') {
+      putCalls += 1
+      if (operation === 'save') return new Promise<Response>((resolve) => { putResponse = resolve })
+      return Response.json({ error: 'database_unavailable' }, { status: 500 })
+    }
+    if (url === '/api/settings/defaults' && init?.method === 'POST') {
+      return Response.json({ error: 'database_unavailable' }, { status: 500 })
+    }
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+    if (url === '/api/portfolio') return Response.json(portfolioResponse([]))
+    if (url === '/api/research') return Response.json({ records: [] })
+    throw new Error(`unexpected_fetch:${url}`)
+  }
+
+  const view = render(React.createElement(App))
+  const user = userEvent.setup({ document: window.document })
+  await user.click(await view.findByRole('button', { name: '系统设置' }))
+  const save = view.getByRole('button', { name: '保存 Runtime 设置' })
+  await user.click(save)
+  await user.click(view.getByRole('button', { name: '保存中…' }))
+  assert.equal(putCalls, 1)
+  assert.equal((view.getByRole('button', { name: '保存中…' }) as HTMLButtonElement).disabled, true)
+  assert.equal((view.getByRole('button', { name: '恢复全部默认值' }) as HTMLButtonElement).disabled, true)
+  putResponse(Response.json({ error: 'invalid_runtime_setting:mainAgentToolRounds' }, { status: 400 }))
+  await view.findByText(/Runtime 设置保存失败.*400.*invalid_runtime_setting/)
+
+  operation = 'field'
+  await user.click(view.getAllByRole('button', { name: '恢复此项' })[0]!)
+  await view.findByText(/Runtime 设置恢复失败.*500.*database_unavailable/)
+
+  operation = 'defaults'
+  await user.click(view.getByRole('button', { name: '恢复全部默认值' }))
+  await view.findByText(/Runtime 设置恢复失败.*500.*database_unavailable/)
+})
+
 function runtimeSettings(overrides: Record<string, number> = {}) {
   return { ...defaultRuntimeSettings, ...overrides }
 }

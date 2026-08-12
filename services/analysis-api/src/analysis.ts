@@ -2,13 +2,14 @@ import { randomUUID } from 'node:crypto'
 import type {
   AgentEvent, AgentEventRepository, AnalysisRepository, RuntimeSettingsRepository,
 } from '@vibe-invest/product-dao'
-import type { RuntimeSettings } from '@vibe-invest/contracts'
+import { defaultRuntimeSettings, type RuntimeSettings } from '@vibe-invest/contracts'
 
-import type { AnalysisReport, ModelEvent } from './model.js'
+import type { AnalyzeInput, AnalysisReport, ModelEvent } from './model.js'
 import type { FactQueryResult, FinancialContext, FinancialFact } from './financial-data-client.js'
+import { createActiveBudget, createConcurrencyGate } from './runtime-policy.js'
 
 type Fact = FinancialFact
-type Model = { analyze(input: Record<string, unknown> & { executionId: string }): AsyncIterable<ModelEvent> }
+type Model = { analyze(input: AnalyzeInput): AsyncIterable<ModelEvent> }
 
 export function createAnalysisService(options: {
   repository: AnalysisRepository
@@ -23,21 +24,19 @@ export function createAnalysisService(options: {
   fetchMarketPrices?: (symbols: string[], signal: AbortSignal) => Promise<Record<string, number>>
   listPortfolioSymbols?: () => Promise<string[]>
   getPortfolioContext?: (symbol: string, marketPrices: Record<string, number>) => Promise<unknown>
-  concurrency?: number
 }) {
   const { repository } = options
   const controllers = new Map<string, AbortController>()
   const listeners = new Map<string, Set<(entry: AgentEvent) => void>>()
   const tasks = new Set<Promise<void>>()
+  const toolGate = createConcurrencyGate()
   let running = 0
-  let concurrency = options.concurrency ?? 2
+  let concurrency: number = defaultRuntimeSettings.analysisConcurrency
   const initialized = Promise.all([
     options.eventRepository.interruptActiveSessions(new Date().toISOString()),
-    options.concurrency === undefined
-      ? options.settingsRepository.current().then((revision) => {
-          concurrency = revision.values.analysisConcurrency
-        })
-      : Promise.resolve(),
+    options.settingsRepository.current().then((revision) => {
+      concurrency = revision.values.analysisConcurrency
+    }),
   ])
 
   async function appendEvent(
@@ -159,19 +158,39 @@ export function createAnalysisService(options: {
     if (!job) return
     const controller = new AbortController()
     controllers.set(analysisId, controller)
+    const wallDeadline = AbortSignal.timeout(runtimeSettings.executionWallClockMinutes * 60_000)
+    const executionSignal = AbortSignal.any([controller.signal, wallDeadline])
+    const activeBudget = createActiveBudget(runtimeSettings.researchActiveMinutes * 60_000)
     const operationId = (kind: string) => `execution:${executionId}:${kind}`
     let modelEventSequence = 0
     const nextModelOperationId = (kind: string) => (
       `execution:${executionId}:model:${++modelEventSequence}:${kind}`
     )
     try {
-      const context = await options.fetchFinancialContext(job.symbol, controller.signal)
+      const releaseContextSlot = await toolGate.acquire(runtimeSettings.toolConcurrency, executionSignal)
+      const contextActive = activeBudget.start(executionSignal)
+      let context: FinancialContext
+      try {
+        context = await options.fetchFinancialContext(job.symbol, contextActive.signal)
+      } finally {
+        contextActive.stop()
+        releaseContextSlot()
+      }
       const quoteFact = context.facts.find((fact) => fact.type === 'quote' && typeof fact.value === 'number')
       let portfolioPrices: Record<string, number> = {}
       let portfolioPriceGap = false
       if (options.fetchMarketPrices && options.listPortfolioSymbols) {
         try {
-          portfolioPrices = await options.fetchMarketPrices(await options.listPortfolioSymbols(), controller.signal)
+          const releasePriceSlot = await toolGate.acquire(runtimeSettings.toolConcurrency, executionSignal)
+          const pricesActive = activeBudget.start(executionSignal)
+          try {
+            portfolioPrices = await options.fetchMarketPrices(
+              await options.listPortfolioSymbols(), pricesActive.signal,
+            )
+          } finally {
+            pricesActive.stop()
+            releasePriceSlot()
+          }
         } catch (error) {
           if (controller.signal.aborted) throw error
           portfolioPriceGap = true
@@ -202,6 +221,9 @@ export function createAnalysisService(options: {
         userPrompt: `分析 ${job.symbol}。个人语境：${JSON.stringify(portfolioContext)}`,
         knownFacts: modelContext.facts,
         fetchFinancialContext: async () => modelContext, signal: controller.signal,
+        executionDeadlineSignal: wallDeadline,
+        activeElapsedMs: activeBudget.elapsedMs(),
+        acquireToolSlot: (limit, signal) => toolGate.acquire(limit, signal),
         searchNews: options.searchNews,
         fetchTechnicalIndicators: options.fetchTechnicalIndicators,
       })) {
@@ -240,6 +262,14 @@ export function createAnalysisService(options: {
     } catch (error) {
       if (controller.signal.aborted) {
         await setStatus(sessionId, operationId('status-cancelled'), 'cancelled')
+      } else if (wallDeadline.aborted) {
+        await setStatus(sessionId, operationId('status-failed'), 'failed', {
+          error: 'execution_runtime_timeout',
+        })
+      } else if (activeBudget.exhausted()) {
+        await setStatus(sessionId, operationId('status-failed'), 'failed', {
+          error: 'research_active_timeout',
+        })
       } else {
         await setStatus(sessionId, operationId('status-failed'), 'failed', {
           error: error instanceof Error ? error.message : String(error),

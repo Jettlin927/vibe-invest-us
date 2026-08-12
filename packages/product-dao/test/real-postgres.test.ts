@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
+import { defaultRuntimeSettings } from '@vibe-invest/contracts'
+
 import {
   checkSchema, createAgentEventRepository, createAnalysisRepository, createPool,
   createPortfolioRepository, createRuntimeSettingsRepository, migrate,
@@ -61,6 +63,73 @@ test('真实 PostgreSQL execution 冻结 settings snapshot 后不随新 revision
   }
 })
 
+test('真实 PostgreSQL 主与专项 execution 创建时原子冻结 settings snapshot', {
+  skip: !migrationUrl || !applicationUrl,
+  concurrency: false,
+}, async () => {
+  await migrate(migrationUrl!)
+  const pool = createPool(applicationUrl!)
+  const settings = createRuntimeSettingsRepository(pool)
+  const events = createAgentEventRepository(pool)
+  const migrationPool = createPool(migrationUrl!)
+  const analysisId = 'settings-snapshot-all-sessions'
+  try {
+    await settings.restoreDefaults('2026-08-13T02:04:00.000Z')
+    await settings.save({ mainAgentToolRounds: 101 }, '2026-08-13T02:05:00.000Z')
+    await events.createResearch({
+      analysisId,
+      sessionId: 'settings-snapshot-main',
+      executionId: 'settings-snapshot-main-execution',
+      symbol: 'SNAPALL',
+      status: 'queued',
+      operationId: 'create-main',
+      event: { type: 'status', status: 'queued' },
+      createdAt: '2026-08-13T02:06:00.000Z',
+    })
+    assert.equal(
+      (await settings.getExecutionSnapshot('settings-snapshot-main-execution'))?.values.mainAgentToolRounds,
+      101,
+    )
+
+    await settings.save({ specialistAgentToolRounds: 202 }, '2026-08-13T02:07:00.000Z')
+    await events.createSession({
+      id: 'settings-snapshot-specialist',
+      analysisId,
+      executionId: 'settings-snapshot-specialist-execution',
+      status: 'queued',
+      operationId: 'create-specialist',
+      event: { type: 'status', status: 'queued' },
+      createdAt: '2026-08-13T02:08:00.000Z',
+    })
+    assert.equal(
+      (await settings.getExecutionSnapshot('settings-snapshot-specialist-execution'))?.values.specialistAgentToolRounds,
+      202,
+    )
+    assert.equal(
+      (await settings.getExecutionSnapshot('settings-snapshot-main-execution'))?.values.specialistAgentToolRounds,
+      20,
+    )
+
+    await migrationPool.query('REVOKE INSERT ON execution_settings_snapshots FROM vibe_invest_app')
+    await assert.rejects(events.createSession({
+      id: 'settings-snapshot-rollback',
+      analysisId,
+      executionId: 'settings-snapshot-rollback-execution',
+      status: 'queued',
+      operationId: 'create-rollback',
+      event: { type: 'status', status: 'queued' },
+      createdAt: '2026-08-13T02:09:00.000Z',
+    }), /permission denied/)
+    assert.equal(await events.getSession('settings-snapshot-rollback'), null)
+    assert.equal(await settings.getExecutionSnapshot('settings-snapshot-rollback-execution'), null)
+  } finally {
+    await migrationPool.query('GRANT INSERT ON execution_settings_snapshots TO vibe_invest_app')
+    await createAnalysisRepository(pool).removeResearch(analysisId)
+    await migrationPool.end()
+    await pool.end()
+  }
+})
+
 test('真实 PostgreSQL 并发保存 Runtime settings 不丢失不同字段更新', {
   skip: !migrationUrl || !applicationUrl,
   concurrency: false,
@@ -78,6 +147,40 @@ test('真实 PostgreSQL 并发保存 Runtime settings 不丢失不同字段更�
     assert.equal(current.values.mainAgentToolRounds, 100)
     assert.equal(current.values.modelRequestTimeoutMinutes, 60)
   } finally {
+    await pool.end()
+  }
+})
+
+test('真实 PostgreSQL save 与 restoreDefaults 共用写锁且不会复活旧设置', {
+  skip: !migrationUrl || !applicationUrl,
+  concurrency: false,
+}, async () => {
+  await migrate(migrationUrl!)
+  const pool = createPool(applicationUrl!)
+  const settings = createRuntimeSettingsRepository(pool)
+  const blocker = await pool.connect()
+  try {
+    await settings.restoreDefaults('2026-08-13T02:13:00.000Z')
+    await settings.save({ modelRequestTimeoutMinutes: 60 }, '2026-08-13T02:14:00.000Z')
+    await blocker.query('SELECT pg_advisory_lock($1)', [8_613_092])
+    let saveSettled = false
+    let restoreSettled = false
+    const saving = settings.save(
+      { mainAgentToolRounds: 100 }, '2026-08-13T02:15:00.000Z',
+    ).finally(() => { saveSettled = true })
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    const restoring = settings.restoreDefaults(
+      '2026-08-13T02:16:00.000Z',
+    ).finally(() => { restoreSettled = true })
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    assert.equal(saveSettled, false)
+    assert.equal(restoreSettled, false)
+    await blocker.query('SELECT pg_advisory_unlock($1)', [8_613_092])
+    await Promise.all([saving, restoring])
+    assert.deepEqual((await settings.current()).values, defaultRuntimeSettings)
+  } finally {
+    await blocker.query('SELECT pg_advisory_unlock($1)', [8_613_092])
+    blocker.release()
     await pool.end()
   }
 })

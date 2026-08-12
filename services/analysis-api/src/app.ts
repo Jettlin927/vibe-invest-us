@@ -31,7 +31,6 @@ type AppDependencies = {
   ) => Promise<FactQueryResult>
   fetchMarketPrices?: (symbols: string[], signal: AbortSignal) => Promise<Record<string, number>>
   model?: { analyze(input: Record<string, unknown>): AsyncIterable<ModelEvent> }
-  analysisConcurrency?: number
   modelConfigured?: boolean
   now?: () => Date
   migrationVerificationToken?: string
@@ -51,7 +50,6 @@ export function buildApp(dependencies: AppDependencies) {
         fetchMarketPrices: dependencies.fetchMarketPrices,
         listPortfolioSymbols: async () => (await portfolio.list()).map((position) => position.symbol),
         model: dependencies.model,
-        concurrency: dependencies.analysisConcurrency,
         getPortfolioContext: (symbol, marketPrices) => portfolio.context(symbol, marketPrices),
       })
     : null

@@ -11,6 +11,12 @@ import {
 } from '@earendil-works/pi-ai'
 import { openAICompletionsApi } from '@earendil-works/pi-ai/api/openai-completions.lazy'
 import { openAIResponsesApi } from '@earendil-works/pi-ai/api/openai-responses.lazy'
+import type { RuntimeSettings } from '@vibe-invest/contracts'
+import { createActiveBudget, createConcurrencyGate, deadlineSignal } from './runtime-policy.js'
+import {
+  compactPiMessagesAtTurnBoundary,
+  type PiAgentAdapterMessage,
+} from './agent-runtime/pi-agent-adapter.js'
 import { analysisModelTools, financialSpecialistTools } from './tools.js'
 
 type Fact = {
@@ -42,9 +48,17 @@ export type AnalysisReport = {
 type TraceEntry =
   | { type: 'system_prompt'; content: string; operationId?: string }
   | { type: 'user_input'; content: string; operationId?: string }
+  | {
+    type: 'runtime_policy'
+    settings: RuntimeSettings
+    freshnessCutoff: string
+    staleFactIds: string[]
+    operationId?: string
+  }
   | { type: 'model_event'; event: unknown; operationId?: string }
   | { type: 'tool_call'; name: string; input: unknown; operationId: string }
   | { type: 'tool_result'; name: string; result: unknown; isError: boolean; operationId: string }
+  | { type: 'compaction'; summarizedCount: number; retainedCount: number; operationId?: string }
   | { type: 'cancelled'; operationId?: string }
 
 export type ModelEvent =
@@ -53,8 +67,9 @@ export type ModelEvent =
   | { type: 'completed'; report: AnalysisReport; usage?: unknown; stopReason?: string; operationId?: string }
   | { type: 'cancelled'; operationId?: string }
 
-type AnalyzeInput = {
+export type AnalyzeInput = {
   executionId: string
+  runtimeSettings: RuntimeSettings
   symbol: string
   systemPrompt: string
   userPrompt: string
@@ -65,6 +80,9 @@ type AnalyzeInput = {
     symbol: string, startDate: string, endDate: string, signal: AbortSignal,
   ) => Promise<{ facts: Fact[]; [key: string]: unknown }>
   signal?: AbortSignal
+  executionDeadlineSignal?: AbortSignal
+  activeElapsedMs?: number
+  acquireToolSlot?: (limit: number, signal: AbortSignal) => Promise<() => void>
 }
 
 type ModelOptions = {
@@ -77,11 +95,30 @@ type ModelOptions = {
   modelName?: string
   baseUrl?: string
   apiKey?: string
+  runtimeMinuteMs?: number
+  now?: () => Date
 }
 
 export function createPiModel(options: ModelOptions = {}) {
+  const modelGate = createConcurrencyGate()
+  const toolGate = createConcurrencyGate()
   return {
     async *analyze(input: AnalyzeInput): AsyncGenerator<ModelEvent> {
+      const runtimeSettings = input.runtimeSettings
+      const runtimeMinuteMs = options.runtimeMinuteMs ?? 60_000
+      const executionSignal = deadlineSignal(
+        input.signal, runtimeSettings.executionWallClockMinutes * runtimeMinuteMs,
+        input.executionDeadlineSignal,
+      )
+      const activeBudget = createActiveBudget(
+        runtimeSettings.researchActiveMinutes * runtimeMinuteMs - (input.activeElapsedMs ?? 0),
+      )
+      const freshnessCutoff = new Date(
+        (options.now?.() ?? new Date()).getTime() - runtimeSettings.reportFreshnessDays * 86_400_000,
+      ).toISOString()
+      const staleFactIds = new Set(input.knownFacts
+        .filter((fact) => isOlderThan(fact.observedAt, freshnessCutoff))
+        .map((fact) => fact.id))
       const models = createModels()
       let selectedModel: Model<Api>
       if (options.fauxResponses) {
@@ -122,7 +159,7 @@ export function createPiModel(options: ModelOptions = {}) {
         throw new Error('model_not_configured')
       }
       const context: Context = {
-        systemPrompt: input.systemPrompt,
+        systemPrompt: `${input.systemPrompt}\n本次冻结 Runtime policy：报告 freshness 截止 ${freshnessCutoff}；compaction reserve ${runtimeSettings.compactionReserveTokens} tokens。`,
         messages: [{ role: 'user' as const, content: input.userPrompt, timestamp: Date.now() }],
         tools: [...analysisModelTools],
       }
@@ -134,9 +171,22 @@ export function createPiModel(options: ModelOptions = {}) {
         }
         if (!frozenContext) {
           const timeoutSignal = AbortSignal.timeout(options.toolTimeoutMs ?? 5_000)
-          const toolSignal = input.signal ? AbortSignal.any([input.signal, timeoutSignal]) : timeoutSignal
-          frozenContext = await input.fetchFinancialContext(symbol, toolSignal)
-          for (const fact of frozenContext.facts) knownFactIds.add(fact.id)
+          const release = await acquireToolSlot(
+            input, toolGate, runtimeSettings.toolConcurrency, executionSignal,
+          )
+          const active = activeBudget.start(executionSignal)
+          try {
+            frozenContext = await input.fetchFinancialContext(
+              symbol, AbortSignal.any([active.signal, timeoutSignal]),
+            )
+          } finally {
+            active.stop()
+            release()
+          }
+          for (const fact of frozenContext.facts) {
+            knownFactIds.add(fact.id)
+            if (isOlderThan(fact.observedAt, freshnessCutoff)) staleFactIds.add(fact.id)
+          }
         }
         return frozenContext
       }
@@ -148,15 +198,30 @@ export function createPiModel(options: ModelOptions = {}) {
         type: 'user_input', content: input.userPrompt,
         operationId: `execution:${input.executionId}:user-input`,
       } }
+      yield { type: 'trace', entry: {
+        type: 'runtime_policy', settings: runtimeSettings, freshnessCutoff,
+        staleFactIds: [...staleFactIds],
+        operationId: `execution:${input.executionId}:runtime-policy`,
+      } }
+      options.log?.({
+        type: 'runtime_policy', modelConcurrency: runtimeSettings.modelConcurrency,
+        toolConcurrency: runtimeSettings.toolConcurrency, freshnessCutoff,
+        compactionReserveTokens: runtimeSettings.compactionReserveTokens,
+      })
 
-      for (let turn = 0; turn < 6; turn += 1) {
-        const attemptId = `execution:${input.executionId}:model-attempt:${turn + 1}`
+      let modelAttempts = 0
+      let toolRounds = 0
+      while (true) {
+        const attemptId = `execution:${input.executionId}:model-attempt:${++modelAttempts}`
         let attemptEventSequence = 0
-        const stream = models.stream(selectedModel, context, { signal: input.signal, apiKey: options.apiKey })
+        const request = await beginModelRequest({
+          input, options, runtimeSettings, executionSignal, activeBudget, modelGate,
+        })
+        const stream = models.stream(selectedModel, context, { signal: request.signal, apiKey: options.apiKey })
         const iterator = stream[Symbol.asyncIterator]()
         try {
           while (true) {
-            const item = await nextEvent(iterator, input.signal)
+            const item = await nextEvent(iterator, request.signal)
             if (item.done) break
             const event = item.value
             const eventId = `${attemptId}:event:${++attemptEventSequence}`
@@ -179,10 +244,14 @@ export function createPiModel(options: ModelOptions = {}) {
             yield { type: 'cancelled', operationId: `${attemptId}:cancelled` }
             return
           }
+          request.assertWithinPolicy()
           throw error
+        } finally {
+          request.finish()
         }
 
         const message = await stream.result()
+        request.assertWithinPolicy()
         context.messages.push(message)
         if (message.stopReason === 'aborted') {
           yield { type: 'cancelled', operationId: `${attemptId}:cancelled` }
@@ -198,6 +267,8 @@ export function createPiModel(options: ModelOptions = {}) {
           })
           continue
         }
+        if (toolRounds >= runtimeSettings.mainAgentToolRounds) throw new Error('analysis_turn_limit')
+        toolRounds += 1
 
         for (const call of calls) {
           const toolInput = validateToolCall([...analysisModelTools], call)
@@ -207,7 +278,9 @@ export function createPiModel(options: ModelOptions = {}) {
             operationId: `${toolOperationId}:call`,
           } }
           if (call.name === 'submit_analysis_report') {
-            const report = normalizeReport(toolInput)
+            const report = applyFreshnessWarning(
+              normalizeReport(toolInput), staleFactIds, runtimeSettings.reportFreshnessDays,
+            )
             try {
               validateEvidence(report, knownFactIds)
               yield {
@@ -256,15 +329,19 @@ export function createPiModel(options: ModelOptions = {}) {
               }
               const specialist = await runFinancialSpecialist(
                 models, selectedModel, specialistContext, input, options,
+                runtimeSettings, executionSignal, activeBudget, modelGate, toolGate,
               )
-              for (const fact of specialist.facts) knownFactIds.add(fact.id)
+              for (const fact of specialist.facts) {
+                knownFactIds.add(fact.id)
+                if (isOlderThan(fact.observedAt, freshnessCutoff)) staleFactIds.add(fact.id)
+              }
               result = { facts: specialist.facts, analysis: specialist.analysis }
             } else {
               result = financialContext
             }
           } catch (error) {
             isError = true
-            const factId = `fact:tool-error:${call.name}:${turn}`
+            const factId = `fact:tool-error:${call.name}:${toolRounds}`
             const timestamp = new Date().toISOString()
             const failureFact: Fact = {
               id: factId, type: 'tool_error', value: 'unavailable', observedAt: timestamp,
@@ -283,8 +360,21 @@ export function createPiModel(options: ModelOptions = {}) {
           } }
           options.log?.({ type: 'tool_result', toolName: call.name, isError })
         }
+        const compacted = compactPiMessagesAtTurnBoundary({
+          messages: context.messages as unknown as PiAgentAdapterMessage[],
+          contextWindow: selectedModel.contextWindow,
+          reserveTokens: runtimeSettings.compactionReserveTokens,
+        })
+        if (compacted) {
+          context.messages = compacted.messages as unknown as Context['messages']
+          yield { type: 'trace', entry: {
+            type: 'compaction', summarizedCount: compacted.summarizedCount,
+            retainedCount: compacted.messages.length,
+            operationId: `execution:${input.executionId}:compaction:${toolRounds}`,
+          } }
+        }
+        if (toolRounds >= runtimeSettings.mainAgentToolRounds) throw new Error('analysis_turn_limit')
       }
-      throw new Error('analysis_turn_limit')
     },
   }
 }
@@ -295,33 +385,63 @@ async function runFinancialSpecialist(
   context: Context,
   input: AnalyzeInput,
   options: ModelOptions,
+  runtimeSettings: RuntimeSettings,
+  executionSignal: AbortSignal,
+  activeBudget: ReturnType<typeof createActiveBudget>,
+  modelGate: ReturnType<typeof createConcurrencyGate>,
+  toolGate: ReturnType<typeof createConcurrencyGate>,
 ) {
   const facts: Fact[] = []
-  for (let turn = 0; turn < 5; turn += 1) {
-    const message = await models.complete(selectedModel, context, {
-      signal: input.signal,
-      apiKey: options.apiKey,
+  let toolRounds = 0
+  while (true) {
+    const request = await beginModelRequest({
+      input, options, runtimeSettings, executionSignal, activeBudget, modelGate, specialist: true,
     })
+    let message: AssistantMessage
+    try {
+      message = await models.complete(selectedModel, context, {
+        signal: request.signal,
+        apiKey: options.apiKey,
+      })
+    } catch (error) {
+      request.assertWithinPolicy()
+      throw error
+    } finally {
+      request.finish()
+    }
+    request.assertWithinPolicy()
     context.messages.push(message)
     if (message.stopReason === 'error') throw new Error(message.errorMessage || 'financial_specialist_error')
     const calls = message.content.filter((block) => block.type === 'toolCall')
     if (!calls.length) return { analysis: contentText(message.content), facts }
+    if (toolRounds >= runtimeSettings.specialistAgentToolRounds) {
+      throw new Error('financial_specialist_turn_limit')
+    }
+    toolRounds += 1
     for (const call of calls) {
       const toolInput = validateToolCall([...financialSpecialistTools], call)
       let result: { facts: Fact[]; [key: string]: unknown }
       let isError = false
+      const releaseTool = await acquireToolSlot(
+        input, toolGate, runtimeSettings.toolConcurrency, executionSignal,
+      )
+      const activeTool = activeBudget.start(executionSignal)
       try {
+        options.log?.({ type: 'tool_request_start', executionId: input.executionId, toolName: call.name })
         if (call.name === 'search_news_by_keyword') {
           if (!input.searchNews) throw new Error('news_search_unavailable')
           const keyword = (toolInput as { keyword?: string }).keyword ?? input.symbol
-          result = await input.searchNews(keyword, toolSignal(input, options))
+          result = await input.searchNews(keyword, toolSignal(
+            input, options, runtimeSettings, activeTool.signal,
+          ))
         } else if (call.name === 'get_technical_indicators') {
           if (!input.fetchTechnicalIndicators) throw new Error('technical_indicators_unavailable')
           const values = toolInput as { symbol?: string; startDate?: string; endDate?: string }
           const endDate = values.endDate ?? new Date().toISOString().slice(0, 10)
           const startDate = values.startDate ?? oneYearBefore(endDate)
           result = await input.fetchTechnicalIndicators(
-            values.symbol ?? input.symbol, startDate, endDate, toolSignal(input, options),
+            values.symbol ?? input.symbol, startDate, endDate,
+            toolSignal(input, options, runtimeSettings, activeTool.signal),
           )
         } else {
           throw new Error(`tool_not_allowed:${call.name}`)
@@ -330,19 +450,83 @@ async function runFinancialSpecialist(
       } catch (error) {
         isError = true
         result = { error: error instanceof Error ? error.message : String(error), facts: [] }
+      } finally {
+        options.log?.({ type: 'tool_request_end', executionId: input.executionId, toolName: call.name })
+        activeTool.stop()
+        releaseTool()
       }
       context.messages.push({
         role: 'toolResult', toolCallId: call.id, toolName: call.name,
         content: [{ type: 'text', text: JSON.stringify(result) }], isError, timestamp: Date.now(),
       })
     }
+    const compacted = compactPiMessagesAtTurnBoundary({
+      messages: context.messages as unknown as PiAgentAdapterMessage[],
+      contextWindow: selectedModel.contextWindow,
+      reserveTokens: runtimeSettings.compactionReserveTokens,
+    })
+    if (compacted) {
+      context.messages = compacted.messages as unknown as Context['messages']
+      options.log?.({
+        type: 'compaction', specialist: true, summarizedCount: compacted.summarizedCount,
+        retainedCount: compacted.messages.length,
+      })
+    }
+    if (toolRounds >= runtimeSettings.specialistAgentToolRounds) {
+      throw new Error('financial_specialist_turn_limit')
+    }
   }
-  throw new Error('financial_specialist_turn_limit')
 }
 
-function toolSignal(input: AnalyzeInput, options: ModelOptions) {
+async function beginModelRequest(input: {
+  input: AnalyzeInput
+  options: ModelOptions
+  runtimeSettings: RuntimeSettings
+  executionSignal: AbortSignal
+  activeBudget: ReturnType<typeof createActiveBudget>
+  modelGate: ReturnType<typeof createConcurrencyGate>
+  specialist?: boolean
+}) {
+  const release = await input.modelGate.acquire(
+    input.runtimeSettings.modelConcurrency, input.executionSignal,
+  )
+  const timeout = AbortSignal.timeout(
+    input.runtimeSettings.modelRequestTimeoutMinutes * (input.options.runtimeMinuteMs ?? 60_000),
+  )
+  const active = input.activeBudget.start(input.executionSignal)
+  input.options.log?.({
+    type: 'model_request_start', executionId: input.input.executionId,
+    specialist: input.specialist,
+  })
+  return {
+    signal: AbortSignal.any([active.signal, timeout]),
+    assertWithinPolicy() {
+      if (timeout.aborted) throw new Error('model_request_timeout')
+      if (input.executionSignal.aborted && !input.input.signal?.aborted) {
+        throw new Error('execution_runtime_timeout')
+      }
+      if (active.exhausted()) throw new Error('research_active_timeout')
+    },
+    finish() {
+      input.options.log?.({
+        type: 'model_request_end', executionId: input.input.executionId,
+        specialist: input.specialist,
+      })
+      active.stop()
+      release()
+    },
+  }
+}
+
+function toolSignal(
+  input: AnalyzeInput, options: ModelOptions, runtimeSettings: RuntimeSettings,
+  activeSignal: AbortSignal,
+) {
   const timeoutSignal = AbortSignal.timeout(options.toolTimeoutMs ?? 30_000)
-  return input.signal ? AbortSignal.any([input.signal, timeoutSignal]) : timeoutSignal
+  const requestTimeout = AbortSignal.timeout(
+    runtimeSettings.modelRequestTimeoutMinutes * (options.runtimeMinuteMs ?? 60_000),
+  )
+  return AbortSignal.any([activeSignal, timeoutSignal, requestTimeout])
 }
 
 function oneYearBefore(endDate: string) {
@@ -391,6 +575,26 @@ function validateEvidence(report: AnalysisReport, knownFactIds: Set<string>) {
   if (unknown.length) throw new Error(`unknown_evidence:${unknown.join(',')}`)
 }
 
+function isOlderThan(observedAt: string, cutoff: string) {
+  const observedTime = Date.parse(observedAt)
+  return Number.isFinite(observedTime) && observedTime < Date.parse(cutoff)
+}
+
+function applyFreshnessWarning(report: AnalysisReport, staleFactIds: Set<string>, freshnessDays: number) {
+  const referencedStaleFacts = [
+    ...report.supportingEvidence,
+    ...report.contraryEvidence,
+    ...report.keyJudgments.flatMap((judgment) => judgment.evidence),
+  ].filter((factId) => staleFactIds.has(factId))
+  if (!referencedStaleFacts.length) return report
+  const warning = `报告引用的数据已超过 ${freshnessDays} 天 freshness：${[...new Set(referencedStaleFacts)].join(', ')}`
+  return {
+    ...report,
+    title: report.title.startsWith('⚠ 数据时效提醒') ? report.title : `⚠ 数据时效提醒｜${report.title}`,
+    limitations: report.limitations.includes(warning) ? report.limitations : [...report.limitations, warning],
+  }
+}
+
 function compactModelEvent(event: Record<string, unknown>) {
   if (event.type === 'thinking_delta' || event.type === 'text_delta') {
     return { type: event.type, delta: event.delta }
@@ -417,4 +621,11 @@ async function nextEvent<T>(iterator: AsyncIterator<T>, signal?: AbortSignal): P
   } finally {
     removeListener()
   }
+}
+
+function acquireToolSlot(
+  input: AnalyzeInput, gate: ReturnType<typeof createConcurrencyGate>,
+  limit: number, signal: AbortSignal,
+) {
+  return input.acquireToolSlot?.(limit, signal) ?? gate.acquire(limit, signal)
 }

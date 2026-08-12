@@ -300,12 +300,23 @@ export function createRuntimeSettingsRepository(pool: Pool) {
       }
     },
     async restoreDefaults(createdAt: string) {
-      const result = await pool.query<RuntimeSettingsRevisionRow>(
-        `INSERT INTO runtime_settings_revisions (settings_json, created_at)
-         VALUES ($1, $2) RETURNING id, settings_json, created_at::text`,
-        [JSON.stringify(defaultRuntimeSettings), createdAt],
-      )
-      return mapRevision(result.rows[0]!)
+      const client = await pool.connect()
+      try {
+        await client.query('BEGIN')
+        await client.query('SELECT pg_advisory_xact_lock($1)', [8_613_092])
+        const result = await client.query<RuntimeSettingsRevisionRow>(
+          `INSERT INTO runtime_settings_revisions (settings_json, created_at)
+           VALUES ($1, $2) RETURNING id, settings_json, created_at::text`,
+          [JSON.stringify(defaultRuntimeSettings), createdAt],
+        )
+        await client.query('COMMIT')
+        return mapRevision(result.rows[0]!)
+      } catch (error) {
+        await client.query('ROLLBACK')
+        throw error
+      } finally {
+        client.release()
+      }
     },
     async freezeExecution(executionId: string, frozenAt: string) {
       const result = await freezeExecutionSettings(pool, executionId, frozenAt)
@@ -896,6 +907,7 @@ export function createAgentEventRepository(pool: Pool) {
            ) VALUES ($1, 1, $2, $3, $4)`,
           [input.id, input.operationId, JSON.stringify(input.event), input.createdAt],
         )
+        await freezeExecutionSettings(client, input.executionId, input.createdAt)
         await client.query('COMMIT')
         return { sequence: 1, created: true, event: {
           sessionId: input.id, sequence: 1, operationId: input.operationId,

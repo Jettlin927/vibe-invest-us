@@ -4,7 +4,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 
-import type { ModelEvent } from '../src/model.js'
+import { fauxAssistantMessage, fauxToolCall } from '@earendil-works/pi-ai'
+
+import { createPiModel, type ModelEvent } from '../src/model.js'
 import { buildApp as buildProductionApp } from '../src/app.js'
 import { createTestProductDatabase } from './support/product-database.js'
 
@@ -50,12 +52,16 @@ function fakeModel(delay = 0) {
 }
 
 async function makeApp(storageKey: string, model = fakeModel(), concurrency = 2) {
+  const database = testDatabases.get(storageKey) ?? createTestProductDatabase()
+  testDatabases.set(storageKey, database)
+  await database.runtimeSettingsRepository.save(
+    { analysisConcurrency: concurrency }, new Date().toISOString(),
+  )
   const app = buildApp({
     storageKey,
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [], indicators: {} }),
     model,
-    analysisConcurrency: concurrency,
   })
   await app.ready()
   return app
@@ -195,6 +201,41 @@ test('模型只接收 execution 创建时冻结的 Runtime settings', async () =
   await app.close()
 })
 
+test('真实 Pi execution 冻结后修改 current 不改变运行轮次', async () => {
+  const database = createTestProductDatabase()
+  await database.runtimeSettingsRepository.save({
+    mainAgentToolRounds: 1,
+  }, '2026-08-13T03:02:00.000Z')
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [], indicators: {} }),
+    model: createPiModel({
+      fauxResponses: [
+        fauxAssistantMessage(fauxToolCall('fetch_financial_context', {}), { stopReason: 'toolUse' }),
+        fauxAssistantMessage(fauxToolCall('submit_analysis_report', report), { stopReason: 'toolUse' }),
+      ],
+      fauxTokensPerSecond: 100,
+    }),
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'REALPI' },
+  })).json()
+  await database.runtimeSettingsRepository.save({
+    mainAgentToolRounds: 20,
+  }, '2026-08-13T03:03:00.000Z')
+
+  const failed = await waitForStatus(app as any, created.analysisId, 'failed')
+  assert.equal(failed.error, 'analysis_turn_limit')
+  assert.equal((await database.runtimeSettingsRepository.current()).values.mainAgentToolRounds, 20)
+  assert.equal(
+    (await database.runtimeSettingsRepository.getExecutionSnapshot(created.executionId))?.values.mainAgentToolRounds,
+    1,
+  )
+  await app.close()
+})
+
 test('同一标的运行中重复创建返回原任务且不重复调用模型', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'vibe-analysis-dedup-'))
   let calls = 0
@@ -244,6 +285,7 @@ test('并发创建多个标的时运行任务数不超过实例上限', async ()
 
 test('并发调度在队列 claim 阻塞时仍不会超出实例上限', async () => {
   const database = createTestProductDatabase()
+  await database.runtimeSettingsRepository.save({ analysisConcurrency: 2 }, new Date().toISOString())
   const repository = database.analysisRepository
   const originalClaim = repository.claimNextQueued
   repository.claimNextQueued = async (updatedAt) => {
@@ -265,7 +307,6 @@ test('并发调度在队列 claim 阻塞时仍不会超出实例上限', async (
         yield { type: 'completed' as const, report }
       },
     },
-    analysisConcurrency: 2,
   })
   await app.ready()
   const created = await Promise.all(Array.from({ length: 12 }, (_, index) => (
@@ -278,6 +319,7 @@ test('并发调度在队列 claim 阻塞时仍不会超出实例上限', async (
 
 test('队列 claim 瞬时失败会归还槽位且后续创建可恢复调度', async () => {
   const database = createTestProductDatabase()
+  await database.runtimeSettingsRepository.save({ analysisConcurrency: 1 }, new Date().toISOString())
   const repository = database.analysisRepository
   const originalClaim = repository.claimNextQueued
   let failOnce = true
@@ -290,7 +332,6 @@ test('队列 claim 瞬时失败会归还槽位且后续创建可恢复调度', a
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [], indicators: {} }),
     model: fakeModel(),
-    analysisConcurrency: 1,
   })
   await app.ready()
   const first = await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'FAILONCE' } })
@@ -303,6 +344,7 @@ test('队列 claim 瞬时失败会归还槽位且后续创建可恢复调度', a
 
 test('running 轨迹写入失败会中断已领取任务并恢复后续调度', async () => {
   const database = createTestProductDatabase()
+  await database.runtimeSettingsRepository.save({ analysisConcurrency: 1 }, new Date().toISOString())
   const repository = database.agentEventRepository
   const originalAppend = repository.append
   let failOnce = true
@@ -320,7 +362,6 @@ test('running 轨迹写入失败会中断已领取任务并恢复后续调度', 
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [], indicators: {} }),
     model: { analyze(input: Parameters<typeof model.analyze>[0]) { modelCalls += 1; return model.analyze(input) } },
-    analysisConcurrency: 1,
   })
   await app.ready()
   const first = await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'TRACEFAIL' } })
@@ -346,15 +387,27 @@ test('取消运行任务会停止模型并保存取消轨迹', async () => {
 })
 
 test('重启后未完成任务标记为中断且不会自动执行', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'vibe-analysis-restart-'))
-  const storageKey = join(dir, 'restart')
-  const first = await makeApp(storageKey, fakeModel(1000), 0)
-  const { analysisId, sessionId } = (await first.inject({
-    method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' },
-  })).json()
-  await first.close()
+  const database = createTestProductDatabase()
+  const analysisId = crypto.randomUUID()
+  const sessionId = crypto.randomUUID()
+  await database.agentEventRepository.createResearch({
+    analysisId,
+    sessionId,
+    executionId: crypto.randomUUID(),
+    symbol: 'NVDA',
+    status: 'queued',
+    operationId: `session:${sessionId}:created`,
+    event: { type: 'status', status: 'queued' },
+    createdAt: new Date().toISOString(),
+  })
   let calls = 0
-  const second = await makeApp(storageKey, { async *analyze() { calls += 1; yield { type: 'completed' as const, report } } })
+  const second = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [], indicators: {} }),
+    model: { async *analyze() { calls += 1; yield { type: 'completed' as const, report } }, },
+  })
+  await second.ready()
   const status = (await second.inject({ method: 'GET', url: `/api/analyses/${analysisId}` })).json()
   assert.equal(status.status, 'interrupted')
   const replay = await second.inject({
