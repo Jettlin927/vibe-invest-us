@@ -3,6 +3,28 @@ export type FinancialDataHealth = {
   status: 'ok'
 }
 
+export const agentExecutionStatuses = [
+  'planning', 'running_model', 'running_tools', 'waiting_for_specialists',
+  'finalizing', 'completed', 'partial', 'failed', 'stopping', 'stopped',
+  'interrupted', 'budget_exhausted',
+] as const
+export type AgentExecutionStatus = typeof agentExecutionStatuses[number]
+export type WaitReason = {
+  kind: 'database' | 'model' | 'tools' | 'specialists' | 'finalizing'
+  target: string
+  startedAt: string
+}
+export function waitReasonForStatus(
+  status: AgentExecutionStatus, target: string, startedAt: string,
+): WaitReason | null {
+  const kind = statusKind[status as keyof typeof statusKind]
+  return kind ? { kind, target, startedAt } : null
+}
+const statusKind = {
+  planning: 'database', running_model: 'model', running_tools: 'tools',
+  waiting_for_specialists: 'specialists', finalizing: 'finalizing',
+} as const
+
 export const defaultRuntimeSettings = {
   mainAgentToolRounds: 20,
   specialistAgentToolRounds: 20,

@@ -37,6 +37,16 @@ type ResearchRecord = ResearchSummary & {
   facts: Fact[]
   trace: Array<Record<string, unknown>>
   snapshot?: { gaps?: Array<{ capability?: string; reason?: string }> }
+  mainAgent?: {
+    id: string; status: string
+    waitReason: { kind: string; target: string; startedAt: string } | null
+    execution: { id: string; generation: number; status: string }
+    segments: Array<{ id: string; ordinal: number; createdAt: string }>
+    events: Array<{
+      sequence: number; type?: string; status?: string; createdAt: string
+      waitReason?: { kind: string; target: string; startedAt: string } | null
+    }>
+  }
 }
 
 const pages: Array<{ id: Page; label: string }> = [
@@ -93,6 +103,21 @@ export function App() {
       loadPortfolio(), loadResearch(),
     ]).catch((cause) => setError(cause instanceof Error ? cause.message : String(cause)))
   }, [])
+  useEffect(() => {
+    const agent = selectedResearch?.mainAgent
+    if (page !== 'research' || !agent || !('EventSource' in globalThis)
+      || ['completed', 'partial', 'failed', 'stopped', 'interrupted', 'budget_exhausted'].includes(agent.status)) return
+    const source = new EventSource(`/api/agent-sessions/${agent.id}/events`, {
+      withCredentials: false,
+    })
+    const refresh = () => { void openResearch(selectedResearch.id) }
+    for (const name of ['runtime_context', 'planning', 'running_model', 'running_tools',
+      'waiting_for_specialists', 'finalizing', 'completed', 'partial', 'failed',
+      'stopping', 'stopped', 'interrupted', 'budget_exhausted']) {
+      source.addEventListener(name, refresh)
+    }
+    return () => source.close()
+  }, [page, selectedResearch?.id, selectedResearch?.mainAgent?.status])
 
   async function savePosition(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -140,6 +165,12 @@ export function App() {
     setAnalysisStatus('queued')
     setAnalysisStages(['queued'])
     setActiveAnalysisId(analysisId)
+    if (!modelConfigured) {
+      await openResearch(analysisId)
+      setPage('research')
+      await loadResearch()
+      return
+    }
     if ('EventSource' in globalThis && sessionId) streamAnalysis(sessionId, analysisId)
     else await pollAnalysis(analysisId)
   }
@@ -148,12 +179,12 @@ export function App() {
   }
   function streamAnalysis(sessionId: string, analysisId: string) {
     const source = new EventSource(`/api/agent-sessions/${sessionId}/events`)
-    const eventNames = ['queued', 'running', 'financial_context', 'model_event', 'text_delta', 'model_completed', 'completed', 'partial', 'failed', 'cancelled', 'interrupted']
+    const eventNames = ['runtime_context', 'planning', 'running_model', 'running_tools', 'waiting_for_specialists', 'finalizing', 'financial_context', 'model_event', 'text_delta', 'model_completed', 'completed', 'partial', 'failed', 'stopping', 'stopped', 'interrupted', 'budget_exhausted']
     for (const name of eventNames) source.addEventListener(name, (event) => {
       const entry = JSON.parse((event as MessageEvent).data) as Record<string, unknown>
       if (name !== 'text_delta') addStage(name)
-      if (['queued', 'running', 'completed', 'partial', 'failed', 'cancelled', 'interrupted'].includes(name)) setAnalysisStatus(name)
-      if (['completed', 'partial', 'failed', 'cancelled', 'interrupted'].includes(name)) {
+      if (['planning', 'running_model', 'running_tools', 'waiting_for_specialists', 'finalizing', 'completed', 'partial', 'failed', 'stopping', 'stopped', 'interrupted', 'budget_exhausted'].includes(name)) setAnalysisStatus(name)
+      if (['completed', 'partial', 'failed', 'stopped', 'interrupted', 'budget_exhausted'].includes(name)) {
         if (name === 'failed' && typeof entry.error === 'string') setError(friendlyError(entry.error))
         source.close()
         setActiveAnalysisId(null)
@@ -167,7 +198,7 @@ export function App() {
       const status = await fetch(`/api/analyses/${id}`).then((response) => response.json())
       setAnalysisStatus(status.status)
       addStage(status.status)
-      if (['completed', 'partial', 'failed', 'cancelled', 'interrupted'].includes(status.status)) {
+      if (['completed', 'partial', 'failed', 'stopped', 'interrupted', 'budget_exhausted'].includes(status.status)) {
         if (status.status === 'failed' && typeof status.error === 'string') setError(friendlyError(status.error))
         const researchResponse = await fetch(`/api/research/${id}`)
         if (researchResponse.ok) setSelectedResearch(await researchResponse.json())
@@ -274,9 +305,26 @@ function ResearchPage({ records, record, onOpen, onUpdate, onDelete, freshnessDa
     <div className="research-layout">
       <aside className="research-index"><p className="micro">全部记录 · {records.length}</p>{records.map((item) => <button className={record?.id === item.id ? 'active' : ''} key={item.id} onClick={() => void onOpen(item.id)}><strong>{item.symbol}</strong><span>{item.report?.title ?? statusLabel(item.status)}</span><small>{item.starred ? `已标记 · ${statusLabel(item.status)}` : statusLabel(item.status)}</small></button>)}</aside>
       <ResearchReport record={record} onUpdate={onUpdate} onDelete={onDelete} freshnessDays={freshnessDays} />
-      <TraceSummary trace={record?.trace ?? []} />
+      <div><AgentRuntime agent={record?.mainAgent} /><TraceSummary trace={record?.trace ?? []} /></div>
     </div>
   </>
+}
+
+function AgentRuntime({ agent }: { agent?: ResearchRecord['mainAgent'] }) {
+  if (!agent) return null
+  return <section className="agent-runtime" role="region" aria-label="主 Agent Runtime">
+    <p className="micro">主 Agent</p>
+    <h2>{statusLabel(agent.status)}</h2>
+    <p>Session {agent.id}</p>
+    <p>Execution {agent.execution.id} · Generation {agent.execution.generation}</p>
+    {agent.waitReason && <p>等待：{agent.waitReason.target} · {formatTime(agent.waitReason.startedAt)}</p>}
+    <div>{agent.segments.map((segment) => <span key={segment.id}>Segment {segment.ordinal}</span>)}</div>
+    <ol>{agent.events.map((event) => <li key={event.sequence}>
+      #{event.sequence} {event.type === 'runtime_context' ? 'Runtime Context' : statusLabel(event.status ?? event.type ?? '')}
+      {' · '}{formatTime(event.createdAt)}
+      {event.waitReason && <> · 等待 {event.waitReason.target}（始于 {formatTime(event.waitReason.startedAt)}）</>}
+    </li>)}</ol>
+  </section>
 }
 
 function ResearchReport({ record, onUpdate, onDelete, freshnessDays }: {

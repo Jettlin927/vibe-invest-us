@@ -42,23 +42,25 @@ type AppDependencies = {
 export function buildApp(dependencies: AppDependencies) {
   const app = Fastify({ logger: false })
   const portfolio = createPortfolio(dependencies.portfolioRepository)
-  const analysis = dependencies.fetchFinancialContext && dependencies.model
-    ? createAnalysisService({
+  const lifecycleOnly = dependencies.modelConfigured === false
+    || !dependencies.fetchFinancialContext || !dependencies.model
+  const analysis = createAnalysisService({
         repository: dependencies.analysisRepository,
         eventRepository: dependencies.agentEventRepository,
         settingsRepository: dependencies.runtimeSettingsRepository,
-        fetchFinancialContext: dependencies.fetchFinancialContext,
+        fetchFinancialContext: dependencies.fetchFinancialContext
+          ?? (async () => { throw new Error('model_not_configured') }),
         searchNews: dependencies.searchNews,
         fetchTechnicalIndicators: dependencies.fetchTechnicalIndicators,
         fetchMarketPrices: dependencies.fetchMarketPrices,
         listPortfolioSymbols: async () => (await portfolio.list()).map((position) => position.symbol),
-        model: dependencies.model,
+        model: dependencies.model ?? { async *analyze() {} },
         getPortfolioContext: (symbol, marketPrices) => portfolio.context(symbol, marketPrices),
         runtimeMinuteMs: dependencies.runtimeMinuteMs,
         activeNow: dependencies.activeNow,
         activeTimeoutSignal: dependencies.activeTimeoutSignal,
+        runEnabled: !lifecycleOnly,
       })
-    : null
 
   app.addHook('onClose', async () => {
     await analysis?.close()

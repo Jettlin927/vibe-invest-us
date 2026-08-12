@@ -130,6 +130,69 @@ test('创建 execution 冻结当前 settings revision 且后续修改不影响�
   await app.close()
 })
 
+test('模型尚未接入也能创建并读取主 Agent 完整初始生命周期', async () => {
+  const database = createTestProductDatabase()
+  let externalCalls = 0
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async () => { externalCalls += 1; throw new Error('must_not_start') },
+    model: { async *analyze() { externalCalls += 1 } },
+    modelConfigured: false,
+  })
+  const created = await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' } })
+  assert.equal(created.statusCode, 202)
+  const body = created.json()
+  assert.equal(body.existing, false)
+
+  const research = await app.inject({ method: 'GET', url: `/api/research/${body.analysisId}` })
+  assert.equal(research.statusCode, 200)
+  const record = research.json()
+  assert.equal(record.mainAgent.status, 'planning')
+  assert.equal(record.mainAgent.execution.generation, 1)
+  assert.equal(record.mainAgent.segments.length, 1)
+  assert.equal(record.mainAgent.segments[0].ordinal, 1)
+  assert.deepEqual(record.mainAgent.waitReason, {
+    kind: 'database', target: '首次研究初始化', startedAt: record.createdAt,
+  })
+  assert.equal(record.mainAgent.events[0].type, 'runtime_context')
+  await new Promise((resolve) => setTimeout(resolve, 10))
+  assert.equal(externalCalls, 0)
+  await app.close()
+})
+
+test('Runtime 状态事件与 waitReason 投影使用同一确定性值', async () => {
+  const database = createTestProductDatabase()
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [], indicators: {} }),
+    model: fakeModel(10),
+  })
+  const created = (await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'WAIT' } })).json()
+  await new Promise((resolve) => setTimeout(resolve, 2))
+  const record = (await app.inject({ method: 'GET', url: `/api/research/${created.analysisId}` })).json()
+  const running = record.mainAgent.events.find((event: { status?: string }) => event.status === 'running_model')
+  assert.deepEqual(running.waitReason, record.mainAgent.waitReason)
+  assert.equal(running.waitReason.target, '主模型响应')
+  await app.close()
+})
+
+test('同一标的重复首次研究返回已有主 Agent 生命周期', async () => {
+  const database = createTestProductDatabase()
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+  })
+  const first = (await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'aapl' } })).json()
+  const repeated = (await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'AAPL' } })).json()
+  assert.equal(repeated.existing, true)
+  assert.equal(repeated.analysisId, first.analysisId)
+  assert.equal(repeated.sessionId, first.sessionId)
+  assert.equal(repeated.executionId, first.executionId)
+  await app.close()
+})
+
 test('修改研究并发后立即启动尚未运行的排队 execution', async () => {
   const database = createTestProductDatabase()
   await database.runtimeSettingsRepository.save({ analysisConcurrency: 1 }, '2026-08-13T03:00:00.000Z')
@@ -560,7 +623,7 @@ test('running 轨迹写入失败会中断已领取任务并恢复后续调度', 
   const originalAppend = repository.append
   let failOnce = true
   repository.append = async (input) => {
-    if (failOnce && input.event.status === 'running') {
+    if (failOnce && input.event.status === 'planning') {
       failOnce = false
       throw new Error('running_trace_write_failed')
     }
@@ -593,7 +656,7 @@ test('取消运行任务会停止模型并保存取消轨迹', async () => {
   assert.equal(cancelled.statusCode, 202)
   await waitForStatus(app, analysisId, 'cancelled')
   const research = await app.inject({ method: 'GET', url: `/api/research/${analysisId}` })
-  assert.ok(research.json().trace.some((entry: { status?: string }) => entry.status === 'cancelled'))
+  assert.ok(research.json().trace.some((entry: { status?: string }) => entry.status === 'stopped'))
   await app.close()
 })
 

@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import test from 'node:test'
 
-import { createAgentEventRepository, createAnalysisRepository, createPool, migrate } from '@vibe-invest/product-dao'
+import { createAgentEventRepository, createAnalysisRepository, createPool, createRuntimeSettingsRepository, migrate } from '@vibe-invest/product-dao'
 
 import { buildApp } from '../src/app.js'
 import { executeMigration, planMigration, verifyMigration } from '../src/sqlite-migration.js'
@@ -66,6 +66,7 @@ test('SQLite 迁移按 plan→execute→verify 导入且明确放弃旧研究', 
     portfolioRepository: createPortfolioRepository(apiPool),
     analysisRepository: createAnalysisRepository(apiPool),
     agentEventRepository: createAgentEventRepository(apiPool),
+    runtimeSettingsRepository: createRuntimeSettingsRepository(apiPool),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     migrationVerificationToken: verificationToken,
   })

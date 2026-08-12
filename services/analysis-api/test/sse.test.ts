@@ -136,3 +136,29 @@ test('SSE 在 PostgreSQL catch-up 与 live 交接窗口不会漏掉终态', asyn
     await app.close()
   }
 })
+
+for (const terminal of ['stopped', 'budget_exhausted']) {
+  test(`SSE 在 ${terminal} 终态后结束`, async () => {
+    const database = createTestProductDatabase()
+    const createdAt = new Date().toISOString()
+    await database.agentEventRepository.createResearch({
+      analysisId: `analysis-${terminal}`, sessionId: `session-${terminal}`,
+      executionId: `execution-${terminal}`, symbol: `T${terminal.length}`,
+      status: 'planning', analysisStatus: 'queued', operationId: 'runtime-context',
+      event: { type: 'runtime_context', status: 'planning' }, createdAt,
+    })
+    await database.agentEventRepository.append({
+      sessionId: `session-${terminal}`, operationId: `terminal-${terminal}`,
+      event: { type: 'status', status: terminal },
+      projection: { status: terminal, executionStatus: terminal as 'stopped' | 'budget_exhausted' },
+      createdAt,
+    })
+    const app = buildProductionApp({
+      ...database,
+      financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    })
+    const response = await app.inject({ method: 'GET', url: `/api/agent-sessions/session-${terminal}/events` })
+    assert.match(response.body, new RegExp(`event: ${terminal}`))
+    await app.close()
+  })
+}

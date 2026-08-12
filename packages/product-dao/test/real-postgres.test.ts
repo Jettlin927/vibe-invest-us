@@ -130,6 +130,78 @@ test('真实 PostgreSQL 主与专项 execution 创建时原子冻结 settings sn
   }
 })
 
+test('真实 PostgreSQL 原子创建主 Session、execution generation、初始 segment、Runtime Context 与 settings snapshot', {
+  skip: !migrationUrl || !applicationUrl,
+  concurrency: false,
+}, async () => {
+  await migrate(migrationUrl!)
+  const pool = createPool(applicationUrl!)
+  const events = createAgentEventRepository(pool)
+  const settings = createRuntimeSettingsRepository(pool)
+  const analysisId = `lifecycle-${crypto.randomUUID()}`
+  const sessionId = `session-${crypto.randomUUID()}`
+  const executionId = `execution-${crypto.randomUUID()}`
+  const createdAt = '2026-08-13T03:00:00.000Z'
+  try {
+    await events.createResearch({
+      analysisId, sessionId, executionId, segmentId: `segment-${crypto.randomUUID()}`,
+      symbol: `L${crypto.randomUUID().replaceAll('-', '').slice(0, 8)}`,
+      status: 'planning', analysisStatus: 'queued', operationId: 'runtime-context',
+      event: {
+        type: 'runtime_context', status: 'planning', executionId, generation: 1,
+        waitReason: { kind: 'database', target: '首次研究初始化', startedAt: createdAt },
+      },
+      createdAt,
+    })
+    const lifecycle = await events.primaryLifecycle(analysisId)
+    assert.equal(lifecycle?.id, sessionId)
+    assert.equal(lifecycle?.execution.id, executionId)
+    assert.equal(lifecycle?.execution.generation, 1)
+    assert.equal(lifecycle?.segments[0]?.ordinal, 1)
+    assert.equal(lifecycle?.events[0]?.type, 'runtime_context')
+    assert.equal(lifecycle?.waitReason?.target, '首次研究初始化')
+    assert.equal((await settings.getExecutionSnapshot(executionId))?.executionId, executionId)
+
+    await assert.rejects(pool.query(
+      `INSERT INTO agent_executions
+       (id, session_id, generation, status, created_at, updated_at)
+       VALUES ($1, $2, 2, 'running_model', $3, $3)`,
+      [`active-${crypto.randomUUID()}`, sessionId, createdAt],
+    ), /duplicate key value/)
+  } finally {
+    await createAnalysisRepository(pool).removeResearch(analysisId)
+    await pool.end()
+  }
+})
+
+test('真实 PostgreSQL settings snapshot 失败时不残留 Session、execution、segment 或事件', {
+  skip: !migrationUrl || !applicationUrl,
+  concurrency: false,
+}, async () => {
+  await migrate(migrationUrl!)
+  const appPool = createPool(applicationUrl!)
+  const migrationPool = createPool(migrationUrl!)
+  const events = createAgentEventRepository(appPool)
+  const analysisId = `rollback-${crypto.randomUUID()}`
+  const sessionId = `rollback-session-${crypto.randomUUID()}`
+  try {
+    await migrationPool.query('REVOKE INSERT ON execution_settings_snapshots FROM vibe_invest_app')
+    await assert.rejects(events.createResearch({
+      analysisId, sessionId, executionId: `rollback-execution-${crypto.randomUUID()}`,
+      symbol: `R${crypto.randomUUID().replaceAll('-', '').slice(0, 8)}`,
+      status: 'planning', analysisStatus: 'queued', operationId: 'runtime-context',
+      event: { type: 'runtime_context', status: 'planning' },
+      createdAt: '2026-08-13T03:10:00.000Z',
+    }), /permission denied/)
+    assert.equal(await events.getSession(sessionId), null)
+    assert.equal(await createAnalysisRepository(appPool).get(analysisId), null)
+  } finally {
+    await migrationPool.query('GRANT INSERT ON execution_settings_snapshots TO vibe_invest_app')
+    await migrationPool.end()
+    await appPool.end()
+  }
+})
+
 test('真实 PostgreSQL 并发保存 Runtime settings 不丢失不同字段更新', {
   skip: !migrationUrl || !applicationUrl,
   concurrency: false,
@@ -193,7 +265,7 @@ test('真实 PostgreSQL migration 幂等且 application role 没有 DDL 权限',
   await migrate(migrationUrl!)
 
   const pool = createPool(applicationUrl!)
-  assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 9 })
+  assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 10 })
   const privileges = await pool.query<{ can_create: boolean; can_temp: boolean }>(
     `SELECT has_schema_privilege(current_user, 'public', 'CREATE') AS can_create,
             has_database_privilege(current_user, current_database(), 'TEMP') AS can_temp`,
@@ -695,6 +767,12 @@ test('真实 PostgreSQL 启动恢复在一个事务内中断全部活跃 Session
     }])
     assert.deepEqual((await events.listSessions(analysisId)).map(({ status }) => status),
       ['interrupted', 'interrupted'])
+    assert.deepEqual((await Promise.all([
+      events.primaryLifecycle(analysisId),
+      pool.query<{ status: string }>(
+        `SELECT status FROM agent_executions WHERE session_id = 'interrupt-all-specialist'`,
+      ).then((result) => result.rows[0]),
+    ])).map((value) => value?.status), ['interrupted', 'interrupted'])
     assert.equal((await analyses.get(analysisId))?.status, 'interrupted')
   } finally {
     await analyses.removeResearch(analysisId)

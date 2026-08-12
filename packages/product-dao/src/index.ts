@@ -1,10 +1,11 @@
 import { Pool, type PoolClient } from 'pg'
 import {
-  defaultRuntimeSettings, parseRuntimeSettingsUpdate,
+  agentExecutionStatuses, defaultRuntimeSettings, parseRuntimeSettingsUpdate,
+  type AgentExecutionStatus,
   type ExecutionSettingsSnapshot, type RuntimeSettings, type RuntimeSettingsRevision,
 } from '@vibe-invest/contracts'
 
-export const schemaVersion = 9
+export const schemaVersion = 10
 
 const migrationSql = `
 CREATE TABLE IF NOT EXISTS product_schema_migrations (
@@ -115,6 +116,61 @@ CREATE TABLE IF NOT EXISTS agent_events (
   UNIQUE (session_id, operation_id)
 );
 
+CREATE TABLE IF NOT EXISTS agent_executions (
+  id text PRIMARY KEY,
+  session_id text NOT NULL REFERENCES agent_sessions(id) ON DELETE CASCADE,
+  generation integer NOT NULL CHECK (generation > 0),
+  status text NOT NULL CHECK (status IN (
+    'planning', 'running_model', 'running_tools', 'waiting_for_specialists', 'finalizing',
+    'completed', 'partial', 'failed', 'stopping', 'stopped', 'interrupted', 'budget_exhausted'
+  )),
+  wait_reason_json jsonb,
+  created_at timestamptz NOT NULL,
+  updated_at timestamptz NOT NULL,
+  UNIQUE (session_id, generation)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS agent_executions_one_active_per_session
+ON agent_executions (session_id) WHERE status IN (
+  'planning', 'running_model', 'running_tools', 'waiting_for_specialists', 'finalizing', 'stopping'
+);
+
+CREATE TABLE IF NOT EXISTS conversation_segments (
+  id text PRIMARY KEY,
+  session_id text NOT NULL REFERENCES agent_sessions(id) ON DELETE CASCADE,
+  ordinal integer NOT NULL CHECK (ordinal > 0),
+  created_at timestamptz NOT NULL,
+  UNIQUE (session_id, ordinal)
+);
+
+INSERT INTO agent_executions (
+  id, session_id, generation, status, wait_reason_json, created_at, updated_at
+)
+SELECT session.execution_id, session.id, 1,
+  CASE session.status
+    WHEN 'queued' THEN 'planning'
+    WHEN 'running' THEN 'running_model'
+    WHEN 'cancelled' THEN 'stopped'
+    WHEN 'completed' THEN 'completed'
+    WHEN 'partial' THEN 'partial'
+    WHEN 'failed' THEN 'failed'
+    WHEN 'interrupted' THEN 'interrupted'
+    ELSE 'interrupted'
+  END,
+  CASE session.status
+    WHEN 'queued' THEN jsonb_build_object('kind', 'database', 'target', '研究规划', 'startedAt', session.updated_at)
+    WHEN 'running' THEN jsonb_build_object('kind', 'model', 'target', '主模型响应', 'startedAt', session.updated_at)
+    ELSE NULL
+  END,
+  session.created_at, session.updated_at
+FROM agent_sessions session
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO conversation_segments (id, session_id, ordinal, created_at)
+SELECT session.id || ':segment:1', session.id, 1, session.created_at
+FROM agent_sessions session
+ON CONFLICT (session_id, ordinal) DO NOTHING;
+
 UPDATE analyses analysis
 SET report_created_at = COALESCE(
   (
@@ -195,6 +251,10 @@ INSERT INTO product_schema_migrations (version)
 VALUES (9)
 ON CONFLICT (version) DO NOTHING;
 
+INSERT INTO product_schema_migrations (version)
+VALUES (10)
+ON CONFLICT (version) DO NOTHING;
+
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM vibe_invest_app;
 REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM vibe_invest_app;
 GRANT SELECT ON product_schema_migrations TO vibe_invest_app;
@@ -203,6 +263,8 @@ GRANT SELECT, INSERT ON legacy_portfolio_migrations TO vibe_invest_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON analyses, atomic_facts, analysis_facts, analysis_trace TO vibe_invest_app;
 GRANT SELECT, INSERT, UPDATE ON agent_sessions TO vibe_invest_app;
 GRANT SELECT, INSERT ON agent_events TO vibe_invest_app;
+GRANT SELECT, INSERT, UPDATE ON agent_executions TO vibe_invest_app;
+GRANT SELECT, INSERT ON conversation_segments TO vibe_invest_app;
 GRANT SELECT, INSERT ON runtime_settings_revisions, execution_settings_snapshots TO vibe_invest_app;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO vibe_invest_app;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM vibe_invest_app;
@@ -358,8 +420,10 @@ export function createRuntimeSettingsRepository(pool: Pool) {
         `SELECT snapshot.execution_id, snapshot.revision_id AS id, snapshot.settings_json,
                 snapshot.frozen_at::text AS created_at
          FROM execution_settings_snapshots snapshot
-         JOIN agent_sessions session ON session.execution_id = snapshot.execution_id
-         WHERE session.status IN ('queued', 'running')
+         JOIN agent_executions execution ON execution.id = snapshot.execution_id
+         WHERE execution.status IN (
+           'planning', 'running_model', 'running_tools', 'waiting_for_specialists', 'finalizing', 'stopping'
+         )
          ORDER BY snapshot.frozen_at, snapshot.execution_id`,
       )
       return result.rows.map(mapSnapshot)
@@ -857,8 +921,10 @@ export function createAgentEventRepository(pool: Pool) {
       analysisId: string
       sessionId: string
       executionId: string
+      segmentId?: string
       symbol: string
       status: string
+      analysisStatus?: string
       operationId: string
       event: Record<string, unknown>
       createdAt: string
@@ -872,7 +938,7 @@ export function createAgentEventRepository(pool: Pool) {
            ON CONFLICT (symbol) WHERE status IN ('queued', 'running')
            DO UPDATE SET symbol = excluded.symbol
            RETURNING id, id = $1 AS created`,
-          [input.analysisId, input.symbol, input.status, input.createdAt],
+          [input.analysisId, input.symbol, input.analysisStatus ?? input.status, input.createdAt],
         )
         const analysisId = analysis.rows[0]!.id
         if (!analysis.rows[0]!.created) {
@@ -887,6 +953,21 @@ export function createAgentEventRepository(pool: Pool) {
              id, analysis_id, is_primary, execution_id, status, latest_sequence, created_at, updated_at
            ) VALUES ($1, $2, true, $3, $4, 1, $5, $5)`,
           [input.sessionId, analysisId, input.executionId, input.status, input.createdAt],
+        )
+        const segmentId = input.segmentId ?? `${input.sessionId}:segment:1`
+        const waitReason = {
+          kind: 'database', target: '首次研究初始化', startedAt: input.createdAt,
+        }
+        await client.query(
+          `INSERT INTO agent_executions (
+             id, session_id, generation, status, wait_reason_json, created_at, updated_at
+           ) VALUES ($1, $2, 1, 'planning', $3, $4, $4)`,
+          [input.executionId, input.sessionId, JSON.stringify(waitReason), input.createdAt],
+        )
+        await client.query(
+          `INSERT INTO conversation_segments (id, session_id, ordinal, created_at)
+           VALUES ($1, $2, 1, $3)`,
+          [segmentId, input.sessionId, input.createdAt],
         )
         await client.query(
           `INSERT INTO agent_events (
@@ -911,6 +992,7 @@ export function createAgentEventRepository(pool: Pool) {
       id: string
       analysisId: string
       executionId: string
+      segmentId?: string
       status: string
       operationId: string
       event: Record<string, unknown>
@@ -933,6 +1015,26 @@ export function createAgentEventRepository(pool: Pool) {
            ) VALUES ($1, 1, $2, $3, $4)`,
           [input.id, input.operationId, JSON.stringify(input.event), input.createdAt],
         )
+        const executionStatus = input.status === 'queued' ? 'planning'
+          : input.status === 'running' ? 'running_model'
+            : isAgentExecutionStatus(input.status) ? input.status : 'interrupted'
+        const waitReason = executionStatus === 'planning'
+          ? { kind: 'database', target: '研究规划', startedAt: input.createdAt }
+          : executionStatus === 'running_model'
+            ? { kind: 'model', target: '模型响应', startedAt: input.createdAt }
+            : null
+        await client.query(
+          `INSERT INTO agent_executions (
+             id, session_id, generation, status, wait_reason_json, created_at, updated_at
+           ) VALUES ($1, $2, 1, $3, $4, $5, $5)`,
+          [input.executionId, input.id, executionStatus,
+            waitReason ? JSON.stringify(waitReason) : null, input.createdAt],
+        )
+        await client.query(
+          `INSERT INTO conversation_segments (id, session_id, ordinal, created_at)
+           VALUES ($1, $2, 1, $3)`,
+          [input.segmentId ?? `${input.id}:segment:1`, input.id, input.createdAt],
+        )
         await freezeExecutionSettings(client, input.executionId, input.createdAt)
         await client.query('COMMIT')
         return { sequence: 1, created: true, event: {
@@ -952,6 +1054,8 @@ export function createAgentEventRepository(pool: Pool) {
       event: Record<string, unknown>
       projection?: {
         status?: string
+        executionStatus?: AgentExecutionStatus
+        waitTarget?: string
         report?: unknown
         snapshot?: unknown
         error?: string
@@ -990,6 +1094,20 @@ export function createAgentEventRepository(pool: Pool) {
            ) VALUES ($1, $2, $3, $4, $5)`,
           [input.sessionId, sequence, input.operationId, JSON.stringify(input.event), input.createdAt],
         )
+        if (input.projection?.executionStatus) {
+          const execution = await client.query<{ id: string }>(
+            `SELECT id FROM agent_executions WHERE session_id = $1
+             ORDER BY generation DESC LIMIT 1 FOR UPDATE`, [input.sessionId],
+          )
+          if (!execution.rows[0]) throw new Error('agent_execution_not_found')
+          const waitReason = input.event.waitReason ?? null
+          await client.query(
+            `UPDATE agent_executions SET status = $1, wait_reason_json = $2, updated_at = $3
+             WHERE id = $4`,
+            [input.projection.executionStatus, waitReason ? JSON.stringify(waitReason) : null,
+              input.createdAt, execution.rows[0].id],
+          )
+        }
         for (const fact of input.projection?.facts ?? []) {
           await client.query(
             `INSERT INTO atomic_facts (id, payload_json, is_public) VALUES ($1, $2, true)
@@ -1039,8 +1157,14 @@ export function createAgentEventRepository(pool: Pool) {
         const sessions = await client.query<{
           id: string; analysis_id: string; is_primary: boolean; latest_sequence: number
         }>(
-          `SELECT id, analysis_id, is_primary, latest_sequence FROM agent_sessions
-           WHERE status IN ('queued', 'running') ORDER BY id FOR UPDATE`,
+          `SELECT session.id, session.analysis_id, session.is_primary, session.latest_sequence
+           FROM agent_sessions session
+           JOIN agent_executions execution ON execution.session_id = session.id
+           WHERE execution.status IN (
+             'planning', 'running_model', 'running_tools', 'waiting_for_specialists',
+             'finalizing', 'stopping'
+           )
+           ORDER BY session.id FOR UPDATE OF session, execution`,
         )
         const interrupted: AgentEvent[] = []
         for (const session of sessions.rows) {
@@ -1057,6 +1181,15 @@ export function createAgentEventRepository(pool: Pool) {
             `UPDATE agent_sessions SET status = 'interrupted', latest_sequence = $1, updated_at = $2
              WHERE id = $3`,
             [sequence, createdAt, session.id],
+          )
+          await client.query(
+            `UPDATE agent_executions
+             SET status = 'interrupted', wait_reason_json = NULL, updated_at = $1
+             WHERE session_id = $2 AND status IN (
+               'planning', 'running_model', 'running_tools', 'waiting_for_specialists',
+               'finalizing', 'stopping'
+             )`,
+            [createdAt, session.id],
           )
           if (session.is_primary) {
             await client.query(
@@ -1109,6 +1242,42 @@ export function createAgentEventRepository(pool: Pool) {
       )
       return result.rows.map(mapAgentSessionRow)
     },
+    async primaryLifecycle(analysisId: string) {
+      const session = await this.findPrimarySession(analysisId)
+      if (!session) return null
+      const [execution, segments, events] = await Promise.all([
+        pool.query<{
+          id: string; generation: number; status: string; wait_reason_json: Record<string, unknown> | null
+          created_at: string; updated_at: string
+        }>(
+          `SELECT id, generation, status, wait_reason_json, created_at::text, updated_at::text
+           FROM agent_executions WHERE session_id = $1 ORDER BY generation DESC LIMIT 1`,
+          [session.id],
+        ),
+        pool.query<{ id: string; ordinal: number; created_at: string }>(
+          `SELECT id, ordinal, created_at::text FROM conversation_segments
+           WHERE session_id = $1 ORDER BY ordinal`, [session.id],
+        ),
+        this.list(session.id, 0),
+      ])
+      const current = execution.rows[0]
+      if (!current) return null
+      return {
+        ...session, status: current.status, waitReason: current.wait_reason_json,
+        execution: {
+          id: current.id, generation: current.generation, status: current.status,
+          createdAt: new Date(current.created_at).toISOString(),
+          updatedAt: new Date(current.updated_at).toISOString(),
+        },
+        segments: segments.rows.map((segment) => ({
+          id: segment.id, ordinal: segment.ordinal,
+          createdAt: new Date(segment.created_at).toISOString(),
+        })),
+        events: events.map((event) => ({
+          sequence: event.sequence, createdAt: event.createdAt, ...event.payload,
+        })),
+      }
+    },
   }
 }
 
@@ -1122,6 +1291,10 @@ function mapAgentEventRow(row: AgentEventRow): AgentEvent {
     payload: row.payload_json,
     createdAt: new Date(row.created_at).toISOString(),
   }
+}
+
+function isAgentExecutionStatus(value: string): value is AgentExecutionStatus {
+  return agentExecutionStatuses.includes(value as AgentExecutionStatus)
 }
 
 function mapAgentSessionRow(row: AgentSessionRow): AgentSession {

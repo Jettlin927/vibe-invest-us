@@ -222,6 +222,92 @@ test('新建分析页展示分析历史并能重新打开报告', async () => {
   await view.findByRole('heading', { name: 'AAPL 综合分析' })
 })
 
+test('研究页展示主 Agent、execution、conversation segment、waitReason 与历史事件', async () => {
+  setupDom()
+  const record = {
+    id: 'runtime-1', symbol: 'NVDA', status: 'planning', createdAt: '2026-08-13T03:00:00.000Z',
+    report: null, facts: [], trace: [],
+    mainAgent: {
+      id: 'session-1', status: 'planning',
+      waitReason: { kind: 'database', target: '首次研究初始化', startedAt: '2026-08-13T03:00:00.000Z' },
+      execution: { id: 'execution-1', generation: 1, status: 'planning' },
+      segments: [{ id: 'segment-1', ordinal: 1, createdAt: '2026-08-13T03:00:00.000Z' }],
+      events: [{ sequence: 1, type: 'runtime_context', status: 'planning', createdAt: '2026-08-13T03:00:00.000Z', waitReason: { kind: 'database', target: '首次研究初始化', startedAt: '2026-08-13T03:00:00.000Z' } }],
+    },
+  }
+  globalThis.fetch = async (input) => {
+    const url = String(input)
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok' }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/settings') return Response.json({ ...settingsResponse(), model: { configured: false } })
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+    if (url === '/api/portfolio') return Response.json(portfolioResponse([]))
+    if (url === '/api/research') return Response.json({ records: [{ id: record.id, symbol: record.symbol, status: record.status, createdAt: record.createdAt }] })
+    if (url === '/api/research/runtime-1') return Response.json(record)
+    throw new Error(`unexpected_fetch:${url}`)
+  }
+  const view = render(React.createElement(App))
+  const user = userEvent.setup({ document: window.document })
+  await user.click(await view.findByRole('button', { name: '新建分析' }))
+  await user.click(await view.findByRole('button', { name: /打开 NVDA/ }))
+  const runtime = await view.findByRole('region', { name: '主 Agent Runtime' })
+  assert.match(runtime.textContent ?? '', /session-1/)
+  assert.match(runtime.textContent ?? '', /execution-1.*Generation 1/)
+  assert.match(runtime.textContent ?? '', /Segment 1/)
+  assert.match(runtime.textContent ?? '', /首次研究初始化/)
+  assert.match(runtime.textContent ?? '', /Runtime Context/)
+  assert.match(runtime.textContent ?? '', /等待 首次研究初始化/)
+})
+
+test('模型未配置时首次研究创建后立即打开主 Agent 生命周期', async () => {
+  setupDom()
+  let created = false
+  globalThis.fetch = async (input, init) => {
+    const url = String(input)
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok' }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/settings') return Response.json({ ...settingsResponse(), model: { configured: false } })
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+    if (url === '/api/portfolio') return Response.json(portfolioResponse([]))
+    if (url === '/api/research') return Response.json({ records: created ? [{ id: 'no-model', symbol: 'NVDA', status: 'queued' }] : [] })
+    if (url === '/api/analyses' && init?.method === 'POST') { created = true; return Response.json({ analysisId: 'no-model', sessionId: 'session-no-model' }, { status: 202 }) }
+    if (url === '/api/research/no-model') return Response.json({
+      id: 'no-model', symbol: 'NVDA', status: 'queued', facts: [], trace: [],
+      mainAgent: { id: 'session-no-model', status: 'planning', waitReason: { kind: 'database', target: '首次研究初始化', startedAt: '2026-08-13T03:00:00Z' }, execution: { id: 'execution-no-model', generation: 1, status: 'planning' }, segments: [{ id: 'segment', ordinal: 1, createdAt: '2026-08-13T03:00:00Z' }], events: [{ sequence: 1, type: 'runtime_context', status: 'planning', createdAt: '2026-08-13T03:00:00Z' }] },
+    })
+    throw new Error(`unexpected_fetch:${url}`)
+  }
+  const view = render(React.createElement(App))
+  const user = userEvent.setup({ document: window.document })
+  await user.click(await view.findByRole('button', { name: '新建分析' }))
+  await user.type(await view.findByLabelText('分析标的'), 'NVDA')
+  await user.click(view.getByRole('button', { name: '开始分析' }))
+  assert.match((await view.findByRole('region', { name: '主 Agent Runtime' })).textContent ?? '', /首次研究初始化/)
+})
+
+for (const terminal of ['stopped', 'budget_exhausted']) {
+  test(`轮询在 ${terminal} 终态打开研究页`, async () => {
+    setupDom()
+    Reflect.deleteProperty(globalThis, 'EventSource')
+    globalThis.fetch = async (input, init) => {
+      const url = String(input)
+      if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok' }, financialData: { service: 'financial-data', status: 'ok' } } })
+      if (url === '/api/settings') return Response.json(settingsResponse())
+      if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+      if (url === '/api/portfolio') return Response.json(portfolioResponse([]))
+      if (url === '/api/research') return Response.json({ records: [] })
+      if (url === '/api/analyses' && init?.method === 'POST') return Response.json({ analysisId: `poll-${terminal}`, sessionId: `session-${terminal}` }, { status: 202 })
+      if (url === `/api/analyses/poll-${terminal}`) return Response.json({ id: `poll-${terminal}`, status: terminal })
+      if (url === `/api/research/poll-${terminal}`) return Response.json({ id: `poll-${terminal}`, symbol: 'NVDA', status: terminal, facts: [], trace: [] })
+      throw new Error(`unexpected_fetch:${url}`)
+    }
+    const view = render(React.createElement(App))
+    const user = userEvent.setup({ document: window.document })
+    await user.click(await view.findByRole('button', { name: '新建分析' }))
+    await user.type(await view.findByLabelText('分析标的'), 'NVDA')
+    await user.click(view.getByRole('button', { name: '开始分析' }))
+    await view.findByRole('heading', { name: '研究记录' })
+  })
+}
+
 test('报告 freshness 按报告年龄提示且不因历史事实改写报告内容', async () => {
   setupDom()
   const oldTitle = '保持原样的历史报告标题'

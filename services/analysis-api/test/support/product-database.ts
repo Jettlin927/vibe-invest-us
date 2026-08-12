@@ -15,6 +15,11 @@ export function createTestProductDatabase() {
   const traces = new Map<string, unknown[]>()
   const agentSessions = new Map<string, AgentSession>()
   const agentEvents = new Map<string, AgentEvent[]>()
+  const lifecycles = new Map<string, {
+    execution: { id: string; generation: number; status: string; createdAt: string; updatedAt: string }
+    waitReason: { kind: 'database'; target: string; startedAt: string }
+    segments: Array<{ id: string; ordinal: number; createdAt: string }>
+  }>()
   let nextSettingsRevisionId = 1
   const runtimeSettingsRevisions = [{
     id: nextSettingsRevisionId, values: { ...defaultRuntimeSettings }, createdAt: '2026-08-13T00:00:00.000Z',
@@ -171,6 +176,11 @@ export function createTestProductDatabase() {
         latestSequence: 1, createdAt: input.createdAt, updatedAt: input.createdAt,
       })
       agentEvents.set(input.sessionId, [event])
+      lifecycles.set(input.sessionId, {
+        execution: { id: input.executionId, generation: 1, status: 'planning', createdAt: input.createdAt, updatedAt: input.createdAt },
+        waitReason: { kind: 'database', target: '首次研究初始化', startedAt: input.createdAt },
+        segments: [{ id: input.segmentId ?? `${input.sessionId}:segment:1`, ordinal: 1, createdAt: input.createdAt }],
+      })
       executionSettingsSnapshots.set(input.executionId, {
         executionId: input.executionId,
         id: runtimeSettingsRevisions.at(-1)!.id,
@@ -178,7 +188,7 @@ export function createTestProductDatabase() {
         createdAt: input.createdAt,
       })
       analyses.set(input.analysisId, {
-        id: input.analysisId, symbol: input.symbol, status: input.status,
+        id: input.analysisId, symbol: input.symbol, status: input.analysisStatus ?? input.status,
         createdAt: input.createdAt, updatedAt: input.createdAt,
         snapshot: null, report: null, reportCreatedAt: null, error: null, starred: false, note: '',
       })
@@ -199,6 +209,15 @@ export function createTestProductDatabase() {
         latestSequence: 1, createdAt: input.createdAt, updatedAt: input.createdAt,
       })
       agentEvents.set(input.id, [event])
+      const executionStatus = input.status === 'queued' ? 'planning'
+        : input.status === 'running' ? 'running_model' : input.status
+      lifecycles.set(input.id, {
+        execution: { id: input.executionId, generation: 1, status: executionStatus, createdAt: input.createdAt, updatedAt: input.createdAt },
+        waitReason: executionStatus === 'planning'
+          ? { kind: 'database', target: '研究规划', startedAt: input.createdAt }
+          : { kind: 'database', target: '模型响应', startedAt: input.createdAt },
+        segments: [{ id: input.segmentId ?? `${input.id}:segment:1`, ordinal: 1, createdAt: input.createdAt }],
+      })
       const current = runtimeSettingsRevisions.at(-1)!
       executionSettingsSnapshots.set(input.executionId, {
         executionId: input.executionId,
@@ -223,6 +242,16 @@ export function createTestProductDatabase() {
         ...session, status: input.projection?.status ?? session.status,
         latestSequence: event.sequence, updatedAt: input.createdAt,
       })
+      const lifecycle = lifecycles.get(input.sessionId)
+      if (lifecycle && input.projection?.executionStatus) {
+        const status = input.projection.executionStatus
+        const waitKind = ({ planning: 'database', running_model: 'model', running_tools: 'tools', waiting_for_specialists: 'specialists', finalizing: 'finalizing' } as const)[status as 'planning']
+        lifecycles.set(input.sessionId, {
+          ...lifecycle,
+          execution: { ...lifecycle.execution, status, updatedAt: input.createdAt },
+          waitReason: waitKind ? { kind: waitKind as 'database', target: input.projection.waitTarget ?? ({ planning: '研究规划', running_model: '主模型响应', running_tools: '工具结果', waiting_for_specialists: '专项分析', finalizing: '报告收口' } as Record<string, string>)[status], startedAt: input.createdAt } : null as never,
+        })
+      }
       if (input.projection) {
         const analysisId = session.analysisId
         for (const fact of input.projection.facts ?? []) {
@@ -256,10 +285,24 @@ export function createTestProductDatabase() {
         .sort((left, right) => Number(right.isPrimary) - Number(left.isPrimary)
           || left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id))
     },
+    async primaryLifecycle(analysisId) {
+      const session = [...agentSessions.values()].find((candidate) => candidate.analysisId === analysisId && candidate.isPrimary)
+      if (!session) return null
+      const lifecycle = lifecycles.get(session.id)
+      if (!lifecycle) return null
+      return {
+        ...session, status: lifecycle.execution.status, waitReason: lifecycle.waitReason,
+        execution: lifecycle.execution, segments: lifecycle.segments,
+        events: (agentEvents.get(session.id) ?? []).map((event) => ({
+          sequence: event.sequence, createdAt: event.createdAt, ...event.payload,
+        })),
+      }
+    },
     async interruptActiveSessions(createdAt) {
       const interrupted: AgentEvent[] = []
       for (const [id, session] of [...agentSessions.entries()].sort(([left], [right]) => left.localeCompare(right))) {
-        if (!['queued', 'running'].includes(session.status)) continue
+        const lifecycle = lifecycles.get(id)
+        if (!lifecycle || !['planning', 'running_model', 'running_tools', 'waiting_for_specialists', 'finalizing', 'stopping'].includes(lifecycle.execution.status)) continue
         const sequence = session.latestSequence + 1
         const operationId = `startup:interrupt:${id}:${sequence}`
         const payload = { type: 'status', status: 'interrupted', at: createdAt }
@@ -267,6 +310,11 @@ export function createTestProductDatabase() {
         agentEvents.set(id, [...(agentEvents.get(id) ?? []), event])
         agentSessions.set(id, {
           ...session, status: 'interrupted', latestSequence: sequence, updatedAt: createdAt,
+        })
+        lifecycles.set(id, {
+          ...lifecycle,
+          execution: { ...lifecycle.execution, status: 'interrupted', updatedAt: createdAt },
+          waitReason: null as never,
         })
         if (session.isPrimary) {
           const record = analyses.get(session.analysisId)
@@ -314,7 +362,10 @@ export function createTestProductDatabase() {
     },
     async listActiveExecutionSnapshots() {
       const activeExecutionIds = new Set([...agentSessions.values()]
-        .filter(({ status }) => ['queued', 'running'].includes(status))
+        .filter(({ id }) => {
+          const status = lifecycles.get(id)?.execution.status
+          return status && ['planning', 'running_model', 'running_tools', 'waiting_for_specialists', 'finalizing', 'stopping'].includes(status)
+        })
         .map(({ executionId }) => executionId))
       return [...executionSettingsSnapshots.values()]
         .filter(({ executionId }) => activeExecutionIds.has(executionId))
@@ -324,7 +375,7 @@ export function createTestProductDatabase() {
 
   return {
     productDatabase: {
-      checkSchema: async () => ({ status: 'ok' as const, version: 6 }),
+      checkSchema: async () => ({ status: 'ok' as const, version: 10 }),
       close: async () => {},
     },
     portfolioRepository,

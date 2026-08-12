@@ -2,9 +2,11 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  agentExecutionStatuses,
   defaultRuntimeSettings,
   isRuntimeSettingsResponse,
   parseRuntimeSettingsUpdate,
+  waitReasonForStatus,
 } from '../src/index.js'
 
 test('Runtime 设置默认值符合产品预算与安全上限', () => {
@@ -70,4 +72,18 @@ test('Settings HTTP 响应守卫拒绝缺字段与越界值', () => {
     ...response,
     current: { ...response.current, values: { ...defaultRuntimeSettings, mainAgentToolRounds: 501 } },
   }), false)
+})
+
+test('Agent execution 状态全集稳定且 waitReason 由 Runtime 确定生成', () => {
+  assert.deepEqual(agentExecutionStatuses, [
+    'planning', 'running_model', 'running_tools', 'waiting_for_specialists',
+    'finalizing', 'completed', 'partial', 'failed', 'stopping', 'stopped',
+    'interrupted', 'budget_exhausted',
+  ])
+  assert.deepEqual(waitReasonForStatus(
+    'running_model', '主模型响应', '2026-08-13T03:00:00.000Z',
+  ), {
+    kind: 'model', target: '主模型响应', startedAt: '2026-08-13T03:00:00.000Z',
+  })
+  assert.equal(waitReasonForStatus('completed', 'ignored', '2026-08-13T03:00:00.000Z'), null)
 })

@@ -2,7 +2,10 @@ import { randomUUID } from 'node:crypto'
 import type {
   AgentEvent, AgentEventRepository, AnalysisRepository, RuntimeSettingsRepository,
 } from '@vibe-invest/product-dao'
-import { defaultRuntimeSettings, type RuntimeSettings } from '@vibe-invest/contracts'
+import {
+  agentExecutionStatuses, defaultRuntimeSettings, waitReasonForStatus,
+  type AgentExecutionStatus, type RuntimeSettings,
+} from '@vibe-invest/contracts'
 
 import type { AnalyzeInput, AnalysisReport, ModelEvent } from './model.js'
 import type { FactQueryResult, FinancialContext, FinancialFact } from './financial-data-client.js'
@@ -27,6 +30,7 @@ export function createAnalysisService(options: {
   runtimeMinuteMs?: number
   activeNow?: () => number
   activeTimeoutSignal?: (timeoutMs: number) => AbortSignal
+  runEnabled?: boolean
 }) {
   const { repository } = options
   const controllers = new Map<string, AbortController>()
@@ -50,11 +54,18 @@ export function createAnalysisService(options: {
     operationId: string,
     payload: Record<string, unknown>,
     projection?: {
-      status?: string; report?: unknown; snapshot?: unknown; error?: string; facts?: Fact[]
+      status?: string; executionStatus?: import('@vibe-invest/contracts').AgentExecutionStatus
+      waitTarget?: string; report?: unknown; snapshot?: unknown; error?: string; facts?: Fact[]
     },
   ) {
+    const createdAt = new Date().toISOString()
+    const executionStatus = projection?.executionStatus
+    const waitReason = executionStatus
+      ? waitReasonForStatus(executionStatus, projection?.waitTarget ?? waitTarget(executionStatus), createdAt)
+      : undefined
+    const event = waitReason === undefined ? payload : { ...payload, waitReason }
     const result = await options.eventRepository.append({
-      sessionId, operationId, event: payload, projection, createdAt: new Date().toISOString(),
+      sessionId, operationId, event, projection, createdAt,
     })
     if (result.created) for (const listener of listeners.get(sessionId) ?? []) listener(result.event)
     return result.event
@@ -76,10 +87,14 @@ export function createAnalysisService(options: {
     status: string,
     extra: { report?: unknown; snapshot?: unknown; error?: string } = {},
   ) {
+    const executionStatus = status === 'cancelled' ? 'stopped' : status
     await appendEvent(sessionId, operationId, {
-      type: 'status', status, at: new Date().toISOString(),
+      type: 'status', status: executionStatus, at: new Date().toISOString(),
       ...(extra.error ? { error: extra.error } : {}),
-    }, { status, ...extra })
+    }, {
+      status, ...extra,
+      ...(isExecutionStatus(executionStatus) ? { executionStatus } : {}),
+    })
   }
   async function get(analysisId: string) {
     await initialized
@@ -95,16 +110,23 @@ export function createAnalysisService(options: {
       analysisId,
       sessionId,
       executionId,
+      segmentId: randomUUID(),
       symbol,
-      status: 'queued',
+      status: 'planning',
+      analysisStatus: 'queued',
       operationId: `session:${sessionId}:created`,
-      event: { type: 'status', status: 'queued', at: now },
+      event: {
+        type: 'runtime_context', status: 'planning', executionId, generation: 1,
+        waitReason: { kind: 'database', target: '首次研究初始化', startedAt: now }, at: now,
+      },
       createdAt: now,
     })
     if (!result.created) return {
-      analysisId: result.analysisId, sessionId: result.sessionId, existing: true,
+      analysisId: result.analysisId, sessionId: result.sessionId,
+      executionId: (await options.eventRepository.getSession(result.sessionId))!.executionId,
+      existing: true,
     }
-    queueMicrotask(() => void schedule())
+    if (options.runEnabled !== false) queueMicrotask(() => void schedule())
     return { analysisId: result.analysisId, sessionId: result.sessionId, executionId, existing: false }
   }
   async function schedule() {
@@ -145,8 +167,8 @@ export function createAnalysisService(options: {
         await appendEvent(
           session.id,
           `execution:${executionId}:running`,
-          { type: 'status', status: 'running', at: now },
-          { status: 'running' },
+          { type: 'status', status: 'planning', at: now },
+          { status: 'running', executionStatus: 'planning', waitTarget: '金融与组合上下文' },
         )
       } catch {
         try {
@@ -249,6 +271,11 @@ export function createAnalysisService(options: {
       }, { snapshot, facts: context.facts })
       assertPolicy()
       const modelContext = createModelContext(snapshot)
+      await appendEvent(
+        sessionId, operationId('running-model'),
+        { type: 'status', status: 'running_model' },
+        { executionStatus: 'running_model' },
+      )
       pauseProcessing()
       for await (const event of options.model.analyze({
         executionId,
@@ -368,7 +395,10 @@ export function createAnalysisService(options: {
     const trace = session
       ? (await options.eventRepository.list(session.id, 0)).map(({ payload }) => payload)
       : []
-    return { ...record, trace }
+    return {
+      ...record, trace,
+      mainAgent: await options.eventRepository.primaryLifecycle(analysisId),
+    }
   }
   async function listResearch(symbol?: string) {
     await initialized
@@ -452,6 +482,17 @@ export function createAnalysisService(options: {
   return { create, get, cancel, research, listResearch, updateResearch, removeResearch, streamEvents, close, updateRuntimePolicy }
 }
 
+function isExecutionStatus(value: string): value is import('@vibe-invest/contracts').AgentExecutionStatus {
+  return agentExecutionStatuses.includes(value as import('@vibe-invest/contracts').AgentExecutionStatus)
+}
+
+function waitTarget(status: AgentExecutionStatus) {
+  return ({
+    planning: '研究规划', running_model: '主模型响应', running_tools: '工具结果',
+    waiting_for_specialists: '专项分析', finalizing: '报告收口',
+  } as Partial<Record<AgentExecutionStatus, string>>)[status] ?? ''
+}
+
 const ANALYSIS_SYSTEM_PROMPT = `你是个人美股研究助手，分析周期为未来一至四周。
 你可以自主规划分析路径。建议先确认本次冻结的金融上下文；按需调用 fetch_financial_context，遇到需要深入解释财报时可调用 analyze_financials。财报专家可通过受控工具补查关键词新闻和指定日期范围的技术指标。只能使用提供的只读工具，最终必须调用 submit_analysis_report 提交报告。
 不得编造行情、新闻、财报、估值或持仓；所有事实判断只能引用工具结果中真实存在的事实 ID。
@@ -493,7 +534,7 @@ function sourceDiagnostics(context: FinancialContext) {
 }
 
 function isTerminal(status: string) {
-  return ['completed', 'partial', 'failed', 'cancelled', 'interrupted'].includes(status)
+  return ['completed', 'partial', 'failed', 'stopped', 'interrupted', 'budget_exhausted'].includes(status)
 }
 
 function enforceDataGaps(report: AnalysisReport, gaps: unknown[]) {
