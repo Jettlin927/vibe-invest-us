@@ -9,6 +9,7 @@ import {
   type FauxResponseStep,
   type Model,
   type Api,
+  type AssistantMessageEvent,
   type Tool,
   type ToolCall,
 } from '@earendil-works/pi-ai'
@@ -83,6 +84,7 @@ export type AnalyzeInput = {
 }
 
 type ModelOptions = {
+  modelsFactory?: typeof createModels
   fauxResponses?: FauxResponseStep[]
   fauxTokensPerSecond?: number
   toolTimeoutMs?: number
@@ -114,7 +116,7 @@ export function createPiModel(options: ModelOptions = {}) {
         runtimeSettings.researchActiveMinutes * runtimeMinuteMs, options.activeNow,
         options.activeTimeoutSignal,
       )
-      const models = createModels()
+      const models = (options.modelsFactory ?? createModels)()
       let selectedModel: Model<Api>
       if (options.fauxResponses) {
         const faux = fauxProvider({ tokensPerSecond: options.fauxTokensPerSecond ?? 1000 })
@@ -215,33 +217,51 @@ export function createPiModel(options: ModelOptions = {}) {
           input, options, runtimeSettings, executionSignal, activeBudget, modelGate,
           countActive: !closing,
         })
-        const stream = models.stream(selectedModel, context, { signal: request.signal, apiKey: options.apiKey })
-        const iterator = stream[Symbol.asyncIterator]()
+        let message: AssistantMessage
+        let iterator: AsyncIterator<AssistantMessageEvent> | undefined
+        let iteratorCompleted = false
         try {
-          while (true) {
-            const item = await nextEvent(iterator, request.signal)
-            if (item.done) break
-            const event = item.value
-            const eventId = `${attemptId}:event:${++attemptEventSequence}`
-            yield { type: 'trace', entry: {
-              type: 'model_event', event: compactModelEvent(event), operationId: eventId,
-            } }
-            options.log?.({
-              type: event.type,
-              toolName: event.type === 'toolcall_end' ? event.toolCall.name : undefined,
-            })
-            if (event.type === 'text_delta') yield {
-              type: 'text_delta', text: event.delta, operationId: `${eventId}:text`,
+          const stream = models.stream(
+            selectedModel, context, { signal: request.signal, apiKey: options.apiKey },
+          )
+          iterator = stream[Symbol.asyncIterator]()
+          try {
+            while (true) {
+              const item = await nextEvent(iterator, request.signal)
+              if (item.done) { iteratorCompleted = true; break }
+              const event = item.value
+              const eventId = `${attemptId}:event:${++attemptEventSequence}`
+              yield { type: 'trace', entry: {
+                type: 'model_event', event: compactModelEvent(event), operationId: eventId,
+              } }
+              options.log?.({
+                type: event.type,
+                toolName: event.type === 'toolcall_end' ? event.toolCall.name : undefined,
+              })
+              if (event.type === 'text_delta') yield {
+                type: 'text_delta', text: event.delta, operationId: `${eventId}:text`,
+              }
             }
+          } catch (error) {
+            if (input.signal?.aborted) {
+              yield { type: 'trace', entry: {
+                type: 'cancelled', operationId: `${attemptId}:cancelled-trace`,
+              } }
+              yield { type: 'cancelled', operationId: `${attemptId}:cancelled` }
+              return
+            }
+            try {
+              request.assertWithinPolicy()
+            } catch (policyError) {
+              if (policyError instanceof Error && policyError.message === 'research_active_timeout') {
+                closing = true
+                continue
+              }
+              throw policyError
+            }
+            throw error
           }
-        } catch (error) {
-          if (input.signal?.aborted) {
-            yield { type: 'trace', entry: {
-              type: 'cancelled', operationId: `${attemptId}:cancelled-trace`,
-            } }
-            yield { type: 'cancelled', operationId: `${attemptId}:cancelled` }
-            return
-          }
+          message = await stream.result()
           try {
             request.assertWithinPolicy()
           } catch (policyError) {
@@ -251,20 +271,16 @@ export function createPiModel(options: ModelOptions = {}) {
             }
             throw policyError
           }
-          throw error
         } finally {
-          request.finish()
-        }
-
-        const message = await stream.result()
-        try {
-          request.assertWithinPolicy()
-        } catch (policyError) {
-          if (policyError instanceof Error && policyError.message === 'research_active_timeout') {
-            closing = true
-            continue
+          request.abort()
+          try {
+            if (!iteratorCompleted) {
+              const closing = iterator?.return?.()
+              if (closing) void Promise.resolve(closing).catch(() => undefined)
+            }
+          } finally {
+            request.finish()
           }
-          throw policyError
         }
         let runtimeWork = activeBudget.start(executionSignal)
         try {
@@ -298,6 +314,7 @@ export function createPiModel(options: ModelOptions = {}) {
 
           const preparedCalls = prepareToolCalls(
             [...analysisModelTools], calls, `execution:${input.executionId}:tool`,
+            `main-attempt:${modelAttempts}`,
           )
           for (const { call, toolOperationId } of preparedCalls) {
             yield { type: 'trace', entry: {
@@ -503,9 +520,11 @@ async function* runFinancialSpecialist(
   const availableTools = projectedSpecialistTools(input)
   context.tools = [...availableTools]
   let toolRounds = 0
+  let modelAttempts = 0
   let closing = false
   let closingAttempts = 0
   while (true) {
+    modelAttempts += 1
     if (activeBudget.exhausted()) closing = true
     if (closing && closingAttempts >= 2) return { analysis: '专项研究预算已到限，未形成额外结论。', facts }
     if (closing) {
@@ -567,6 +586,7 @@ async function* runFinancialSpecialist(
       }
       const preparedCalls = prepareToolCalls(
         [...availableTools], calls, `execution:${input.executionId}:specialist-tool`,
+        `specialist-attempt:${modelAttempts}`,
       )
       for (const { call, toolOperationId } of preparedCalls) {
         yield {
@@ -667,19 +687,12 @@ async function* runFinancialSpecialist(
   }
 }
 
-function prepareToolCalls(tools: Tool[], calls: ToolCall[], operationPrefix: string) {
-  const occurrences = new Map<string, number>()
-  const runtimeIds = new Set<string>()
+function prepareToolCalls(
+  tools: Tool[], calls: ToolCall[], operationPrefix: string, turnId: string,
+) {
   return calls.map((call, index) => {
-    const providerId = call.id || `missing:${index + 1}`
-    let occurrence = (occurrences.get(providerId) ?? 0) + 1
-    occurrences.set(providerId, occurrence)
-    let runtimeId = occurrence === 1 ? providerId : `${providerId}:occurrence:${occurrence}`
-    while (runtimeIds.has(runtimeId)) {
-      occurrence += 1
-      runtimeId = `${providerId}:occurrence:${occurrence}`
-    }
-    runtimeIds.add(runtimeId)
+    const providerId = call.id || 'missing'
+    const runtimeId = `${providerId}:${turnId}:position:${index + 1}`
     call.id = runtimeId
     const prepared = {
       call,
@@ -748,31 +761,54 @@ async function beginModelRequest(input: {
   const release = await (input.input.acquireModelSlot
     ? input.input.acquireModelSlot(input.executionSignal)
     : input.modelGate.acquire(input.executionSignal))
-  const timeout = AbortSignal.timeout(
-    input.runtimeSettings.modelRequestTimeoutMinutes * (input.options.runtimeMinuteMs ?? 60_000),
-  )
-  const active = input.countActive ? input.activeBudget.start(input.executionSignal) : undefined
-  input.options.log?.({
-    type: 'model_request_start', executionId: input.input.executionId,
-    specialist: input.specialist,
-  })
-  return {
-    signal: AbortSignal.any([...(active ? [active.signal] : []), input.executionSignal, timeout]),
-    assertWithinPolicy() {
-      if (timeout.aborted) throw new Error('model_request_timeout')
-      if (input.executionSignal.aborted && !input.input.signal?.aborted) {
-        throw new Error('execution_runtime_timeout')
-      }
-      if (active?.exhausted()) throw new Error('research_active_timeout')
-    },
-    finish() {
-      input.options.log?.({
-        type: 'model_request_end', executionId: input.input.executionId,
-        specialist: input.specialist,
-      })
+  const owner = new AbortController()
+  let active: ReturnType<ActiveBudget['start']> | undefined
+  try {
+    const timeout = AbortSignal.timeout(
+      input.runtimeSettings.modelRequestTimeoutMinutes * (input.options.runtimeMinuteMs ?? 60_000),
+    )
+    active = input.countActive ? input.activeBudget.start(input.executionSignal) : undefined
+    input.options.log?.({
+      type: 'model_request_start', executionId: input.input.executionId,
+      specialist: input.specialist,
+    })
+    let finished = false
+    return {
+      signal: AbortSignal.any([
+        ...(active ? [active.signal] : []), input.executionSignal, timeout, owner.signal,
+      ]),
+      assertWithinPolicy() {
+        if (timeout.aborted) throw new Error('model_request_timeout')
+        if (input.executionSignal.aborted && !input.input.signal?.aborted) {
+          throw new Error('execution_runtime_timeout')
+        }
+        if (active?.exhausted()) throw new Error('research_active_timeout')
+      },
+      abort() {
+        if (!owner.signal.aborted) owner.abort(new Error('model_request_closed'))
+      },
+      finish() {
+        if (finished) return
+        finished = true
+        if (!owner.signal.aborted) owner.abort(new Error('model_request_closed'))
+        try {
+          input.options.log?.({
+            type: 'model_request_end', executionId: input.input.executionId,
+            specialist: input.specialist,
+          })
+        } finally {
+          active?.stop()
+          release()
+        }
+      },
+    }
+  } catch (error) {
+    try {
       active?.stop()
+    } finally {
       release()
-    },
+    }
+    throw error
   }
 }
 

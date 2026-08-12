@@ -203,19 +203,20 @@ test('Pi Runtime 使用持久 executionId 派生工具 operationId 且真实 Pos
     const session = await events.getSession(created.sessionId)
     assert.ok(session)
     const ledger = await events.list(created.sessionId, 0)
-    const toolPrefix = `execution:${session.executionId}:tool:${callId}`
-    const duplicateToolPrefix = `${toolPrefix}:occurrence:2`
-    assert.equal(ledger.filter(({ operationId }) => operationId === `${toolPrefix}:call`).length, 1)
-    assert.equal(ledger.filter(({ operationId }) => operationId === `${toolPrefix}:result`).length, 1)
+    const toolPrefix = `execution:${session.executionId}:tool:${callId}:main-attempt:1`
+    const duplicateToolPrefix = `${toolPrefix}:position:2`
+    const firstToolPrefix = `${toolPrefix}:position:1`
+    assert.equal(ledger.filter(({ operationId }) => operationId === `${firstToolPrefix}:call`).length, 1)
+    assert.equal(ledger.filter(({ operationId }) => operationId === `${firstToolPrefix}:result`).length, 1)
     assert.equal(ledger.filter(({ operationId }) => operationId === `${duplicateToolPrefix}:call`).length, 1)
     assert.equal(ledger.filter(({ operationId }) => operationId === `${duplicateToolPrefix}:result`).length, 1)
     assert.deepEqual(ledger.filter(({ operationId }) => operationId.startsWith(toolPrefix))
       .map(({ operationId }) => operationId), [
-      `${toolPrefix}:call`, `${duplicateToolPrefix}:call`,
-      `${toolPrefix}:result`, `${duplicateToolPrefix}:result`,
+      `${firstToolPrefix}:call`, `${duplicateToolPrefix}:call`,
+      `${firstToolPrefix}:result`, `${duplicateToolPrefix}:result`,
     ])
-    const reportPrefix = `execution:${session.executionId}:tool:${reportCallId}`
-    const cancelledPrefix = `execution:${session.executionId}:tool:${cancelledAfterReportCallId}`
+    const reportPrefix = `execution:${session.executionId}:tool:${reportCallId}:main-attempt:2:position:1`
+    const cancelledPrefix = `execution:${session.executionId}:tool:${cancelledAfterReportCallId}:main-attempt:2:position:2`
     const sealedBatch = ledger.filter(({ operationId }) => (
       operationId === `${reportPrefix}:call`
       || operationId === `${cancelledPrefix}:call`
@@ -282,29 +283,27 @@ test('主 Agent 校验失败与合法调用在下一轮前按原序封存到真�
         || operationId.startsWith(`${prefix}:${invalidCallId}:`)
         || operationId.startsWith(`${prefix}:${validCallId}:`)
       ))
+      const runtimeIds = [unknownCallId, invalidCallId, validCallId]
+        .map((id, index) => `${id}:main-attempt:1:position:${index + 1}`)
       assert.deepEqual(sealed.map(({ operationId }) => operationId), [
-        `${prefix}:${unknownCallId}:call`,
-        `${prefix}:${invalidCallId}:call`,
-        `${prefix}:${validCallId}:call`,
-        `${prefix}:${unknownCallId}:result`,
-        `${prefix}:${invalidCallId}:result`,
-        `${prefix}:${validCallId}:result`,
+        ...runtimeIds.map((id) => `${prefix}:${id}:call`),
+        ...runtimeIds.map((id) => `${prefix}:${id}:result`),
       ])
       assert.deepEqual(sealed.slice(3, 5).map(({ payload }) => payload), [
         {
           type: 'tool_result', name: 'hidden_main_tool',
           result: { error: 'tool_not_available', facts: [] }, isError: true,
-          operationId: `${prefix}:${unknownCallId}:result`,
+          operationId: `${prefix}:${runtimeIds[0]}:result`,
         },
         {
           type: 'tool_result', name: 'fetch_financial_context',
           result: { error: 'invalid_tool_arguments', facts: [] }, isError: true,
-          operationId: `${prefix}:${invalidCallId}:result`,
+          operationId: `${prefix}:${runtimeIds[1]}:result`,
         },
       ])
       assert.deepEqual(context.messages.filter(({ role }) => role === 'toolResult')
         .map((message) => message.role === 'toolResult' ? message.toolCallId : ''), [
-        unknownCallId, invalidCallId, validCallId,
+        ...runtimeIds,
       ])
       providerObservedSealedLedger = true
       return fauxAssistantMessage(
@@ -335,6 +334,105 @@ test('主 Agent 校验失败与合法调用在下一轮前按原序封存到真�
     await waitForAnalysisStatus(app, created.analysisId, 'partial')
     assert.equal(providerObservedSealedLedger, true)
     assert.equal(validCalls, 1)
+  } finally {
+    await app.close()
+  }
+})
+
+test('主 Agent 跨 Turn 复用与空 call id 在真实 PostgreSQL 各自完整封存且重放幂等', {
+  skip: !databaseUrl,
+  concurrency: false,
+}, async () => {
+  const pool = createPool(databaseUrl!)
+  const events = createAgentEventRepository(pool)
+  const analyses = createAnalysisRepository(pool)
+  const reusedId = 'pg-cross-turn-reused'
+  const reportCallId = 'pg-cross-turn-report'
+  let createdSessionId: string | undefined
+  let providerChecks = 0
+  const report = {
+    title: '跨 Turn operationId 测试', marketState: '未知', trend: '未知', drivers: [],
+    supportingEvidence: [], contraryEvidence: [], keyJudgments: [], scenarios: [],
+    invalidationConditions: [], valuation: null, personalImpact: null,
+    conditionalSuggestion: null, limitations: ['测试上下文为空'],
+  }
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(
+      fauxToolCall('fetch_financial_context', {}, { id: reusedId }), { stopReason: 'toolUse' },
+    ),
+    async () => {
+      assert.ok(createdSessionId)
+      const session = await events.getSession(createdSessionId)
+      assert.ok(session)
+      const firstPrefix = `execution:${session.executionId}:tool:${reusedId}:main-attempt:1:position:1`
+      assert.deepEqual((await events.list(createdSessionId, 0))
+        .filter(({ operationId }) => operationId.startsWith(firstPrefix))
+        .map(({ operationId }) => operationId), [`${firstPrefix}:call`, `${firstPrefix}:result`])
+      providerChecks += 1
+      return fauxAssistantMessage(
+        fauxToolCall('fetch_financial_context', {}, { id: reusedId }), { stopReason: 'toolUse' },
+      )
+    },
+    async () => {
+      assert.ok(createdSessionId)
+      const session = await events.getSession(createdSessionId)
+      assert.ok(session)
+      const prefix = `execution:${session.executionId}:tool:${reusedId}`
+      assert.deepEqual((await events.list(createdSessionId, 0))
+        .filter(({ operationId }) => operationId.startsWith(prefix))
+        .map(({ operationId }) => operationId), [
+        `${prefix}:main-attempt:1:position:1:call`,
+        `${prefix}:main-attempt:1:position:1:result`,
+        `${prefix}:main-attempt:2:position:1:call`,
+        `${prefix}:main-attempt:2:position:1:result`,
+      ])
+      providerChecks += 1
+      return fauxAssistantMessage(
+        fauxToolCall('fetch_financial_context', {}, { id: '' }), { stopReason: 'toolUse' },
+      )
+    },
+    async () => {
+      assert.ok(createdSessionId)
+      const session = await events.getSession(createdSessionId)
+      assert.ok(session)
+      const emptyPrefix = `execution:${session.executionId}:tool:missing:main-attempt:3:position:1`
+      const ledger = await events.list(createdSessionId, 0)
+      assert.deepEqual(ledger.filter(({ operationId }) => operationId.startsWith(emptyPrefix))
+        .map(({ operationId }) => operationId), [`${emptyPrefix}:call`, `${emptyPrefix}:result`])
+      const beforeReplay = ledger.length
+      const replayed = await events.append({
+        sessionId: createdSessionId,
+        operationId: `${emptyPrefix}:result`,
+        event: ledger.find(({ operationId }) => operationId === `${emptyPrefix}:result`)!.payload,
+        createdAt: new Date().toISOString(),
+      })
+      assert.equal(replayed.created, false)
+      assert.equal((await events.list(createdSessionId, 0)).length, beforeReplay)
+      providerChecks += 1
+      return fauxAssistantMessage(
+        fauxToolCall('submit_analysis_report', report, { id: reportCallId }),
+        { stopReason: 'toolUse' },
+      )
+    },
+  ] })
+  const app = buildApp({
+    productDatabase: { checkSchema: () => checkSchema(pool), close: () => pool.end() },
+    portfolioRepository: createPortfolioRepository(pool),
+    analysisRepository: analyses,
+    agentEventRepository: events,
+    runtimeSettingsRepository: createRuntimeSettingsRepository(pool),
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, gaps: [], facts: [] }),
+    model,
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'PGCROSS' },
+  })).json() as { analysisId: string; sessionId: string }
+  createdSessionId = created.sessionId
+  try {
+    await waitForAnalysisStatus(app, created.analysisId, 'partial')
+    assert.equal(providerChecks, 3)
   } finally {
     await app.close()
   }
@@ -383,32 +481,49 @@ test('专项下一轮 provider 启动前已在真实 PostgreSQL 封存上一批�
         || operationId.startsWith(`${prefix}:${newsCallId}:`)
         || operationId.startsWith(`${prefix}:${indicatorCallId}:`)
       ))
+      const runtimeIds = [unknownCallId, invalidCallId, newsCallId, indicatorCallId]
+        .map((id, index) => `${id}:specialist-attempt:1:position:${index + 1}`)
       assert.deepEqual(sealed.map(({ operationId }) => operationId), [
-        `${prefix}:${unknownCallId}:call`,
-        `${prefix}:${invalidCallId}:call`,
-        `${prefix}:${newsCallId}:call`,
-        `${prefix}:${indicatorCallId}:call`,
-        `${prefix}:${unknownCallId}:result`,
-        `${prefix}:${invalidCallId}:result`,
-        `${prefix}:${newsCallId}:result`,
-        `${prefix}:${indicatorCallId}:result`,
+        ...runtimeIds.map((id) => `${prefix}:${id}:call`),
+        ...runtimeIds.map((id) => `${prefix}:${id}:result`),
       ])
       assert.deepEqual(sealed.slice(4, 6).map(({ payload }) => payload), [
         {
           type: 'tool_result', name: 'hidden_specialist_tool',
           result: { error: 'tool_not_available', facts: [] }, isError: true,
-          operationId: `${prefix}:${unknownCallId}:result`,
+          operationId: `${prefix}:${runtimeIds[0]}:result`,
         },
         {
           type: 'tool_result', name: 'search_news_by_keyword',
           result: { error: 'invalid_tool_arguments', facts: [] }, isError: true,
-          operationId: `${prefix}:${invalidCallId}:result`,
+          operationId: `${prefix}:${runtimeIds[1]}:result`,
         },
       ])
       assert.deepEqual(context.messages.filter(({ role }) => role === 'toolResult')
         .map((message) => message.role === 'toolResult' ? message.toolCallId : ''), [
-        unknownCallId, invalidCallId, newsCallId, indicatorCallId,
+        ...runtimeIds,
       ])
+      return fauxAssistantMessage(
+        fauxToolCall('search_news_by_keyword', {}, { id: newsCallId }),
+        { stopReason: 'toolUse' },
+      )
+    },
+    async (context) => {
+      assert.ok(createdSessionId)
+      const session = await events.getSession(createdSessionId)
+      assert.ok(session)
+      const prefix = `execution:${session.executionId}:specialist-tool:${newsCallId}`
+      assert.deepEqual((await events.list(createdSessionId, 0))
+        .filter(({ operationId }) => operationId.startsWith(prefix))
+        .map(({ operationId }) => operationId), [
+        `${prefix}:specialist-attempt:1:position:3:call`,
+        `${prefix}:specialist-attempt:1:position:3:result`,
+        `${prefix}:specialist-attempt:2:position:1:call`,
+        `${prefix}:specialist-attempt:2:position:1:result`,
+      ])
+      const resultIds = context.messages.filter(({ role }) => role === 'toolResult')
+        .map((message) => message.role === 'toolResult' ? message.toolCallId : '')
+      assert.notEqual(resultIds.at(-2), resultIds.at(-1))
       providerObservedSealedLedger = true
       return fauxAssistantMessage('专项收口完成')
     },
