@@ -92,6 +92,109 @@ test('创建分析立即返回标识并自动保存完成报告、快照、事�
   await app.close()
 })
 
+test('创建 execution 冻结当前 settings revision 且后续修改不影响运行值', async () => {
+  const database = createTestProductDatabase()
+  await database.runtimeSettingsRepository.save({ mainAgentToolRounds: 100 }, '2026-08-13T03:00:00.000Z')
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [], indicators: {} }),
+    model: fakeModel(50),
+  })
+  await app.ready()
+
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'SNAPSHOT' },
+  })).json()
+  await database.runtimeSettingsRepository.save({ mainAgentToolRounds: 200 }, '2026-08-13T03:01:00.000Z')
+  const settings = (await app.inject({ method: 'GET', url: '/api/settings' })).json()
+
+  assert.equal(settings.current.values.mainAgentToolRounds, 200)
+  assert.equal(settings.activeExecutions[0].executionId, created.executionId)
+  assert.equal(settings.activeExecutions[0].values.mainAgentToolRounds, 100)
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  await app.close()
+})
+
+test('修改研究并发后立即启动尚未运行的排队 execution', async () => {
+  const database = createTestProductDatabase()
+  await database.runtimeSettingsRepository.save({ analysisConcurrency: 1 }, '2026-08-13T03:00:00.000Z')
+  let releaseFirst!: () => void
+  const firstBarrier = new Promise<void>((resolve) => { releaseFirst = resolve })
+  let active = 0
+  let maximumActive = 0
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [], indicators: {} }),
+    model: {
+      async *analyze() {
+        active += 1
+        maximumActive = Math.max(maximumActive, active)
+        if (active === 1) await firstBarrier
+        active -= 1
+        yield { type: 'completed' as const, report }
+      },
+    },
+  })
+  await app.ready()
+  const first = (await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'C1' } })).json()
+  const second = (await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'C2' } })).json()
+  await new Promise((resolve) => setTimeout(resolve, 10))
+  assert.equal((await app.inject({ method: 'GET', url: `/api/analyses/${second.analysisId}` })).json().status, 'queued')
+
+  await app.inject({ method: 'PUT', url: '/api/settings', payload: { analysisConcurrency: 2 } })
+  await new Promise((resolve) => setTimeout(resolve, 10))
+  assert.equal(maximumActive, 2)
+  releaseFirst()
+  await waitForStatus(app as any, first.analysisId, 'completed')
+  await waitForStatus(app as any, second.analysisId, 'completed')
+  await app.close()
+})
+
+test('settings snapshot 冻结失败时请求失败且不创建没有冻结契约的 execution', async () => {
+  const database = createTestProductDatabase()
+  database.agentEventRepository.createResearch = async () => { throw new Error('snapshot_failed') }
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [], indicators: {} }),
+    model: fakeModel(),
+  })
+  await app.ready()
+  const response = await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'SNAPFAIL' } })
+
+  assert.equal(response.statusCode, 500)
+  assert.deepEqual(await database.analysisRepository.listResearch(), [])
+  assert.deepEqual(await database.agentEventRepository.listSessions(response.json().analysisId ?? ''), [])
+  await app.close()
+})
+
+test('模型只接收 execution 创建时冻结的 Runtime settings', async () => {
+  const database = createTestProductDatabase()
+  await database.runtimeSettingsRepository.save({ mainAgentToolRounds: 100 }, '2026-08-13T03:00:00.000Z')
+  let receivedSettings: Record<string, unknown> | undefined
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [], indicators: {} }),
+    model: {
+      async *analyze(input) {
+        receivedSettings = input.runtimeSettings as Record<string, unknown>
+        yield { type: 'completed' as const, report }
+      },
+    },
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'FROZEN' },
+  })).json()
+  await database.runtimeSettingsRepository.save({ mainAgentToolRounds: 200 }, '2026-08-13T03:01:00.000Z')
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  assert.equal(receivedSettings?.mainAgentToolRounds, 100)
+  await app.close()
+})
+
 test('同一标的运行中重复创建返回原任务且不重复调用模型', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'vibe-analysis-dedup-'))
   let calls = 0

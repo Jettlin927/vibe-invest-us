@@ -16,6 +16,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@vibe-invest/contracts": "0.1.0",
     "pg": "8.16.3"
   },
   "devDependencies": {

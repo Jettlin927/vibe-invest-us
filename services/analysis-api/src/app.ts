@@ -1,8 +1,12 @@
 import fastifyStatic from '@fastify/static'
 import Fastify from 'fastify'
 
-import { formatSseEvent, type FinancialDataHealth } from '@vibe-invest/contracts'
-import type { AgentEventRepository, AnalysisRepository, PortfolioRepository } from '@vibe-invest/product-dao'
+import {
+  defaultRuntimeSettings, formatSseEvent, parseRuntimeSettingsUpdate, type FinancialDataHealth,
+} from '@vibe-invest/contracts'
+import type {
+  AgentEventRepository, AnalysisRepository, PortfolioRepository, RuntimeSettingsRepository,
+} from '@vibe-invest/product-dao'
 
 import { createAnalysisService } from './analysis.js'
 import type { ModelEvent } from './model.js'
@@ -17,6 +21,7 @@ type AppDependencies = {
   portfolioRepository: PortfolioRepository
   analysisRepository: AnalysisRepository
   agentEventRepository: AgentEventRepository
+  runtimeSettingsRepository: RuntimeSettingsRepository
   financialDataHealth: () => Promise<FinancialDataHealth>
   staticDir?: string
   fetchFinancialContext?: (symbol: string, signal: AbortSignal) => Promise<FinancialContext>
@@ -39,13 +44,14 @@ export function buildApp(dependencies: AppDependencies) {
     ? createAnalysisService({
         repository: dependencies.analysisRepository,
         eventRepository: dependencies.agentEventRepository,
+        settingsRepository: dependencies.runtimeSettingsRepository,
         fetchFinancialContext: dependencies.fetchFinancialContext,
         searchNews: dependencies.searchNews,
         fetchTechnicalIndicators: dependencies.fetchTechnicalIndicators,
         fetchMarketPrices: dependencies.fetchMarketPrices,
         listPortfolioSymbols: async () => (await portfolio.list()).map((position) => position.symbol),
         model: dependencies.model,
-        concurrency: dependencies.analysisConcurrency ?? 2,
+        concurrency: dependencies.analysisConcurrency,
         getPortfolioContext: (symbol, marketPrices) => portfolio.context(symbol, marketPrices),
       })
     : null
@@ -128,7 +134,32 @@ export function buildApp(dependencies: AppDependencies) {
 
   app.get('/api/settings', async () => ({
     model: { configured: dependencies.modelConfigured ?? Boolean(dependencies.model) },
+    current: await dependencies.runtimeSettingsRepository.current(),
+    defaults: defaultRuntimeSettings,
+    activeExecutions: await dependencies.runtimeSettingsRepository.listActiveExecutionSnapshots(),
   }))
+
+  app.put<{ Body: unknown }>('/api/settings', async (request, reply) => {
+    let update
+    try {
+      update = parseRuntimeSettingsUpdate(request.body)
+    } catch (error) {
+      return reply.status(400).send({ error: error instanceof Error ? error.message : 'invalid_runtime_settings_update' })
+    }
+    const revision = await dependencies.runtimeSettingsRepository.save(
+      update, (dependencies.now?.() ?? new Date()).toISOString(),
+    )
+    analysis?.updateConcurrency(revision.values.analysisConcurrency)
+    return revision
+  })
+
+  app.post('/api/settings/defaults', async () => {
+    const revision = await dependencies.runtimeSettingsRepository.restoreDefaults(
+      (dependencies.now?.() ?? new Date()).toISOString(),
+    )
+    analysis?.updateConcurrency(revision.values.analysisConcurrency)
+    return revision
+  })
 
   app.put<{ Params: { symbol: string }; Body: { quantity?: unknown; averageCost?: unknown } }>(
     '/api/positions/:symbol',

@@ -37,3 +37,14 @@ test('生产存储只使用 Product DAO 和 PostgreSQL', async () => {
     }
   }
 })
+
+test('普通 Runtime 设置不再由环境变量覆盖 PostgreSQL', async () => {
+  const [server, compose, environment] = await Promise.all([
+    readFile(new URL('../src/server.ts', import.meta.url), 'utf8'),
+    readFile(new URL('../../../compose.yaml', import.meta.url), 'utf8'),
+    readFile(new URL('../../../.env.example', import.meta.url), 'utf8'),
+  ])
+  assert.doesNotMatch(server, /ANALYSIS_CONCURRENCY/)
+  assert.doesNotMatch(compose, /ANALYSIS_CONCURRENCY/)
+  assert.doesNotMatch(environment, /ANALYSIS_CONCURRENCY/)
+})

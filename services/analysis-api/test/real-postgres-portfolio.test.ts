@@ -7,6 +7,7 @@ import {
   createAnalysisRepository,
   createPool,
   createPortfolioRepository,
+  createRuntimeSettingsRepository,
 } from '@vibe-invest/product-dao'
 
 import { buildApp } from '../src/app.js'
@@ -24,6 +25,7 @@ function createPostgresApp(now?: () => Date) {
     portfolioRepository: createPortfolioRepository(pool),
     analysisRepository: createAnalysisRepository(pool),
     agentEventRepository: createAgentEventRepository(pool),
+    runtimeSettingsRepository: createRuntimeSettingsRepository(pool),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchMarketPrices: async (symbols) => Object.fromEntries(
       symbols.map((symbol) => [symbol, symbol === 'NVDA' ? 120 : 240]),
@@ -106,6 +108,7 @@ test('真实 PostgreSQL HTTP 持仓与研究闭环在重启后持久化', {
     portfolioRepository: createPortfolioRepository(analysisPool),
     analysisRepository: createAnalysisRepository(analysisPool),
     agentEventRepository: createAgentEventRepository(analysisPool),
+    runtimeSettingsRepository: createRuntimeSettingsRepository(analysisPool),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({
       symbol, gaps: [], facts: [{
@@ -181,4 +184,43 @@ test('迁移验证 API 保留 PostgreSQL decimal 文本精度且默认受令牌�
     averageCost: '9876543210.1234567890123456789',
   })
   await app.close()
+})
+
+test('真实 PostgreSQL Settings HTTP 保存 revision、冻结 execution 并恢复默认值', {
+  skip: !databaseUrl,
+  concurrency: false,
+}, async () => {
+  const cleanup = createPool(databaseUrl!)
+  await cleanup.query("DELETE FROM analyses WHERE symbol = 'PGSET'")
+  await cleanup.end()
+  const app = createPostgresApp()
+  await app.ready()
+  try {
+    await app.inject({ method: 'POST', url: '/api/settings/defaults' })
+    const changed = await app.inject({
+      method: 'PUT', url: '/api/settings',
+      payload: { mainAgentToolRounds: 100, modelRequestTimeoutMinutes: 60 },
+    })
+    assert.equal(changed.statusCode, 200)
+    const created = (await app.inject({
+      method: 'POST', url: '/api/analyses', payload: { symbol: 'PGSET' },
+    })).json() as { analysisId: string; executionId: string }
+    await app.inject({
+      method: 'PUT', url: '/api/settings', payload: { mainAgentToolRounds: 200 },
+    })
+
+    const readback = (await app.inject({ method: 'GET', url: '/api/settings' })).json()
+    assert.equal(readback.current.values.mainAgentToolRounds, 200)
+    const frozen = readback.activeExecutions.find((snapshot: { executionId: string }) => (
+      snapshot.executionId === created.executionId
+    ))
+    assert.equal(frozen.values.mainAgentToolRounds, 100)
+    assert.equal(frozen.values.modelRequestTimeoutMinutes, 60)
+
+    const restored = await app.inject({ method: 'POST', url: '/api/settings/defaults' })
+    assert.equal(restored.json().values.mainAgentToolRounds, 20)
+    assert.equal(restored.json().values.modelRequestTimeoutMinutes, 15)
+  } finally {
+    await app.close()
+  }
 })

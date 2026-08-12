@@ -4,6 +4,7 @@ import { JSDOM } from 'jsdom'
 import React from 'react'
 import { cleanup, render, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { defaultRuntimeSettings } from '@vibe-invest/contracts'
 
 import { App } from './app.js'
 
@@ -309,3 +310,70 @@ test('分析轨迹可展开查看各能力的数据源状态与错误', async ()
   await view.findByText('UnicodeDecodeError')
   await view.findByText('采用 multiple · 20 条')
 })
+
+test('设置页展示当前、默认、修改时间与运行 execution 冻结值并可保存和恢复', async () => {
+  setupDom()
+  let currentRounds = 100
+  let currentRevision = 2
+  const requests: Array<{ url: string; method: string }> = []
+  const settingsResponse = () => ({
+    model: { configured: true },
+    current: {
+      id: currentRevision,
+      createdAt: '2026-08-13T03:00:00.000Z',
+      values: runtimeSettings({ mainAgentToolRounds: currentRounds }),
+    },
+    defaults: runtimeSettings(),
+    activeExecutions: [{
+      executionId: 'execution-1', id: 1, createdAt: '2026-08-13T02:55:00.000Z',
+      values: runtimeSettings({ mainAgentToolRounds: 20 }),
+    }],
+  })
+  globalThis.fetch = async (input, init) => {
+    const url = String(input)
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok', engine: 'postgresql', schemaVersion: 8 }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/settings' && (!init?.method || init.method === 'GET')) return Response.json(settingsResponse())
+    if (url === '/api/settings' && init?.method === 'PUT') {
+      requests.push({ url, method: init.method })
+      currentRounds = JSON.parse(String(init.body)).mainAgentToolRounds
+      currentRevision += 1
+      return Response.json(settingsResponse().current)
+    }
+    if (url === '/api/settings/defaults' && init?.method === 'POST') {
+      requests.push({ url, method: init.method })
+      currentRounds = 20
+      currentRevision += 1
+      return Response.json(settingsResponse().current)
+    }
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+    if (url === '/api/portfolio') return Response.json(portfolioResponse([]))
+    if (url === '/api/research') return Response.json({ records: [] })
+    throw new Error(`unexpected_fetch:${url}`)
+  }
+
+  const view = render(React.createElement(App))
+  const user = userEvent.setup({ document: window.document })
+  await user.click(await view.findByRole('button', { name: '系统设置' }))
+  await view.findByText('当前 revision #2')
+  await view.findByText(/上次修改：2026年8月13日 11:00/)
+  await view.findByText(/运行 execution execution-1/)
+  await view.findByText(/主 Agent 20 轮.*墙钟 45 分钟.*研究\/模型\/工具并发 2\/4\/8.*Freshness 7 天.*Compaction 保留 20,000 Token/)
+  const rounds = view.getByRole('spinbutton', { name: '主 Agent 轮次' })
+  assert.equal((rounds as HTMLInputElement).value, '100')
+  assert.equal((rounds as HTMLInputElement).max, '500')
+  assert.match(rounds.parentElement?.textContent ?? '', /默认 20/)
+
+  await user.clear(rounds)
+  await user.type(rounds, '120')
+  await user.click(view.getByRole('button', { name: '保存 Runtime 设置' }))
+  assert.deepEqual(requests[0], { url: '/api/settings', method: 'PUT' })
+  await user.click(view.getAllByRole('button', { name: '恢复此项' })[0]!)
+  assert.deepEqual(requests[1], { url: '/api/settings', method: 'PUT' })
+  await waitFor(() => assert.equal((view.getByRole('spinbutton', { name: '主 Agent 轮次' }) as HTMLInputElement).value, '20'))
+  await user.click(view.getByRole('button', { name: '恢复全部默认值' }))
+  assert.deepEqual(requests[2], { url: '/api/settings/defaults', method: 'POST' })
+})
+
+function runtimeSettings(overrides: Record<string, number> = {}) {
+  return { ...defaultRuntimeSettings, ...overrides }
+}

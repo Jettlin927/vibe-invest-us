@@ -1,6 +1,10 @@
-import { Pool } from 'pg'
+import { Pool, type PoolClient } from 'pg'
+import {
+  defaultRuntimeSettings, parseRuntimeSettingsUpdate,
+  type ExecutionSettingsSnapshot, type RuntimeSettings, type RuntimeSettingsRevision,
+} from '@vibe-invest/contracts'
 
-export const schemaVersion = 7
+export const schemaVersion = 8
 
 const migrationSql = `
 CREATE TABLE IF NOT EXISTS product_schema_migrations (
@@ -108,6 +112,23 @@ CREATE TABLE IF NOT EXISTS agent_events (
   UNIQUE (session_id, operation_id)
 );
 
+CREATE TABLE IF NOT EXISTS runtime_settings_revisions (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  settings_json jsonb NOT NULL,
+  created_at timestamptz NOT NULL
+);
+
+INSERT INTO runtime_settings_revisions (settings_json, created_at)
+SELECT '${JSON.stringify(defaultRuntimeSettings)}'::jsonb, now()
+WHERE NOT EXISTS (SELECT 1 FROM runtime_settings_revisions);
+
+CREATE TABLE IF NOT EXISTS execution_settings_snapshots (
+  execution_id text PRIMARY KEY,
+  revision_id integer NOT NULL REFERENCES runtime_settings_revisions(id),
+  settings_json jsonb NOT NULL,
+  frozen_at timestamptz NOT NULL
+);
+
 WITH duplicate_active AS (
   SELECT id, row_number() OVER (PARTITION BY symbol ORDER BY created_at, id) AS position
   FROM analyses WHERE status IN ('queued', 'running')
@@ -147,6 +168,10 @@ INSERT INTO product_schema_migrations (version)
 VALUES (7)
 ON CONFLICT (version) DO NOTHING;
 
+INSERT INTO product_schema_migrations (version)
+VALUES (8)
+ON CONFLICT (version) DO NOTHING;
+
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM vibe_invest_app;
 REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM vibe_invest_app;
 GRANT SELECT ON product_schema_migrations TO vibe_invest_app;
@@ -155,6 +180,7 @@ GRANT SELECT, INSERT ON legacy_portfolio_migrations TO vibe_invest_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON analyses, atomic_facts, analysis_facts, analysis_trace TO vibe_invest_app;
 GRANT SELECT, INSERT, UPDATE ON agent_sessions TO vibe_invest_app;
 GRANT SELECT, INSERT ON agent_events TO vibe_invest_app;
+GRANT SELECT, INSERT ON runtime_settings_revisions, execution_settings_snapshots TO vibe_invest_app;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO vibe_invest_app;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM vibe_invest_app;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON SEQUENCES FROM vibe_invest_app;
@@ -193,6 +219,121 @@ export async function checkSchema(pool: Pool) {
 }
 
 export type ProductPool = Pool
+
+type RuntimeSettingsRevisionRow = {
+  id: number
+  settings_json: RuntimeSettings
+  created_at: string
+}
+
+type ExecutionSettingsSnapshotRow = RuntimeSettingsRevisionRow & {
+  execution_id: string
+}
+
+async function freezeExecutionSettings(
+  database: Pool | PoolClient, executionId: string, frozenAt: string,
+) {
+  return database.query<ExecutionSettingsSnapshotRow>(
+    `WITH inserted AS (
+       INSERT INTO execution_settings_snapshots (execution_id, revision_id, settings_json, frozen_at)
+       SELECT $1, id, settings_json, $2 FROM runtime_settings_revisions ORDER BY id DESC LIMIT 1
+       ON CONFLICT (execution_id) DO NOTHING
+       RETURNING execution_id, revision_id, settings_json, frozen_at
+     )
+     SELECT execution_id, revision_id AS id, settings_json, frozen_at::text AS created_at
+     FROM inserted
+     UNION ALL
+     SELECT execution_id, revision_id AS id, settings_json, frozen_at::text AS created_at
+     FROM execution_settings_snapshots WHERE execution_id = $1
+     LIMIT 1`,
+    [executionId, frozenAt],
+  )
+}
+
+export function createRuntimeSettingsRepository(pool: Pool) {
+  const mapRevision = (row: RuntimeSettingsRevisionRow): RuntimeSettingsRevision => ({
+    id: row.id, values: row.settings_json, createdAt: row.created_at,
+  })
+  const mapSnapshot = (row: ExecutionSettingsSnapshotRow): ExecutionSettingsSnapshot => ({
+    executionId: row.execution_id, ...mapRevision(row),
+  })
+  return {
+    async current() {
+      const result = await pool.query<RuntimeSettingsRevisionRow>(
+        `SELECT id, settings_json, created_at::text FROM runtime_settings_revisions
+         ORDER BY id DESC LIMIT 1`,
+      )
+      if (!result.rows[0]) throw new Error('runtime_settings_revision_not_found')
+      return mapRevision(result.rows[0])
+    },
+    async getRevision(id: number) {
+      const result = await pool.query<RuntimeSettingsRevisionRow>(
+        `SELECT id, settings_json, created_at::text FROM runtime_settings_revisions WHERE id = $1`,
+        [id],
+      )
+      return result.rows[0] ? mapRevision(result.rows[0]) : null
+    },
+    async save(update: unknown, createdAt: string) {
+      const parsed = parseRuntimeSettingsUpdate(update)
+      const client = await pool.connect()
+      try {
+        await client.query('BEGIN')
+        await client.query('SELECT pg_advisory_xact_lock($1)', [8_613_092])
+        const current = await client.query<RuntimeSettingsRevisionRow>(
+          `SELECT id, settings_json, created_at::text FROM runtime_settings_revisions
+           ORDER BY id DESC LIMIT 1`,
+        )
+        if (!current.rows[0]) throw new Error('runtime_settings_revision_not_found')
+        const values = { ...current.rows[0].settings_json, ...parsed }
+        const result = await client.query<RuntimeSettingsRevisionRow>(
+          `INSERT INTO runtime_settings_revisions (settings_json, created_at)
+           VALUES ($1, $2) RETURNING id, settings_json, created_at::text`,
+          [JSON.stringify(values), createdAt],
+        )
+        await client.query('COMMIT')
+        return mapRevision(result.rows[0]!)
+      } catch (error) {
+        await client.query('ROLLBACK')
+        throw error
+      } finally {
+        client.release()
+      }
+    },
+    async restoreDefaults(createdAt: string) {
+      const result = await pool.query<RuntimeSettingsRevisionRow>(
+        `INSERT INTO runtime_settings_revisions (settings_json, created_at)
+         VALUES ($1, $2) RETURNING id, settings_json, created_at::text`,
+        [JSON.stringify(defaultRuntimeSettings), createdAt],
+      )
+      return mapRevision(result.rows[0]!)
+    },
+    async freezeExecution(executionId: string, frozenAt: string) {
+      const result = await freezeExecutionSettings(pool, executionId, frozenAt)
+      return mapSnapshot(result.rows[0]!)
+    },
+    async getExecutionSnapshot(executionId: string) {
+      const result = await pool.query<ExecutionSettingsSnapshotRow>(
+        `SELECT execution_id, revision_id AS id, settings_json, frozen_at::text AS created_at
+         FROM execution_settings_snapshots WHERE execution_id = $1`,
+        [executionId],
+      )
+      return result.rows[0] ? mapSnapshot(result.rows[0]) : null
+    },
+    async listActiveExecutionSnapshots() {
+      const result = await pool.query<ExecutionSettingsSnapshotRow>(
+        `SELECT snapshot.execution_id, snapshot.revision_id AS id, snapshot.settings_json,
+                snapshot.frozen_at::text AS created_at
+         FROM execution_settings_snapshots snapshot
+         JOIN agent_sessions session ON session.execution_id = snapshot.execution_id
+         WHERE session.status IN ('queued', 'running')
+         ORDER BY snapshot.frozen_at, snapshot.execution_id`,
+      )
+      return result.rows.map(mapSnapshot)
+    },
+  }
+}
+
+export type RuntimeSettingsRepository = ReturnType<typeof createRuntimeSettingsRepository>
 
 export type ProductPosition = {
   symbol: string
@@ -716,6 +857,7 @@ export function createAgentEventRepository(pool: Pool) {
            ) VALUES ($1, 1, $2, $3, $4)`,
           [input.sessionId, input.operationId, JSON.stringify(input.event), input.createdAt],
         )
+        await freezeExecutionSettings(client, input.executionId, input.createdAt)
         await client.query('COMMIT')
         return { analysisId, sessionId: input.sessionId, sequence: 1, created: true, event: {
           sessionId: input.sessionId, sequence: 1, operationId: input.operationId,

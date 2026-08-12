@@ -1,5 +1,8 @@
 import { randomUUID } from 'node:crypto'
-import type { AgentEvent, AgentEventRepository, AnalysisRepository } from '@vibe-invest/product-dao'
+import type {
+  AgentEvent, AgentEventRepository, AnalysisRepository, RuntimeSettingsRepository,
+} from '@vibe-invest/product-dao'
+import type { RuntimeSettings } from '@vibe-invest/contracts'
 
 import type { AnalysisReport, ModelEvent } from './model.js'
 import type { FactQueryResult, FinancialContext, FinancialFact } from './financial-data-client.js'
@@ -10,6 +13,7 @@ type Model = { analyze(input: Record<string, unknown> & { executionId: string })
 export function createAnalysisService(options: {
   repository: AnalysisRepository
   eventRepository: AgentEventRepository
+  settingsRepository: RuntimeSettingsRepository
   model: Model
   fetchFinancialContext: (symbol: string, signal: AbortSignal) => Promise<FinancialContext>
   searchNews?: (keyword: string, signal: AbortSignal) => Promise<FactQueryResult>
@@ -19,14 +23,22 @@ export function createAnalysisService(options: {
   fetchMarketPrices?: (symbols: string[], signal: AbortSignal) => Promise<Record<string, number>>
   listPortfolioSymbols?: () => Promise<string[]>
   getPortfolioContext?: (symbol: string, marketPrices: Record<string, number>) => Promise<unknown>
-  concurrency: number
+  concurrency?: number
 }) {
   const { repository } = options
   const controllers = new Map<string, AbortController>()
   const listeners = new Map<string, Set<(entry: AgentEvent) => void>>()
   const tasks = new Set<Promise<void>>()
   let running = 0
-  const initialized = options.eventRepository.interruptActiveSessions(new Date().toISOString())
+  let concurrency = options.concurrency ?? 2
+  const initialized = Promise.all([
+    options.eventRepository.interruptActiveSessions(new Date().toISOString()),
+    options.concurrency === undefined
+      ? options.settingsRepository.current().then((revision) => {
+          concurrency = revision.values.analysisConcurrency
+        })
+      : Promise.resolve(),
+  ])
 
   async function appendEvent(
     sessionId: string,
@@ -88,10 +100,10 @@ export function createAnalysisService(options: {
       analysisId: result.analysisId, sessionId: result.sessionId, existing: true,
     }
     queueMicrotask(() => void schedule())
-    return { analysisId: result.analysisId, sessionId: result.sessionId, existing: false }
+    return { analysisId: result.analysisId, sessionId: result.sessionId, executionId, existing: false }
   }
   async function schedule() {
-    while (running < options.concurrency) {
+    while (running < concurrency) {
       running += 1
       const now = new Date().toISOString()
       let next: string | null
@@ -105,6 +117,15 @@ export function createAnalysisService(options: {
       const session = await options.eventRepository.findPrimarySession(next)
       if (!session) { running -= 1; continue }
       const executionId = session.executionId
+      const settingsSnapshot = await options.settingsRepository.getExecutionSnapshot(executionId)
+      if (!settingsSnapshot) {
+        await setStatus(
+          session.id, `execution:${executionId}:settings-snapshot-missing`, 'interrupted',
+          { error: 'execution_settings_snapshot_missing' },
+        )
+        running -= 1
+        continue
+      }
       try {
         await appendEvent(
           session.id,
@@ -124,12 +145,16 @@ export function createAnalysisService(options: {
         running -= 1
         continue
       }
-      const task = run(next, session.id, executionId).finally(() => { running -= 1; void schedule() })
+      const task = run(next, session.id, executionId, settingsSnapshot.values)
+        .finally(() => { running -= 1; void schedule() })
       tasks.add(task)
       void task.then(() => tasks.delete(task), () => tasks.delete(task))
     }
   }
-  async function run(analysisId: string, sessionId: string, executionId: string) {
+  async function run(
+    analysisId: string, sessionId: string, executionId: string,
+    runtimeSettings: RuntimeSettings,
+  ) {
     const job = await get(analysisId)
     if (!job) return
     const controller = new AbortController()
@@ -171,6 +196,7 @@ export function createAnalysisService(options: {
       const modelContext = createModelContext(snapshot)
       for await (const event of options.model.analyze({
         executionId,
+        runtimeSettings,
         symbol: job.symbol,
         systemPrompt: ANALYSIS_SYSTEM_PROMPT,
         userPrompt: `分析 ${job.symbol}。个人语境：${JSON.stringify(portfolioContext)}`,
@@ -316,7 +342,11 @@ export function createAnalysisService(options: {
     for (const controller of controllers.values()) controller.abort()
     await Promise.allSettled(tasks)
   }
-  return { create, get, cancel, research, listResearch, updateResearch, removeResearch, streamEvents, close }
+  function updateConcurrency(value: number) {
+    concurrency = value
+    queueMicrotask(() => void schedule())
+  }
+  return { create, get, cancel, research, listResearch, updateResearch, removeResearch, streamEvents, close, updateConcurrency }
 }
 
 const ANALYSIS_SYSTEM_PROMPT = `你是个人美股研究助手，分析周期为未来一至四周。

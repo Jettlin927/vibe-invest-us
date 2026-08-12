@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 
-import { isSystemHealth, type SystemHealth } from '@vibe-invest/contracts'
+import {
+  isRuntimeSettingsResponse, isSystemHealth, runtimeSettingLimits,
+  type RuntimeSettings, type RuntimeSettingsResponse, type SystemHealth,
+} from '@vibe-invest/contracts'
 
 type Page = 'overview' | 'analysis' | 'research' | 'portfolio' | 'settings'
 type Position = { symbol: string; quantity: number; averageCost: number }
@@ -48,6 +51,7 @@ export function App() {
   const [page, setPage] = useState<Page>('overview')
   const [health, setHealth] = useState<SystemHealth | null>(null)
   const [modelConfigured, setModelConfigured] = useState(false)
+  const [runtimeSettings, setRuntimeSettings] = useState<RuntimeSettingsResponse | null>(null)
   const [positions, setPositions] = useState<Position[]>([])
   const [portfolio, setPortfolio] = useState<PortfolioOverview>(emptyPortfolio())
   const [portfolioHistory, setPortfolioHistory] = useState<PortfolioEquitySnapshot[]>([])
@@ -73,13 +77,19 @@ export function App() {
     setRecords(next)
     if (!selectedResearch && next[0]) void openResearch(next[0].id)
   }
+  async function loadSettings() {
+    const value: unknown = await fetch('/api/settings').then((response) => response.json())
+    if (!isRuntimeSettingsResponse(value)) throw new Error('settings_contract_invalid')
+    setModelConfigured(value.model.configured)
+    setRuntimeSettings(value)
+  }
   useEffect(() => {
     void Promise.all([
       fetch('/api/health').then((response) => response.json()).then((value: unknown) => {
         if (!isSystemHealth(value)) throw new Error('health_contract_invalid')
         setHealth(value)
       }),
-      fetch('/api/settings').then((response) => response.json()).then((value) => setModelConfigured(value.model.configured)),
+      loadSettings(),
       loadPortfolio(), loadResearch(),
     ]).catch((cause) => setError(cause instanceof Error ? cause.message : String(cause)))
   }, [])
@@ -208,7 +218,7 @@ export function App() {
       {page === 'analysis' && <AnalysisPage symbol={analysisSymbol} setSymbol={setAnalysisSymbol} status={analysisStatus} stages={analysisStages} active={Boolean(activeAnalysisId)} onStart={startAnalysis} onCancel={cancelAnalysis} health={health} modelConfigured={modelConfigured} records={records} onOpen={async (id) => { await openResearch(id); navigate('research') }} />}
       {page === 'research' && <ResearchPage records={records} record={selectedResearch} onOpen={openResearch} onUpdate={updateResearch} onDelete={removeResearch} />}
       {page === 'portfolio' && <PortfolioPage portfolio={portfolio} history={portfolioHistory} onSave={savePosition} onSaveCash={saveCash} onReduce={reducePosition} onDelete={removePosition} />}
-      {page === 'settings' && <SettingsPage health={health} modelConfigured={modelConfigured} />}
+      {page === 'settings' && <SettingsPage health={health} modelConfigured={modelConfigured} settings={runtimeSettings} onReload={loadSettings} />}
     </main>
   </div>
 }
@@ -362,8 +372,50 @@ function ReduceDialog({ position, cash, onCancel, onSubmit }: { position: Portfo
   return <div className="portfolio-modal"><form role="dialog" aria-modal="true" aria-label={`减仓 ${position.symbol}`} onSubmit={(event) => { event.preventDefault(); if (valid) void onSubmit(shares, salePrice) }}><p className="micro">REDUCE POSITION</p><h2>减仓 {position.symbol}</h2><p>当前持有 {formatNumber(position.quantity)} 股，平均成本 {formatMoney(position.averageCost)}。</p><label>卖出数量<input autoFocus aria-label="卖出数量" type="number" min="0.000001" max={position.quantity} step="any" value={quantity} onChange={(event) => setQuantity(event.target.value)} required /></label><label>成交价<input aria-label="成交价" type="number" min="0" step="any" value={price} onChange={(event) => setPrice(event.target.value)} required /></label><div className="trade-preview"><span>卖出所得<strong>{valid ? formatMoney(proceeds) : '—'}</strong></span><span>减仓后现金<strong>{valid ? formatMoney(cash + proceeds) : '—'}</strong></span><span>本次已实现盈亏<strong className={valueTone(realized)}>{valid ? formatSignedMoney(realized) : '—'}</strong></span></div>{shares > position.quantity && <p role="alert" className="missing">卖出数量不能超过当前持仓。</p>}<div className="modal-actions"><button type="button" className="quiet" onClick={onCancel}>取消</button><button type="submit" disabled={!valid}>确认减仓</button></div></form></div>
 }
 
-function SettingsPage({ health, modelConfigured }: { health: SystemHealth | null; modelConfigured: boolean }) {
-  return <><PageHeader eyebrow="INSTANCE SETTINGS" title="系统设置" description="这里仅显示当前实例能力是否就绪，密钥值永远不会返回浏览器。" /><div className="settings-grid"><Setting title="Analysis API" description="分析任务、研究记录与持仓管理" ready={health?.status === 'ok'} /><Setting title="Financial Data" description="行情、新闻、财报与确定性计算" ready={health?.dependencies.financialData.status === 'ok'} /><Setting title="AI Model" description="由 .env 指定的兼容模型端点" ready={modelConfigured} /><Setting title="PostgreSQL" description="持仓、权益历史、事实与研究轨迹" ready={health?.dependencies.productDatabase.status === 'ok'} /></div></>
+function SettingsPage({ health, modelConfigured, settings, onReload }: {
+  health: SystemHealth | null; modelConfigured: boolean; settings: RuntimeSettingsResponse | null
+  onReload: () => Promise<void>
+}) {
+  const fields: Array<{ key: keyof RuntimeSettings; label: string }> = [
+    { key: 'mainAgentToolRounds', label: '主 Agent 轮次' },
+    { key: 'specialistAgentToolRounds', label: '专项 Agent 轮次' },
+    { key: 'researchActiveMinutes', label: '研究时长（分钟）' },
+    { key: 'executionWallClockMinutes', label: 'Execution 墙钟（分钟）' },
+    { key: 'analysisConcurrency', label: '研究并发' },
+    { key: 'modelConcurrency', label: '模型并发' },
+    { key: 'toolConcurrency', label: '工具并发' },
+    { key: 'modelRequestTimeoutMinutes', label: '模型请求超时（分钟）' },
+    { key: 'reportFreshnessDays', label: 'Freshness（天）' },
+    { key: 'compactionReserveTokens', label: 'Compaction 保留 Token' },
+  ]
+  async function save(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const data = new FormData(event.currentTarget)
+    const body = Object.fromEntries(fields.map(({ key }) => [key, Number(data.get(key))]))
+    const response = await fetch('/api/settings', {
+      method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+    })
+    if (!response.ok) throw new Error('Runtime 设置保存失败')
+    await onReload()
+  }
+  async function restoreDefaults() {
+    const response = await fetch('/api/settings/defaults', { method: 'POST' })
+    if (!response.ok) throw new Error('Runtime 设置恢复失败')
+    await onReload()
+  }
+  async function restoreField(key: keyof RuntimeSettings) {
+    const response = await fetch('/api/settings', {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ [key]: settings!.defaults[key] }),
+    })
+    if (!response.ok) throw new Error('Runtime 设置恢复失败')
+    await onReload()
+  }
+  return <><PageHeader eyebrow="INSTANCE SETTINGS" title="系统设置" description="普通 Runtime 设置保存在 PostgreSQL；密钥值永远不会返回浏览器。" /><div className="settings-grid"><Setting title="Analysis API" description="分析任务、研究记录与持仓管理" ready={health?.status === 'ok'} /><Setting title="Financial Data" description="行情、新闻、财报与确定性计算" ready={health?.dependencies.financialData.status === 'ok'} /><Setting title="AI Model" description="由 .env 指定的兼容模型端点" ready={modelConfigured} /><Setting title="PostgreSQL" description="持仓、权益历史、事实与研究轨迹" ready={health?.dependencies.productDatabase.status === 'ok'} /></div>{settings?.current && settings.defaults && <section className="runtime-settings"><header><div><p className="micro">AGENT RUNTIME</p><h2>当前 revision #{settings.current.id}</h2><p>上次修改：{formatTime(settings.current.createdAt)}</p></div><button type="button" className="quiet" onClick={() => void restoreDefaults()}>恢复全部默认值</button></header><form key={settings.current.id} onSubmit={(event) => void save(event)}>{fields.map(({ key, label }) => <label key={key}>{label}<input aria-label={label} name={key} type="number" min={runtimeSettingLimits[key][0]} max={runtimeSettingLimits[key][1]} defaultValue={settings.current!.values[key]} required /><small>默认 {settings.defaults![key].toLocaleString('zh-CN')} <button type="button" className="text-button" onClick={() => void restoreField(key)}>恢复此项</button></small></label>)}<button type="submit">保存 Runtime 设置</button></form>{settings.activeExecutions.length > 0 && <div className="frozen-settings"><h3>运行中的冻结值</h3>{settings.activeExecutions.map((snapshot) => <article key={snapshot.executionId}><strong>运行 execution {snapshot.executionId}</strong><span>{formatFrozenSettings(snapshot.values)}</span></article>)}</div>}</section>}</>
+}
+
+function formatFrozenSettings(settings: RuntimeSettings) {
+  return `主 Agent ${settings.mainAgentToolRounds} 轮 · 专项 ${settings.specialistAgentToolRounds} 轮 · 研究 ${settings.researchActiveMinutes} 分钟 · 墙钟 ${settings.executionWallClockMinutes} 分钟 · 研究/模型/工具并发 ${settings.analysisConcurrency}/${settings.modelConcurrency}/${settings.toolConcurrency} · 模型超时 ${settings.modelRequestTimeoutMinutes} 分钟 · Freshness ${settings.reportFreshnessDays} 天 · Compaction 保留 ${settings.compactionReserveTokens.toLocaleString('zh-CN')} Token`
 }
 
 function PriceChart({ facts, compact = false }: { facts: Fact[]; compact?: boolean }) {

@@ -8,6 +8,7 @@ import {
   createAnalysisRepository,
   createPool,
   createPortfolioRepository,
+  createRuntimeSettingsRepository,
 } from '@vibe-invest/product-dao'
 
 import { buildApp } from '../src/app.js'
@@ -31,6 +32,7 @@ test('真实 PostgreSQL 与真实 HTTP SSE 断线后先 catch-up 再继续 live'
     portfolioRepository: createPortfolioRepository(pool),
     analysisRepository: createAnalysisRepository(pool),
     agentEventRepository: eventRepository,
+    runtimeSettingsRepository: createRuntimeSettingsRepository(pool),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({ symbol, gaps: [], facts: [] }),
     model: {
@@ -128,6 +130,7 @@ test('真实 PostgreSQL 重启恢复在 API、Session ledger 与 SSE 中一致�
     portfolioRepository: createPortfolioRepository(pool),
     analysisRepository: analyses,
     agentEventRepository: events,
+    runtimeSettingsRepository: createRuntimeSettingsRepository(pool),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({ symbol, gaps: [], facts: [] }),
     model: { async *analyze(): AsyncGenerator<ModelEvent> { return } },
@@ -185,6 +188,7 @@ test('Pi Runtime 使用持久 executionId 派生工具 operationId 且真实 Pos
     portfolioRepository: createPortfolioRepository(pool),
     analysisRepository: analyses,
     agentEventRepository: events,
+    runtimeSettingsRepository: createRuntimeSettingsRepository(pool),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({ symbol, gaps: [], facts: [] }),
     model,

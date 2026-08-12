@@ -2,7 +2,7 @@ import { resolve } from 'node:path'
 
 import {
   checkSchema, createAgentEventRepository, createAnalysisRepository, createPool,
-  createPortfolioRepository,
+  createPortfolioRepository, createRuntimeSettingsRepository,
 } from '@vibe-invest/product-dao'
 
 import { buildApp } from './app.js'
@@ -38,6 +38,7 @@ const app = buildApp({
   portfolioRepository: createPortfolioRepository(productPool),
   analysisRepository: createAnalysisRepository(productPool),
   agentEventRepository: createAgentEventRepository(productPool),
+  runtimeSettingsRepository: createRuntimeSettingsRepository(productPool),
   staticDir,
   financialDataHealth: () => financialData.health(),
   fetchFinancialContext: (symbol, signal) => financialData.context(symbol, signal),
@@ -47,7 +48,6 @@ const app = buildApp({
   ),
   fetchMarketPrices: (symbols, signal) => financialData.quotes(symbols, signal),
   model,
-  analysisConcurrency: Number(process.env.ANALYSIS_CONCURRENCY ?? 2),
   modelConfigured: Boolean(
     modelProvider && process.env.MODEL_NAME && process.env.MODEL_BASE_URL && modelApiKey
     && (modelApiProtocol === 'responses' || modelApiProtocol === 'chat-completions'),

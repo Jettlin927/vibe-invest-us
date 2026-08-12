@@ -3,6 +3,110 @@ export type FinancialDataHealth = {
   status: 'ok'
 }
 
+export const defaultRuntimeSettings = {
+  mainAgentToolRounds: 20,
+  specialistAgentToolRounds: 20,
+  researchActiveMinutes: 10,
+  executionWallClockMinutes: 45,
+  analysisConcurrency: 2,
+  modelConcurrency: 4,
+  toolConcurrency: 8,
+  modelRequestTimeoutMinutes: 15,
+  reportFreshnessDays: 7,
+  compactionReserveTokens: 20_000,
+} as const
+
+export type RuntimeSettings = {
+  -readonly [Key in keyof typeof defaultRuntimeSettings]: number
+}
+
+export type RuntimeSettingsRevision = {
+  id: number
+  values: RuntimeSettings
+  createdAt: string
+}
+
+export type ExecutionSettingsSnapshot = RuntimeSettingsRevision & {
+  executionId: string
+}
+
+export type RuntimeSettingsResponse = {
+  model: { configured: boolean }
+  current: RuntimeSettingsRevision
+  defaults: RuntimeSettings
+  activeExecutions: ExecutionSettingsSnapshot[]
+}
+
+export const runtimeSettingLimits: Record<keyof RuntimeSettings, readonly [number, number]> = {
+  mainAgentToolRounds: [1, 500],
+  specialistAgentToolRounds: [1, 500],
+  researchActiveMinutes: [1, 240],
+  executionWallClockMinutes: [1, 240],
+  analysisConcurrency: [1, 16],
+  modelConcurrency: [1, 32],
+  toolConcurrency: [1, 64],
+  modelRequestTimeoutMinutes: [1, 60],
+  reportFreshnessDays: [1, 365],
+  compactionReserveTokens: [1, 1_000_000],
+}
+
+export function parseRuntimeSettingsUpdate(value: unknown): Partial<RuntimeSettings> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('invalid_runtime_settings_update')
+  }
+  const input = value as Record<string, unknown>
+  const entries = Object.entries(input)
+  if (!entries.length) throw new Error('runtime_settings_update_empty')
+  const result: Partial<RuntimeSettings> = {}
+  for (const [key, setting] of entries) {
+    if (!(key in runtimeSettingLimits)) throw new Error(`unknown_runtime_setting:${key}`)
+    const typedKey = key as keyof RuntimeSettings
+    const [minimum, maximum] = runtimeSettingLimits[typedKey]
+    if (typeof setting !== 'number' || !Number.isInteger(setting)
+      || setting < minimum || setting > maximum) {
+      throw new Error(`invalid_runtime_setting:${key}`)
+    }
+    result[typedKey] = setting
+  }
+  return result
+}
+
+export function isRuntimeSettingsResponse(value: unknown): value is RuntimeSettingsResponse {
+  if (!value || typeof value !== 'object') return false
+  const candidate = value as Record<string, unknown>
+  const model = candidate.model
+  const current = candidate.current
+  return !!model && typeof model === 'object'
+    && typeof (model as Record<string, unknown>).configured === 'boolean'
+    && isRuntimeSettingsRevision(current)
+    && isRuntimeSettings(candidate.defaults)
+    && Array.isArray(candidate.activeExecutions)
+    && candidate.activeExecutions.every((snapshot) => (
+      isRuntimeSettingsRevision(snapshot)
+      && typeof (snapshot as Record<string, unknown>).executionId === 'string'
+    ))
+}
+
+function isRuntimeSettingsRevision(value: unknown): value is RuntimeSettingsRevision {
+  if (!value || typeof value !== 'object') return false
+  const candidate = value as Record<string, unknown>
+  return Number.isInteger(candidate.id)
+    && typeof candidate.createdAt === 'string'
+    && isRuntimeSettings(candidate.values)
+}
+
+function isRuntimeSettings(value: unknown): value is RuntimeSettings {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const candidate = value as Record<string, unknown>
+  const keys = Object.keys(runtimeSettingLimits)
+  return Object.keys(candidate).length === keys.length && keys.every((key) => {
+    const setting = candidate[key]
+    const [minimum, maximum] = runtimeSettingLimits[key as keyof RuntimeSettings]
+    return typeof setting === 'number' && Number.isInteger(setting)
+      && setting >= minimum && setting <= maximum
+  })
+}
+
 export type SystemHealth = {
   service: 'analysis-api'
   status: 'ok'

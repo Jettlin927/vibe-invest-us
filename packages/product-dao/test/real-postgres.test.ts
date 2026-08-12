@@ -3,11 +3,84 @@ import test from 'node:test'
 
 import {
   checkSchema, createAgentEventRepository, createAnalysisRepository, createPool,
-  createPortfolioRepository, migrate,
+  createPortfolioRepository, createRuntimeSettingsRepository, migrate,
 } from '../src/index.js'
 
 const migrationUrl = process.env.TEST_MIGRATION_DATABASE_URL
 const applicationUrl = process.env.TEST_DATABASE_URL
+
+test('真实 PostgreSQL 保存不可变 Runtime settings revision 并可恢复默认值', {
+  skip: !migrationUrl || !applicationUrl,
+  concurrency: false,
+}, async () => {
+  await migrate(migrationUrl!)
+  const pool = createPool(applicationUrl!)
+  const settings = createRuntimeSettingsRepository(pool)
+  try {
+    const defaults = await settings.restoreDefaults('2026-08-13T01:00:00.000Z')
+    const changed = await settings.save({
+      mainAgentToolRounds: 100,
+      modelRequestTimeoutMinutes: 60,
+    }, '2026-08-13T01:01:00.000Z')
+    const restored = await settings.restoreDefaults('2026-08-13T01:02:00.000Z')
+
+    assert.notEqual(defaults.id, changed.id)
+    assert.notEqual(changed.id, restored.id)
+    assert.equal((await settings.getRevision(changed.id))?.values.mainAgentToolRounds, 100)
+    assert.equal((await settings.getRevision(changed.id))?.values.modelRequestTimeoutMinutes, 60)
+    assert.equal(restored.values.mainAgentToolRounds, 20)
+    assert.equal(restored.values.modelRequestTimeoutMinutes, 15)
+    await assert.rejects(
+      pool.query('UPDATE runtime_settings_revisions SET settings_json = $1 WHERE id = $2', ['{}', changed.id]),
+      /permission denied/,
+    )
+  } finally {
+    await pool.end()
+  }
+})
+
+test('真实 PostgreSQL execution 冻结 settings snapshot 后不随新 revision 改变', {
+  skip: !migrationUrl || !applicationUrl,
+  concurrency: false,
+}, async () => {
+  await migrate(migrationUrl!)
+  const pool = createPool(applicationUrl!)
+  const settings = createRuntimeSettingsRepository(pool)
+  const executionId = 'settings-snapshot-execution'
+  try {
+    await settings.restoreDefaults('2026-08-13T02:00:00.000Z')
+    const frozen = await settings.freezeExecution(executionId, '2026-08-13T02:01:00.000Z')
+    await settings.save({ mainAgentToolRounds: 200 }, '2026-08-13T02:02:00.000Z')
+
+    assert.equal(frozen.values.mainAgentToolRounds, 20)
+    assert.equal((await settings.getExecutionSnapshot(executionId))?.values.mainAgentToolRounds, 20)
+    assert.equal((await settings.current()).values.mainAgentToolRounds, 200)
+    assert.deepEqual(await settings.freezeExecution(executionId, '2026-08-13T02:03:00.000Z'), frozen)
+  } finally {
+    await pool.end()
+  }
+})
+
+test('真实 PostgreSQL 并发保存 Runtime settings 不丢失不同字段更新', {
+  skip: !migrationUrl || !applicationUrl,
+  concurrency: false,
+}, async () => {
+  await migrate(migrationUrl!)
+  const pool = createPool(applicationUrl!)
+  const settings = createRuntimeSettingsRepository(pool)
+  try {
+    await settings.restoreDefaults('2026-08-13T02:10:00.000Z')
+    await Promise.all([
+      settings.save({ mainAgentToolRounds: 100 }, '2026-08-13T02:11:00.000Z'),
+      settings.save({ modelRequestTimeoutMinutes: 60 }, '2026-08-13T02:12:00.000Z'),
+    ])
+    const current = await settings.current()
+    assert.equal(current.values.mainAgentToolRounds, 100)
+    assert.equal(current.values.modelRequestTimeoutMinutes, 60)
+  } finally {
+    await pool.end()
+  }
+})
 
 test('真实 PostgreSQL migration 幂等且 application role 没有 DDL 权限', {
   skip: !migrationUrl || !applicationUrl,
@@ -17,7 +90,7 @@ test('真实 PostgreSQL migration 幂等且 application role 没有 DDL 权限',
   await migrate(migrationUrl!)
 
   const pool = createPool(applicationUrl!)
-  assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 7 })
+  assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 8 })
   const privileges = await pool.query<{ can_create: boolean; can_temp: boolean }>(
     `SELECT has_schema_privilege(current_user, 'public', 'CREATE') AS can_create,
             has_database_privilege(current_user, current_database(), 'TEMP') AS can_temp`,

@@ -1,8 +1,9 @@
 import type {
   AgentEvent, AgentEventRepository, AgentSession, AnalysisRecord, AnalysisRepository, PortfolioRepository,
-  ProductEquitySnapshot,
+  ProductEquitySnapshot, RuntimeSettingsRepository,
   ProductPosition,
 } from '@vibe-invest/product-dao'
+import { defaultRuntimeSettings, parseRuntimeSettingsUpdate } from '@vibe-invest/contracts'
 
 export function createTestProductDatabase() {
   const positions = new Map<string, ProductPosition>()
@@ -14,6 +15,11 @@ export function createTestProductDatabase() {
   const traces = new Map<string, unknown[]>()
   const agentSessions = new Map<string, AgentSession>()
   const agentEvents = new Map<string, AgentEvent[]>()
+  let nextSettingsRevisionId = 1
+  const runtimeSettingsRevisions = [{
+    id: nextSettingsRevisionId, values: { ...defaultRuntimeSettings }, createdAt: '2026-08-13T00:00:00.000Z',
+  }]
+  const executionSettingsSnapshots = new Map<string, Awaited<ReturnType<RuntimeSettingsRepository['freezeExecution']>>>()
 
   const portfolioRepository: PortfolioRepository = {
     async list() { return [...positions.values()].sort((left, right) => left.symbol.localeCompare(right.symbol)) },
@@ -164,6 +170,12 @@ export function createTestProductDatabase() {
         latestSequence: 1, createdAt: input.createdAt, updatedAt: input.createdAt,
       })
       agentEvents.set(input.sessionId, [event])
+      executionSettingsSnapshots.set(input.executionId, {
+        executionId: input.executionId,
+        id: runtimeSettingsRevisions.at(-1)!.id,
+        values: { ...runtimeSettingsRevisions.at(-1)!.values },
+        createdAt: input.createdAt,
+      })
       analyses.set(input.analysisId, {
         id: input.analysisId, symbol: input.symbol, status: input.status,
         createdAt: input.createdAt, updatedAt: input.createdAt,
@@ -259,6 +271,48 @@ export function createTestProductDatabase() {
     },
   }
 
+  const runtimeSettingsRepository: RuntimeSettingsRepository = {
+    async current() { return structuredClone(runtimeSettingsRevisions.at(-1)!) },
+    async getRevision(id) {
+      const revision = runtimeSettingsRevisions.find((candidate) => candidate.id === id)
+      return revision ? structuredClone(revision) : null
+    },
+    async save(update, createdAt) {
+      const revision = {
+        id: ++nextSettingsRevisionId,
+        values: { ...runtimeSettingsRevisions.at(-1)!.values, ...parseRuntimeSettingsUpdate(update) },
+        createdAt,
+      }
+      runtimeSettingsRevisions.push(revision)
+      return structuredClone(revision)
+    },
+    async restoreDefaults(createdAt) {
+      const revision = { id: ++nextSettingsRevisionId, values: { ...defaultRuntimeSettings }, createdAt }
+      runtimeSettingsRevisions.push(revision)
+      return structuredClone(revision)
+    },
+    async freezeExecution(executionId, frozenAt) {
+      const existing = executionSettingsSnapshots.get(executionId)
+      if (existing) return structuredClone(existing)
+      const current = runtimeSettingsRevisions.at(-1)!
+      const snapshot = { executionId, id: current.id, values: { ...current.values }, createdAt: frozenAt }
+      executionSettingsSnapshots.set(executionId, snapshot)
+      return structuredClone(snapshot)
+    },
+    async getExecutionSnapshot(executionId) {
+      const snapshot = executionSettingsSnapshots.get(executionId)
+      return snapshot ? structuredClone(snapshot) : null
+    },
+    async listActiveExecutionSnapshots() {
+      const activeExecutionIds = new Set([...agentSessions.values()]
+        .filter(({ status }) => ['queued', 'running'].includes(status))
+        .map(({ executionId }) => executionId))
+      return [...executionSettingsSnapshots.values()]
+        .filter(({ executionId }) => activeExecutionIds.has(executionId))
+        .map((snapshot) => structuredClone(snapshot))
+    },
+  }
+
   return {
     productDatabase: {
       checkSchema: async () => ({ status: 'ok' as const, version: 6 }),
@@ -267,5 +321,6 @@ export function createTestProductDatabase() {
     portfolioRepository,
     analysisRepository,
     agentEventRepository,
+    runtimeSettingsRepository,
   }
 }
