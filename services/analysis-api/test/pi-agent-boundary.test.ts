@@ -33,12 +33,18 @@ function piAgentCoreReferences(source: string): Array<{
     if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
       references.push({ specifier: node.moduleSpecifier.text, importDeclaration: node })
     } else if (
+      ts.isImportEqualsDeclaration(node)
+      && ts.isExternalModuleReference(node.moduleReference)
+      && node.moduleReference.expression
+      && ts.isStringLiteralLike(node.moduleReference.expression)
+    ) {
+      references.push({ specifier: node.moduleReference.expression.text })
+    } else if (
       ts.isCallExpression(node)
       && node.arguments.length >= 1
-      && ts.isStringLiteral(node.arguments[0]!)
+      && ts.isStringLiteralLike(node.arguments[0]!)
       && (node.expression.kind === ts.SyntaxKind.ImportKeyword
-        || (node.arguments.length === 1
-          && ts.isIdentifier(node.expression) && node.expression.text === 'require'))
+        || (ts.isIdentifier(node.expression) && node.expression.text === 'require'))
     ) {
       references.push({ specifier: node.arguments[0]!.text })
     }
@@ -130,7 +136,11 @@ test('未知 pi-agent-core 子路径在静态、动态和 require 导入中均�
     "import { Agent } from '@earendil-works/pi-agent-core'; import x from '@earendil-works/pi-agent-core/unknown'",
     "import { Agent } from '@earendil-works/pi-agent-core'; void import('@earendil-works/pi-agent-core/unknown')",
     "import { Agent } from '@earendil-works/pi-agent-core'; void import('@earendil-works/pi-agent-core/unknown', { with: { type: 'json' } })",
+    "import { Agent } from '@earendil-works/pi-agent-core'; void import(`@earendil-works/pi-agent-core/unknown`)",
     "import { Agent } from '@earendil-works/pi-agent-core'; require('@earendil-works/pi-agent-core/unknown')",
+    "import { Agent } from '@earendil-works/pi-agent-core'; require('@earendil-works/pi-agent-core/unknown', {})",
+    "import { Agent } from '@earendil-works/pi-agent-core'; require(`@earendil-works/pi-agent-core/unknown`)",
+    "import { Agent } from '@earendil-works/pi-agent-core'; import core = require('@earendil-works/pi-agent-core/unknown')",
   ]) {
     assert.throws(() => assertPiAgentCoreBoundary(source, allowlist), /只允许精确包根/)
   }
