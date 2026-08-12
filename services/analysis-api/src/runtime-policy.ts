@@ -47,6 +47,38 @@ export function createConcurrencyGate() {
 
 export type ActiveBudget = ReturnType<typeof createActiveBudget>
 
+export async function acquireActiveSlot(input: {
+  acquire: () => Promise<() => void>
+  activeBudget: ActiveBudget
+  signal: AbortSignal
+  onStart?: () => void
+  onEnd?: () => void
+}) {
+  const release = await input.acquire()
+  let active: ReturnType<ActiveBudget['start']> | undefined
+  try {
+    active = input.activeBudget.start(input.signal)
+    input.onStart?.()
+  } catch (error) {
+    try { active?.stop() } finally { release() }
+    throw error
+  }
+  let finished = false
+  return {
+    signal: active.signal,
+    exhausted: active.exhausted,
+    finish() {
+      if (finished) return
+      finished = true
+      try {
+        try { input.onEnd?.() } catch { /* logging must not replace the operation outcome */ }
+      } finally {
+        try { active.stop() } finally { release() }
+      }
+    },
+  }
+}
+
 export function createActiveBudget(
   totalMs: number,
   now: () => number = () => performance.now(),

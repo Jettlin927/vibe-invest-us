@@ -16,7 +16,9 @@ import {
 import { openAICompletionsApi } from '@earendil-works/pi-ai/api/openai-completions.lazy'
 import { openAIResponsesApi } from '@earendil-works/pi-ai/api/openai-responses.lazy'
 import type { RuntimeSettings } from '@vibe-invest/contracts'
-import { createActiveBudget, createConcurrencyGate, deadlineSignal, type ActiveBudget } from './runtime-policy.js'
+import {
+  acquireActiveSlot, createActiveBudget, createConcurrencyGate, deadlineSignal, type ActiveBudget,
+} from './runtime-policy.js'
 import { analysisModelTools, financialSpecialistTools } from './tools.js'
 
 type Fact = {
@@ -168,15 +170,16 @@ export function createPiModel(options: ModelOptions = {}) {
         }
         if (!frozenContext) {
           const timeoutSignal = AbortSignal.timeout(options.toolTimeoutMs ?? 5_000)
-          const release = await acquireToolSlot(input, toolGate, executionSignal)
-          const active = activeBudget.start(executionSignal)
+          const owner = await acquireActiveSlot({
+            acquire: () => acquireToolSlot(input, toolGate, executionSignal),
+            activeBudget, signal: executionSignal,
+          })
           try {
             frozenContext = await input.fetchFinancialContext(
-              symbol, AbortSignal.any([active.signal, timeoutSignal]),
+              symbol, AbortSignal.any([owner.signal, timeoutSignal]),
             )
           } finally {
-            active.stop()
-            release()
+            owner.finish()
           }
           for (const fact of frozenContext.facts) knownFactIds.add(fact.id)
         }
@@ -408,7 +411,7 @@ export function createPiModel(options: ModelOptions = {}) {
                 }
                 const specialistIterator = runFinancialSpecialist(
                   models, selectedModel, specialistContext, input, options,
-                  runtimeSettings, executionSignal, activeBudget, modelGate, toolGate,
+                  runtimeSettings, executionSignal, activeBudget, modelGate, toolGate, call.id,
                 )
                 let specialist: Awaited<ReturnType<typeof specialistIterator.next>>['value']
                 let specialistCompleted = false
@@ -511,6 +514,7 @@ async function* runFinancialSpecialist(
   activeBudget: ReturnType<typeof createActiveBudget>,
   modelGate: ReturnType<typeof createConcurrencyGate>,
   toolGate: ReturnType<typeof createConcurrencyGate>,
+  invocationId: string,
 ): AsyncGenerator<TraceEntry, {
   analysis: string
   facts: Fact[]
@@ -586,7 +590,7 @@ async function* runFinancialSpecialist(
       }
       const preparedCalls = prepareToolCalls(
         [...availableTools], calls, `execution:${input.executionId}:specialist-tool`,
-        `specialist-attempt:${modelAttempts}`,
+        `specialist-invocation:${encodeURIComponent(invocationId)}:attempt:${modelAttempts}`,
       )
       for (const { call, toolOperationId } of preparedCalls) {
         yield {
@@ -614,17 +618,23 @@ async function* runFinancialSpecialist(
         let result: { facts: Fact[]; [key: string]: unknown }
         let isError = false
         runtimeWork.stop()
-        let releaseTool: (() => void) | undefined
-        let activeTool: ReturnType<ActiveBudget['start']> | undefined
+        let toolOwner: Awaited<ReturnType<typeof acquireActiveSlot>> | undefined
         try {
-          releaseTool = await acquireToolSlot(input, toolGate, executionSignal)
-          activeTool = activeBudget.start(executionSignal)
-          options.log?.({ type: 'tool_request_start', executionId: input.executionId, toolName: call.name })
+          toolOwner = await acquireActiveSlot({
+            acquire: () => acquireToolSlot(input, toolGate, executionSignal),
+            activeBudget, signal: executionSignal,
+            onStart: () => options.log?.({
+              type: 'tool_request_start', executionId: input.executionId, toolName: call.name,
+            }),
+            onEnd: () => options.log?.({
+              type: 'tool_request_end', executionId: input.executionId, toolName: call.name,
+            }),
+          })
           if (call.name === 'search_news_by_keyword') {
             if (!input.searchNews) throw new Error('news_search_unavailable')
             const keyword = (toolInput as { keyword?: string }).keyword ?? input.symbol
             result = await input.searchNews(keyword, toolSignal(
-              input, options, runtimeSettings, activeTool.signal,
+              input, options, runtimeSettings, toolOwner.signal,
             ))
           } else if (call.name === 'get_technical_indicators') {
             if (!input.fetchTechnicalIndicators) throw new Error('technical_indicators_unavailable')
@@ -633,7 +643,7 @@ async function* runFinancialSpecialist(
             const startDate = values.startDate ?? oneYearBefore(endDate)
             result = await input.fetchTechnicalIndicators(
               values.symbol ?? input.symbol, startDate, endDate,
-              toolSignal(input, options, runtimeSettings, activeTool.signal),
+              toolSignal(input, options, runtimeSettings, toolOwner.signal),
             )
           } else {
             throw new Error(`tool_not_allowed:${call.name}`)
@@ -641,7 +651,7 @@ async function* runFinancialSpecialist(
           assertExecutionPolicy(input, executionSignal, activeBudget)
           facts.push(...result.facts)
         } catch (error) {
-          if (executionSignal.aborted || activeTool?.exhausted() || activeBudget.exhausted()) {
+          if (executionSignal.aborted || toolOwner?.exhausted() || activeBudget.exhausted()) {
             for (const pending of calls.slice(calls.indexOf(call))) {
               const cancelledResult = policyToolResult(input, executionSignal, activeBudget)
               context.messages.push(toolResultMessage(pending, cancelledResult, true))
@@ -668,9 +678,7 @@ async function* runFinancialSpecialist(
           isError = true
           result = { error: error instanceof Error ? error.message : String(error), facts: [] }
         } finally {
-          options.log?.({ type: 'tool_request_end', executionId: input.executionId, toolName: call.name })
-          activeTool?.stop()
-          releaseTool?.()
+          toolOwner?.finish()
         }
         runtimeWork = activeBudget.start(executionSignal)
         context.messages.push(toolResultMessage(call, result, isError))

@@ -482,7 +482,9 @@ test('专项下一轮 provider 启动前已在真实 PostgreSQL 封存上一批�
         || operationId.startsWith(`${prefix}:${indicatorCallId}:`)
       ))
       const runtimeIds = [unknownCallId, invalidCallId, newsCallId, indicatorCallId]
-        .map((id, index) => `${id}:specialist-attempt:1:position:${index + 1}`)
+        .map((id, index) => `${id}:specialist-invocation:${encodeURIComponent(
+          `${specialistEntryId}:main-attempt:1:position:1`,
+        )}:attempt:1:position:${index + 1}`)
       assert.deepEqual(sealed.map(({ operationId }) => operationId), [
         ...runtimeIds.map((id) => `${prefix}:${id}:call`),
         ...runtimeIds.map((id) => `${prefix}:${id}:result`),
@@ -513,13 +515,14 @@ test('专项下一轮 provider 启动前已在真实 PostgreSQL 封存上一批�
       const session = await events.getSession(createdSessionId)
       assert.ok(session)
       const prefix = `execution:${session.executionId}:specialist-tool:${newsCallId}`
+      const invocation = encodeURIComponent(`${specialistEntryId}:main-attempt:1:position:1`)
       assert.deepEqual((await events.list(createdSessionId, 0))
         .filter(({ operationId }) => operationId.startsWith(prefix))
         .map(({ operationId }) => operationId), [
-        `${prefix}:specialist-attempt:1:position:3:call`,
-        `${prefix}:specialist-attempt:1:position:3:result`,
-        `${prefix}:specialist-attempt:2:position:1:call`,
-        `${prefix}:specialist-attempt:2:position:1:result`,
+        `${prefix}:specialist-invocation:${invocation}:attempt:1:position:3:call`,
+        `${prefix}:specialist-invocation:${invocation}:attempt:1:position:3:result`,
+        `${prefix}:specialist-invocation:${invocation}:attempt:2:position:1:call`,
+        `${prefix}:specialist-invocation:${invocation}:attempt:2:position:1:result`,
       ])
       const resultIds = context.messages.filter(({ role }) => role === 'toolResult')
         .map((message) => message.role === 'toolResult' ? message.toolCallId : '')
@@ -552,6 +555,90 @@ test('专项下一轮 provider 启动前已在真实 PostgreSQL 封存上一批�
   try {
     await waitForAnalysisStatus(app, created.analysisId, 'partial')
     assert.equal(providerObservedSealedLedger, true)
+  } finally {
+    await app.close()
+  }
+})
+
+test('同一 execution 两次专项 invocation 在真实 PostgreSQL 各自封存且重放幂等', {
+  skip: !databaseUrl,
+  concurrency: false,
+}, async () => {
+  const pool = createPool(databaseUrl!)
+  const events = createAgentEventRepository(pool)
+  const analyses = createAnalysisRepository(pool)
+  const parentId = 'pg-specialist-parent-reused'
+  const repeatedId = 'pg-specialist-child-reused'
+  const report = {
+    title: '多次专项命名空间测试', marketState: '未知', trend: '未知', drivers: [],
+    supportingEvidence: [], contraryEvidence: [], keyJudgments: [], scenarios: [],
+    invalidationConditions: [], valuation: null, personalImpact: null,
+    conditionalSuggestion: null, limitations: ['测试上下文为空'],
+  }
+  let createdSessionId: string | undefined
+  let checks = 0
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall('analyze_financials', {}, { id: parentId }), {
+      stopReason: 'toolUse',
+    }),
+    fauxAssistantMessage([
+      fauxToolCall('search_news_by_keyword', {}, { id: repeatedId }),
+      fauxToolCall('search_news_by_keyword', {}, { id: '' }),
+    ], { stopReason: 'toolUse' }),
+    async (context) => {
+      assert.ok(createdSessionId)
+      const ledger = await events.list(createdSessionId, 0)
+      const sealed = ledger.filter(({ operationId }) => operationId.includes(':specialist-tool:'))
+      assert.equal(sealed.length, 4)
+      assert.equal(new Set(sealed.map(({ operationId }) => operationId)).size, 4)
+      assert.equal(context.messages.filter(({ role }) => role === 'toolResult').length, 2)
+      checks += 1
+      return fauxAssistantMessage('第一次专项完成')
+    },
+    fauxAssistantMessage(fauxToolCall('analyze_financials', {}, { id: parentId }), {
+      stopReason: 'toolUse',
+    }),
+    fauxAssistantMessage([
+      fauxToolCall('search_news_by_keyword', {}, { id: repeatedId }),
+      fauxToolCall('search_news_by_keyword', {}, { id: '' }),
+    ], { stopReason: 'toolUse' }),
+    async (context) => {
+      assert.ok(createdSessionId)
+      const ledger = await events.list(createdSessionId, 0)
+      const sealed = ledger.filter(({ operationId }) => operationId.includes(':specialist-tool:'))
+      assert.equal(sealed.length, 8)
+      assert.equal(new Set(sealed.map(({ operationId }) => operationId)).size, 8)
+      assert.equal(context.messages.filter(({ role }) => role === 'toolResult').length, 2)
+      const replay = sealed[0]!
+      const replayed = await events.append({
+        sessionId: createdSessionId, operationId: replay.operationId,
+        event: replay.payload, createdAt: new Date().toISOString(),
+      })
+      assert.equal(replayed.created, false)
+      assert.equal((await events.list(createdSessionId, 0)).filter(
+        ({ operationId }) => operationId.includes(':specialist-tool:'),
+      ).length, 8)
+      checks += 1
+      return fauxAssistantMessage('第二次专项完成')
+    },
+    fauxAssistantMessage(fauxToolCall('submit_analysis_report', report), { stopReason: 'toolUse' }),
+  ] })
+  const app = buildApp({
+    productDatabase: { checkSchema: () => checkSchema(pool), close: () => pool.end() },
+    portfolioRepository: createPortfolioRepository(pool), analysisRepository: analyses,
+    agentEventRepository: events, runtimeSettingsRepository: createRuntimeSettingsRepository(pool),
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, gaps: [], facts: [], financials: {} }),
+    searchNews: async () => ({ facts: [] }), model,
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'PGMSP' },
+  })).json() as { analysisId: string; sessionId: string }
+  createdSessionId = created.sessionId
+  try {
+    await waitForAnalysisStatus(app, created.analysisId, 'partial')
+    assert.equal(checks, 2)
   } finally {
     await app.close()
   }

@@ -259,6 +259,42 @@ test('Runtime processing 单独耗尽 active budget 后进入确定性收口', a
   await app.close()
 })
 
+test('Analysis 外部数据 active start 失败会释放工具槽且下一 execution 可运行', async () => {
+  const database = createTestProductDatabase()
+  await database.runtimeSettingsRepository.save({
+    analysisConcurrency: 1, toolConcurrency: 1,
+  }, new Date().toISOString())
+  let timeoutSignals = 0
+  let fetches = 0
+  const app = buildProductionApp({
+    ...database,
+    activeTimeoutSignal: () => {
+      timeoutSignals += 1
+      if (timeoutSignals === 2) throw new Error('analysis_tool_active_start_failed')
+      return new AbortController().signal
+    },
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => {
+      fetches += 1
+      return { symbol, facts: [fact], gaps: [], indicators: {} }
+    },
+    model: fakeModel(),
+  })
+  await app.ready()
+  const first = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'ACTIVEFAIL' },
+  })).json()
+  const failed = await waitForStatus(app as any, first.analysisId, 'failed')
+  assert.equal(failed.error, 'analysis_tool_active_start_failed')
+
+  const second = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'ACTIVENEXT' },
+  })).json()
+  await waitForStatus(app as any, second.analysisId, 'completed')
+  assert.equal(fetches, 1)
+  await app.close()
+})
+
 test('8 分钟 Runtime 加 8 分钟 provider 共用 10 分钟 active budget 并进入收口', async () => {
   const database = createTestProductDatabase()
   await database.runtimeSettingsRepository.save({ researchActiveMinutes: 1 }, new Date().toISOString())

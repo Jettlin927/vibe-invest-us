@@ -52,11 +52,15 @@ function toolTurnOperations(
 }
 
 function providerCallId(runtimeId: string) {
-  return runtimeId.replace(/:(?:main|specialist)-attempt:\d+:position:\d+$/, '')
+  return runtimeId
+    .replace(/:specialist-invocation:[^:]+:attempt:\d+:position:\d+$/, '')
+    .replace(/:(?:main|specialist)-attempt:\d+:position:\d+$/, '')
 }
 
 function legacyOperationId(operationId: string) {
-  return operationId.replace(/:(?:main|specialist)-attempt:\d+:position:\d+(?=:(?:call|result)$)/, '')
+  return operationId
+    .replace(/:specialist-invocation:[^:]+:attempt:\d+:position:\d+(?=:(?:call|result)$)/, '')
+    .replace(/:(?:main|specialist)-attempt:\d+:position:\d+(?=:(?:call|result)$)/, '')
 }
 
 test('主分析模型和财报专家使用不同的显式工具集', () => {
@@ -610,6 +614,68 @@ for (const providerId of ['specialist-reused-across-turns', ''] as const) {
   })
 }
 
+for (const providerId of ['specialist-reused-across-invocations', ''] as const) {
+  test(`同一 execution 两次专项 invocation 的${providerId ? '重复' : '空'} call id 各自唯一配对`, async () => {
+    const specialistContexts: string[][] = []
+    const mainContexts: string[][] = []
+    const model = createPiModel({ fauxResponses: [
+      fauxAssistantMessage(
+        fauxToolCall('analyze_financials', {}, { id: 'reused-specialist-parent' }),
+        { stopReason: 'toolUse' },
+      ),
+      fauxAssistantMessage(
+        fauxToolCall('search_news_by_keyword', {}, { id: providerId }), { stopReason: 'toolUse' },
+      ),
+      (context) => {
+        specialistContexts.push(context.messages.filter(({ role }) => role === 'toolResult')
+          .map((message) => message.role === 'toolResult' ? message.toolCallId : ''))
+        return fauxAssistantMessage(fauxText('第一次专项完成'))
+      },
+      (context) => {
+        mainContexts.push(context.messages.filter(({ role }) => role === 'toolResult')
+          .map((message) => message.role === 'toolResult' ? message.toolCallId : ''))
+        return fauxAssistantMessage(
+          fauxToolCall('analyze_financials', {}, { id: 'reused-specialist-parent' }),
+          { stopReason: 'toolUse' },
+        )
+      },
+      fauxAssistantMessage(
+        fauxToolCall('search_news_by_keyword', {}, { id: providerId }), { stopReason: 'toolUse' },
+      ),
+      (context) => {
+        specialistContexts.push(context.messages.filter(({ role }) => role === 'toolResult')
+          .map((message) => message.role === 'toolResult' ? message.toolCallId : ''))
+        return fauxAssistantMessage(fauxText('第二次专项完成'))
+      },
+      (context) => {
+        mainContexts.push(context.messages.filter(({ role }) => role === 'toolResult')
+          .map((message) => message.role === 'toolResult' ? message.toolCallId : ''))
+        return fauxAssistantMessage(
+          fauxToolCall('submit_analysis_report', validReport), { stopReason: 'toolUse' },
+        )
+      },
+    ] })
+    const events = []
+    for await (const event of model.analyze({
+      executionId: `specialist-invocations-${providerId || 'empty'}`,
+      runtimeSettings: runtimeSettings(), symbol: 'NVDA', systemPrompt: 'system',
+      userPrompt: 'user', knownFacts: facts,
+      fetchFinancialContext: async () => ({ facts, financials: {} }),
+      searchNews: async () => ({ facts: [] }),
+    })) events.push(event)
+
+    assert.equal(specialistContexts.length, 2)
+    assert.equal(specialistContexts[0]?.length, 1)
+    assert.equal(specialistContexts[1]?.length, 1)
+    assert.notEqual(specialistContexts[0]?.[0], specialistContexts[1]?.[0])
+    assert.deepEqual(mainContexts.map((ids) => ids.length), [1, 2])
+    assert.notEqual(mainContexts[1]?.[0], mainContexts[1]?.[1])
+    const operations = toolTurnOperations(events, /specialist-tool:/)
+    assert.equal(operations.length, 4)
+    assert.equal(new Set(operations).size, operations.length)
+  })
+}
+
 test('专项 Agent policy abort 为同批全部工具按原顺序补齐 toolResult 后再返回主 Agent', async () => {
   let now = 0
   const budget = createActiveBudget(10, () => now, () => new AbortController().signal)
@@ -828,6 +894,121 @@ test('主 Agent 校验 trace 持久化失败时也会停止 runtime active segme
   await assert.rejects(iterator.throw(new Error('pg_trace_failed')), /pg_trace_failed/)
   now = 90
   assert.equal(budget.elapsedMs(), 35)
+})
+
+test('主工具 active start 失败会释放槽位且同批后续工具可再次取得', async () => {
+  const baseBudget = createActiveBudget(60_000)
+  let starts = 0
+  const budget = {
+    ...baseBudget,
+    start(signal: AbortSignal) {
+      starts += 1
+      if (starts === 3) throw new Error('tool_active_start_failed')
+      return baseBudget.start(signal)
+    },
+  }
+  let acquired = 0
+  let released = 0
+  let fetches = 0
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage([
+      fauxToolCall('fetch_financial_context', {}, { id: 'active-failure' }),
+      fauxToolCall('fetch_financial_context', {}, { id: 'active-retry' }),
+    ], { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('submit_analysis_report', validReport), { stopReason: 'toolUse' }),
+  ] })
+  const events = []
+  for await (const event of model.analyze({
+    executionId: 'main-tool-active-start', runtimeSettings: runtimeSettings(), activeBudget: budget,
+    symbol: 'NVDA', systemPrompt: 'system', userPrompt: 'user', knownFacts: facts,
+    fetchFinancialContext: async () => { fetches += 1; return { facts } },
+    acquireToolSlot: async () => {
+      acquired += 1
+      return () => { released += 1 }
+    },
+  })) events.push(event)
+
+  assert.equal(fetches, 1)
+  assert.equal(acquired, 2)
+  assert.equal(released, 2)
+  assert.match(JSON.stringify(events), /tool_active_start_failed/)
+  assert.ok(events.some((event) => event.type === 'completed'))
+})
+
+test('专项工具 start log 失败会释放槽位且同批后续工具可再次取得', async () => {
+  let acquired = 0
+  let released = 0
+  let starts = 0
+  let fetches = 0
+  const model = createPiModel({
+    fauxResponses: [
+      fauxAssistantMessage(fauxToolCall('analyze_financials', {}), { stopReason: 'toolUse' }),
+      fauxAssistantMessage([
+        fauxToolCall('search_news_by_keyword', {}, { id: 'log-failure' }),
+        fauxToolCall('search_news_by_keyword', {}, { id: 'log-retry' }),
+      ], { stopReason: 'toolUse' }),
+      fauxAssistantMessage(fauxText('专项完成')),
+      fauxAssistantMessage(fauxToolCall('submit_analysis_report', validReport), { stopReason: 'toolUse' }),
+    ],
+    log(entry) {
+      if (entry.type === 'tool_request_start' && ++starts === 1) throw new Error('tool_start_log_failed')
+    },
+  })
+  const events = []
+  for await (const event of model.analyze({
+    executionId: 'main-tool-start-log', runtimeSettings: runtimeSettings(),
+    symbol: 'NVDA', systemPrompt: 'system', userPrompt: 'user', knownFacts: facts,
+    fetchFinancialContext: async () => ({ facts, financials: {} }),
+    searchNews: async () => { fetches += 1; return { facts: [] } },
+    acquireToolSlot: async () => {
+      acquired += 1
+      return () => { released += 1 }
+    },
+  })) events.push(event)
+
+  assert.equal(fetches, 1)
+  assert.equal(acquired, 3)
+  assert.equal(released, 3)
+  assert.match(JSON.stringify(events), /tool_start_log_failed/)
+  assert.ok(events.some((event) => event.type === 'completed'))
+})
+
+test('专项工具 end log 失败不覆盖结果且后续 Turn 可再次取得槽位', async () => {
+  let acquired = 0
+  let released = 0
+  let searches = 0
+  const model = createPiModel({
+    fauxResponses: [
+      fauxAssistantMessage(fauxToolCall('analyze_financials', {}), { stopReason: 'toolUse' }),
+      fauxAssistantMessage(fauxToolCall('search_news_by_keyword', {}, { id: 'logged-first' }), {
+        stopReason: 'toolUse',
+      }),
+      fauxAssistantMessage(fauxToolCall('search_news_by_keyword', {}, { id: 'logged-second' }), {
+        stopReason: 'toolUse',
+      }),
+      fauxAssistantMessage(fauxText('专项完成')),
+      fauxAssistantMessage(fauxToolCall('submit_analysis_report', validReport), { stopReason: 'toolUse' }),
+    ],
+    log(entry) {
+      if (entry.type === 'tool_request_end') throw new Error('tool_end_log_failed')
+    },
+  })
+  const events = []
+  for await (const event of model.analyze({
+    executionId: 'specialist-end-log', runtimeSettings: runtimeSettings(),
+    symbol: 'NVDA', systemPrompt: 'system', userPrompt: 'user', knownFacts: facts,
+    fetchFinancialContext: async () => ({ facts, financials: {} }),
+    searchNews: async () => { searches += 1; return { facts: [] } },
+    acquireToolSlot: async () => {
+      acquired += 1
+      return () => { released += 1 }
+    },
+  })) events.push(event)
+
+  assert.equal(searches, 2)
+  assert.equal(acquired, 3)
+  assert.equal(released, 3)
+  assert.ok(events.some((event) => event.type === 'completed'))
 })
 
 test('专项 Agent 在工具并发槽等待期 abort 仍为同批全部调用补齐 toolResult', async () => {

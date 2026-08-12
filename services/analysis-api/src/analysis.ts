@@ -6,7 +6,7 @@ import { defaultRuntimeSettings, type RuntimeSettings } from '@vibe-invest/contr
 
 import type { AnalyzeInput, AnalysisReport, ModelEvent } from './model.js'
 import type { FactQueryResult, FinancialContext, FinancialFact } from './financial-data-client.js'
-import { createActiveBudget, createConcurrencyGate } from './runtime-policy.js'
+import { acquireActiveSlot, createActiveBudget, createConcurrencyGate } from './runtime-policy.js'
 
 type Fact = FinancialFact
 type Model = { analyze(input: AnalyzeInput): AsyncIterable<ModelEvent> }
@@ -196,13 +196,13 @@ export function createAnalysisService(options: {
     )
     try {
       pauseProcessing()
-      const releaseContextSlot = await toolGate.acquire(executionSignal)
-      const contextActive = activeBudget.start(executionSignal)
+      const contextOwner = await acquireActiveSlot({
+        acquire: () => toolGate.acquire(executionSignal), activeBudget, signal: executionSignal,
+      })
       try {
-        context = await options.fetchFinancialContext(job.symbol, contextActive.signal)
+        context = await options.fetchFinancialContext(job.symbol, contextOwner.signal)
       } finally {
-        contextActive.stop()
-        releaseContextSlot()
+        contextOwner.finish()
       }
       resumeProcessing()
       assertPolicy()
@@ -213,15 +213,15 @@ export function createAnalysisService(options: {
       if (options.fetchMarketPrices && options.listPortfolioSymbols) {
         try {
           pauseProcessing()
-          const releasePriceSlot = await toolGate.acquire(executionSignal)
-          const pricesActive = activeBudget.start(executionSignal)
+          const pricesOwner = await acquireActiveSlot({
+            acquire: () => toolGate.acquire(executionSignal), activeBudget, signal: executionSignal,
+          })
           try {
             portfolioPrices = await options.fetchMarketPrices(
-              await options.listPortfolioSymbols(), pricesActive.signal,
+              await options.listPortfolioSymbols(), pricesOwner.signal,
             )
           } finally {
-            pricesActive.stop()
-            releasePriceSlot()
+            pricesOwner.finish()
           }
           resumeProcessing()
           assertPolicy()
