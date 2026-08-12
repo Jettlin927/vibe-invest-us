@@ -204,8 +204,16 @@ test('Pi Runtime 使用持久 executionId 派生工具 operationId 且真实 Pos
     assert.ok(session)
     const ledger = await events.list(created.sessionId, 0)
     const toolPrefix = `execution:${session.executionId}:tool:${callId}`
+    const duplicateToolPrefix = `${toolPrefix}:occurrence:2`
     assert.equal(ledger.filter(({ operationId }) => operationId === `${toolPrefix}:call`).length, 1)
     assert.equal(ledger.filter(({ operationId }) => operationId === `${toolPrefix}:result`).length, 1)
+    assert.equal(ledger.filter(({ operationId }) => operationId === `${duplicateToolPrefix}:call`).length, 1)
+    assert.equal(ledger.filter(({ operationId }) => operationId === `${duplicateToolPrefix}:result`).length, 1)
+    assert.deepEqual(ledger.filter(({ operationId }) => operationId.startsWith(toolPrefix))
+      .map(({ operationId }) => operationId), [
+      `${toolPrefix}:call`, `${duplicateToolPrefix}:call`,
+      `${toolPrefix}:result`, `${duplicateToolPrefix}:result`,
+    ])
     const reportPrefix = `execution:${session.executionId}:tool:${reportCallId}`
     const cancelledPrefix = `execution:${session.executionId}:tool:${cancelledAfterReportCallId}`
     const sealedBatch = ledger.filter(({ operationId }) => (
@@ -238,6 +246,100 @@ test('Pi Runtime 使用持久 executionId 派生工具 operationId 且真实 Pos
   }
 })
 
+test('主 Agent 校验失败与合法调用在下一轮前按原序封存到真实 PostgreSQL', {
+  skip: !databaseUrl,
+  concurrency: false,
+}, async () => {
+  const pool = createPool(databaseUrl!)
+  const events = createAgentEventRepository(pool)
+  const analyses = createAnalysisRepository(pool)
+  const unknownCallId = 'pg-main-unknown'
+  const invalidCallId = 'pg-main-invalid'
+  const validCallId = 'pg-main-valid'
+  const reportCallId = 'pg-main-validation-report'
+  let createdSessionId: string | undefined
+  let providerObservedSealedLedger = false
+  let validCalls = 0
+  const report = {
+    title: '主批次校验封存测试', marketState: '未知', trend: '未知', drivers: [],
+    supportingEvidence: [], contraryEvidence: [], keyJudgments: [], scenarios: [],
+    invalidationConditions: [], valuation: null, personalImpact: null,
+    conditionalSuggestion: null, limitations: ['测试上下文为空'],
+  }
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage([
+      fauxToolCall('hidden_main_tool', {}, { id: unknownCallId }),
+      fauxToolCall('fetch_financial_context', { symbol: '' }, { id: invalidCallId }),
+      fauxToolCall('fetch_financial_context', {}, { id: validCallId }),
+    ], { stopReason: 'toolUse' }),
+    async (context) => {
+      assert.ok(createdSessionId)
+      const session = await events.getSession(createdSessionId)
+      assert.ok(session)
+      const prefix = `execution:${session.executionId}:tool`
+      const sealed = (await events.list(createdSessionId, 0)).filter(({ operationId }) => (
+        operationId.startsWith(`${prefix}:${unknownCallId}:`)
+        || operationId.startsWith(`${prefix}:${invalidCallId}:`)
+        || operationId.startsWith(`${prefix}:${validCallId}:`)
+      ))
+      assert.deepEqual(sealed.map(({ operationId }) => operationId), [
+        `${prefix}:${unknownCallId}:call`,
+        `${prefix}:${invalidCallId}:call`,
+        `${prefix}:${validCallId}:call`,
+        `${prefix}:${unknownCallId}:result`,
+        `${prefix}:${invalidCallId}:result`,
+        `${prefix}:${validCallId}:result`,
+      ])
+      assert.deepEqual(sealed.slice(3, 5).map(({ payload }) => payload), [
+        {
+          type: 'tool_result', name: 'hidden_main_tool',
+          result: { error: 'tool_not_available', facts: [] }, isError: true,
+          operationId: `${prefix}:${unknownCallId}:result`,
+        },
+        {
+          type: 'tool_result', name: 'fetch_financial_context',
+          result: { error: 'invalid_tool_arguments', facts: [] }, isError: true,
+          operationId: `${prefix}:${invalidCallId}:result`,
+        },
+      ])
+      assert.deepEqual(context.messages.filter(({ role }) => role === 'toolResult')
+        .map((message) => message.role === 'toolResult' ? message.toolCallId : ''), [
+        unknownCallId, invalidCallId, validCallId,
+      ])
+      providerObservedSealedLedger = true
+      return fauxAssistantMessage(
+        fauxToolCall('submit_analysis_report', report, { id: reportCallId }),
+        { stopReason: 'toolUse' },
+      )
+    },
+  ] })
+  const app = buildApp({
+    productDatabase: { checkSchema: () => checkSchema(pool), close: () => pool.end() },
+    portfolioRepository: createPortfolioRepository(pool),
+    analysisRepository: analyses,
+    agentEventRepository: events,
+    runtimeSettingsRepository: createRuntimeSettingsRepository(pool),
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => {
+      validCalls += 1
+      return { symbol, gaps: [], facts: [] }
+    },
+    model,
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'PGMAIN' },
+  })).json() as { analysisId: string; sessionId: string }
+  createdSessionId = created.sessionId
+  try {
+    await waitForAnalysisStatus(app, created.analysisId, 'partial')
+    assert.equal(providerObservedSealedLedger, true)
+    assert.equal(validCalls, 1)
+  } finally {
+    await app.close()
+  }
+})
+
 test('专项下一轮 provider 启动前已在真实 PostgreSQL 封存上一批工具事件', {
   skip: !databaseUrl,
   concurrency: false,
@@ -246,6 +348,8 @@ test('专项下一轮 provider 启动前已在真实 PostgreSQL 封存上一批�
   const events = createAgentEventRepository(pool)
   const analyses = createAnalysisRepository(pool)
   const specialistEntryId = 'pg-specialist-entry'
+  const unknownCallId = 'pg-specialist-unknown'
+  const invalidCallId = 'pg-specialist-invalid'
   const newsCallId = 'pg-specialist-news'
   const indicatorCallId = 'pg-specialist-indicator'
   const reportCallId = 'pg-specialist-report'
@@ -263,6 +367,8 @@ test('专项下一轮 provider 启动前已在真实 PostgreSQL 封存上一批�
       { stopReason: 'toolUse' },
     ),
     fauxAssistantMessage([
+      fauxToolCall('hidden_specialist_tool', {}, { id: unknownCallId }),
+      fauxToolCall('search_news_by_keyword', { keyword: '' }, { id: invalidCallId }),
       fauxToolCall('search_news_by_keyword', {}, { id: newsCallId }),
       fauxToolCall('get_technical_indicators', {}, { id: indicatorCallId }),
     ], { stopReason: 'toolUse' }),
@@ -272,18 +378,36 @@ test('专项下一轮 provider 启动前已在真实 PostgreSQL 封存上一批�
       assert.ok(session)
       const prefix = `execution:${session.executionId}:specialist-tool`
       const sealed = (await events.list(createdSessionId, 0)).filter(({ operationId }) => (
-        operationId.startsWith(`${prefix}:${newsCallId}:`)
+        operationId.startsWith(`${prefix}:${unknownCallId}:`)
+        || operationId.startsWith(`${prefix}:${invalidCallId}:`)
+        || operationId.startsWith(`${prefix}:${newsCallId}:`)
         || operationId.startsWith(`${prefix}:${indicatorCallId}:`)
       ))
       assert.deepEqual(sealed.map(({ operationId }) => operationId), [
+        `${prefix}:${unknownCallId}:call`,
+        `${prefix}:${invalidCallId}:call`,
         `${prefix}:${newsCallId}:call`,
         `${prefix}:${indicatorCallId}:call`,
+        `${prefix}:${unknownCallId}:result`,
+        `${prefix}:${invalidCallId}:result`,
         `${prefix}:${newsCallId}:result`,
         `${prefix}:${indicatorCallId}:result`,
       ])
+      assert.deepEqual(sealed.slice(4, 6).map(({ payload }) => payload), [
+        {
+          type: 'tool_result', name: 'hidden_specialist_tool',
+          result: { error: 'tool_not_available', facts: [] }, isError: true,
+          operationId: `${prefix}:${unknownCallId}:result`,
+        },
+        {
+          type: 'tool_result', name: 'search_news_by_keyword',
+          result: { error: 'invalid_tool_arguments', facts: [] }, isError: true,
+          operationId: `${prefix}:${invalidCallId}:result`,
+        },
+      ])
       assert.deepEqual(context.messages.filter(({ role }) => role === 'toolResult')
         .map((message) => message.role === 'toolResult' ? message.toolCallId : ''), [
-        newsCallId, indicatorCallId,
+        unknownCallId, invalidCallId, newsCallId, indicatorCallId,
       ])
       providerObservedSealedLedger = true
       return fauxAssistantMessage('专项收口完成')

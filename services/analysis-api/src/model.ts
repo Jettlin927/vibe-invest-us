@@ -9,6 +9,8 @@ import {
   type FauxResponseStep,
   type Model,
   type Api,
+  type Tool,
+  type ToolCall,
 } from '@earendil-works/pi-ai'
 import { openAICompletionsApi } from '@earendil-works/pi-ai/api/openai-completions.lazy'
 import { openAIResponsesApi } from '@earendil-works/pi-ai/api/openai-responses.lazy'
@@ -265,208 +267,217 @@ export function createPiModel(options: ModelOptions = {}) {
           throw policyError
         }
         let runtimeWork = activeBudget.start(executionSignal)
-        context.messages.push(message)
-        if (message.stopReason === 'aborted') {
-          runtimeWork.stop()
-          yield { type: 'cancelled', operationId: `${attemptId}:cancelled` }
-          return
-        }
-        if (message.stopReason === 'error') {
-          runtimeWork.stop()
-          throw new Error(message.errorMessage || 'model_error')
-        }
-        const calls = message.content.filter((block) => block.type === 'toolCall')
-        if (!calls.length) {
-          context.messages.push({
-            role: 'user',
-            content: '请继续自主规划。可按需使用受限工具；准备好后提交结构化报告。',
-            timestamp: Date.now(),
-          })
-          runtimeWork.stop()
-          continue
-        }
-        if (!closing) {
-          if (toolRounds >= runtimeSettings.mainAgentToolRounds) {
-            closing = true
-          } else {
-            toolRounds += 1
+        try {
+          context.messages.push(message)
+          if (message.stopReason === 'aborted') {
+            runtimeWork.stop()
+            yield { type: 'cancelled', operationId: `${attemptId}:cancelled` }
+            return
           }
-        }
+          if (message.stopReason === 'error') {
+            runtimeWork.stop()
+            throw new Error(message.errorMessage || 'model_error')
+          }
+          const calls = message.content.filter((block) => block.type === 'toolCall')
+          if (!calls.length) {
+            context.messages.push({
+              role: 'user',
+              content: '请继续自主规划。可按需使用受限工具；准备好后提交结构化报告。',
+              timestamp: Date.now(),
+            })
+            runtimeWork.stop()
+            continue
+          }
+          if (!closing) {
+            if (toolRounds >= runtimeSettings.mainAgentToolRounds) {
+              closing = true
+            } else {
+              toolRounds += 1
+            }
+          }
 
-        const preparedCalls = calls.map((call) => ({
-          call,
-          toolInput: validateToolCall([...analysisModelTools], call),
-          toolOperationId: `execution:${input.executionId}:tool:${call.id}`,
-        }))
-        for (const { call, toolInput, toolOperationId } of preparedCalls) {
-          yield { type: 'trace', entry: {
-            type: 'tool_call', name: call.name, input: toolInput,
-            operationId: `${toolOperationId}:call`,
-          } }
-        }
-        let completedReport: AnalysisReport | undefined
-        let completedOperationId: string | undefined
-        for (const { call, toolInput, toolOperationId } of preparedCalls) {
-          if (completedReport) {
-            const result = { error: 'cancelled_after_report_submission', cancelled: true, facts: [] as Fact[] }
-            context.messages.push(toolResultMessage(call, result, true))
+          const preparedCalls = prepareToolCalls(
+            [...analysisModelTools], calls, `execution:${input.executionId}:tool`,
+          )
+          for (const { call, toolOperationId } of preparedCalls) {
             yield { type: 'trace', entry: {
-              type: 'tool_result', name: call.name, result, isError: true,
-              operationId: `${toolOperationId}:result`,
+              type: 'tool_call', name: call.name, input: call.arguments,
+              operationId: `${toolOperationId}:call`,
             } }
-            continue
           }
-          if (closing && call.name !== 'submit_analysis_report') {
-            const result = { error: 'tool_rejected_during_closure', rejected: true, facts: [] as Fact[] }
-            context.messages.push(toolResultMessage(call, result, true))
-            yield { type: 'trace', entry: {
-              type: 'tool_result', name: call.name, result, isError: true,
-              operationId: `${toolOperationId}:result`,
-            } }
-            continue
-          }
-          if (call.name === 'submit_analysis_report') {
-            const report = normalizeReport(toolInput)
-            try {
-              validateEvidence(report, knownFactIds)
-              const result = { submitted: true }
-              context.messages.push(toolResultMessage(call, result, false))
-              yield { type: 'trace', entry: {
-                type: 'tool_result', name: call.name, result, isError: false,
-                operationId: `${toolOperationId}:result`,
-              } }
-              completedReport = report
-              completedOperationId = `${toolOperationId}:report`
-            } catch (error) {
-              const result = {
-                error: error instanceof Error ? error.message : String(error),
-                instruction: '依据字段只能填写工具结果中完整、原样的事实 ID。请修正报告后重新调用 submit_analysis_report。',
-              }
-              context.messages.push({
-                role: 'toolResult', toolCallId: call.id, toolName: call.name,
-                content: [{ type: 'text', text: JSON.stringify(result) }], isError: true, timestamp: Date.now(),
-              })
+          let completedReport: AnalysisReport | undefined
+          let completedOperationId: string | undefined
+          for (const { call, toolInput, validationError, toolOperationId } of preparedCalls) {
+            if (completedReport) {
+              const result = { error: 'cancelled_after_report_submission', cancelled: true, facts: [] as Fact[] }
+              context.messages.push(toolResultMessage(call, result, true))
               yield { type: 'trace', entry: {
                 type: 'tool_result', name: call.name, result, isError: true,
                 operationId: `${toolOperationId}:result`,
               } }
+              continue
             }
-            continue
-          }
-          if (call.name !== 'fetch_financial_context' && call.name !== 'analyze_financials') {
-            throw new Error(`tool_not_allowed:${call.name}`)
-          }
-
-          let result: { facts: Fact[]; [key: string]: unknown } | { error: string; facts: Fact[] }
-          let isError = false
-          runtimeWork.stop()
-          let resumeRuntimeWork = () => {
-            runtimeWork = activeBudget.start(executionSignal)
-            resumeRuntimeWork = () => {}
-          }
-          try {
-            const toolSymbol = (toolInput as { symbol?: string }).symbol ?? input.symbol
-            const financialContext = await loadFrozenContext(toolSymbol)
-            if (call.name === 'analyze_financials') {
-              const specialistContext: Context = {
-                systemPrompt: `你是独立财报分析专家。以给定的冻结财报上下文为基础，可按需通过 search_news_by_keyword 补查新闻，或通过 get_technical_indicators 查询指定股票与日期范围的确定性技术指标。不得使用工具结果之外的信息，不重新计算宿主已经计算的增长率、利润率、TTM、自由现金流或质量标记。每项判断必须引用输入或工具结果中存在的事实 ID；数据不足时明确说明。输出供主分析 Agent 使用的简洁备忘录，不提交最终股票报告。`,
-                messages: [{
-                  role: 'user',
-                  content: JSON.stringify({
-                    symbol: input.symbol,
-                    financials: financialContext.financials ?? null,
-                    facts: financialContext.facts.filter((fact) => isFinancialFact(fact)),
-                  }),
-                  timestamp: Date.now(),
-                }],
-                tools: [...financialSpecialistTools],
-              }
-              const specialistIterator = runFinancialSpecialist(
-                models, selectedModel, specialistContext, input, options,
-                runtimeSettings, executionSignal, activeBudget, modelGate, toolGate,
-              )
-              let specialist: Awaited<ReturnType<typeof specialistIterator.next>>['value']
-              let specialistCompleted = false
+            const terminalError = validationError === 'tool_not_available'
+              ? { error: validationError, facts: [] as Fact[] }
+              : closing && call.name !== 'submit_analysis_report'
+                ? { error: 'tool_rejected_during_closure', rejected: true, facts: [] as Fact[] }
+                : validationError
+                  ? { error: validationError, facts: [] as Fact[] }
+                  : undefined
+            if (terminalError) {
+              const result = terminalError
+              context.messages.push(toolResultMessage(call, result, true))
+              yield { type: 'trace', entry: {
+                type: 'tool_result', name: call.name, result, isError: true,
+                operationId: `${toolOperationId}:result`,
+              } }
+              continue
+            }
+            if (call.name === 'submit_analysis_report') {
+              const report = normalizeReport(toolInput)
               try {
-                let specialistStep = await specialistIterator.next()
-                while (!specialistStep.done) {
-                  yield { type: 'trace', entry: specialistStep.value }
-                  specialistStep = await specialistIterator.next()
-                }
-                specialist = specialistStep.value
-                specialistCompleted = true
-              } finally {
-                if (!specialistCompleted) {
-                  await specialistIterator.return({ analysis: '专项研究被上层终止。', facts: [] })
-                }
-              }
-              if (specialist.policyError === 'cancelled') {
+                validateEvidence(report, knownFactIds)
+                const result = { submitted: true }
+                context.messages.push(toolResultMessage(call, result, false))
                 yield { type: 'trace', entry: {
-                  type: 'cancelled', operationId: `${toolOperationId}:specialist-cancelled-trace`,
+                  type: 'tool_result', name: call.name, result, isError: false,
+                  operationId: `${toolOperationId}:result`,
                 } }
-                yield { type: 'cancelled', operationId: `${toolOperationId}:specialist-cancelled` }
-                return
+                completedReport = report
+                completedOperationId = `${toolOperationId}:report`
+              } catch (error) {
+                const result = {
+                  error: error instanceof Error ? error.message : String(error),
+                  instruction: '依据字段只能填写工具结果中完整、原样的事实 ID。请修正报告后重新调用 submit_analysis_report。',
+                }
+                context.messages.push({
+                  role: 'toolResult', toolCallId: call.id, toolName: call.name,
+                  content: [{ type: 'text', text: JSON.stringify(result) }], isError: true, timestamp: Date.now(),
+                })
+                yield { type: 'trace', entry: {
+                  type: 'tool_result', name: call.name, result, isError: true,
+                  operationId: `${toolOperationId}:result`,
+                } }
               }
-              if (specialist.policyError === 'execution_runtime_timeout') {
-                throw new Error('execution_runtime_timeout')
-              }
-              for (const fact of specialist.facts) knownFactIds.add(fact.id)
-              result = { facts: specialist.facts, analysis: specialist.analysis }
-            } else {
-              result = financialContext
+              continue
             }
-            assertExecutionPolicy(input, executionSignal, activeBudget)
-          } catch (error) {
+            if (call.name !== 'fetch_financial_context' && call.name !== 'analyze_financials') {
+              throw new Error(`tool_not_allowed:${call.name}`)
+            }
+
+            let result: { facts: Fact[]; [key: string]: unknown } | { error: string; facts: Fact[] }
+            let isError = false
+            runtimeWork.stop()
+            let resumeRuntimeWork = () => {
+              runtimeWork = activeBudget.start(executionSignal)
+              resumeRuntimeWork = () => {}
+            }
+            try {
+              const toolSymbol = (toolInput as { symbol?: string }).symbol ?? input.symbol
+              const financialContext = await loadFrozenContext(toolSymbol)
+              if (call.name === 'analyze_financials') {
+                const specialistContext: Context = {
+                  systemPrompt: `你是独立财报分析专家。以给定的冻结财报上下文为基础，可按需通过 search_news_by_keyword 补查新闻，或通过 get_technical_indicators 查询指定股票与日期范围的确定性技术指标。不得使用工具结果之外的信息，不重新计算宿主已经计算的增长率、利润率、TTM、自由现金流或质量标记。每项判断必须引用输入或工具结果中存在的事实 ID；数据不足时明确说明。输出供主分析 Agent 使用的简洁备忘录，不提交最终股票报告。`,
+                  messages: [{
+                    role: 'user',
+                    content: JSON.stringify({
+                      symbol: input.symbol,
+                      financials: financialContext.financials ?? null,
+                      facts: financialContext.facts.filter((fact) => isFinancialFact(fact)),
+                    }),
+                    timestamp: Date.now(),
+                  }],
+                  tools: [...financialSpecialistTools],
+                }
+                const specialistIterator = runFinancialSpecialist(
+                  models, selectedModel, specialistContext, input, options,
+                  runtimeSettings, executionSignal, activeBudget, modelGate, toolGate,
+                )
+                let specialist: Awaited<ReturnType<typeof specialistIterator.next>>['value']
+                let specialistCompleted = false
+                try {
+                  let specialistStep = await specialistIterator.next()
+                  while (!specialistStep.done) {
+                    yield { type: 'trace', entry: specialistStep.value }
+                    specialistStep = await specialistIterator.next()
+                  }
+                  specialist = specialistStep.value
+                  specialistCompleted = true
+                } finally {
+                  if (!specialistCompleted) {
+                    await specialistIterator.return({ analysis: '专项研究被上层终止。', facts: [] })
+                  }
+                }
+                if (specialist.policyError === 'cancelled') {
+                  yield { type: 'trace', entry: {
+                    type: 'cancelled', operationId: `${toolOperationId}:specialist-cancelled-trace`,
+                  } }
+                  yield { type: 'cancelled', operationId: `${toolOperationId}:specialist-cancelled` }
+                  return
+                }
+                if (specialist.policyError === 'execution_runtime_timeout') {
+                  throw new Error('execution_runtime_timeout')
+                }
+                for (const fact of specialist.facts) knownFactIds.add(fact.id)
+                result = { facts: specialist.facts, analysis: specialist.analysis }
+              } else {
+                result = financialContext
+              }
+              assertExecutionPolicy(input, executionSignal, activeBudget)
+            } catch (error) {
+              resumeRuntimeWork()
+              if (executionSignal.aborted || activeBudget.exhausted()) {
+                const pendingCalls = calls.slice(calls.indexOf(call))
+                for (const pending of pendingCalls) {
+                  const cancelledResult = policyToolResult(input, executionSignal, activeBudget)
+                  context.messages.push(toolResultMessage(pending, cancelledResult, true))
+                  yield { type: 'trace', entry: {
+                    type: 'tool_result', name: pending.name, result: cancelledResult, isError: true,
+                    operationId: `execution:${input.executionId}:tool:${pending.id}:result`,
+                  } }
+                }
+                if (input.signal?.aborted) {
+                  yield { type: 'trace', entry: {
+                    type: 'cancelled', operationId: `${attemptId}:tool-batch-cancelled-trace`,
+                  } }
+                  yield { type: 'cancelled', operationId: `${attemptId}:tool-batch-cancelled` }
+                  runtimeWork.stop()
+                  return
+                }
+                if (activeBudget.exhausted()) { closing = true; break }
+                throw error
+              }
+              isError = true
+              const factId = `fact:tool-error:${call.name}:${toolRounds}`
+              const timestamp = new Date().toISOString()
+              const failureFact: Fact = {
+                id: factId, type: 'tool_error', value: 'unavailable', observedAt: timestamp,
+                fetchedAt: timestamp, source: 'system', sourceReference: 'internal://tool-error',
+              }
+              knownFactIds.add(factId)
+              result = { error: error instanceof Error ? error.message : String(error), facts: [failureFact] }
+            }
             resumeRuntimeWork()
-            if (executionSignal.aborted || activeBudget.exhausted()) {
-              const pendingCalls = calls.slice(calls.indexOf(call))
-              for (const pending of pendingCalls) {
-                const cancelledResult = policyToolResult(input, executionSignal, activeBudget)
-                context.messages.push(toolResultMessage(pending, cancelledResult, true))
-                yield { type: 'trace', entry: {
-                  type: 'tool_result', name: pending.name, result: cancelledResult, isError: true,
-                  operationId: `execution:${input.executionId}:tool:${pending.id}:result`,
-                } }
-              }
-              if (input.signal?.aborted) {
-                yield { type: 'trace', entry: {
-                  type: 'cancelled', operationId: `${attemptId}:tool-batch-cancelled-trace`,
-                } }
-                yield { type: 'cancelled', operationId: `${attemptId}:tool-batch-cancelled` }
-                runtimeWork.stop()
-                return
-              }
-              if (activeBudget.exhausted()) { closing = true; break }
-              throw error
-            }
-            isError = true
-            const factId = `fact:tool-error:${call.name}:${toolRounds}`
-            const timestamp = new Date().toISOString()
-            const failureFact: Fact = {
-              id: factId, type: 'tool_error', value: 'unavailable', observedAt: timestamp,
-              fetchedAt: timestamp, source: 'system', sourceReference: 'internal://tool-error',
-            }
-            knownFactIds.add(factId)
-            result = { error: error instanceof Error ? error.message : String(error), facts: [failureFact] }
+            context.messages.push(toolResultMessage(call, result, isError))
+            yield { type: 'trace', entry: {
+              type: 'tool_result', name: call.name, result, isError,
+              operationId: `${toolOperationId}:result`,
+            } }
+            options.log?.({ type: 'tool_result', toolName: call.name, isError })
           }
-          resumeRuntimeWork()
-          context.messages.push(toolResultMessage(call, result, isError))
-          yield { type: 'trace', entry: {
-            type: 'tool_result', name: call.name, result, isError,
-            operationId: `${toolOperationId}:result`,
-          } }
-          options.log?.({ type: 'tool_result', toolName: call.name, isError })
-        }
-        runtimeWork.stop()
-        if (completedReport) {
-          yield {
-            type: 'completed', report: completedReport,
-            usage: message.usage, stopReason: message.stopReason,
-            operationId: completedOperationId,
+          runtimeWork.stop()
+          if (completedReport) {
+            yield {
+              type: 'completed', report: completedReport,
+              usage: message.usage, stopReason: message.stopReason,
+              operationId: completedOperationId,
+            }
+            return
           }
-          return
+          if (!closing && toolRounds >= runtimeSettings.mainAgentToolRounds) closing = true
+        } finally {
+          runtimeWork.stop()
         }
-        if (!closing && toolRounds >= runtimeSettings.mainAgentToolRounds) closing = true
       }
     },
   }
@@ -489,6 +500,8 @@ async function* runFinancialSpecialist(
   policyError?: 'cancelled' | 'execution_runtime_timeout'
 }> {
   const facts: Fact[] = []
+  const availableTools = projectedSpecialistTools(input)
+  context.tools = [...availableTools]
   let toolRounds = 0
   let closing = false
   let closingAttempts = 0
@@ -533,116 +546,164 @@ async function* runFinancialSpecialist(
       throw policyError
     }
     let runtimeWork = activeBudget.start(executionSignal)
-    context.messages.push(message)
-    if (message.stopReason === 'error') {
-      runtimeWork.stop()
-      throw new Error(message.errorMessage || 'financial_specialist_error')
-    }
-    const calls = message.content.filter((block) => block.type === 'toolCall')
-    if (!calls.length) {
-      runtimeWork.stop()
-      return { analysis: contentText(message.content), facts }
-    }
-    if (!closing) {
-      if (toolRounds >= runtimeSettings.specialistAgentToolRounds) {
-        closing = true
-        context.tools = []
-      } else {
-        toolRounds += 1
+    try {
+      context.messages.push(message)
+      if (message.stopReason === 'error') {
+        runtimeWork.stop()
+        throw new Error(message.errorMessage || 'financial_specialist_error')
       }
-    }
-    const preparedCalls = calls.map((call) => ({
-      call,
-      toolInput: validateToolCall([...financialSpecialistTools], call),
-      toolOperationId: `execution:${input.executionId}:specialist-tool:${call.id}`,
-    }))
-    for (const { call, toolInput, toolOperationId } of preparedCalls) {
-      yield {
-        type: 'tool_call', name: call.name, input: toolInput,
-        operationId: `${toolOperationId}:call`,
+      const calls = message.content.filter((block) => block.type === 'toolCall')
+      if (!calls.length) {
+        runtimeWork.stop()
+        return { analysis: contentText(message.content), facts }
       }
-    }
-    for (const { call, toolInput, toolOperationId } of preparedCalls) {
-      if (closing) {
-        const result = { error: 'tool_rejected_during_closure', rejected: true, facts: [] as Fact[] }
-        context.messages.push(toolResultMessage(call, result, true))
+      if (!closing) {
+        if (toolRounds >= runtimeSettings.specialistAgentToolRounds) {
+          closing = true
+          context.tools = []
+        } else {
+          toolRounds += 1
+        }
+      }
+      const preparedCalls = prepareToolCalls(
+        [...availableTools], calls, `execution:${input.executionId}:specialist-tool`,
+      )
+      for (const { call, toolOperationId } of preparedCalls) {
         yield {
-          type: 'tool_result', name: call.name, result, isError: true,
+          type: 'tool_call', name: call.name, input: call.arguments,
+          operationId: `${toolOperationId}:call`,
+        }
+      }
+      for (const { call, toolInput, validationError, toolOperationId } of preparedCalls) {
+        const terminalError = validationError === 'tool_not_available'
+          ? { error: validationError, facts: [] as Fact[] }
+          : closing
+            ? { error: 'tool_rejected_during_closure', rejected: true, facts: [] as Fact[] }
+            : validationError
+              ? { error: validationError, facts: [] as Fact[] }
+              : undefined
+        if (terminalError) {
+          const result = terminalError
+          context.messages.push(toolResultMessage(call, result, true))
+          yield {
+            type: 'tool_result', name: call.name, result, isError: true,
+            operationId: `${toolOperationId}:result`,
+          }
+          continue
+        }
+        let result: { facts: Fact[]; [key: string]: unknown }
+        let isError = false
+        runtimeWork.stop()
+        let releaseTool: (() => void) | undefined
+        let activeTool: ReturnType<ActiveBudget['start']> | undefined
+        try {
+          releaseTool = await acquireToolSlot(input, toolGate, executionSignal)
+          activeTool = activeBudget.start(executionSignal)
+          options.log?.({ type: 'tool_request_start', executionId: input.executionId, toolName: call.name })
+          if (call.name === 'search_news_by_keyword') {
+            if (!input.searchNews) throw new Error('news_search_unavailable')
+            const keyword = (toolInput as { keyword?: string }).keyword ?? input.symbol
+            result = await input.searchNews(keyword, toolSignal(
+              input, options, runtimeSettings, activeTool.signal,
+            ))
+          } else if (call.name === 'get_technical_indicators') {
+            if (!input.fetchTechnicalIndicators) throw new Error('technical_indicators_unavailable')
+            const values = toolInput as { symbol?: string; startDate?: string; endDate?: string }
+            const endDate = values.endDate ?? new Date().toISOString().slice(0, 10)
+            const startDate = values.startDate ?? oneYearBefore(endDate)
+            result = await input.fetchTechnicalIndicators(
+              values.symbol ?? input.symbol, startDate, endDate,
+              toolSignal(input, options, runtimeSettings, activeTool.signal),
+            )
+          } else {
+            throw new Error(`tool_not_allowed:${call.name}`)
+          }
+          assertExecutionPolicy(input, executionSignal, activeBudget)
+          facts.push(...result.facts)
+        } catch (error) {
+          if (executionSignal.aborted || activeTool?.exhausted() || activeBudget.exhausted()) {
+            for (const pending of calls.slice(calls.indexOf(call))) {
+              const cancelledResult = policyToolResult(input, executionSignal, activeBudget)
+              context.messages.push(toolResultMessage(pending, cancelledResult, true))
+              yield {
+                type: 'tool_result', name: pending.name, result: cancelledResult, isError: true,
+                operationId: `execution:${input.executionId}:specialist-tool:${pending.id}:result`,
+              }
+            }
+            if (input.signal?.aborted) {
+              return {
+                analysis: '专项研究已取消。', facts,
+                policyError: 'cancelled' as const,
+              }
+            }
+            if (executionSignal.aborted && !activeBudget.exhausted()) {
+              return {
+                analysis: '专项研究超过 execution wall。', facts,
+                policyError: 'execution_runtime_timeout' as const,
+              }
+            }
+            closing = true
+            break
+          }
+          isError = true
+          result = { error: error instanceof Error ? error.message : String(error), facts: [] }
+        } finally {
+          options.log?.({ type: 'tool_request_end', executionId: input.executionId, toolName: call.name })
+          activeTool?.stop()
+          releaseTool?.()
+        }
+        runtimeWork = activeBudget.start(executionSignal)
+        context.messages.push(toolResultMessage(call, result, isError))
+        yield {
+          type: 'tool_result', name: call.name, result, isError,
           operationId: `${toolOperationId}:result`,
         }
-        continue
       }
-      let result: { facts: Fact[]; [key: string]: unknown }
-      let isError = false
       runtimeWork.stop()
-      let releaseTool: (() => void) | undefined
-      let activeTool: ReturnType<ActiveBudget['start']> | undefined
-      try {
-        releaseTool = await acquireToolSlot(input, toolGate, executionSignal)
-        activeTool = activeBudget.start(executionSignal)
-        options.log?.({ type: 'tool_request_start', executionId: input.executionId, toolName: call.name })
-        if (call.name === 'search_news_by_keyword') {
-          if (!input.searchNews) throw new Error('news_search_unavailable')
-          const keyword = (toolInput as { keyword?: string }).keyword ?? input.symbol
-          result = await input.searchNews(keyword, toolSignal(
-            input, options, runtimeSettings, activeTool.signal,
-          ))
-        } else if (call.name === 'get_technical_indicators') {
-          if (!input.fetchTechnicalIndicators) throw new Error('technical_indicators_unavailable')
-          const values = toolInput as { symbol?: string; startDate?: string; endDate?: string }
-          const endDate = values.endDate ?? new Date().toISOString().slice(0, 10)
-          const startDate = values.startDate ?? oneYearBefore(endDate)
-          result = await input.fetchTechnicalIndicators(
-            values.symbol ?? input.symbol, startDate, endDate,
-            toolSignal(input, options, runtimeSettings, activeTool.signal),
-          )
-        } else {
-          throw new Error(`tool_not_allowed:${call.name}`)
-        }
-        assertExecutionPolicy(input, executionSignal, activeBudget)
-        facts.push(...result.facts)
-      } catch (error) {
-        if (executionSignal.aborted || activeTool?.exhausted() || activeBudget.exhausted()) {
-          for (const pending of calls.slice(calls.indexOf(call))) {
-            const cancelledResult = policyToolResult(input, executionSignal, activeBudget)
-            context.messages.push(toolResultMessage(pending, cancelledResult, true))
-            yield {
-              type: 'tool_result', name: pending.name, result: cancelledResult, isError: true,
-              operationId: `execution:${input.executionId}:specialist-tool:${pending.id}:result`,
-            }
-          }
-          if (input.signal?.aborted) {
-            return {
-              analysis: '专项研究已取消。', facts,
-              policyError: 'cancelled' as const,
-            }
-          }
-          if (executionSignal.aborted && !activeBudget.exhausted()) {
-            return {
-              analysis: '专项研究超过 execution wall。', facts,
-              policyError: 'execution_runtime_timeout' as const,
-            }
-          }
-          closing = true
-          break
-        }
-        isError = true
-        result = { error: error instanceof Error ? error.message : String(error), facts: [] }
-      } finally {
-        options.log?.({ type: 'tool_request_end', executionId: input.executionId, toolName: call.name })
-        activeTool?.stop()
-        releaseTool?.()
-      }
-      runtimeWork = activeBudget.start(executionSignal)
-      context.messages.push(toolResultMessage(call, result, isError))
-      yield {
-        type: 'tool_result', name: call.name, result, isError,
-        operationId: `${toolOperationId}:result`,
-      }
+      if (toolRounds >= runtimeSettings.specialistAgentToolRounds) closing = true
+    } finally {
+      runtimeWork.stop()
     }
-    runtimeWork.stop()
-    if (toolRounds >= runtimeSettings.specialistAgentToolRounds) closing = true
   }
+}
+
+function prepareToolCalls(tools: Tool[], calls: ToolCall[], operationPrefix: string) {
+  const occurrences = new Map<string, number>()
+  const runtimeIds = new Set<string>()
+  return calls.map((call, index) => {
+    const providerId = call.id || `missing:${index + 1}`
+    let occurrence = (occurrences.get(providerId) ?? 0) + 1
+    occurrences.set(providerId, occurrence)
+    let runtimeId = occurrence === 1 ? providerId : `${providerId}:occurrence:${occurrence}`
+    while (runtimeIds.has(runtimeId)) {
+      occurrence += 1
+      runtimeId = `${providerId}:occurrence:${occurrence}`
+    }
+    runtimeIds.add(runtimeId)
+    call.id = runtimeId
+    const prepared = {
+      call,
+      toolInput: undefined as unknown,
+      validationError: undefined as 'tool_not_available' | 'invalid_tool_arguments' | undefined,
+      toolOperationId: `${operationPrefix}:${runtimeId}`,
+    }
+    if (!tools.some(({ name }) => name === call.name)) {
+      prepared.validationError = 'tool_not_available'
+      return prepared
+    }
+    try {
+      prepared.toolInput = validateToolCall(tools, call)
+    } catch {
+      prepared.validationError = 'invalid_tool_arguments'
+    }
+    return prepared
+  })
+}
+
+function projectedSpecialistTools(input: AnalyzeInput) {
+  return financialSpecialistTools.filter(({ name }) => (
+    name === 'search_news_by_keyword' ? Boolean(input.searchNews) : Boolean(input.fetchTechnicalIndicators)
+  ))
 }
 
 function assertExecutionPolicy(

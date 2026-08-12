@@ -341,6 +341,128 @@ for (const [position, calls, expectedExecutions] of [
   })
 }
 
+for (const [position, calls] of [
+  ['首位', [
+    fauxToolCall('hidden_shell', { command: 'whoami' }, { id: 'unknown-first' }),
+    fauxToolCall('fetch_financial_context', {}, { id: 'valid-after-unknown' }),
+  ]],
+  ['中间', [
+    fauxToolCall('fetch_financial_context', {}, { id: 'valid-before-unknown' }),
+    fauxToolCall('hidden_shell', {}, { id: 'unknown-middle' }),
+    fauxToolCall('fetch_financial_context', {}, { id: 'valid-after-middle' }),
+  ]],
+  ['末位', [
+    fauxToolCall('fetch_financial_context', {}, { id: 'valid-before-last' }),
+    fauxToolCall('hidden_shell', {}, { id: 'unknown-last' }),
+  ]],
+] as const) {
+  test(`主 Agent 未知工具位于批次${position}时归一化错误且其他合法工具继续`, async () => {
+    let executions = 0
+    const observedResults: Array<{ id: string; value: unknown; isError: boolean }> = []
+    const model = createPiModel({ fauxResponses: [
+      fauxAssistantMessage([...calls], { stopReason: 'toolUse' }),
+      (context) => {
+        observedResults.push(...context.messages.filter(({ role }) => role === 'toolResult')
+          .map((message) => message.role === 'toolResult' ? {
+            id: message.toolCallId, value: JSON.parse(message.content[0]?.type === 'text'
+              ? message.content[0].text : '{}'), isError: message.isError,
+          } : { id: '', value: null, isError: false }))
+        return fauxAssistantMessage(
+          fauxToolCall('submit_analysis_report', validReport), { stopReason: 'toolUse' },
+        )
+      },
+    ] })
+    const events = []
+    for await (const event of model.analyze({
+      executionId: `unknown-${position}`, runtimeSettings: runtimeSettings(),
+      symbol: 'NVDA', systemPrompt: 'system', userPrompt: 'user', knownFacts: facts,
+      fetchFinancialContext: async () => { executions += 1; return { facts } },
+    })) events.push(event)
+
+    assert.equal(executions, 1)
+    assert.deepEqual(observedResults.map(({ id }) => id), calls.map(({ id }) => id))
+    assert.equal(observedResults.filter(({ id, isError }) => id.startsWith('valid-') && !isError).length,
+      calls.filter(({ name }) => name === 'fetch_financial_context').length)
+    const hidden = observedResults.find(({ id }) => id.startsWith('unknown-'))
+    assert.deepEqual(hidden, {
+      id: calls.find(({ id }) => id.startsWith('unknown-'))?.id,
+      value: { error: 'tool_not_available', facts: [] }, isError: true,
+    })
+    assert.doesNotMatch(JSON.stringify(observedResults.map(({ value }) => value)),
+      /Tool .* not found|hidden_shell|Validation failed/)
+    assert.deepEqual(toolTurnOperations(events, /:tool:(unknown-|valid-)/), [
+      ...calls.map(({ id }) => `execution:unknown-${position}:tool:${id}:call`),
+      ...calls.map(({ id }) => `execution:unknown-${position}:tool:${id}:result`),
+    ])
+    assert.ok(events.some(({ type }) => type === 'completed'))
+  })
+}
+
+test('主 Agent 非法参数只拒绝当前 call 且同批合法工具仍执行', async () => {
+  const invalid = fauxToolCall('fetch_financial_context', { symbol: '' }, { id: 'invalid-arguments' })
+  const valid = fauxToolCall('fetch_financial_context', {}, { id: 'valid-with-invalid' })
+  let executions = 0
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage([invalid, valid], { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('submit_analysis_report', validReport), { stopReason: 'toolUse' }),
+  ] })
+  const events = []
+  for await (const event of model.analyze({
+    executionId: 'invalid-main', runtimeSettings: runtimeSettings(),
+    symbol: 'NVDA', systemPrompt: 'system', userPrompt: 'user', knownFacts: facts,
+    fetchFinancialContext: async () => { executions += 1; return { facts } },
+  })) events.push(event)
+  assert.equal(executions, 1)
+  const invalidResult = events.find((event) => event.type === 'trace'
+    && event.entry.operationId === 'execution:invalid-main:tool:invalid-arguments:result')
+  assert.deepEqual(invalidResult, { type: 'trace', entry: {
+    type: 'tool_result', name: 'fetch_financial_context',
+    result: { error: 'invalid_tool_arguments', facts: [] }, isError: true,
+    operationId: 'execution:invalid-main:tool:invalid-arguments:result',
+  } })
+  assert.doesNotMatch(JSON.stringify(events), /Validation failed|Received arguments/)
+})
+
+test('同批重复 provider call id 会稳定派生唯一 Context 与 trace 配对', async () => {
+  const contextPairs: string[][] = []
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage([
+      fauxToolCall('fetch_financial_context', {}, { id: 'duplicate-call' }),
+      fauxToolCall('fetch_financial_context', {}, { id: 'duplicate-call' }),
+    ], { stopReason: 'toolUse' }),
+    (context) => {
+      const assistant = context.messages.find(({ role }) => role === 'assistant')
+      contextPairs.push([
+        ...(assistant?.role === 'assistant'
+          ? assistant.content.filter(({ type }) => type === 'toolCall').map(({ id }) => id)
+          : []),
+        ...context.messages.filter(({ role }) => role === 'toolResult')
+          .map((message) => message.role === 'toolResult' ? message.toolCallId : ''),
+      ])
+      return fauxAssistantMessage(
+        fauxToolCall('submit_analysis_report', validReport), { stopReason: 'toolUse' },
+      )
+    },
+  ] })
+  const events = []
+  for await (const event of model.analyze({
+    executionId: 'duplicate-provider-id', runtimeSettings: runtimeSettings(),
+    symbol: 'NVDA', systemPrompt: 'system', userPrompt: 'user', knownFacts: facts,
+    fetchFinancialContext: async () => ({ facts }),
+  })) events.push(event)
+
+  assert.deepEqual(contextPairs, [[
+    'duplicate-call', 'duplicate-call:occurrence:2',
+    'duplicate-call', 'duplicate-call:occurrence:2',
+  ]])
+  assert.deepEqual(toolTurnOperations(events, /:tool:duplicate-call/), [
+    'execution:duplicate-provider-id:tool:duplicate-call:call',
+    'execution:duplicate-provider-id:tool:duplicate-call:occurrence:2:call',
+    'execution:duplicate-provider-id:tool:duplicate-call:result',
+    'execution:duplicate-provider-id:tool:duplicate-call:occurrence:2:result',
+  ])
+})
+
 test('专项 Agent policy abort 为同批全部工具按原顺序补齐 toolResult 后再返回主 Agent', async () => {
   let now = 0
   const budget = createActiveBudget(10, () => now, () => new AbortController().signal)
@@ -419,6 +541,144 @@ test('专项 Agent 轮次到限后拒绝整批工具并向收口轮提供完整 
     'execution:specialist-closing:specialist-tool:specialist-closing-second:result',
   ])
   assert.ok(events.some((event) => event.type === 'completed'))
+})
+
+test('专项未知工具与非法参数逐项归一化且同批合法工具继续执行', async () => {
+  const specialistResults: Array<{ id: string; value: unknown; isError: boolean }> = []
+  let searches = 0
+  let indicators = 0
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall('analyze_financials', {}, { id: 'validation-entry' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage([
+      fauxToolCall('hidden_specialist_tool', {}, { id: 'specialist-unknown' }),
+      fauxToolCall('search_news_by_keyword', { keyword: '' }, { id: 'specialist-invalid' }),
+      fauxToolCall('search_news_by_keyword', { keyword: 'NVDA' }, { id: 'specialist-valid-news' }),
+      fauxToolCall('get_technical_indicators', {}, { id: 'specialist-valid-indicator' }),
+    ], { stopReason: 'toolUse' }),
+    (context) => {
+      specialistResults.push(...context.messages.filter(({ role }) => role === 'toolResult')
+        .map((message) => message.role === 'toolResult' ? {
+          id: message.toolCallId, value: JSON.parse(message.content[0]?.type === 'text'
+            ? message.content[0].text : '{}'), isError: message.isError,
+        } : { id: '', value: null, isError: false }))
+      return fauxAssistantMessage(fauxText('专项校验完成'))
+    },
+    fauxAssistantMessage(fauxToolCall('submit_analysis_report', validReport), { stopReason: 'toolUse' }),
+  ] })
+  const events = []
+  for await (const event of model.analyze({
+    executionId: 'specialist-validation', runtimeSettings: runtimeSettings(),
+    symbol: 'NVDA', systemPrompt: 'system', userPrompt: 'user', knownFacts: facts,
+    fetchFinancialContext: async () => ({ facts, financials: {} }),
+    searchNews: async () => { searches += 1; return { facts: [] } },
+    fetchTechnicalIndicators: async () => { indicators += 1; return { facts: [] } },
+  })) events.push(event)
+
+  assert.equal(searches, 1)
+  assert.equal(indicators, 1)
+  assert.deepEqual(specialistResults.map(({ id }) => id), [
+    'specialist-unknown', 'specialist-invalid',
+    'specialist-valid-news', 'specialist-valid-indicator',
+  ])
+  assert.deepEqual(specialistResults.slice(0, 2), [
+    { id: 'specialist-unknown', value: { error: 'tool_not_available', facts: [] }, isError: true },
+    { id: 'specialist-invalid', value: { error: 'invalid_tool_arguments', facts: [] }, isError: true },
+  ])
+  assert.deepEqual(toolTurnOperations(events, /specialist-tool:specialist-(unknown|invalid|valid)/), [
+    'execution:specialist-validation:specialist-tool:specialist-unknown:call',
+    'execution:specialist-validation:specialist-tool:specialist-invalid:call',
+    'execution:specialist-validation:specialist-tool:specialist-valid-news:call',
+    'execution:specialist-validation:specialist-tool:specialist-valid-indicator:call',
+    'execution:specialist-validation:specialist-tool:specialist-unknown:result',
+    'execution:specialist-validation:specialist-tool:specialist-invalid:result',
+    'execution:specialist-validation:specialist-tool:specialist-valid-news:result',
+    'execution:specialist-validation:specialist-tool:specialist-valid-indicator:result',
+  ])
+})
+
+test('专项未投影工具统一不可用且同批已投影工具继续执行', async () => {
+  const specialistResults: Array<{ id: string; value: unknown; isError: boolean }> = []
+  let searches = 0
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(
+      fauxToolCall('analyze_financials', {}, { id: 'projection-entry' }), { stopReason: 'toolUse' },
+    ),
+    fauxAssistantMessage([
+      fauxToolCall('get_technical_indicators', {}, { id: 'not-projected' }),
+      fauxToolCall('search_news_by_keyword', {}, { id: 'projected-news' }),
+    ], { stopReason: 'toolUse' }),
+    (context) => {
+      specialistResults.push(...context.messages.filter(({ role }) => role === 'toolResult')
+        .map((message) => message.role === 'toolResult' ? {
+          id: message.toolCallId, value: JSON.parse(message.content[0]?.type === 'text'
+            ? message.content[0].text : '{}'), isError: message.isError,
+        } : { id: '', value: null, isError: false }))
+      return fauxAssistantMessage(fauxText('专项投影检查完成'))
+    },
+    fauxAssistantMessage(fauxToolCall('submit_analysis_report', validReport), { stopReason: 'toolUse' }),
+  ] })
+  const events = []
+  for await (const event of model.analyze({
+    executionId: 'specialist-projection', runtimeSettings: runtimeSettings(),
+    symbol: 'NVDA', systemPrompt: 'system', userPrompt: 'user', knownFacts: facts,
+    fetchFinancialContext: async () => ({ facts, financials: {} }),
+    searchNews: async () => { searches += 1; return { facts: [] } },
+  })) events.push(event)
+
+  assert.equal(searches, 1)
+  assert.deepEqual(specialistResults, [
+    { id: 'not-projected', value: { error: 'tool_not_available', facts: [] }, isError: true },
+    { id: 'projected-news', value: { facts: [] }, isError: false },
+  ])
+  assert.doesNotMatch(JSON.stringify(events), /technical_indicators_unavailable/)
+})
+
+test('主 Agent 校验结果 yield 时消费者提前关闭会停止 runtime active segment', async () => {
+  let now = 0
+  const budget = createActiveBudget(100, () => now, () => new AbortController().signal)
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall('hidden_tool', {}, { id: 'active-release' }), { stopReason: 'toolUse' }),
+  ] })
+  const iterator = model.analyze({
+    executionId: 'validation-active-release', runtimeSettings: runtimeSettings(), activeBudget: budget,
+    symbol: 'NVDA', systemPrompt: 'system', userPrompt: 'user', knownFacts: facts,
+    fetchFinancialContext: async () => ({ facts }),
+  })
+  while (true) {
+    const step = await iterator.next()
+    assert.equal(step.done, false)
+    if (!step.done && step.value.type === 'trace'
+      && step.value.entry.operationId === 'execution:validation-active-release:tool:active-release:result') break
+  }
+  now = 40
+  await iterator.return(undefined)
+  now = 90
+  assert.equal(budget.elapsedMs(), 40)
+})
+
+test('主 Agent 校验 trace 持久化失败时也会停止 runtime active segment', async () => {
+  let now = 0
+  const budget = createActiveBudget(100, () => now, () => new AbortController().signal)
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall('hidden_tool', {}, { id: 'trace-write-failure' }), {
+      stopReason: 'toolUse',
+    }),
+  ] })
+  const iterator = model.analyze({
+    executionId: 'validation-trace-write-failure', runtimeSettings: runtimeSettings(),
+    activeBudget: budget, symbol: 'NVDA', systemPrompt: 'system', userPrompt: 'user',
+    knownFacts: facts, fetchFinancialContext: async () => ({ facts }),
+  })
+  while (true) {
+    const step = await iterator.next()
+    assert.equal(step.done, false)
+    if (!step.done && step.value.type === 'trace'
+      && step.value.entry.operationId.endsWith(':trace-write-failure:result')) break
+  }
+  now = 35
+  await assert.rejects(iterator.throw(new Error('pg_trace_failed')), /pg_trace_failed/)
+  now = 90
+  assert.equal(budget.elapsedMs(), 35)
 })
 
 test('专项 Agent 在工具并发槽等待期 abort 仍为同批全部调用补齐 toolResult', async () => {
@@ -642,27 +902,32 @@ test('主 Agent 工具轮次到限后停止研究并在两轮内确定性收口�
   assert.ok(events.some((event) => event.type === 'completed'))
 })
 
-test('研究 active 到限后不再调用研究工具并由主 Agent 收口为报告', async () => {
+test('研究 active 在 provider 后耗尽时不再调用研究工具并由主 Agent 收口为报告', async () => {
   let toolCalls = 0
+  let now = 0
+  const budget = createActiveBudget(10, () => now, () => new AbortController().signal)
   const model = createPiModel({
     fauxResponses: [
-      fauxAssistantMessage(fauxToolCall('fetch_financial_context', {}), { stopReason: 'toolUse' }),
+      () => {
+        now = 11
+        return fauxAssistantMessage(
+          fauxToolCall('fetch_financial_context', {}), { stopReason: 'toolUse' },
+        )
+      },
       fauxAssistantMessage(fauxToolCall('submit_analysis_report', validReport), { stopReason: 'toolUse' }),
     ],
-    runtimeMinuteMs: 5,
   })
   const events = []
   for await (const event of model.analyze({
     executionId: 'active-closing', runtimeSettings: runtimeSettings({ researchActiveMinutes: 1, modelRequestTimeoutMinutes: 60 }),
+    activeBudget: budget,
     symbol: 'NVDA', systemPrompt: 'system', userPrompt: 'user', knownFacts: facts,
-    fetchFinancialContext: async (_symbol, signal) => {
+    fetchFinancialContext: async () => {
       toolCalls += 1
-      await new Promise((resolve) => setTimeout(resolve, 8))
-      signal.throwIfAborted()
       return { facts }
     },
   })) events.push(event)
-  assert.equal(toolCalls, 1)
+  assert.equal(toolCalls, 0)
   assert.ok(events.some((event) => event.type === 'completed'))
 })
 
