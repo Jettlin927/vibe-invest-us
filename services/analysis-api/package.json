@@ -10,6 +10,7 @@
     "dev": "tsx watch src/server.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/server.js",
+    "migrate:sqlite": "tsx src/sqlite-migration-cli.ts",
     "pretest": "npm run build --workspace @vibe-invest/product-dao",
     "test": "tsx --test --test-concurrency=1 test/**/*.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"

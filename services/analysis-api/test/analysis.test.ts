@@ -118,6 +118,27 @@ test('实例并发上限使额外任务排队', async () => {
   await app.close()
 })
 
+test('并发创建多个标的时运行任务数不超过实例上限', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'vibe-analysis-concurrency-'))
+  let active = 0
+  let maximumActive = 0
+  const app = await makeApp(join(dir, 'storage'), {
+    async *analyze() {
+      active += 1
+      maximumActive = Math.max(maximumActive, active)
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      active -= 1
+      yield { type: 'completed' as const, report }
+    },
+  }, 2)
+  const created = await Promise.all(Array.from({ length: 12 }, (_, index) => (
+    app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: `T${index}` } })
+  )))
+  await Promise.all(created.map((response) => waitForStatus(app, response.json().analysisId, 'completed')))
+  assert.equal(maximumActive, 2)
+  await app.close()
+})
+
 test('取消运行任务会停止模型并保存取消轨迹', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'vibe-analysis-cancel-'))
   const app = await makeApp(join(dir, 'storage'), fakeModel(1000), 1)

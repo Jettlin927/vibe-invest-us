@@ -1,6 +1,6 @@
 import { Pool } from 'pg'
 
-export const schemaVersion = 3
+export const schemaVersion = 4
 
 const migrationSql = `
 CREATE TABLE IF NOT EXISTS product_schema_migrations (
@@ -36,6 +36,12 @@ CREATE TABLE IF NOT EXISTS portfolio_equity_snapshots (
   after_close boolean NOT NULL DEFAULT false
 );
 
+CREATE TABLE IF NOT EXISTS legacy_portfolio_migrations (
+  source_sha256 text PRIMARY KEY,
+  source_path text NOT NULL,
+  migrated_at timestamptz NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS analyses (
   id text PRIMARY KEY,
   symbol text NOT NULL,
@@ -68,6 +74,17 @@ CREATE TABLE IF NOT EXISTS analysis_trace (
   PRIMARY KEY (analysis_id, sequence)
 );
 
+WITH duplicate_active AS (
+  SELECT id, row_number() OVER (PARTITION BY symbol ORDER BY created_at, id) AS position
+  FROM analyses WHERE status IN ('queued', 'running')
+)
+UPDATE analyses SET status = 'interrupted', updated_at = now()
+FROM duplicate_active
+WHERE analyses.id = duplicate_active.id AND duplicate_active.position > 1;
+
+CREATE UNIQUE INDEX IF NOT EXISTS analyses_one_active_per_symbol
+ON analyses (symbol) WHERE status IN ('queued', 'running');
+
 INSERT INTO product_schema_migrations (version)
 VALUES (1)
 ON CONFLICT (version) DO NOTHING;
@@ -80,12 +97,15 @@ INSERT INTO product_schema_migrations (version)
 VALUES (3)
 ON CONFLICT (version) DO NOTHING;
 
-DROP TABLE IF EXISTS legacy_portfolio_migrations;
+INSERT INTO product_schema_migrations (version)
+VALUES (4)
+ON CONFLICT (version) DO NOTHING;
 
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM vibe_invest_app;
 REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM vibe_invest_app;
 GRANT SELECT ON product_schema_migrations TO vibe_invest_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON positions, portfolio_settings, portfolio_equity_snapshots TO vibe_invest_app;
+GRANT SELECT, INSERT ON legacy_portfolio_migrations TO vibe_invest_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON analyses, atomic_facts, analysis_facts, analysis_trace TO vibe_invest_app;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO vibe_invest_app;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM vibe_invest_app;
@@ -331,12 +351,22 @@ export function createAnalysisRepository(pool: Pool) {
       } finally { client.release() }
     },
     async appendTrace(analysisId: string, payload: unknown) {
-      await pool.query(
-        `INSERT INTO analysis_trace (analysis_id, sequence, payload_json)
-         SELECT $1, COALESCE(max(sequence), 0) + 1, $2
-         FROM analysis_trace WHERE analysis_id = $1`,
-        [analysisId, JSON.stringify(payload)],
-      )
+      const client = await pool.connect()
+      try {
+        await client.query('BEGIN')
+        const parent = await client.query('SELECT id FROM analyses WHERE id = $1 FOR UPDATE', [analysisId])
+        if (!parent.rowCount) throw new Error('analysis_not_found')
+        await client.query(
+          `INSERT INTO analysis_trace (analysis_id, sequence, payload_json)
+           SELECT $1, COALESCE(max(sequence), 0) + 1, $2
+           FROM analysis_trace WHERE analysis_id = $1`,
+          [analysisId, JSON.stringify(payload)],
+        )
+        await client.query('COMMIT')
+      } catch (error) {
+        await client.query('ROLLBACK')
+        throw error
+      } finally { client.release() }
     },
     async setStatus(id: string, status: string, updatedAt: string, extra: {
       report?: unknown; snapshot?: unknown; error?: string
@@ -354,23 +384,30 @@ export function createAnalysisRepository(pool: Pool) {
       const result = await pool.query<AnalysisRow>('SELECT * FROM analyses WHERE id = $1', [id])
       return result.rows[0] ? mapAnalysisRow(result.rows[0]) : null
     },
-    async findActive(symbol: string) {
-      const result = await pool.query<{ id: string }>(
-        `SELECT id FROM analyses WHERE symbol = $1 AND status IN ('queued', 'running')
-         ORDER BY created_at LIMIT 1`, [symbol],
-      )
-      return result.rows[0]?.id ?? null
-    },
-    async create(record: { id: string; symbol: string; status: string; createdAt: string; updatedAt: string }) {
-      await pool.query(
+    async createOrReturn(record: { id: string; symbol: string; status: string; createdAt: string; updatedAt: string }) {
+      const result = await pool.query<{ id: string; created: boolean }>(
         `INSERT INTO analyses (id, symbol, status, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5)`,
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (symbol) WHERE status IN ('queued', 'running')
+         DO UPDATE SET symbol = excluded.symbol
+         RETURNING id, id = $1 AS created`,
         [record.id, record.symbol, record.status, record.createdAt, record.updatedAt],
       )
+      return { analysisId: result.rows[0]!.id, created: result.rows[0]!.created }
     },
-    async nextQueued() {
+    async claimNextQueued(updatedAt: string) {
       const result = await pool.query<{ id: string }>(
-        `SELECT id FROM analyses WHERE status = 'queued' ORDER BY created_at LIMIT 1`,
+        `WITH candidate AS (
+           SELECT id FROM analyses
+           WHERE status = 'queued'
+           ORDER BY created_at, id
+           FOR UPDATE SKIP LOCKED
+           LIMIT 1
+         )
+         UPDATE analyses SET status = 'running', updated_at = $1
+         FROM candidate
+         WHERE analyses.id = candidate.id
+         RETURNING analyses.id`, [updatedAt],
       )
       return result.rows[0]?.id ?? null
     },

@@ -74,17 +74,20 @@ export function createTestProductDatabase() {
       })
     },
     async get(id) { return analyses.get(id) ?? null },
-    async findActive(symbol) {
-      return [...analyses.values()]
-        .filter((record) => record.symbol === symbol && ['queued', 'running'].includes(record.status))
-        .sort((left, right) => left.createdAt.localeCompare(right.createdAt))[0]?.id ?? null
-    },
-    async create(record) {
+    async createOrReturn(record) {
+      const existing = [...analyses.values()]
+        .filter((candidate) => candidate.symbol === record.symbol && ['queued', 'running'].includes(candidate.status))
+        .sort((left, right) => left.createdAt.localeCompare(right.createdAt))[0]
+      if (existing) return { analysisId: existing.id, created: false }
       analyses.set(record.id, { ...record, snapshot: null, report: null, error: null, starred: false, note: '' })
+      return { analysisId: record.id, created: true }
     },
-    async nextQueued() {
-      return [...analyses.values()].filter((record) => record.status === 'queued')
-        .sort((left, right) => left.createdAt.localeCompare(right.createdAt))[0]?.id ?? null
+    async claimNextQueued(updatedAt) {
+      const record = [...analyses.values()].filter((candidate) => candidate.status === 'queued')
+        .sort((left, right) => left.createdAt.localeCompare(right.createdAt))[0]
+      if (!record) return null
+      analyses.set(record.id, { ...record, status: 'running', updatedAt })
+      return record.id
     },
     async saveSnapshot(id, snapshot) {
       const record = analyses.get(id)
@@ -124,7 +127,7 @@ export function createTestProductDatabase() {
 
   return {
     productDatabase: {
-      checkSchema: async () => ({ status: 'ok' as const, version: 3 }),
+      checkSchema: async () => ({ status: 'ok' as const, version: 4 }),
       close: async () => {},
     },
     portfolioRepository,

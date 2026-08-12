@@ -50,20 +50,20 @@ export function createAnalysisService(options: {
   async function create(symbolInput: string) {
     await initialized
     const symbol = symbolInput.trim().toUpperCase()
-    const existing = await repository.findActive(symbol)
-    if (existing) return { analysisId: existing, existing: true }
     const id = randomUUID(), now = new Date().toISOString()
-    await repository.create({ id, symbol, status: 'queued', createdAt: now, updatedAt: now })
-    await appendTrace(id, { type: 'status', status: 'queued', at: now })
+    const result = await repository.createOrReturn({ id, symbol, status: 'queued', createdAt: now, updatedAt: now })
+    if (!result.created) return { analysisId: result.analysisId, existing: true }
+    await appendTrace(result.analysisId, { type: 'status', status: 'queued', at: now })
     queueMicrotask(() => void schedule())
-    return { analysisId: id, existing: false }
+    return { analysisId: result.analysisId, existing: false }
   }
   async function schedule() {
     while (running < options.concurrency) {
-      const next = await repository.nextQueued()
+      const now = new Date().toISOString()
+      const next = await repository.claimNextQueued(now)
       if (!next) return
       running += 1
-      await setStatus(next, 'running')
+      await appendTrace(next, { type: 'status', status: 'running', at: now })
       const task = run(next).finally(() => { running -= 1; void schedule() })
       tasks.add(task)
       void task.then(() => tasks.delete(task), () => tasks.delete(task))

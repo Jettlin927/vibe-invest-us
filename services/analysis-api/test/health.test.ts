@@ -15,7 +15,7 @@ test('聚合健康状态包含 Analysis API、PostgreSQL schema 和 Financial Da
   let schemaChecks = 0
   const app = buildApp({
     productDatabase: {
-      checkSchema: async () => { schemaChecks += 1; return { status: 'ok', version: 3 } },
+      checkSchema: async () => { schemaChecks += 1; return { status: 'ok', version: 4 } },
       close: async () => {},
     },
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
@@ -28,7 +28,7 @@ test('聚合健康状态包含 Analysis API、PostgreSQL schema 和 Financial Da
     service: 'analysis-api',
     status: 'ok',
     dependencies: {
-      productDatabase: { status: 'ok', engine: 'postgresql', schemaVersion: 3 },
+      productDatabase: { status: 'ok', engine: 'postgresql', schemaVersion: 4 },
       financialData: { service: 'financial-data', status: 'ok' },
     },
   })
