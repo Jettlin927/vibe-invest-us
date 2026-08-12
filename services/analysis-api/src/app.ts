@@ -11,6 +11,10 @@ import { createPortfolio, isValidSymbol, normalizeSymbol } from './portfolio.js'
 
 type AppDependencies = {
   databasePath: string
+  productDatabase?: {
+    checkSchema: () => Promise<{ status: 'ok'; version: number }>
+    close: () => Promise<void>
+  }
   financialDataHealth: () => Promise<FinancialDataHealth>
   staticDir?: string
   fetchFinancialContext?: (symbol: string, signal: AbortSignal) => Promise<FinancialContext>
@@ -43,7 +47,11 @@ export function buildApp(dependencies: AppDependencies) {
       })
     : null
 
-  app.addHook('onClose', async () => { analysis?.close(); database.close() })
+  app.addHook('onClose', async () => {
+    analysis?.close()
+    database.close()
+    await dependencies.productDatabase?.close()
+  })
 
   if (dependencies.staticDir) {
     void app.register(fastifyStatic, {
@@ -54,13 +62,21 @@ export function buildApp(dependencies: AppDependencies) {
   app.get('/api/health', async (_request, reply) => {
     try {
       database.exec('PRAGMA user_version')
+      const productDatabase = await dependencies.productDatabase?.checkSchema()
       const financialData = await dependencies.financialDataHealth()
 
       return {
         service: 'analysis-api',
         status: 'ok',
         dependencies: {
-          database: { status: 'ok' },
+          database: { status: 'ok', engine: 'sqlite' },
+          ...(productDatabase ? {
+            productDatabase: {
+              status: productDatabase.status,
+              engine: 'postgresql',
+              schemaVersion: productDatabase.version,
+            },
+          } : {}),
           financialData,
         },
       }

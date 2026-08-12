@@ -6,10 +6,15 @@ import test from 'node:test'
 
 import { buildApp } from '../src/app.js'
 
-test('聚合健康状态包含 Analysis API、SQLite 和 Financial Data', async () => {
+test('聚合健康状态包含 Analysis API、PostgreSQL schema、SQLite 和 Financial Data', async () => {
   const dataDir = await mkdtemp(join(tmpdir(), 'vibe-invest-health-'))
+  let schemaChecks = 0
   const app = buildApp({
     databasePath: join(dataDir, 'app.db'),
+    productDatabase: {
+      checkSchema: async () => { schemaChecks += 1; return { status: 'ok', version: 1 } },
+      close: async () => {},
+    },
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
   })
 
@@ -20,10 +25,12 @@ test('聚合健康状态包含 Analysis API、SQLite 和 Financial Data', async 
     service: 'analysis-api',
     status: 'ok',
     dependencies: {
-      database: { status: 'ok' },
+      database: { status: 'ok', engine: 'sqlite' },
+      productDatabase: { status: 'ok', engine: 'postgresql', schemaVersion: 1 },
       financialData: { service: 'financial-data', status: 'ok' },
     },
   })
+  assert.equal(schemaChecks, 1)
 
   await app.close()
 })
