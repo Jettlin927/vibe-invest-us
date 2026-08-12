@@ -5,14 +5,27 @@ import { join } from 'node:path'
 import test from 'node:test'
 
 import { buildApp } from '../src/app.js'
+import { createTestProductDatabase } from './support/product-database.js'
 
 const healthyFinancialData = async () => ({
   service: 'financial-data' as const,
   status: 'ok' as const,
 })
 
+const testDatabases = new Map<string, ReturnType<typeof createTestProductDatabase>>()
+
+function productDatabaseFor(databasePath: string) {
+  const existing = testDatabases.get(databasePath)
+  if (existing) return existing
+  const created = createTestProductDatabase()
+  testDatabases.set(databasePath, created)
+  return created
+}
+
 async function createTestApp(databasePath: string) {
-  const app = buildApp({ databasePath, financialDataHealth: healthyFinancialData })
+  const app = buildApp({
+    databasePath, ...productDatabaseFor(databasePath), financialDataHealth: healthyFinancialData,
+  })
   await app.ready()
   return app
 }
@@ -20,6 +33,7 @@ async function createTestApp(databasePath: string) {
 async function createPricedTestApp(databasePath: string, prices: Record<string, number>) {
   const app = buildApp({
     databasePath,
+    ...productDatabaseFor(databasePath),
     financialDataHealth: healthyFinancialData,
     fetchMarketPrices: async (symbols) => Object.fromEntries(
       symbols.flatMap((symbol) => prices[symbol] === undefined ? [] : [[symbol, prices[symbol]]]),
@@ -32,6 +46,7 @@ async function createPricedTestApp(databasePath: string, prices: Record<string, 
 async function createHistoricalTestApp(databasePath: string, prices: Record<string, number>, now: () => Date) {
   const app = buildApp({
     databasePath,
+    ...productDatabaseFor(databasePath),
     financialDataHealth: healthyFinancialData,
     fetchMarketPrices: async (symbols) => Object.fromEntries(
       symbols.flatMap((symbol) => prices[symbol] === undefined ? [] : [[symbol, prices[symbol]]]),

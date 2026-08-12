@@ -16,8 +16,8 @@ export function createAnalysisService(options: {
     symbol: string, startDate: string, endDate: string, signal: AbortSignal,
   ) => Promise<FactQueryResult>
   fetchMarketPrices?: (symbols: string[], signal: AbortSignal) => Promise<Record<string, number>>
-  listPortfolioSymbols?: () => string[]
-  getPortfolioContext?: (symbol: string, marketPrices: Record<string, number>) => unknown
+  listPortfolioSymbols?: () => Promise<string[]>
+  getPortfolioContext?: (symbol: string, marketPrices: Record<string, number>) => Promise<unknown>
   concurrency: number
 }) {
   const { database } = options
@@ -91,14 +91,14 @@ export function createAnalysisService(options: {
       let portfolioPriceGap = false
       if (options.fetchMarketPrices && options.listPortfolioSymbols) {
         try {
-          portfolioPrices = await options.fetchMarketPrices(options.listPortfolioSymbols(), controller.signal)
+          portfolioPrices = await options.fetchMarketPrices(await options.listPortfolioSymbols(), controller.signal)
         } catch (error) {
           if (controller.signal.aborted) throw error
           portfolioPriceGap = true
         }
       }
       if (quoteFact) portfolioPrices[job.symbol] = quoteFact.value as number
-      const portfolioContext = options.getPortfolioContext?.(
+      const portfolioContext = await options.getPortfolioContext?.(
         job.symbol,
         portfolioPrices,
       ) ?? { position: null, portfolio: null }

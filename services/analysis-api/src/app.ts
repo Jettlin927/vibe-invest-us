@@ -2,6 +2,7 @@ import fastifyStatic from '@fastify/static'
 import Fastify from 'fastify'
 
 import type { FinancialDataHealth } from '@vibe-invest/contracts'
+import type { PortfolioRepository } from '@vibe-invest/product-dao'
 
 import { createAnalysisService } from './analysis.js'
 import { openDatabase } from './database.js'
@@ -11,10 +12,11 @@ import { createPortfolio, isValidSymbol, normalizeSymbol } from './portfolio.js'
 
 type AppDependencies = {
   databasePath: string
-  productDatabase?: {
+  productDatabase: {
     checkSchema: () => Promise<{ status: 'ok'; version: number }>
     close: () => Promise<void>
   }
+  portfolioRepository: PortfolioRepository
   financialDataHealth: () => Promise<FinancialDataHealth>
   staticDir?: string
   fetchFinancialContext?: (symbol: string, signal: AbortSignal) => Promise<FinancialContext>
@@ -32,7 +34,7 @@ type AppDependencies = {
 export function buildApp(dependencies: AppDependencies) {
   const app = Fastify({ logger: false })
   const database = openDatabase(dependencies.databasePath)
-  const portfolio = createPortfolio(database)
+  const portfolio = createPortfolio(dependencies.portfolioRepository)
   const analysis = dependencies.fetchFinancialContext && dependencies.model
     ? createAnalysisService({
         database,
@@ -40,7 +42,7 @@ export function buildApp(dependencies: AppDependencies) {
         searchNews: dependencies.searchNews,
         fetchTechnicalIndicators: dependencies.fetchTechnicalIndicators,
         fetchMarketPrices: dependencies.fetchMarketPrices,
-        listPortfolioSymbols: () => portfolio.list().map((position) => position.symbol),
+        listPortfolioSymbols: async () => (await portfolio.list()).map((position) => position.symbol),
         model: dependencies.model,
         concurrency: dependencies.analysisConcurrency ?? 2,
         getPortfolioContext: (symbol, marketPrices) => portfolio.context(symbol, marketPrices),
@@ -50,7 +52,7 @@ export function buildApp(dependencies: AppDependencies) {
   app.addHook('onClose', async () => {
     analysis?.close()
     database.close()
-    await dependencies.productDatabase?.close()
+    await dependencies.productDatabase.close()
   })
 
   if (dependencies.staticDir) {
@@ -62,7 +64,7 @@ export function buildApp(dependencies: AppDependencies) {
   app.get('/api/health', async (_request, reply) => {
     try {
       database.exec('PRAGMA user_version')
-      const productDatabase = await dependencies.productDatabase?.checkSchema()
+      const productDatabase = await dependencies.productDatabase.checkSchema()
       const financialData = await dependencies.financialDataHealth()
 
       return {
@@ -70,13 +72,11 @@ export function buildApp(dependencies: AppDependencies) {
         status: 'ok',
         dependencies: {
           database: { status: 'ok', engine: 'sqlite' },
-          ...(productDatabase ? {
-            productDatabase: {
-              status: productDatabase.status,
-              engine: 'postgresql',
-              schemaVersion: productDatabase.version,
-            },
-          } : {}),
+          productDatabase: {
+            status: productDatabase.status,
+            engine: 'postgresql',
+            schemaVersion: productDatabase.version,
+          },
           financialData,
         },
       }
@@ -88,10 +88,10 @@ export function buildApp(dependencies: AppDependencies) {
     }
   })
 
-  app.get('/api/positions', async () => ({ positions: portfolio.list() }))
+  app.get('/api/positions', async () => ({ positions: await portfolio.list() }))
 
   app.get('/api/portfolio', async (_request, reply) => {
-    const positions = portfolio.list()
+    const positions = await portfolio.list()
     if (!positions.length) return portfolio.overview({})
     if (!dependencies.fetchMarketPrices) return portfolio.overview({})
     try {
@@ -99,17 +99,17 @@ export function buildApp(dependencies: AppDependencies) {
         positions.map((position) => position.symbol),
         AbortSignal.timeout(10_000),
       )
-      const overview = portfolio.overview(prices)
-      portfolio.recordSnapshot(overview, dependencies.now?.() ?? new Date())
+      const overview = await portfolio.overview(prices)
+      await portfolio.recordSnapshot(overview, dependencies.now?.() ?? new Date())
       return overview
     } catch {
-      return reply.status(200).send(portfolio.overview({}))
+      return reply.status(200).send(await portfolio.overview({}))
     }
   })
 
   app.get<{ Querystring: { limit?: string } }>('/api/portfolio/history', async (request) => ({
     currency: 'USD',
-    snapshots: portfolio.history(Number(request.query.limit ?? 30)),
+    snapshots: await portfolio.history(Number(request.query.limit ?? 30)),
   }))
 
   app.put<{ Body: { cash?: unknown } }>('/api/portfolio/cash', async (request, reply) => {
@@ -117,7 +117,7 @@ export function buildApp(dependencies: AppDependencies) {
     if (typeof cash !== 'number' || !Number.isFinite(cash) || cash < 0) {
       return reply.status(400).send({ error: 'invalid_cash' })
     }
-    return { cash: portfolio.setCash(cash) }
+    return { cash: await portfolio.setCash(cash) }
   })
 
   app.get('/api/settings', async () => ({
@@ -147,7 +147,7 @@ export function buildApp(dependencies: AppDependencies) {
   app.delete<{ Params: { symbol: string } }>('/api/positions/:symbol', async (request, reply) => {
     const symbol = normalizeSymbol(request.params.symbol)
     if (!isValidSymbol(symbol)) return reply.status(400).send({ error: 'invalid_symbol' })
-    portfolio.remove(symbol)
+    await portfolio.remove(symbol)
     return reply.status(204).send()
   })
 
@@ -162,7 +162,7 @@ export function buildApp(dependencies: AppDependencies) {
       || typeof quantity !== 'number' || !Number.isFinite(quantity) || quantity <= 0
       || typeof price !== 'number' || !Number.isFinite(price) || price < 0
     ) return reply.status(400).send({ error: 'invalid_reduction' })
-    const result = portfolio.reduce(symbol, quantity, price)
+    const result = await portfolio.reduce(symbol, quantity, price)
     return result ?? reply.status(400).send({ error: 'reduction_exceeds_position' })
   })
 

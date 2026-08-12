@@ -1,13 +1,14 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { checkSchema, createPool, migrate } from '../src/index.js'
+import { checkSchema, createPool, createPortfolioRepository, migrate } from '../src/index.js'
 
 const migrationUrl = process.env.TEST_MIGRATION_DATABASE_URL
 const applicationUrl = process.env.TEST_DATABASE_URL
 
 test('真实 PostgreSQL migration 幂等且 application role 没有 DDL 权限', {
   skip: !migrationUrl || !applicationUrl,
+  concurrency: false,
 }, async () => {
   await migrate(migrationUrl!)
   await migrate(migrationUrl!)
@@ -39,6 +40,7 @@ test('真实 PostgreSQL migration 幂等且 application role 没有 DDL 权限',
 
 test('application role 的事务失败会回滚产品写入', {
   skip: !applicationUrl,
+  concurrency: false,
 }, async () => {
   const pool = createPool(applicationUrl!)
   const client = await pool.connect()
@@ -55,4 +57,28 @@ test('application role 的事务失败会回滚产品写入', {
   const result = await pool.query('SELECT symbol FROM positions WHERE symbol = $1', ['ROLLBACK'])
   assert.deepEqual(result.rows, [])
   await pool.end()
+})
+
+test('真实 PostgreSQL 持仓 DAO 完成 CRUD、现金和原子减仓', {
+  skip: !applicationUrl,
+  concurrency: false,
+}, async () => {
+  const pool = createPool(applicationUrl!)
+  try {
+    const portfolio = createPortfolioRepository(pool)
+    await portfolio.remove('NVDA')
+    await portfolio.setCash(500)
+    await portfolio.save({ symbol: 'NVDA', quantity: 10.125, averageCost: 100.25 })
+    assert.deepEqual((await portfolio.list()).find(({ symbol }) => symbol === 'NVDA'),
+      { symbol: 'NVDA', quantity: 10.125, averageCost: 100.25 })
+    assert.deepEqual(await portfolio.reduce('NVDA', 0.125, 125.5), {
+      position: { symbol: 'NVDA', quantity: 10, averageCost: 100.25 },
+      cash: 515.6875,
+      proceeds: 15.6875,
+      realizedProfitLoss: 3.15625,
+    })
+    assert.equal(await portfolio.cash(), 515.6875)
+  } finally {
+    await pool.end()
+  }
 })

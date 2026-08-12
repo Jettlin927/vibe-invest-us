@@ -5,7 +5,12 @@ import { join } from 'node:path'
 import test from 'node:test'
 
 import type { ModelEvent } from '../src/model.js'
-import { buildApp } from '../src/app.js'
+import { buildApp as buildProductionApp } from '../src/app.js'
+import { createTestProductDatabase } from './support/product-database.js'
+
+function buildApp(dependencies: Parameters<typeof buildProductionApp>[0]) {
+  return buildProductionApp({ ...createTestProductDatabase(), ...dependencies })
+}
 
 const fact = {
   id: 'fact:NVDA:quote:sina:2026-08-12T13:48:38Z', type: 'quote', value: 217.5,

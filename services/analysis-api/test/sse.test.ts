@@ -4,7 +4,12 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 
-import { buildApp } from '../src/app.js'
+import { buildApp as buildProductionApp } from '../src/app.js'
+import { createTestProductDatabase } from './support/product-database.js'
+
+function buildApp(dependencies: Parameters<typeof buildProductionApp>[0]) {
+  return buildProductionApp({ ...createTestProductDatabase(), ...dependencies })
+}
 
 test('真实 HTTP SSE 在任务完成前依次发送运行进度和终态', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'vibe-sse-'))
