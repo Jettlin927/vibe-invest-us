@@ -23,45 +23,67 @@ async function sourceFiles(directory: string): Promise<string[]> {
   return files
 }
 
-function piAgentCoreReferences(source: string): Array<{
-  specifier: string
+type PiAgentCoreReference = {
+  specifier?: string
+  kind: 'import' | 'export' | 'import-equals' | 'dynamic-import' | 'require'
   importDeclaration?: ts.ImportDeclaration
-}> {
+}
+
+function piAgentCoreReferences(source: string): PiAgentCoreReference[] {
   const sourceFile = ts.createSourceFile('boundary.ts', source, ts.ScriptTarget.Latest, true)
-  const references: Array<{ specifier: string, importDeclaration?: ts.ImportDeclaration }> = []
+  const references: PiAgentCoreReference[] = []
+  const addReference = (
+    expression: ts.Expression,
+    kind: PiAgentCoreReference['kind'],
+    importDeclaration?: ts.ImportDeclaration,
+  ): void => {
+    if (ts.isStringLiteralLike(expression)) {
+      if (expression.text.startsWith(piAgentCorePackage)) {
+        references.push({ specifier: expression.text, kind, importDeclaration })
+      }
+    } else if (expression.getText(sourceFile).includes(piAgentCorePackage)) {
+      references.push({ kind })
+    }
+  }
   const visit = (node: ts.Node): void => {
-    if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
-      references.push({ specifier: node.moduleSpecifier.text, importDeclaration: node })
+    if (ts.isImportDeclaration(node)) {
+      addReference(node.moduleSpecifier, 'import', node)
+    } else if (ts.isExportDeclaration(node) && node.moduleSpecifier) {
+      addReference(node.moduleSpecifier, 'export')
     } else if (
       ts.isImportEqualsDeclaration(node)
       && ts.isExternalModuleReference(node.moduleReference)
       && node.moduleReference.expression
-      && ts.isStringLiteralLike(node.moduleReference.expression)
     ) {
-      references.push({ specifier: node.moduleReference.expression.text })
+      addReference(node.moduleReference.expression, 'import-equals')
     } else if (
       ts.isCallExpression(node)
       && node.arguments.length >= 1
-      && ts.isStringLiteralLike(node.arguments[0]!)
       && (node.expression.kind === ts.SyntaxKind.ImportKeyword
         || (ts.isIdentifier(node.expression) && node.expression.text === 'require'))
     ) {
-      references.push({ specifier: node.arguments[0]!.text })
+      addReference(
+        node.arguments[0]!,
+        node.expression.kind === ts.SyntaxKind.ImportKeyword ? 'dynamic-import' : 'require',
+      )
     }
     ts.forEachChild(node, visit)
   }
   visit(sourceFile)
-  return references.filter(({ specifier }) => specifier.startsWith(piAgentCorePackage))
+  return references
 }
 
 function assertPiAgentCoreBoundary(source: string, allowlist: string[]): void {
   const references = piAgentCoreReferences(source)
   for (const { specifier } of references) {
+    assert.ok(specifier, 'pi-agent-core 禁止动态模块表达式')
     assert.equal(specifier, piAgentCorePackage, 'pi-agent-core 只允许精确包根')
   }
   assert.equal(references.length, 1, '必须且只能存在一条 pi-agent-core 包根 import')
+  assert.equal(references[0]!.kind, 'import', 'pi-agent-core 只允许普通静态 import')
   const declaration = references[0]!.importDeclaration
   assert.ok(declaration, 'pi-agent-core 包根必须使用静态 named import')
+  assert.equal(declaration.attributes, undefined, 'pi-agent-core import 禁止 attributes/assertClause')
   const clause = declaration.importClause
   assert.ok(clause && !clause.name && clause.namedBindings && ts.isNamedImports(clause.namedBindings),
     '只允许 pi-agent-core named import')
@@ -143,5 +165,28 @@ test('未知 pi-agent-core 子路径在静态、动态和 require 导入中均�
     "import { Agent } from '@earendil-works/pi-agent-core'; import core = require('@earendil-works/pi-agent-core/unknown')",
   ]) {
     assert.throws(() => assertPiAgentCoreBoundary(source, allowlist), /只允许精确包根/)
+  }
+})
+
+test('Pi Core 的转导出、动态表达式和 import attributes 均失败', () => {
+  const allowlist = ['Agent']
+  for (const source of [
+    "import { Agent } from '@earendil-works/pi-agent-core'; export { Session } from '@earendil-works/pi-agent-core/unknown'",
+    "import { Agent } from '@earendil-works/pi-agent-core'; void import(`@earendil-works/pi-agent-core/${suffix}`)",
+    "import { Agent } from '@earendil-works/pi-agent-core'; require('@earendil-works/pi-agent-core' + suffix)",
+    "import { Agent } from '@earendil-works/pi-agent-core' with { type: 'json' }",
+  ]) {
+    assert.throws(() => assertPiAgentCoreBoundary(source, allowlist))
+  }
+})
+
+test('Pi Core 包根也只允许普通静态 named import', () => {
+  for (const source of [
+    "export { Agent } from '@earendil-works/pi-agent-core'",
+    "import core = require('@earendil-works/pi-agent-core')",
+    "void import('@earendil-works/pi-agent-core')",
+    "require('@earendil-works/pi-agent-core')",
+  ]) {
+    assert.throws(() => assertPiAgentCoreBoundary(source, ['Agent']), /只允许普通静态 import/)
   }
 })
