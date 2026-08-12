@@ -5,8 +5,10 @@ import { extname, join, relative, resolve } from 'node:path'
 import test from 'node:test'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
+import * as ts from 'typescript'
 
 const root = resolve(import.meta.dirname, '../../..')
+const piAgentCorePackage = '@earendil-works/pi-agent-core'
 const productionRoots = ['services/analysis-api/src', 'apps/web/src', 'packages']
   .map((path) => join(root, path))
 const execFileAsync = promisify(execFile)
@@ -21,11 +23,53 @@ async function sourceFiles(directory: string): Promise<string[]> {
   return files
 }
 
+function piAgentCoreReferences(source: string): Array<{
+  specifier: string
+  importDeclaration?: ts.ImportDeclaration
+}> {
+  const sourceFile = ts.createSourceFile('boundary.ts', source, ts.ScriptTarget.Latest, true)
+  const references: Array<{ specifier: string, importDeclaration?: ts.ImportDeclaration }> = []
+  const visit = (node: ts.Node): void => {
+    if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
+      references.push({ specifier: node.moduleSpecifier.text, importDeclaration: node })
+    } else if (
+      ts.isCallExpression(node)
+      && node.arguments.length === 1
+      && ts.isStringLiteral(node.arguments[0]!)
+      && (node.expression.kind === ts.SyntaxKind.ImportKeyword
+        || (ts.isIdentifier(node.expression) && node.expression.text === 'require'))
+    ) {
+      references.push({ specifier: node.arguments[0]!.text })
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(sourceFile)
+  return references.filter(({ specifier }) => specifier.startsWith(piAgentCorePackage))
+}
+
+function assertPiAgentCoreBoundary(source: string, allowlist: string[]): void {
+  const references = piAgentCoreReferences(source)
+  for (const { specifier } of references) {
+    assert.equal(specifier, piAgentCorePackage, 'pi-agent-core 只允许精确包根')
+  }
+  assert.equal(references.length, 1, '必须且只能存在一条 pi-agent-core 包根 import')
+  const declaration = references[0]!.importDeclaration
+  assert.ok(declaration, 'pi-agent-core 包根必须使用静态 named import')
+  const clause = declaration.importClause
+  assert.ok(clause && !clause.name && clause.namedBindings && ts.isNamedImports(clause.namedBindings),
+    '只允许 pi-agent-core named import')
+  const imports = clause.namedBindings.elements
+    .map((element) => (element.propertyName ?? element.name).text)
+    .sort()
+  assert.deepEqual(imports, [...allowlist].sort())
+}
+
 test('只有 Pi Adapter 可直接导入 pi-agent-core', async () => {
   const files = (await Promise.all(productionRoots.map(sourceFiles))).flat()
   for (const file of files) {
     const source = await readFile(file, 'utf8')
-    if (source.includes('@earendil-works/pi-agent-core')) {
+    for (const { specifier } of piAgentCoreReferences(source)) {
+      assert.equal(specifier, piAgentCorePackage, 'pi-agent-core 只允许精确包根')
       assert.equal(relative(root, file), 'services/analysis-api/src/agent-runtime/pi-agent-adapter.ts')
     }
   }
@@ -33,7 +77,7 @@ test('只有 Pi Adapter 可直接导入 pi-agent-core', async () => {
 
 test('生产代码静态禁止 Pi 持久化、Harness、文件和 Shell 能力', async () => {
   const files = (await Promise.all(productionRoots.map(sourceFiles))).flat()
-  const forbiddenEverywhere = /@earendil-works\/pi-coding-agent|pi-agent-core\/(?:node|session|harness)/i
+  const forbiddenEverywhere = /@earendil-works\/pi-coding-agent/i
   const forbiddenPiCapability = /AgentHarness|SessionRepo|Jsonl|JSONL|NodeExecutionEnv|create(Read|Write|Edit|Bash)Tool/i
   for (const file of files) {
     const source = await readFile(file, 'utf8')
@@ -74,22 +118,18 @@ test('Adapter 从 pi-agent-core 包根导入仅限显式 allowlist', async () =>
   const source = await readFile(
     join(root, 'services/analysis-api/src/agent-runtime/pi-agent-adapter.ts'), 'utf8',
   )
-  const packageImports = [...source.matchAll(
-    /import\s+([\s\S]*?)\s+from\s+['"]@earendil-works\/pi-agent-core['"]/g,
-  )]
-  assert.equal(packageImports.length, 1, '必须且只能存在一条 pi-agent-core 包根 import')
-  assert.equal(
-    [...source.matchAll(/['"]@earendil-works\/pi-agent-core['"]/g)].length,
-    1,
-    '拒绝额外、side-effect 或无法解析的 pi-agent-core 包根 import',
-  )
-  const clause = packageImports[0]![1]!.trim()
-  assert.match(clause, /^\{[\s\S]*\}$/, '只允许 pi-agent-core named import')
-  const imports = clause.slice(1, -1).split(',')
-    .map((name) => name.replace(/\btype\s+/g, '').trim())
-    .filter(Boolean)
-    .sort()
-  assert.deepEqual(imports, [
+  assertPiAgentCoreBoundary(source, [
     'Agent', 'AgentTool', 'estimateContextTokens', 'prepareCompaction', 'shouldCompact',
-  ].sort())
+  ])
+})
+
+test('未知 pi-agent-core 子路径在静态、动态和 require 导入中均失败', () => {
+  const allowlist = ['Agent']
+  for (const source of [
+    "import { Agent } from '@earendil-works/pi-agent-core'; import x from '@earendil-works/pi-agent-core/unknown'",
+    "import { Agent } from '@earendil-works/pi-agent-core'; void import('@earendil-works/pi-agent-core/unknown')",
+    "import { Agent } from '@earendil-works/pi-agent-core'; require('@earendil-works/pi-agent-core/unknown')",
+  ]) {
+    assert.throws(() => assertPiAgentCoreBoundary(source, allowlist), /只允许精确包根/)
+  }
 })
