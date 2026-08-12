@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import type { AnalysisRepository } from '@vibe-invest/product-dao'
+import type { AgentEvent, AgentEventRepository, AnalysisRepository } from '@vibe-invest/product-dao'
 
 import type { AnalysisReport, ModelEvent } from './model.js'
 import type { FactQueryResult, FinancialContext, FinancialFact } from './financial-data-client.js'
@@ -9,6 +9,7 @@ type Model = { analyze(input: Record<string, unknown>): AsyncIterable<ModelEvent
 
 export function createAnalysisService(options: {
   repository: AnalysisRepository
+  eventRepository: AgentEventRepository
   model: Model
   fetchFinancialContext: (symbol: string, signal: AbortSignal) => Promise<FinancialContext>
   searchNews?: (keyword: string, signal: AbortSignal) => Promise<FactQueryResult>
@@ -22,26 +23,41 @@ export function createAnalysisService(options: {
 }) {
   const { repository } = options
   const controllers = new Map<string, AbortController>()
-  const listeners = new Map<string, Set<(entry: Record<string, unknown>) => void>>()
+  const listeners = new Map<string, Set<(entry: AgentEvent) => void>>()
   const tasks = new Set<Promise<void>>()
   let running = 0
   const initialized = repository.interruptRunning(new Date().toISOString())
 
-  async function persistFact(analysisId: string, fact: Fact) {
-    await repository.saveFact(analysisId, fact)
+  async function appendEvent(
+    id: string,
+    operationId: string,
+    payload: Record<string, unknown>,
+    projection?: {
+      status?: string; report?: unknown; snapshot?: unknown; error?: string; facts?: Fact[]
+    },
+  ) {
+    const result = await options.eventRepository.append({
+      sessionId: id, operationId, event: payload, projection, createdAt: new Date().toISOString(),
+    })
+    if (result.created) for (const listener of listeners.get(id) ?? []) listener(result.event)
+    return result.event
   }
   async function appendTrace(id: string, payload: unknown) {
-    await repository.appendTrace(id, payload)
-    if (payload && typeof payload === 'object') {
-      for (const listener of listeners.get(id) ?? []) listener(payload as Record<string, unknown>)
-    }
+    if (!payload || typeof payload !== 'object') return
+    const entry = payload as Record<string, unknown>
+    if (entry.type === 'model_event'
+      && (entry.event as Record<string, unknown> | undefined)?.type === 'thinking_delta') return
+    const operationId = typeof entry.operationId === 'string' ? entry.operationId : randomUUID()
+    const facts = entry.type === 'tool_result'
+      ? ((entry.result as { facts?: Fact[] } | undefined)?.facts ?? [])
+      : []
+    await appendEvent(id, operationId, entry, facts.length ? { facts } : undefined)
   }
   async function setStatus(id: string, status: string, extra: { report?: unknown; snapshot?: unknown; error?: string } = {}) {
-    await repository.setStatus(id, status, new Date().toISOString(), extra)
-    await appendTrace(id, {
+    await appendEvent(id, randomUUID(), {
       type: 'status', status, at: new Date().toISOString(),
       ...(extra.error ? { error: extra.error } : {}),
-    })
+    }, { status, ...extra })
   }
   async function get(id: string) {
     await initialized
@@ -51,9 +67,15 @@ export function createAnalysisService(options: {
     await initialized
     const symbol = symbolInput.trim().toUpperCase()
     const id = randomUUID(), now = new Date().toISOString()
-    const result = await repository.createOrReturn({ id, symbol, status: 'queued', createdAt: now, updatedAt: now })
+    const result = await options.eventRepository.createSession({
+      id,
+      symbol,
+      status: 'queued',
+      operationId: `analysis:${id}:created`,
+      event: { type: 'status', status: 'queued', at: now },
+      createdAt: now,
+    })
     if (!result.created) return { analysisId: result.analysisId, existing: true }
-    await appendTrace(result.analysisId, { type: 'status', status: 'queued', at: now })
     queueMicrotask(() => void schedule())
     return { analysisId: result.analysisId, existing: false }
   }
@@ -70,7 +92,12 @@ export function createAnalysisService(options: {
       }
       if (!next) { running -= 1; return }
       try {
-        await appendTrace(next, { type: 'status', status: 'running', at: now })
+        await appendEvent(
+          next,
+          `analysis:${next}:running`,
+          { type: 'status', status: 'running', at: now },
+          { status: 'running' },
+        )
       } catch {
         try {
           await setStatus(next, 'interrupted', { error: 'analysis_running_trace_failed' })
@@ -113,14 +140,12 @@ export function createAnalysisService(options: {
         ...(portfolioPriceGap ? [{ capability: 'portfolio_prices', reason: 'source_unavailable' }] : []),
       ]
       const snapshot = { ...context, gaps, portfolioContext, createdAt: new Date().toISOString() }
-      for (const fact of context.facts) await persistFact(id, fact)
-      await repository.saveSnapshot(id, snapshot)
-      await appendTrace(id, {
+      await appendEvent(id, `analysis:${id}:financial-context`, {
         type: 'financial_context',
         gaps,
         capabilities: sourceDiagnostics(context),
         degradedSources: sourceDegradations(context),
-      })
+      }, { snapshot, facts: context.facts })
       const modelContext = createModelContext(snapshot)
       for await (const event of options.model.analyze({
         symbol: job.symbol,
@@ -132,10 +157,6 @@ export function createAnalysisService(options: {
         fetchTechnicalIndicators: options.fetchTechnicalIndicators,
       })) {
         if (event.type === 'trace') {
-          if (event.entry.type === 'tool_result') {
-            const toolResult = event.entry.result as { facts?: Fact[] }
-            for (const fact of toolResult.facts ?? []) await persistFact(id, fact)
-          }
           await appendTrace(id, event.entry)
         }
         else if (event.type === 'text_delta') await appendTrace(id, event)
@@ -174,7 +195,10 @@ export function createAnalysisService(options: {
   }
   async function research(id: string) {
     await initialized
-    return repository.research(id)
+    const record = await repository.research(id)
+    if (!record) return null
+    const trace = (await options.eventRepository.list(id, 0)).map(({ payload }) => payload)
+    return { ...record, trace }
   }
   async function listResearch(symbol?: string) {
     await initialized
@@ -188,21 +212,12 @@ export function createAnalysisService(options: {
     await initialized
     return repository.removeResearch(id)
   }
-  async function events(id: string) {
-    const record = await research(id)
-    if (!record) return null
-    return record.trace.map((value) => {
-      const entry = value as Record<string, unknown>
-      const event = entry.type === 'status' ? entry.status : entry.type
-      return `event: ${event}\ndata: ${JSON.stringify(entry)}\n\n`
-    }).join('')
-  }
-  async function *streamEvents(id: string, signal?: AbortSignal) {
-    const record = await research(id)
-    if (!record) return
-    const queue: Record<string, unknown>[] = []
+  async function *streamEvents(id: string, afterSequence: number, signal?: AbortSignal) {
+    const session = await options.eventRepository.getSession(id)
+    if (!session) return
+    const queue: AgentEvent[] = []
     let wake: (() => void) | undefined
-    const listener = (entry: Record<string, unknown>) => {
+    const listener = (entry: AgentEvent) => {
       queue.push(entry)
       wake?.()
     }
@@ -210,17 +225,42 @@ export function createAnalysisService(options: {
     subscriptions.add(listener)
     listeners.set(id, subscriptions)
     try {
-      const current = await research(id)
+      let cursor = afterSequence
+      const catchUp = await options.eventRepository.list(id, afterSequence)
+      for (const entry of catchUp) {
+        cursor = entry.sequence
+        yield entry
+      }
+      while (queue.length) {
+        const entry = queue.shift()!
+        if (entry.sequence <= cursor) continue
+        cursor = entry.sequence
+        yield entry
+        if (entry.payload.type === 'status' && isTerminal(String(entry.payload.status))) return
+      }
+      const current = await options.eventRepository.getSession(id)
       if (!current) return
-      for (const entry of current.trace) yield entry as Record<string, unknown>
-      if (isTerminal(current.status)) return
+      if (isTerminal(current.status)) {
+        for (const entry of await options.eventRepository.list(id, cursor)) {
+          cursor = entry.sequence
+          yield entry
+        }
+        return
+      }
       while (!signal?.aborted) {
-        if (!queue.length) await new Promise<void>((resolve) => { wake = resolve })
+        if (!queue.some(({ sequence }) => sequence > cursor)) {
+          await new Promise<void>((resolve) => {
+            wake = resolve
+            signal?.addEventListener('abort', () => resolve(), { once: true })
+          })
+        }
         wake = undefined
         while (queue.length) {
           const entry = queue.shift()!
+          if (entry.sequence <= cursor) continue
+          cursor = entry.sequence
           yield entry
-          if (entry.type === 'status' && isTerminal(String(entry.status))) return
+          if (entry.payload.type === 'status' && isTerminal(String(entry.payload.status))) return
         }
       }
     } finally {
@@ -232,7 +272,7 @@ export function createAnalysisService(options: {
     for (const controller of controllers.values()) controller.abort()
     await Promise.allSettled(tasks)
   }
-  return { create, get, cancel, research, listResearch, updateResearch, removeResearch, events, streamEvents, close }
+  return { create, get, cancel, research, listResearch, updateResearch, removeResearch, streamEvents, close }
 }
 
 const ANALYSIS_SYSTEM_PROMPT = `你是个人美股研究助手，分析周期为未来一至四周。

@@ -2,7 +2,8 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
-  checkSchema, createAnalysisRepository, createPool, createPortfolioRepository, migrate,
+  checkSchema, createAgentEventRepository, createAnalysisRepository, createPool,
+  createPortfolioRepository, migrate,
 } from '../src/index.js'
 
 const migrationUrl = process.env.TEST_MIGRATION_DATABASE_URL
@@ -16,7 +17,7 @@ test('真实 PostgreSQL migration 幂等且 application role 没有 DDL 权限',
   await migrate(migrationUrl!)
 
   const pool = createPool(applicationUrl!)
-  assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 4 })
+  assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 5 })
   const privileges = await pool.query<{ can_create: boolean; can_temp: boolean }>(
     `SELECT has_schema_privilege(current_user, 'public', 'CREATE') AS can_create,
             has_database_privilege(current_user, current_database(), 'TEMP') AS can_temp`,
@@ -191,6 +192,117 @@ test('真实 PostgreSQL 并发追加轨迹无丢失且 sequence 严格连续', {
     assert.deepEqual(rows.rows.map(({ sequence }) => sequence), Array.from({ length: 40 }, (_, index) => index + 1))
   } finally {
     await repository.removeResearch(id)
+    await pool.end()
+  }
+})
+
+test('真实 PostgreSQL Agent Session 事件 sequence 严格递增且 operationId 幂等', {
+  skip: !applicationUrl,
+  concurrency: false,
+}, async () => {
+  const pool = createPool(applicationUrl!)
+  const analyses = createAnalysisRepository(pool)
+  const events = createAgentEventRepository(pool)
+  const sessionId = 'agent-event-ledger-session'
+  try {
+    await analyses.removeResearch(sessionId)
+    const now = '2026-08-13T00:00:00.000Z'
+    const created = await events.createSession({
+      id: sessionId,
+      symbol: 'LEDGER',
+      status: 'queued',
+      operationId: 'create-session',
+      event: { type: 'status', status: 'queued', at: now },
+      createdAt: now,
+    })
+    assert.deepEqual({ analysisId: created.analysisId, created: created.created }, {
+      analysisId: sessionId, created: true,
+    })
+    const concurrent = await Promise.all(Array.from({ length: 40 }, (_, index) => (
+      events.append({
+        sessionId,
+        operationId: `trace-${index}`,
+        event: { type: 'trace', index },
+        createdAt: now,
+      })
+    )))
+    const first = await events.append({
+      sessionId,
+      operationId: 'complete-session',
+      event: { type: 'status', status: 'completed', at: now },
+      projection: { status: 'completed' },
+      createdAt: now,
+    })
+    const replay = await events.append({
+      sessionId,
+      operationId: 'complete-session',
+      event: { type: 'status', status: 'completed', at: now },
+      projection: { status: 'completed' },
+      createdAt: now,
+    })
+    const concurrentReplay = await Promise.all(Array.from({ length: 20 }, () => events.append({
+      sessionId,
+      operationId: 'one-concurrent-operation',
+      event: { type: 'trace', value: 'only-once' },
+      createdAt: now,
+    })))
+
+    assert.equal(new Set(concurrent.map(({ sequence }) => sequence)).size, 40)
+    assert.equal(replay.sequence, first.sequence)
+    assert.equal(replay.created, false)
+    assert.equal(new Set(concurrentReplay.map(({ sequence }) => sequence)).size, 1)
+    assert.equal(concurrentReplay.filter(({ created }) => created).length, 1)
+    assert.deepEqual((await events.list(sessionId, 0)).map(({ sequence }) => sequence),
+      Array.from({ length: 43 }, (_, index) => index + 1))
+    assert.equal((await events.getSession(sessionId))?.status, 'completed')
+    assert.equal((await analyses.get(sessionId))?.status, 'completed')
+    await assert.rejects(
+      pool.query(
+        'UPDATE agent_events SET operation_id = $1 WHERE session_id = $2 AND sequence = 1',
+        ['forbidden-update', sessionId],
+      ),
+      /permission denied/,
+    )
+  } finally {
+    await analyses.removeResearch(sessionId)
+    await pool.end()
+  }
+})
+
+test('真实 PostgreSQL 事件与 Session 读取投影在投影失败时一起回滚', {
+  skip: !applicationUrl,
+  concurrency: false,
+}, async () => {
+  const pool = createPool(applicationUrl!)
+  const analyses = createAnalysisRepository(pool)
+  const events = createAgentEventRepository(pool)
+  const sessionId = 'agent-event-rollback-session'
+  try {
+    await analyses.removeResearch(sessionId)
+    const now = '2026-08-13T00:00:00.000Z'
+    await events.createSession({
+      id: sessionId,
+      symbol: 'ROLLBACK-EVENT',
+      status: 'queued',
+      operationId: 'create-session',
+      event: { type: 'status', status: 'queued', at: now },
+      createdAt: now,
+    })
+
+    await assert.rejects(events.append({
+      sessionId,
+      operationId: 'invalid-projection',
+      event: { type: 'status', status: '', at: now },
+      projection: { status: '', facts: [{ id: 'rolled-back-fact', type: 'quote', value: 100 }] },
+      createdAt: now,
+    }))
+
+    assert.equal((await events.getSession(sessionId))?.latestSequence, 1)
+    assert.deepEqual(await events.list(sessionId, 1), [])
+    assert.equal((await analyses.get(sessionId))?.status, 'queued')
+    assert.deepEqual((await analyses.research(sessionId))?.facts, [])
+  } finally {
+    await analyses.removeResearch(sessionId)
     await pool.end()
   }
 })

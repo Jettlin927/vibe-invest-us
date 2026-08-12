@@ -1,5 +1,5 @@
 import type {
-  AnalysisRecord, AnalysisRepository, PortfolioRepository,
+  AgentEvent, AgentEventRepository, AgentSession, AnalysisRecord, AnalysisRepository, PortfolioRepository,
   ProductEquitySnapshot,
   ProductPosition,
 } from '@vibe-invest/product-dao'
@@ -12,6 +12,8 @@ export function createTestProductDatabase() {
   const facts = new Map<string, Record<string, unknown>>()
   const analysisFacts = new Map<string, Set<string>>()
   const traces = new Map<string, unknown[]>()
+  const agentSessions = new Map<string, AgentSession>()
+  const agentEvents = new Map<string, AgentEvent[]>()
 
   const portfolioRepository: PortfolioRepository = {
     async list() { return [...positions.values()].sort((left, right) => left.symbol.localeCompare(right.symbol)) },
@@ -137,12 +139,78 @@ export function createTestProductDatabase() {
     },
   }
 
+  const agentEventRepository: AgentEventRepository = {
+    async createSession(input) {
+      const existing = [...analyses.values()]
+        .find((record) => record.symbol === input.symbol && ['queued', 'running'].includes(record.status))
+      if (existing) {
+        const session = agentSessions.get(existing.id)
+        const event = agentEvents.get(existing.id)?.[0]
+        if (!session || !event) throw new Error('agent_session_not_found')
+        return { analysisId: existing.id, sequence: event.sequence, created: false, event }
+      }
+      const event = {
+        sessionId: input.id, sequence: 1, operationId: input.operationId,
+        payload: input.event, createdAt: input.createdAt,
+      }
+      agentSessions.set(input.id, {
+        id: input.id, analysisId: input.id, status: input.status,
+        latestSequence: 1, createdAt: input.createdAt, updatedAt: input.createdAt,
+      })
+      agentEvents.set(input.id, [event])
+      analyses.set(input.id, {
+        id: input.id, symbol: input.symbol, status: input.status,
+        createdAt: input.createdAt, updatedAt: input.createdAt,
+        snapshot: null, report: null, error: null, starred: false, note: '',
+      })
+      return { analysisId: input.id, sequence: 1, created: true, event }
+    },
+    async append(input) {
+      const events = agentEvents.get(input.sessionId) ?? []
+      const existing = events.find(({ operationId }) => operationId === input.operationId)
+      if (existing) return { sequence: existing.sequence, created: false, event: existing }
+      const session = agentSessions.get(input.sessionId)
+      if (!session) throw new Error('agent_session_not_found')
+      const event = {
+        sessionId: input.sessionId, sequence: session.latestSequence + 1,
+        operationId: input.operationId, payload: input.event, createdAt: input.createdAt,
+      }
+      agentEvents.set(input.sessionId, [...events, event])
+      agentSessions.set(input.sessionId, {
+        ...session, status: input.projection?.status ?? session.status,
+        latestSequence: event.sequence, updatedAt: input.createdAt,
+      })
+      if (input.projection) {
+        const analysisId = session.analysisId
+        for (const fact of input.projection.facts ?? []) {
+          facts.set(fact.id, fact)
+          const ids = analysisFacts.get(analysisId) ?? new Set()
+          ids.add(fact.id)
+          analysisFacts.set(analysisId, ids)
+        }
+        const record = analyses.get(analysisId)
+        if (record) analyses.set(analysisId, {
+          ...record, status: input.projection.status ?? record.status, updatedAt: input.createdAt,
+          report: input.projection.report ?? record.report,
+          snapshot: input.projection.snapshot ?? record.snapshot,
+          error: input.projection.error ?? record.error,
+        })
+      }
+      return { sequence: event.sequence, created: true, event }
+    },
+    async list(sessionId, afterSequence) {
+      return (agentEvents.get(sessionId) ?? []).filter(({ sequence }) => sequence > afterSequence)
+    },
+    async getSession(id) { return agentSessions.get(id) ?? null },
+  }
+
   return {
     productDatabase: {
-      checkSchema: async () => ({ status: 'ok' as const, version: 4 }),
+      checkSchema: async () => ({ status: 'ok' as const, version: 5 }),
       close: async () => {},
     },
     portfolioRepository,
     analysisRepository,
+    agentEventRepository,
   }
 }

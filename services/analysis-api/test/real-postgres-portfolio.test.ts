@@ -3,6 +3,7 @@ import test from 'node:test'
 
 import {
   checkSchema,
+  createAgentEventRepository,
   createAnalysisRepository,
   createPool,
   createPortfolioRepository,
@@ -22,6 +23,7 @@ function createPostgresApp(now?: () => Date) {
     },
     portfolioRepository: createPortfolioRepository(pool),
     analysisRepository: createAnalysisRepository(pool),
+    agentEventRepository: createAgentEventRepository(pool),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchMarketPrices: async (symbols) => Object.fromEntries(
       symbols.map((symbol) => [symbol, symbol === 'NVDA' ? 120 : 240]),
@@ -103,6 +105,7 @@ test('真实 PostgreSQL HTTP 持仓与研究闭环在重启后持久化', {
     },
     portfolioRepository: createPortfolioRepository(analysisPool),
     analysisRepository: createAnalysisRepository(analysisPool),
+    agentEventRepository: createAgentEventRepository(analysisPool),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({
       symbol, gaps: [], facts: [{
