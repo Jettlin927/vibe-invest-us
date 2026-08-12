@@ -167,6 +167,7 @@ test('Pi Runtime 使用持久 executionId 派生工具 operationId 且真实 Pos
   const analyses = createAnalysisRepository(pool)
   const callId = 'replayed-provider-call'
   const reportCallId = 'stable-report-call'
+  const cancelledAfterReportCallId = 'cancelled-after-report-call'
   const report = {
     title: '稳定 operationId 测试', marketState: '未知', trend: '未知', drivers: [],
     supportingEvidence: [], contraryEvidence: [], keyJudgments: [], scenarios: [],
@@ -178,10 +179,10 @@ test('Pi Runtime 使用持久 executionId 派生工具 operationId 且真实 Pos
       fauxToolCall('fetch_financial_context', { symbol: 'PGOPID' }, { id: callId }),
       fauxToolCall('fetch_financial_context', { symbol: 'PGOPID' }, { id: callId }),
     ], { stopReason: 'toolUse' }),
-    fauxAssistantMessage(
+    fauxAssistantMessage([
       fauxToolCall('submit_analysis_report', report, { id: reportCallId }),
-      { stopReason: 'toolUse' },
-    ),
+      fauxToolCall('fetch_financial_context', { symbol: 'PGOPID' }, { id: cancelledAfterReportCallId }),
+    ], { stopReason: 'toolUse' }),
   ] })
   const app = buildApp({
     productDatabase: { checkSchema: () => checkSchema(pool), close: () => pool.end() },
@@ -205,9 +206,113 @@ test('Pi Runtime 使用持久 executionId 派生工具 operationId 且真实 Pos
     const toolPrefix = `execution:${session.executionId}:tool:${callId}`
     assert.equal(ledger.filter(({ operationId }) => operationId === `${toolPrefix}:call`).length, 1)
     assert.equal(ledger.filter(({ operationId }) => operationId === `${toolPrefix}:result`).length, 1)
-    assert.equal(ledger.filter(({ operationId }) => (
-      operationId === `execution:${session.executionId}:tool:${reportCallId}:report`
-    )).length, 1)
+    const reportPrefix = `execution:${session.executionId}:tool:${reportCallId}`
+    const cancelledPrefix = `execution:${session.executionId}:tool:${cancelledAfterReportCallId}`
+    const sealedBatch = ledger.filter(({ operationId }) => (
+      operationId === `${reportPrefix}:call`
+      || operationId === `${cancelledPrefix}:call`
+      || operationId === `${reportPrefix}:result`
+      || operationId === `${cancelledPrefix}:result`
+      || operationId === `${reportPrefix}:report`
+    ))
+    assert.deepEqual(sealedBatch.map(({ operationId }) => operationId), [
+      `${reportPrefix}:call`,
+      `${cancelledPrefix}:call`,
+      `${reportPrefix}:result`,
+      `${cancelledPrefix}:result`,
+      `${reportPrefix}:report`,
+    ])
+    assert.deepEqual(sealedBatch.slice(0, 4).map(({ payload }) => payload.type), [
+      'tool_call', 'tool_call', 'tool_result', 'tool_result',
+    ])
+    assert.equal(sealedBatch[2]?.payload.isError, false)
+    assert.equal(sealedBatch[3]?.payload.isError, true)
+    assert.deepEqual(sealedBatch[3]?.payload, {
+      type: 'tool_result', name: 'fetch_financial_context',
+      result: { error: 'cancelled_after_report_submission', cancelled: true, facts: [] },
+      isError: true,
+      operationId: `${cancelledPrefix}:result`,
+    })
+  } finally {
+    await app.close()
+  }
+})
+
+test('专项下一轮 provider 启动前已在真实 PostgreSQL 封存上一批工具事件', {
+  skip: !databaseUrl,
+  concurrency: false,
+}, async () => {
+  const pool = createPool(databaseUrl!)
+  const events = createAgentEventRepository(pool)
+  const analyses = createAnalysisRepository(pool)
+  const specialistEntryId = 'pg-specialist-entry'
+  const newsCallId = 'pg-specialist-news'
+  const indicatorCallId = 'pg-specialist-indicator'
+  const reportCallId = 'pg-specialist-report'
+  let createdSessionId: string | undefined
+  let providerObservedSealedLedger = false
+  const report = {
+    title: '专项批次封存测试', marketState: '未知', trend: '未知', drivers: [],
+    supportingEvidence: [], contraryEvidence: [], keyJudgments: [], scenarios: [],
+    invalidationConditions: [], valuation: null, personalImpact: null,
+    conditionalSuggestion: null, limitations: ['测试上下文为空'],
+  }
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(
+      fauxToolCall('analyze_financials', {}, { id: specialistEntryId }),
+      { stopReason: 'toolUse' },
+    ),
+    fauxAssistantMessage([
+      fauxToolCall('search_news_by_keyword', {}, { id: newsCallId }),
+      fauxToolCall('get_technical_indicators', {}, { id: indicatorCallId }),
+    ], { stopReason: 'toolUse' }),
+    async (context) => {
+      assert.ok(createdSessionId)
+      const session = await events.getSession(createdSessionId)
+      assert.ok(session)
+      const prefix = `execution:${session.executionId}:specialist-tool`
+      const sealed = (await events.list(createdSessionId, 0)).filter(({ operationId }) => (
+        operationId.startsWith(`${prefix}:${newsCallId}:`)
+        || operationId.startsWith(`${prefix}:${indicatorCallId}:`)
+      ))
+      assert.deepEqual(sealed.map(({ operationId }) => operationId), [
+        `${prefix}:${newsCallId}:call`,
+        `${prefix}:${indicatorCallId}:call`,
+        `${prefix}:${newsCallId}:result`,
+        `${prefix}:${indicatorCallId}:result`,
+      ])
+      assert.deepEqual(context.messages.filter(({ role }) => role === 'toolResult')
+        .map((message) => message.role === 'toolResult' ? message.toolCallId : ''), [
+        newsCallId, indicatorCallId,
+      ])
+      providerObservedSealedLedger = true
+      return fauxAssistantMessage('专项收口完成')
+    },
+    fauxAssistantMessage(
+      fauxToolCall('submit_analysis_report', report, { id: reportCallId }),
+      { stopReason: 'toolUse' },
+    ),
+  ] })
+  const app = buildApp({
+    productDatabase: { checkSchema: () => checkSchema(pool), close: () => pool.end() },
+    portfolioRepository: createPortfolioRepository(pool),
+    analysisRepository: analyses,
+    agentEventRepository: events,
+    runtimeSettingsRepository: createRuntimeSettingsRepository(pool),
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, gaps: [], facts: [], financials: {} }),
+    searchNews: async () => ({ facts: [] }),
+    fetchTechnicalIndicators: async () => ({ facts: [] }),
+    model,
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'PGSEAL' },
+  })).json() as { analysisId: string; sessionId: string }
+  createdSessionId = created.sessionId
+  try {
+    await waitForAnalysisStatus(app, created.analysisId, 'partial')
+    assert.equal(providerObservedSealedLedger, true)
   } finally {
     await app.close()
   }

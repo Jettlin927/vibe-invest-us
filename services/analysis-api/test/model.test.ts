@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { fauxAssistantMessage, fauxText, fauxToolCall } from '@earendil-works/pi-ai'
+import { fauxAssistantMessage, fauxText, fauxToolCall, type Context } from '@earendil-works/pi-ai'
 import { defaultRuntimeSettings } from '@vibe-invest/contracts'
 
 import { createPiModel } from '../src/model.js'
@@ -36,6 +36,17 @@ const validReport = {
 
 function runtimeSettings(overrides: Partial<typeof defaultRuntimeSettings> = {}) {
   return { ...defaultRuntimeSettings, ...overrides }
+}
+
+function toolTurnOperations(
+  events: Array<{ type: string; entry?: { type?: string; operationId?: string } }>,
+  pattern: RegExp,
+) {
+  return events.flatMap((event) => event.type === 'trace'
+    && (event.entry?.type === 'tool_call' || event.entry?.type === 'tool_result')
+    && event.entry.operationId && pattern.test(event.entry.operationId)
+    ? [event.entry.operationId]
+    : [])
 }
 
 test('主分析模型和财报专家使用不同的显式工具集', () => {
@@ -238,12 +249,97 @@ test('主 Agent policy abort 为同批全部工具按原顺序补齐 toolResult 
     .filter((event) => event.type === 'trace' && /main-(first|second)/.test(event.entry.operationId))
     .map((event) => event.type === 'trace' ? event.entry.operationId : ''), [
       'execution:main-policy:tool:main-first:call',
-      'execution:main-policy:tool:main-first:result',
       'execution:main-policy:tool:main-second:call',
+      'execution:main-policy:tool:main-first:result',
       'execution:main-policy:tool:main-second:result',
     ])
   assert.ok(events.some((event) => event.type === 'completed'))
 })
+
+test('主 Agent 收口阶段拒绝整批非 submit 工具并向下一轮提供完整 toolResult', async () => {
+  const rejectedFirst = fauxToolCall('fetch_financial_context', {}, { id: 'closing-first' })
+  const rejectedSecond = fauxToolCall('analyze_financials', {}, { id: 'closing-second' })
+  const observedResults: string[][] = []
+  let executed = 0
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall('fetch_financial_context', {}, { id: 'consume-round' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage([rejectedFirst, rejectedSecond], { stopReason: 'toolUse' }),
+    (context) => {
+      observedResults.push(context.messages.filter(({ role }) => role === 'toolResult')
+        .map((message) => message.role === 'toolResult' ? message.toolCallId : ''))
+      return fauxAssistantMessage(fauxToolCall('submit_analysis_report', validReport, { id: 'closing-submit' }), { stopReason: 'toolUse' })
+    },
+  ] })
+  const events = []
+  for await (const event of model.analyze({
+    executionId: 'closing-main', runtimeSettings: runtimeSettings({ mainAgentToolRounds: 1 }),
+    symbol: 'NVDA', systemPrompt: 'system', userPrompt: 'user', knownFacts: facts,
+    fetchFinancialContext: async () => { executed += 1; return { facts } },
+  })) events.push(event)
+
+  assert.equal(executed, 1)
+  assert.deepEqual(observedResults, [['consume-round', 'closing-first', 'closing-second']])
+  assert.deepEqual(toolTurnOperations(events, /closing-(first|second)/), [
+    'execution:closing-main:tool:closing-first:call',
+    'execution:closing-main:tool:closing-second:call',
+    'execution:closing-main:tool:closing-first:result',
+    'execution:closing-main:tool:closing-second:result',
+  ])
+  assert.ok(events.filter((event) => event.type === 'trace' && event.entry.type === 'tool_result'
+    && /closing-(first|second)/.test(event.entry.operationId))
+    .every((event) => event.type === 'trace' && event.entry.isError))
+  assert.ok(events.some((event) => event.type === 'completed'))
+})
+
+for (const [position, calls, expectedExecutions] of [
+  ['首位', [
+    fauxToolCall('submit_analysis_report', validReport, { id: 'submit-first' }),
+    fauxToolCall('fetch_financial_context', {}, { id: 'after-first' }),
+  ], 0],
+  ['中间', [
+    fauxToolCall('fetch_financial_context', {}, { id: 'before-middle' }),
+    fauxToolCall('submit_analysis_report', validReport, { id: 'submit-middle' }),
+    fauxToolCall('fetch_financial_context', {}, { id: 'after-middle' }),
+  ], 1],
+  ['末位', [
+    fauxToolCall('fetch_financial_context', {}, { id: 'before-last' }),
+    fauxToolCall('submit_analysis_report', validReport, { id: 'submit-last' }),
+  ], 1],
+] as const) {
+  test(`submit 位于批次${position}时先封存全部结果且不执行其后工具`, async () => {
+    let executions = 0
+    const finalContexts: Context[] = []
+    const model = createPiModel({ fauxResponses: [
+      (context) => {
+        finalContexts.push(context)
+        return fauxAssistantMessage([...calls], { stopReason: 'toolUse' })
+      },
+    ] })
+    const events = []
+    for await (const event of model.analyze({
+      executionId: `submit-${position}`, runtimeSettings: runtimeSettings(),
+      symbol: 'NVDA', systemPrompt: 'system', userPrompt: 'user', knownFacts: facts,
+      fetchFinancialContext: async () => { executions += 1; return { facts } },
+    })) events.push(event)
+
+    assert.equal(executions, expectedExecutions)
+    const ids = calls.map(({ id }) => id)
+    assert.deepEqual(finalContexts[0]?.messages.filter(({ role }) => role === 'toolResult')
+      .map((message) => message.role === 'toolResult' ? message.toolCallId : ''), ids)
+    assert.deepEqual(toolTurnOperations(events, new RegExp(ids.join('|'))), [
+      ...ids.map((id) => `execution:submit-${position}:tool:${id}:call`),
+      ...ids.map((id) => `execution:submit-${position}:tool:${id}:result`),
+    ])
+    const completedIndex = events.findIndex(({ type }) => type === 'completed')
+    const finalResultIndex = events.findLastIndex((event) => event.type === 'trace'
+      && event.entry.type === 'tool_result')
+    assert.ok(completedIndex > finalResultIndex)
+    const afterSubmit = ids.slice(ids.findIndex((id) => id.startsWith('submit-')) + 1)
+    assert.ok(events.filter((event) => event.type === 'trace' && event.entry.type === 'tool_result'
+      && afterSubmit.some((id) => event.entry.operationId.includes(`:${id}:`)))
+      .every((event) => event.type === 'trace' && event.entry.isError))
+  })
+}
 
 test('专项 Agent policy abort 为同批全部工具按原顺序补齐 toolResult 后再返回主 Agent', async () => {
   let now = 0
@@ -276,10 +372,52 @@ test('专项 Agent policy abort 为同批全部工具按原顺序补齐 toolResu
     && event.entry.operationId.includes('specialist-tool'))
     .map((event) => event.type === 'trace' ? event.entry.operationId : ''), [
       'execution:specialist-policy:specialist-tool:specialist-first:call',
-      'execution:specialist-policy:specialist-tool:specialist-first:result',
       'execution:specialist-policy:specialist-tool:specialist-second:call',
+      'execution:specialist-policy:specialist-tool:specialist-first:result',
       'execution:specialist-policy:specialist-tool:specialist-second:result',
     ])
+  assert.ok(events.some((event) => event.type === 'completed'))
+})
+
+test('专项 Agent 轮次到限后拒绝整批工具并向收口轮提供完整 toolResult', async () => {
+  const observedResults: string[][] = []
+  let searches = 0
+  let indicators = 0
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall('analyze_financials', {}, { id: 'specialist-entry' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('search_news_by_keyword', {}, { id: 'specialist-consume' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage([
+      fauxToolCall('search_news_by_keyword', {}, { id: 'specialist-closing-first' }),
+      fauxToolCall('get_technical_indicators', {}, { id: 'specialist-closing-second' }),
+    ], { stopReason: 'toolUse' }),
+    (context) => {
+      observedResults.push(context.messages.filter(({ role }) => role === 'toolResult')
+        .map((message) => message.role === 'toolResult' ? message.toolCallId : ''))
+      return fauxAssistantMessage(fauxText('专项完成收口'))
+    },
+    fauxAssistantMessage(fauxToolCall('submit_analysis_report', validReport), { stopReason: 'toolUse' }),
+  ] })
+  const events = []
+  for await (const event of model.analyze({
+    executionId: 'specialist-closing',
+    runtimeSettings: runtimeSettings({ specialistAgentToolRounds: 1 }),
+    symbol: 'NVDA', systemPrompt: 'system', userPrompt: 'user', knownFacts: facts,
+    fetchFinancialContext: async () => ({ facts, financials: {} }),
+    searchNews: async () => { searches += 1; return { facts: [] } },
+    fetchTechnicalIndicators: async () => { indicators += 1; return { facts: [] } },
+  })) events.push(event)
+
+  assert.equal(searches, 1)
+  assert.equal(indicators, 0)
+  assert.deepEqual(observedResults, [[
+    'specialist-consume', 'specialist-closing-first', 'specialist-closing-second',
+  ]])
+  assert.deepEqual(toolTurnOperations(events, /specialist-closing-(first|second)/), [
+    'execution:specialist-closing:specialist-tool:specialist-closing-first:call',
+    'execution:specialist-closing:specialist-tool:specialist-closing-second:call',
+    'execution:specialist-closing:specialist-tool:specialist-closing-first:result',
+    'execution:specialist-closing:specialist-tool:specialist-closing-second:result',
+  ])
   assert.ok(events.some((event) => event.type === 'completed'))
 })
 
@@ -314,11 +452,46 @@ test('专项 Agent 在工具并发槽等待期 abort 仍为同批全部调用补
     && event.entry.operationId.includes('specialist-tool'))
     .map((event) => event.type === 'trace' ? event.entry.operationId : ''), [
     'execution:gate-wait:specialist-tool:waiting-first:call',
-    'execution:gate-wait:specialist-tool:waiting-first:result',
     'execution:gate-wait:specialist-tool:waiting-second:call',
+    'execution:gate-wait:specialist-tool:waiting-first:result',
     'execution:gate-wait:specialist-tool:waiting-second:result',
   ])
   assert.ok(events.some((event) => event.type === 'cancelled'))
+})
+
+test('专项 abort result 的消费者提前关闭时仍释放已取得的工具槽', async () => {
+  const controller = new AbortController()
+  let acquired = 0
+  let released = 0
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall('analyze_financials', {}, { id: 'release-entry' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('search_news_by_keyword', {}, { id: 'release-tool' }), { stopReason: 'toolUse' }),
+  ] })
+  const iterator = model.analyze({
+    executionId: 'specialist-release', runtimeSettings: runtimeSettings(), signal: controller.signal,
+    symbol: 'NVDA', systemPrompt: 'system', userPrompt: 'user', knownFacts: facts,
+    fetchFinancialContext: async () => ({ facts, financials: {} }),
+    acquireToolSlot: async () => {
+      acquired += 1
+      return () => { released += 1 }
+    },
+    searchNews: async () => {
+      controller.abort(new Error('cancelled'))
+      throw controller.signal.reason
+    },
+  })
+  while (true) {
+    const step = await iterator.next()
+    assert.equal(step.done, false)
+    if (!step.done && step.value.type === 'trace'
+      && step.value.entry.type === 'tool_result'
+      && step.value.entry.operationId.includes('specialist-tool:release-tool')) break
+  }
+
+  assert.equal(acquired, 2)
+  assert.equal(released, 1)
+  await iterator.return(undefined)
+  assert.equal(released, 2)
 })
 
 test('Pi Model 不允许工具越过当前分析标的', async () => {

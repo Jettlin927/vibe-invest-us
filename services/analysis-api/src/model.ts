@@ -276,10 +276,6 @@ export function createPiModel(options: ModelOptions = {}) {
           throw new Error(message.errorMessage || 'model_error')
         }
         const calls = message.content.filter((block) => block.type === 'toolCall')
-        if (closing && !calls.some(({ name }) => name === 'submit_analysis_report')) {
-          runtimeWork.stop()
-          continue
-        }
         if (!calls.length) {
           context.messages.push({
             role: 'user',
@@ -292,30 +288,55 @@ export function createPiModel(options: ModelOptions = {}) {
         if (!closing) {
           if (toolRounds >= runtimeSettings.mainAgentToolRounds) {
             closing = true
-            runtimeWork.stop()
-            continue
+          } else {
+            toolRounds += 1
           }
-          toolRounds += 1
         }
 
-        for (const call of calls) {
-          if (closing && call.name !== 'submit_analysis_report') continue
-          const toolInput = validateToolCall([...analysisModelTools], call)
-          const toolOperationId = `execution:${input.executionId}:tool:${call.id}`
+        const preparedCalls = calls.map((call) => ({
+          call,
+          toolInput: validateToolCall([...analysisModelTools], call),
+          toolOperationId: `execution:${input.executionId}:tool:${call.id}`,
+        }))
+        for (const { call, toolInput, toolOperationId } of preparedCalls) {
           yield { type: 'trace', entry: {
             type: 'tool_call', name: call.name, input: toolInput,
             operationId: `${toolOperationId}:call`,
           } }
+        }
+        let completedReport: AnalysisReport | undefined
+        let completedOperationId: string | undefined
+        for (const { call, toolInput, toolOperationId } of preparedCalls) {
+          if (completedReport) {
+            const result = { error: 'cancelled_after_report_submission', cancelled: true, facts: [] as Fact[] }
+            context.messages.push(toolResultMessage(call, result, true))
+            yield { type: 'trace', entry: {
+              type: 'tool_result', name: call.name, result, isError: true,
+              operationId: `${toolOperationId}:result`,
+            } }
+            continue
+          }
+          if (closing && call.name !== 'submit_analysis_report') {
+            const result = { error: 'tool_rejected_during_closure', rejected: true, facts: [] as Fact[] }
+            context.messages.push(toolResultMessage(call, result, true))
+            yield { type: 'trace', entry: {
+              type: 'tool_result', name: call.name, result, isError: true,
+              operationId: `${toolOperationId}:result`,
+            } }
+            continue
+          }
           if (call.name === 'submit_analysis_report') {
             const report = normalizeReport(toolInput)
             try {
               validateEvidence(report, knownFactIds)
-              yield {
-                type: 'completed', report, usage: message.usage, stopReason: message.stopReason,
-                operationId: `${toolOperationId}:report`,
-              }
-              runtimeWork.stop()
-              return
+              const result = { submitted: true }
+              context.messages.push(toolResultMessage(call, result, false))
+              yield { type: 'trace', entry: {
+                type: 'tool_result', name: call.name, result, isError: false,
+                operationId: `${toolOperationId}:result`,
+              } }
+              completedReport = report
+              completedOperationId = `${toolOperationId}:report`
             } catch (error) {
               const result = {
                 error: error instanceof Error ? error.message : String(error),
@@ -329,8 +350,8 @@ export function createPiModel(options: ModelOptions = {}) {
                 type: 'tool_result', name: call.name, result, isError: true,
                 operationId: `${toolOperationId}:result`,
               } }
-              continue
             }
+            continue
           }
           if (call.name !== 'fetch_financial_context' && call.name !== 'analyze_financials') {
             throw new Error(`tool_not_allowed:${call.name}`)
@@ -360,11 +381,25 @@ export function createPiModel(options: ModelOptions = {}) {
                 }],
                 tools: [...financialSpecialistTools],
               }
-              const specialist = await runFinancialSpecialist(
+              const specialistIterator = runFinancialSpecialist(
                 models, selectedModel, specialistContext, input, options,
                 runtimeSettings, executionSignal, activeBudget, modelGate, toolGate,
               )
-              for (const entry of specialist.traces) yield { type: 'trace', entry }
+              let specialist: Awaited<ReturnType<typeof specialistIterator.next>>['value']
+              let specialistCompleted = false
+              try {
+                let specialistStep = await specialistIterator.next()
+                while (!specialistStep.done) {
+                  yield { type: 'trace', entry: specialistStep.value }
+                  specialistStep = await specialistIterator.next()
+                }
+                specialist = specialistStep.value
+                specialistCompleted = true
+              } finally {
+                if (!specialistCompleted) {
+                  await specialistIterator.return({ analysis: '专项研究被上层终止。', facts: [] })
+                }
+              }
               if (specialist.policyError === 'cancelled') {
                 yield { type: 'trace', entry: {
                   type: 'cancelled', operationId: `${toolOperationId}:specialist-cancelled-trace`,
@@ -386,13 +421,6 @@ export function createPiModel(options: ModelOptions = {}) {
             if (executionSignal.aborted || activeBudget.exhausted()) {
               const pendingCalls = calls.slice(calls.indexOf(call))
               for (const pending of pendingCalls) {
-                if (pending !== call) {
-                  yield { type: 'trace', entry: {
-                    type: 'tool_call', name: pending.name,
-                    input: validateToolCall([...analysisModelTools], pending),
-                    operationId: `execution:${input.executionId}:tool:${pending.id}:call`,
-                  } }
-                }
                 const cancelledResult = policyToolResult(input, executionSignal, activeBudget)
                 context.messages.push(toolResultMessage(pending, cancelledResult, true))
                 yield { type: 'trace', entry: {
@@ -430,13 +458,21 @@ export function createPiModel(options: ModelOptions = {}) {
           options.log?.({ type: 'tool_result', toolName: call.name, isError })
         }
         runtimeWork.stop()
+        if (completedReport) {
+          yield {
+            type: 'completed', report: completedReport,
+            usage: message.usage, stopReason: message.stopReason,
+            operationId: completedOperationId,
+          }
+          return
+        }
         if (!closing && toolRounds >= runtimeSettings.mainAgentToolRounds) closing = true
       }
     },
   }
 }
 
-async function runFinancialSpecialist(
+async function* runFinancialSpecialist(
   models: ReturnType<typeof createModels>,
   selectedModel: Model<Api>,
   context: Context,
@@ -447,15 +483,18 @@ async function runFinancialSpecialist(
   activeBudget: ReturnType<typeof createActiveBudget>,
   modelGate: ReturnType<typeof createConcurrencyGate>,
   toolGate: ReturnType<typeof createConcurrencyGate>,
-) {
+): AsyncGenerator<TraceEntry, {
+  analysis: string
+  facts: Fact[]
+  policyError?: 'cancelled' | 'execution_runtime_timeout'
+}> {
   const facts: Fact[] = []
-  const traces: TraceEntry[] = []
   let toolRounds = 0
   let closing = false
   let closingAttempts = 0
   while (true) {
     if (activeBudget.exhausted()) closing = true
-    if (closing && closingAttempts >= 2) return { analysis: '专项研究预算已到限，未形成额外结论。', facts, traces }
+    if (closing && closingAttempts >= 2) return { analysis: '专项研究预算已到限，未形成额外结论。', facts }
     if (closing) {
       closingAttempts += 1
       context.tools = []
@@ -502,25 +541,37 @@ async function runFinancialSpecialist(
     const calls = message.content.filter((block) => block.type === 'toolCall')
     if (!calls.length) {
       runtimeWork.stop()
-      return { analysis: contentText(message.content), facts, traces }
+      return { analysis: contentText(message.content), facts }
     }
-    if (closing) {
-      runtimeWork.stop()
-      continue
+    if (!closing) {
+      if (toolRounds >= runtimeSettings.specialistAgentToolRounds) {
+        closing = true
+        context.tools = []
+      } else {
+        toolRounds += 1
+      }
     }
-    if (toolRounds >= runtimeSettings.specialistAgentToolRounds) {
-      closing = true
-      runtimeWork.stop()
-      continue
-    }
-    toolRounds += 1
-    for (const call of calls) {
-      const toolInput = validateToolCall([...financialSpecialistTools], call)
-      const toolOperationId = `execution:${input.executionId}:specialist-tool:${call.id}`
-      traces.push({
+    const preparedCalls = calls.map((call) => ({
+      call,
+      toolInput: validateToolCall([...financialSpecialistTools], call),
+      toolOperationId: `execution:${input.executionId}:specialist-tool:${call.id}`,
+    }))
+    for (const { call, toolInput, toolOperationId } of preparedCalls) {
+      yield {
         type: 'tool_call', name: call.name, input: toolInput,
         operationId: `${toolOperationId}:call`,
-      })
+      }
+    }
+    for (const { call, toolInput, toolOperationId } of preparedCalls) {
+      if (closing) {
+        const result = { error: 'tool_rejected_during_closure', rejected: true, facts: [] as Fact[] }
+        context.messages.push(toolResultMessage(call, result, true))
+        yield {
+          type: 'tool_result', name: call.name, result, isError: true,
+          operationId: `${toolOperationId}:result`,
+        }
+        continue
+      }
       let result: { facts: Fact[]; [key: string]: unknown }
       let isError = false
       runtimeWork.stop()
@@ -553,29 +604,22 @@ async function runFinancialSpecialist(
       } catch (error) {
         if (executionSignal.aborted || activeTool?.exhausted() || activeBudget.exhausted()) {
           for (const pending of calls.slice(calls.indexOf(call))) {
-            if (pending !== call) {
-              traces.push({
-                type: 'tool_call', name: pending.name,
-                input: validateToolCall([...financialSpecialistTools], pending),
-                operationId: `execution:${input.executionId}:specialist-tool:${pending.id}:call`,
-              })
-            }
             const cancelledResult = policyToolResult(input, executionSignal, activeBudget)
             context.messages.push(toolResultMessage(pending, cancelledResult, true))
-            traces.push({
+            yield {
               type: 'tool_result', name: pending.name, result: cancelledResult, isError: true,
               operationId: `execution:${input.executionId}:specialist-tool:${pending.id}:result`,
-            })
+            }
           }
           if (input.signal?.aborted) {
             return {
-              analysis: '专项研究已取消。', facts, traces,
+              analysis: '专项研究已取消。', facts,
               policyError: 'cancelled' as const,
             }
           }
           if (executionSignal.aborted && !activeBudget.exhausted()) {
             return {
-              analysis: '专项研究超过 execution wall。', facts, traces,
+              analysis: '专项研究超过 execution wall。', facts,
               policyError: 'execution_runtime_timeout' as const,
             }
           }
@@ -591,10 +635,10 @@ async function runFinancialSpecialist(
       }
       runtimeWork = activeBudget.start(executionSignal)
       context.messages.push(toolResultMessage(call, result, isError))
-      traces.push({
+      yield {
         type: 'tool_result', name: call.name, result, isError,
         operationId: `${toolOperationId}:result`,
-      })
+      }
     }
     runtimeWork.stop()
     if (toolRounds >= runtimeSettings.specialistAgentToolRounds) closing = true
