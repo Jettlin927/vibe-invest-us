@@ -158,6 +158,97 @@ test('修改研究并发后立即启动尚未运行的排队 execution', async (
   await app.close()
 })
 
+test('即时 model/tool concurrency 对新旧 execution 使用同一全局上限', async () => {
+  const database = createTestProductDatabase()
+  await database.runtimeSettingsRepository.save({
+    analysisConcurrency: 4, modelConcurrency: 2, toolConcurrency: 2,
+  }, new Date().toISOString())
+  let activeModels = 0
+  let maxModels = 0
+  let maxNewModelGlobalActive = 0
+  let activeTools = 0
+  let maxTools = 0
+  let maxNewToolGlobalActive = 0
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol, signal) => {
+      activeTools += 1
+      maxTools = Math.max(maxTools, activeTools)
+      if (symbol.startsWith('NEW')) maxNewToolGlobalActive = Math.max(maxNewToolGlobalActive, activeTools)
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(resolve, 20)
+        signal.addEventListener('abort', () => { clearTimeout(timer); reject(signal.reason) }, { once: true })
+      })
+      activeTools -= 1
+      return { symbol, facts: [fact], gaps: [], indicators: {} }
+    },
+    model: {
+      async *analyze(input) {
+        const release = await input.acquireModelSlot(input.signal)
+        activeModels += 1
+        maxModels = Math.max(maxModels, activeModels)
+        if (String(input.symbol).startsWith('NEW')) {
+          maxNewModelGlobalActive = Math.max(maxNewModelGlobalActive, activeModels)
+        }
+        await new Promise((resolve) => setTimeout(resolve, 20))
+        activeModels -= 1
+        release()
+        yield { type: 'completed' as const, report }
+      },
+    },
+  })
+  await app.ready()
+  const oldExecutions = await Promise.all(['OLD1', 'OLD2'].map((symbol) => app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol },
+  })))
+  await app.inject({
+    method: 'PUT', url: '/api/settings', payload: { modelConcurrency: 1, toolConcurrency: 1 },
+  })
+  const newExecutions = await Promise.all(['NEW1', 'NEW2'].map((symbol) => app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol },
+  })))
+  await Promise.all([...oldExecutions, ...newExecutions].map((response) => (
+    waitForStatus(app as any, response.json().analysisId, 'completed')
+  )))
+  assert.ok(maxModels <= 2)
+  assert.ok(maxTools <= 2)
+  assert.equal(maxNewModelGlobalActive, 1)
+  assert.equal(maxNewToolGlobalActive, 1)
+  await app.close()
+})
+
+test('初始工具 active policy 到期后 fail closed 且不再进入模型', async () => {
+  const database = createTestProductDatabase()
+  await database.runtimeSettingsRepository.save({ researchActiveMinutes: 1 }, new Date().toISOString())
+  let modelCalls = 0
+  let toolCalls = 0
+  const app = buildProductionApp({
+    ...database,
+    runtimeMinuteMs: 5,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (_symbol, signal) => {
+      toolCalls += 1
+      await new Promise((resolve) => setTimeout(resolve, 8))
+      signal.throwIfAborted()
+      return { symbol: 'ABORT', facts: [fact], gaps: [], indicators: {} }
+    },
+    model: {
+      async *analyze() {
+        modelCalls += 1
+        yield { type: 'completed' as const, report }
+      },
+    },
+  })
+  await app.ready()
+  const created = (await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'ABORT' } })).json()
+  const failed = await waitForStatus(app as any, created.analysisId, 'failed')
+  assert.equal(failed.error, 'research_active_timeout')
+  assert.equal(toolCalls, 1)
+  assert.equal(modelCalls, 0)
+  await app.close()
+})
+
 test('settings snapshot 冻结失败时请求失败且不创建没有冻结契约的 execution', async () => {
   const database = createTestProductDatabase()
   database.agentEventRepository.createResearch = async () => { throw new Error('snapshot_failed') }
@@ -215,7 +306,7 @@ test('真实 Pi execution 冻结后修改 current 不改变运行轮次', async 
         fauxAssistantMessage(fauxToolCall('fetch_financial_context', {}), { stopReason: 'toolUse' }),
         fauxAssistantMessage(fauxToolCall('submit_analysis_report', report), { stopReason: 'toolUse' }),
       ],
-      fauxTokensPerSecond: 100,
+      fauxTokensPerSecond: 1000,
     }),
   })
   await app.ready()
@@ -226,8 +317,8 @@ test('真实 Pi execution 冻结后修改 current 不改变运行轮次', async 
     mainAgentToolRounds: 20,
   }, '2026-08-13T03:03:00.000Z')
 
-  const failed = await waitForStatus(app as any, created.analysisId, 'failed')
-  assert.equal(failed.error, 'analysis_turn_limit')
+  const completed = await waitForStatus(app as any, created.analysisId, 'completed')
+  assert.equal(completed.report.title, report.title)
   assert.equal((await database.runtimeSettingsRepository.current()).values.mainAgentToolRounds, 20)
   assert.equal(
     (await database.runtimeSettingsRepository.getExecutionSnapshot(created.executionId))?.values.mainAgentToolRounds,
@@ -259,6 +350,42 @@ test('实例并发上限使额外任务排队', async () => {
   assert.equal(secondStatus.status, 'queued')
   await waitForStatus(app, first.analysisId, 'completed')
   await waitForStatus(app, second.analysisId, 'completed')
+  await app.close()
+})
+
+test('execution wall 从创建时计时且排队超限后不启动任何外部调用', async () => {
+  const database = createTestProductDatabase()
+  await database.runtimeSettingsRepository.save({
+    analysisConcurrency: 1, executionWallClockMinutes: 1,
+  }, new Date().toISOString())
+  let providerCalls = 0
+  let toolCalls = 0
+  const app = buildProductionApp({
+    ...database,
+    runtimeMinuteMs: 10,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => {
+      toolCalls += 1
+      return { symbol, facts: [fact], gaps: [], indicators: {} }
+    },
+    model: {
+      async *analyze() {
+        providerCalls += 1
+        await new Promise((resolve) => setTimeout(resolve, 25))
+        yield { type: 'completed' as const, report }
+      },
+    },
+  })
+  await app.ready()
+  const first = (await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'WALL1' } })).json()
+  const queued = (await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'WALL2' } })).json()
+
+  const firstExpired = await waitForStatus(app as any, first.analysisId, 'failed')
+  assert.equal(firstExpired.error, 'execution_runtime_timeout')
+  const expired = await waitForStatus(app as any, queued.analysisId, 'failed')
+  assert.equal(expired.error, 'execution_runtime_timeout')
+  assert.equal(providerCalls, 1)
+  assert.equal(toolCalls, 1)
   await app.close()
 })
 

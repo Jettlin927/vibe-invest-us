@@ -33,6 +33,7 @@ type AppDependencies = {
   model?: { analyze(input: Record<string, unknown>): AsyncIterable<ModelEvent> }
   modelConfigured?: boolean
   now?: () => Date
+  runtimeMinuteMs?: number
   migrationVerificationToken?: string
 }
 
@@ -51,6 +52,7 @@ export function buildApp(dependencies: AppDependencies) {
         listPortfolioSymbols: async () => (await portfolio.list()).map((position) => position.symbol),
         model: dependencies.model,
         getPortfolioContext: (symbol, marketPrices) => portfolio.context(symbol, marketPrices),
+        runtimeMinuteMs: dependencies.runtimeMinuteMs,
       })
     : null
 
@@ -147,7 +149,7 @@ export function buildApp(dependencies: AppDependencies) {
     const revision = await dependencies.runtimeSettingsRepository.save(
       update, (dependencies.now?.() ?? new Date()).toISOString(),
     )
-    analysis?.updateConcurrency(revision.values.analysisConcurrency)
+    analysis?.updateRuntimePolicy(revision.values)
     return revision
   })
 
@@ -155,7 +157,7 @@ export function buildApp(dependencies: AppDependencies) {
     const revision = await dependencies.runtimeSettingsRepository.restoreDefaults(
       (dependencies.now?.() ?? new Date()).toISOString(),
     )
-    analysis?.updateConcurrency(revision.values.analysisConcurrency)
+    analysis?.updateRuntimePolicy(revision.values)
     return revision
   })
 

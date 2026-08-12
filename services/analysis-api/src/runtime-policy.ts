@@ -1,11 +1,18 @@
 export function createConcurrencyGate() {
   let active = 0
   const waiting: Array<() => void> = []
-  const wake = () => waiting.shift()?.()
+  let currentLimit = Number.POSITIVE_INFINITY
+  const wake = () => {
+    for (const resume of waiting.splice(0)) resume()
+  }
   return {
-    async acquire(limit: number, signal: AbortSignal) {
+    setLimit(limit: number) {
+      currentLimit = limit
+      wake()
+    },
+    async acquire(signal: AbortSignal) {
       signal.throwIfAborted()
-      while (active >= limit) {
+      while (active >= currentLimit) {
         await new Promise<void>((resolve, reject) => {
           let queued = true
           const resume = () => {

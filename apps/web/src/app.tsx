@@ -216,7 +216,7 @@ export function App() {
       {error && <p role="alert" className="error-banner">{error}</p>}
       {page === 'overview' && <Overview records={records} selected={selectedResearch} positions={positions} health={health} modelConfigured={modelConfigured} onNavigate={navigate} onOpen={async (id) => { await openResearch(id); navigate('research') }} />}
       {page === 'analysis' && <AnalysisPage symbol={analysisSymbol} setSymbol={setAnalysisSymbol} status={analysisStatus} stages={analysisStages} active={Boolean(activeAnalysisId)} onStart={startAnalysis} onCancel={cancelAnalysis} health={health} modelConfigured={modelConfigured} records={records} onOpen={async (id) => { await openResearch(id); navigate('research') }} />}
-      {page === 'research' && <ResearchPage records={records} record={selectedResearch} onOpen={openResearch} onUpdate={updateResearch} onDelete={removeResearch} />}
+      {page === 'research' && <ResearchPage records={records} record={selectedResearch} onOpen={openResearch} onUpdate={updateResearch} onDelete={removeResearch} freshnessDays={runtimeSettings?.current.values.reportFreshnessDays ?? null} />}
       {page === 'portfolio' && <PortfolioPage portfolio={portfolio} history={portfolioHistory} onSave={savePosition} onSaveCash={saveCash} onReduce={reducePosition} onDelete={removePosition} />}
       {page === 'settings' && <SettingsPage health={health} modelConfigured={modelConfigured} settings={runtimeSettings} onReload={loadSettings} />}
     </main>
@@ -264,22 +264,24 @@ function AnalysisPage({ symbol, setSymbol, status, stages, active, onStart, onCa
   </>
 }
 
-function ResearchPage({ records, record, onOpen, onUpdate, onDelete }: {
+function ResearchPage({ records, record, onOpen, onUpdate, onDelete, freshnessDays }: {
   records: ResearchSummary[]; record: ResearchRecord | null; onOpen: (id: string) => Promise<void>
   onUpdate: (event: React.FormEvent<HTMLFormElement>) => Promise<void>; onDelete: () => Promise<void>
+  freshnessDays: number | null
 }) {
   return <>
     <PageHeader eyebrow="RESEARCH ARCHIVE" title="研究记录" description="每份报告都绑定当时的数据快照、来源和分析轨迹，结论变化也有迹可循。" />
     <div className="research-layout">
       <aside className="research-index"><p className="micro">全部记录 · {records.length}</p>{records.map((item) => <button className={record?.id === item.id ? 'active' : ''} key={item.id} onClick={() => void onOpen(item.id)}><strong>{item.symbol}</strong><span>{item.report?.title ?? statusLabel(item.status)}</span><small>{item.starred ? `已标记 · ${statusLabel(item.status)}` : statusLabel(item.status)}</small></button>)}</aside>
-      <ResearchReport record={record} onUpdate={onUpdate} onDelete={onDelete} />
+      <ResearchReport record={record} onUpdate={onUpdate} onDelete={onDelete} freshnessDays={freshnessDays} />
       <TraceSummary trace={record?.trace ?? []} />
     </div>
   </>
 }
 
-function ResearchReport({ record, onUpdate, onDelete }: {
+function ResearchReport({ record, onUpdate, onDelete, freshnessDays }: {
   record: ResearchRecord | null; onUpdate: (event: React.FormEvent<HTMLFormElement>) => Promise<void>; onDelete: () => Promise<void>
+  freshnessDays: number | null
 }) {
   if (!record) return <article className="research-report empty">选择一条研究记录开始阅读。</article>
   const facts = new Map(record.facts.map((fact) => [fact.id, fact]))
@@ -287,8 +289,9 @@ function ResearchReport({ record, onUpdate, onDelete }: {
   const indicatorFact = record.facts.find((fact) => fact.type === 'indicators')
   const indicator = asRecord(indicatorFact?.value)
   const valuationFact = record.facts.find((fact) => fact.type === 'valuation')
+  const stale = freshnessDays !== null && isReportOlderThan(record.createdAt, freshnessDays)
   return <article className="research-report">
-    <header className="report-title"><div><p className="micro">{record.symbol} · {statusLabel(record.status)}</p><h2>{report?.title ?? '受限分析'}</h2></div><span className={`verdict ${record.status}`}>{trendVerdict(report?.trend)}<small>未来 1—4 周</small></span></header>
+    <header className="report-title"><div><p className="micro">{record.symbol} · {statusLabel(record.status)}</p><h2>{report?.title ?? '受限分析'}</h2>{stale && <p role="status" className="data-warning">此报告已超过当前 {freshnessDays} 天有效期，请重新生成后再据此判断。</p>}</div><span className={`verdict ${record.status}`}>{trendVerdict(report?.trend)}<small>未来 1—4 周</small></span></header>
     {record.error && <p role="alert" className="error-banner">{friendlyError(record.error)}</p>}
     <section className="report-hero"><div><p className="micro">当前市场状态</p><p>{report?.marketState ?? '没有足够数据形成市场状态判断。'}</p><strong>{report?.trend}</strong></div><PriceChart facts={record.facts} /></section>
     <section className="indicator-strip"><Metric label="MA 5" value={formatMaybeMoney(indicator.ma_5)} /><Metric label="MA 20" value={formatMaybeMoney(indicator.ma_20)} /><Metric label="RSI 14" value={formatMaybeNumber(indicator.rsi_14)} /><Metric label="年化波动" value={formatPercent(indicator.annualized_volatility)} /><Metric label="最大回撤" value={formatPercent(indicator.max_drawdown)} /></section>
@@ -587,3 +590,9 @@ function formatSignedPercentOrDash(value: number | null) { return value === null
 function valueTone(value?: number | null) { return value === undefined || value === null || value === 0 ? '' : value > 0 ? 'positive' : 'negative' }
 function emptyPortfolio(): PortfolioOverview { return { cash: 0, totalCost: 0, totalMarketValue: 0, totalEquity: 0, totalUnrealizedProfitLoss: 0, totalUnrealizedReturn: null, pricedPositionCount: 0, unpricedPositionCount: 0, positions: [] } }
 function friendlyError(value: string) { if (value.startsWith('unknown_evidence:')) return 'AI 引用了一条不存在的报告依据，本次报告已被拒绝。'; if (value.includes('report_tool_required')) return 'AI 没有返回规定格式的报告，本次分析未保存为完成报告。'; if (value.includes('model_not_configured')) return '尚未配置 AI 模型，暂时不能创建新分析。'; if (value.includes('model_')) return 'AI 模型调用失败，请检查模型配置后重试。'; if (value.includes('financial_context')) return '金融数据格式不完整，本次分析已停止以避免生成错误结论。'; return `分析没有完成：${value}` }
+
+function isReportOlderThan(createdAt: string | undefined, freshnessDays: number) {
+  if (!createdAt) return false
+  const createdTime = Date.parse(createdAt)
+  return Number.isFinite(createdTime) && Date.now() - createdTime > freshnessDays * 86_400_000
+}

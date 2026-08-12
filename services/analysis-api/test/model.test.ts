@@ -142,6 +142,8 @@ test('Pi Model 在关键判断依据不存在时不接受报告', async () => {
     ...Array.from({ length: 5 }, () => fauxAssistantMessage(
       fauxToolCall('submit_analysis_report', badReport), { stopReason: 'toolUse' },
     )),
+    fauxAssistantMessage(fauxToolCall('submit_analysis_report', badReport), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('submit_analysis_report', badReport), { stopReason: 'toolUse' }),
   ] })
   await assert.rejects(async () => {
     for await (const _event of model.analyze({
@@ -149,7 +151,7 @@ test('Pi Model 在关键判断依据不存在时不接受报告', async () => {
       symbol: 'NVDA', systemPrompt: 'system', userPrompt: 'user',
       knownFacts: facts, fetchFinancialContext: async () => ({ facts }),
     })) { /* consume */ }
-  }, /analysis_turn_limit/)
+  }, /report_tool_required/)
 })
 
 test('Pi Model 为结构不完整的报告补齐安全默认值', async () => {
@@ -263,7 +265,6 @@ test('财报专家可自由调用新闻和技术指标工具并把新增事实�
     ...facts[0]!, id: 'fact:news:query', type: 'news', observedAt: '2026-08-01T00:00:00.000Z',
   }
   const indicatorFact = { ...facts[0]!, id: 'fact:indicator:query', type: 'indicators' }
-  const logs: Array<Record<string, unknown>> = []
   const model = createPiModel({ fauxResponses: [
     fauxAssistantMessage(fauxToolCall('analyze_financials', {}), { stopReason: 'toolUse' }),
     fauxAssistantMessage(fauxToolCall('search_news_by_keyword', { keyword: 'NAND' }), { stopReason: 'toolUse' }),
@@ -274,7 +275,7 @@ test('财报专家可自由调用新闻和技术指标工具并把新增事实�
       supportingEvidence: [newsFact.id],
       keyJudgments: [{ judgment: '补查结果可追溯', evidence: [indicatorFact.id] }],
     }), { stopReason: 'toolUse' }),
-  ], now: () => new Date('2026-08-13T00:00:00.000Z'), log: (entry) => logs.push(entry) })
+  ] })
   const events = []
   for await (const event of model.analyze({
     runtimeSettings: runtimeSettings({ reportFreshnessDays: 3, compactionReserveTokens: 1_000_000 }),
@@ -293,12 +294,11 @@ test('财报专家可自由调用新闻和技术指标工具并把新增事实�
     && event.entry.type === 'tool_result' && event.entry.name === 'analyze_financials')
   assert.match(JSON.stringify(specialistResult), /fact:news:query/)
   assert.match(JSON.stringify(specialistResult), /fact:indicator:query/)
-  assert.ok(logs.some((entry) => entry.type === 'compaction' && entry.specialist === true))
   const completed = events.find((event) => event.type === 'completed')
   assert.equal(completed?.type, 'completed')
   if (completed?.type === 'completed') {
-    assert.match(completed.report.title, /^⚠ 数据时效提醒/)
-    assert.ok(completed.report.limitations.some((item) => item.includes(newsFact.id)))
+    assert.equal(completed.report.title, validReport.title)
+    assert.deepEqual(completed.report.limitations, [])
   }
 })
 
@@ -323,6 +323,7 @@ test('真实 Pi 仅在含工具调用的 Turn 消耗主与专项冻结轮次', a
     fauxAssistantMessage(fauxToolCall('analyze_financials', {}), { stopReason: 'toolUse' }),
     fauxAssistantMessage(fauxToolCall('search_news_by_keyword', {}), { stopReason: 'toolUse' }),
     fauxAssistantMessage(fauxToolCall('search_news_by_keyword', {}), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxText('专项 Agent 已停止新增研究并整理现有证据。')),
     fauxAssistantMessage(fauxToolCall('submit_analysis_report', {
       ...validReport, limitations: ['专项 Agent 达到冻结轮次上限'],
     }), { stopReason: 'toolUse' }),
@@ -337,11 +338,52 @@ test('真实 Pi 仅在含工具调用的 Turn 消耗主与专项冻结轮次', a
   })) events.push(event)
   assert.ok(events.some((event) => event.type === 'trace'
     && event.entry.type === 'tool_result'
-    && JSON.stringify(event.entry.result).includes('financial_specialist_turn_limit')))
+    && JSON.stringify(event.entry.result).includes('停止新增研究')))
   assert.ok(events.some((event) => event.type === 'completed'))
 })
 
-test('真实 Pi 使用冻结 timeout、freshness、并发和 compaction policy', async () => {
+test('主 Agent 工具轮次到限后停止研究并在两轮内确定性收口报告', async () => {
+  let toolCalls = 0
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall('fetch_financial_context', {}), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxText('收口前整理')),
+    fauxAssistantMessage(fauxToolCall('submit_analysis_report', validReport), { stopReason: 'toolUse' }),
+  ] })
+  const events = []
+  for await (const event of model.analyze({
+    executionId: 'main-closing', runtimeSettings: runtimeSettings({ mainAgentToolRounds: 1 }),
+    symbol: 'NVDA', systemPrompt: 'system', userPrompt: 'user', knownFacts: facts,
+    fetchFinancialContext: async () => { toolCalls += 1; return { facts } },
+  })) events.push(event)
+  assert.equal(toolCalls, 1)
+  assert.ok(events.some((event) => event.type === 'completed'))
+})
+
+test('研究 active 到限后不再调用研究工具并由主 Agent 收口为报告', async () => {
+  let toolCalls = 0
+  const model = createPiModel({
+    fauxResponses: [
+      fauxAssistantMessage(fauxToolCall('fetch_financial_context', {}), { stopReason: 'toolUse' }),
+      fauxAssistantMessage(fauxToolCall('submit_analysis_report', validReport), { stopReason: 'toolUse' }),
+    ],
+    runtimeMinuteMs: 5,
+  })
+  const events = []
+  for await (const event of model.analyze({
+    executionId: 'active-closing', runtimeSettings: runtimeSettings({ researchActiveMinutes: 1, modelRequestTimeoutMinutes: 60 }),
+    symbol: 'NVDA', systemPrompt: 'system', userPrompt: 'user', knownFacts: facts,
+    fetchFinancialContext: async (_symbol, signal) => {
+      toolCalls += 1
+      await new Promise((resolve) => setTimeout(resolve, 8))
+      signal.throwIfAborted()
+      return { facts }
+    },
+  })) events.push(event)
+  assert.equal(toolCalls, 1)
+  assert.ok(events.some((event) => event.type === 'completed'))
+})
+
+test('真实 Pi 使用冻结 timeout、并发且只审计 freshness/compaction 设置', async () => {
   const logs: Array<Record<string, unknown>> = []
   const settings = runtimeSettings({
     modelRequestTimeoutMinutes: 1,
@@ -354,7 +396,6 @@ test('真实 Pi 使用冻结 timeout、freshness、并发和 compaction policy',
     fauxResponses: [fauxAssistantMessage(fauxText('很慢'.repeat(100)))],
     fauxTokensPerSecond: 1,
     runtimeMinuteMs: 5,
-    now: () => new Date('2026-08-13T00:00:00.000Z'),
     log: (entry) => logs.push(entry),
   })
   const startedAt = performance.now()
@@ -369,7 +410,6 @@ test('真实 Pi 使用冻结 timeout、freshness、并发和 compaction policy',
   assert.ok(logs.some((entry) => entry.type === 'runtime_policy'
     && entry.modelConcurrency === 1
     && entry.toolConcurrency === 1
-    && entry.freshnessCutoff === '2026-08-10T00:00:00.000Z'
     && entry.compactionReserveTokens === 12_345))
 })
 
@@ -392,7 +432,7 @@ test('专项 Pi provider 超时保留统一冻结 policy 错误语义', async ()
   }, /model_request_timeout/)
 })
 
-test('真实 Pi 在完整工具 Turn 边界按冻结 reserve 压缩后续 provider 上下文', async () => {
+test('compaction/freshness 仅进入审计 seam 且不注入普通模型文本或改写报告', async () => {
   const model = createPiModel({ fauxResponses: [
     fauxAssistantMessage(fauxText('早期推理 '.repeat(1_000))),
     fauxAssistantMessage(fauxToolCall('fetch_financial_context', {}), { stopReason: 'toolUse' }),
@@ -405,40 +445,21 @@ test('真实 Pi 在完整工具 Turn 边界按冻结 reserve 压缩后续 provid
     symbol: 'NVDA', systemPrompt: 'system', userPrompt: 'user', knownFacts: facts,
     fetchFinancialContext: async () => ({ facts }),
   })) events.push(event)
-  const compacted = events.find((event) => event.type === 'trace' && event.entry.type === 'compaction')
-  assert.equal(compacted?.type, 'trace')
-  if (compacted?.type === 'trace' && compacted.entry.type === 'compaction') {
-    assert.ok(compacted.entry.summarizedCount > 0)
-  }
-  assert.ok(events.some((event) => event.type === 'completed'))
-})
-
-test('真实 Pi 由宿主确定性标记超过冻结 freshness 的事实与报告', async () => {
-  const oldFact = { ...facts[0]!, observedAt: '2026-08-01T00:00:00.000Z' }
-  const model = createPiModel({
-    fauxResponses: [
-      fauxAssistantMessage(fauxToolCall('submit_analysis_report', {
-        ...validReport,
-        supportingEvidence: [oldFact.id], contraryEvidence: [oldFact.id],
-        keyJudgments: [{ judgment: '短期趋势偏强', evidence: [oldFact.id] }],
-      }), { stopReason: 'toolUse' }),
-    ],
-    now: () => new Date('2026-08-13T00:00:00.000Z'),
-  })
-  const events = []
-  for await (const event of model.analyze({
-    executionId: 'freshness-host', runtimeSettings: runtimeSettings({ reportFreshnessDays: 3 }),
-    symbol: 'NVDA', systemPrompt: 'system', userPrompt: 'user', knownFacts: [oldFact],
-    fetchFinancialContext: async () => ({ facts: [oldFact] }),
-  })) events.push(event)
   const policy = events.find((event) => event.type === 'trace'
     && event.entry.type === 'runtime_policy')
-  assert.match(JSON.stringify(policy), /fact:nvda:price:2026-08-12/)
+  assert.match(JSON.stringify(policy), /"reportFreshnessDays":7/)
+  assert.match(JSON.stringify(policy), /"compactionReserveTokens":1000000/)
+  const prompt = events.find((event) => event.type === 'trace' && event.entry.type === 'system_prompt')
+  assert.deepEqual(prompt, {
+    type: 'trace', entry: {
+      type: 'system_prompt', content: 'system',
+      operationId: 'execution:compaction-boundary:system-prompt',
+    },
+  })
   const completed = events.find((event) => event.type === 'completed')
   assert.equal(completed?.type, 'completed')
   if (completed?.type === 'completed') {
-    assert.match(completed.report.title, /^⚠ 数据时效提醒/)
-    assert.ok(completed.report.limitations.some((item) => item.includes('超过 3 天 freshness')))
+    assert.deepEqual(completed.report, validReport)
   }
 })
 
@@ -456,21 +477,19 @@ test('真实 Pi 用冻结 model concurrency 限制并行 provider 请求', async
     fauxResponses: [
       fauxAssistantMessage(fauxToolCall('fetch_financial_context', {}), { stopReason: 'toolUse' }),
       fauxAssistantMessage(fauxToolCall('fetch_financial_context', {}), { stopReason: 'toolUse' }),
-      fauxAssistantMessage(fauxToolCall('fetch_financial_context', {}), { stopReason: 'toolUse' }),
-      fauxAssistantMessage(fauxToolCall('fetch_financial_context', {}), { stopReason: 'toolUse' }),
+      fauxAssistantMessage(fauxToolCall('submit_analysis_report', validReport), { stopReason: 'toolUse' }),
+      fauxAssistantMessage(fauxToolCall('submit_analysis_report', validReport), { stopReason: 'toolUse' }),
     ],
     fauxTokensPerSecond: 100,
     log: logs,
   })
   const settings = runtimeSettings({ mainAgentToolRounds: 1, modelConcurrency: 1 })
   await Promise.all(['one', 'two'].map(async (executionId) => {
-    await assert.rejects(async () => {
-      for await (const _event of model.analyze({
+    for await (const _event of model.analyze({
         executionId, runtimeSettings: settings,
         symbol: 'NVDA', systemPrompt: 'system', userPrompt: 'user', knownFacts: facts,
         fetchFinancialContext: async () => ({ facts }),
       })) { /* consume */ }
-    }, /analysis_turn_limit/)
   }))
   assert.equal(maximumActive, 1)
 })

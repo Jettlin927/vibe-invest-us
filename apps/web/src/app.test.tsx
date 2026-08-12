@@ -39,6 +39,18 @@ function portfolioResponse(positions: Array<{ symbol: string; quantity: number; 
   }
 }
 
+function settingsResponse(overrides: Partial<Record<keyof typeof defaultRuntimeSettings, number>> = {}) {
+  return {
+    model: { configured: true },
+    current: {
+      id: 1, createdAt: new Date().toISOString(),
+      values: { ...defaultRuntimeSettings, ...overrides },
+    },
+    defaults: defaultRuntimeSettings,
+    activeExecutions: [],
+  }
+}
+
 test('用户保存持仓后能在持仓列表看到它', async () => {
   setupDom()
   let positions: unknown[] = []
@@ -208,6 +220,63 @@ test('新建分析页展示分析历史并能重新打开报告', async () => {
   await user.click(view.getByRole('button', { name: /打开 AAPL 综合分析/ }))
   await view.findByRole('heading', { name: '研究记录' })
   await view.findByRole('heading', { name: 'AAPL 综合分析' })
+})
+
+test('报告 freshness 按报告年龄提示且不因历史事实改写报告内容', async () => {
+  setupDom()
+  const oldTitle = '保持原样的历史报告标题'
+  const oldLimitations = ['原始限制']
+  const oldRecord = {
+    id: 'old-report', symbol: 'NVDA', status: 'completed',
+    createdAt: new Date(Date.now() - 10 * 86_400_000).toISOString(),
+    report: { title: oldTitle, trend: '中性', limitations: oldLimitations },
+    facts: [{
+      id: 'old-financial', type: 'reported_financial', value: {},
+      observedAt: '2020-01-01T00:00:00.000Z', source: 'sec', sourceReference: 'https://example.com',
+    }],
+    trace: [],
+  }
+  globalThis.fetch = async (input) => {
+    const url = String(input)
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok', engine: 'postgresql', schemaVersion: 8 }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/settings') return Response.json(settingsResponse({ reportFreshnessDays: 7 }))
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+    if (url === '/api/portfolio') return Response.json(portfolioResponse([]))
+    if (url === '/api/research') return Response.json({ records: [oldRecord] })
+    if (url === '/api/research/old-report') return Response.json(oldRecord)
+    throw new Error(`unexpected_fetch:${url}`)
+  }
+  const view = render(React.createElement(App))
+  const user = userEvent.setup({ document: window.document })
+  await user.click(await view.findByRole('button', { name: '研究记录' }))
+  await view.findByText('此报告已超过当前 7 天有效期，请重新生成后再据此判断。')
+  assert.equal(view.getByRole('heading', { name: oldTitle }).textContent, oldTitle)
+  assert.deepEqual(oldRecord.report.limitations, oldLimitations)
+})
+
+test('刚生成报告即使引用历史财报也不显示 freshness 过期提示', async () => {
+  setupDom()
+  const freshRecord = {
+    id: 'fresh-report', symbol: 'NVDA', status: 'completed', createdAt: new Date().toISOString(),
+    report: { title: '刚生成的报告', trend: '中性', limitations: [] },
+    facts: [{ id: 'historical', type: 'reported_financial', value: {}, observedAt: '2019-01-01T00:00:00.000Z', source: 'sec', sourceReference: 'https://example.com' }],
+    trace: [],
+  }
+  globalThis.fetch = async (input) => {
+    const url = String(input)
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok', engine: 'postgresql', schemaVersion: 8 }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/settings') return Response.json(settingsResponse({ reportFreshnessDays: 1 }))
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+    if (url === '/api/portfolio') return Response.json(portfolioResponse([]))
+    if (url === '/api/research') return Response.json({ records: [freshRecord] })
+    if (url === '/api/research/fresh-report') return Response.json(freshRecord)
+    throw new Error(`unexpected_fetch:${url}`)
+  }
+  const view = render(React.createElement(App))
+  const user = userEvent.setup({ document: window.document })
+  await user.click(await view.findByRole('button', { name: '研究记录' }))
+  await view.findByRole('heading', { name: '刚生成的报告' })
+  assert.equal(view.queryByText(/此报告已超过当前/), null)
 })
 
 test('坏报告依据被拒绝时用户看到可理解的失败原因', async () => {

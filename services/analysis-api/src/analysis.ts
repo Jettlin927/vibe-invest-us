@@ -24,18 +24,22 @@ export function createAnalysisService(options: {
   fetchMarketPrices?: (symbols: string[], signal: AbortSignal) => Promise<Record<string, number>>
   listPortfolioSymbols?: () => Promise<string[]>
   getPortfolioContext?: (symbol: string, marketPrices: Record<string, number>) => Promise<unknown>
+  runtimeMinuteMs?: number
 }) {
   const { repository } = options
   const controllers = new Map<string, AbortController>()
   const listeners = new Map<string, Set<(entry: AgentEvent) => void>>()
   const tasks = new Set<Promise<void>>()
   const toolGate = createConcurrencyGate()
+  const modelGate = createConcurrencyGate()
   let running = 0
   let concurrency: number = defaultRuntimeSettings.analysisConcurrency
   const initialized = Promise.all([
     options.eventRepository.interruptActiveSessions(new Date().toISOString()),
     options.settingsRepository.current().then((revision) => {
       concurrency = revision.values.analysisConcurrency
+      modelGate.setLimit(revision.values.modelConcurrency)
+      toolGate.setLimit(revision.values.toolConcurrency)
     }),
   ])
 
@@ -125,6 +129,16 @@ export function createAnalysisService(options: {
         running -= 1
         continue
       }
+      const wallBudgetMs = settingsSnapshot.values.executionWallClockMinutes
+        * (options.runtimeMinuteMs ?? 60_000)
+      const remainingWallMs = wallBudgetMs - (Date.now() - Date.parse(session.createdAt))
+      if (remainingWallMs <= 0) {
+        await setStatus(session.id, `execution:${executionId}:status-failed`, 'failed', {
+          error: 'execution_runtime_timeout',
+        })
+        running -= 1
+        continue
+      }
       try {
         await appendEvent(
           session.id,
@@ -144,7 +158,7 @@ export function createAnalysisService(options: {
         running -= 1
         continue
       }
-      const task = run(next, session.id, executionId, settingsSnapshot.values)
+      const task = run(next, session.id, executionId, settingsSnapshot.values, remainingWallMs)
         .finally(() => { running -= 1; void schedule() })
       tasks.add(task)
       void task.then(() => tasks.delete(task), () => tasks.delete(task))
@@ -152,22 +166,33 @@ export function createAnalysisService(options: {
   }
   async function run(
     analysisId: string, sessionId: string, executionId: string,
-    runtimeSettings: RuntimeSettings,
+    runtimeSettings: RuntimeSettings, remainingWallMs: number,
   ) {
     const job = await get(analysisId)
     if (!job) return
     const controller = new AbortController()
     controllers.set(analysisId, controller)
-    const wallDeadline = AbortSignal.timeout(runtimeSettings.executionWallClockMinutes * 60_000)
+    const wallDeadline = AbortSignal.timeout(Math.max(1, Math.ceil(remainingWallMs)))
     const executionSignal = AbortSignal.any([controller.signal, wallDeadline])
-    const activeBudget = createActiveBudget(runtimeSettings.researchActiveMinutes * 60_000)
+    const activeBudget = createActiveBudget(
+      runtimeSettings.researchActiveMinutes * (options.runtimeMinuteMs ?? 60_000),
+    )
+    let processing = activeBudget.start(executionSignal)
+    const pauseProcessing = () => processing.stop()
+    const resumeProcessing = () => { processing = activeBudget.start(executionSignal) }
+    const assertPolicy = () => {
+      if (controller.signal.aborted) throw controller.signal.reason
+      if (wallDeadline.aborted) throw new Error('execution_runtime_timeout')
+      if (activeBudget.exhausted()) throw new Error('research_active_timeout')
+    }
     const operationId = (kind: string) => `execution:${executionId}:${kind}`
     let modelEventSequence = 0
     const nextModelOperationId = (kind: string) => (
       `execution:${executionId}:model:${++modelEventSequence}:${kind}`
     )
     try {
-      const releaseContextSlot = await toolGate.acquire(runtimeSettings.toolConcurrency, executionSignal)
+      pauseProcessing()
+      const releaseContextSlot = await toolGate.acquire(executionSignal)
       const contextActive = activeBudget.start(executionSignal)
       let context: FinancialContext
       try {
@@ -176,12 +201,15 @@ export function createAnalysisService(options: {
         contextActive.stop()
         releaseContextSlot()
       }
+      resumeProcessing()
+      assertPolicy()
       const quoteFact = context.facts.find((fact) => fact.type === 'quote' && typeof fact.value === 'number')
       let portfolioPrices: Record<string, number> = {}
       let portfolioPriceGap = false
       if (options.fetchMarketPrices && options.listPortfolioSymbols) {
         try {
-          const releasePriceSlot = await toolGate.acquire(runtimeSettings.toolConcurrency, executionSignal)
+          pauseProcessing()
+          const releasePriceSlot = await toolGate.acquire(executionSignal)
           const pricesActive = activeBudget.start(executionSignal)
           try {
             portfolioPrices = await options.fetchMarketPrices(
@@ -191,8 +219,11 @@ export function createAnalysisService(options: {
             pricesActive.stop()
             releasePriceSlot()
           }
+          resumeProcessing()
+          assertPolicy()
         } catch (error) {
-          if (controller.signal.aborted) throw error
+          resumeProcessing()
+          if (executionSignal.aborted || activeBudget.exhausted()) throw error
           portfolioPriceGap = true
         }
       }
@@ -212,7 +243,9 @@ export function createAnalysisService(options: {
         capabilities: sourceDiagnostics(context),
         degradedSources: sourceDegradations(context),
       }, { snapshot, facts: context.facts })
+      assertPolicy()
       const modelContext = createModelContext(snapshot)
+      pauseProcessing()
       for await (const event of options.model.analyze({
         executionId,
         runtimeSettings,
@@ -223,10 +256,13 @@ export function createAnalysisService(options: {
         fetchFinancialContext: async () => modelContext, signal: controller.signal,
         executionDeadlineSignal: wallDeadline,
         activeElapsedMs: activeBudget.elapsedMs(),
-        acquireToolSlot: (limit, signal) => toolGate.acquire(limit, signal),
+        acquireModelSlot: (signal) => modelGate.acquire(signal),
+        acquireToolSlot: (signal) => toolGate.acquire(signal),
         searchNews: options.searchNews,
         fetchTechnicalIndicators: options.fetchTechnicalIndicators,
       })) {
+        resumeProcessing()
+        assertPolicy()
         if (event.type === 'trace') {
           await appendTrace(sessionId, event.entry.operationId ? event.entry : {
             ...event.entry, operationId: nextModelOperationId(event.entry.type),
@@ -258,6 +294,8 @@ export function createAnalysisService(options: {
           await setStatus(sessionId, operationId(`status-${status}`), status, { report })
           return
         }
+        assertPolicy()
+        pauseProcessing()
       }
     } catch (error) {
       if (controller.signal.aborted) {
@@ -276,6 +314,7 @@ export function createAnalysisService(options: {
         })
       }
     } finally {
+      processing.stop()
       controllers.delete(analysisId)
     }
   }
@@ -372,11 +411,13 @@ export function createAnalysisService(options: {
     for (const controller of controllers.values()) controller.abort()
     await Promise.allSettled(tasks)
   }
-  function updateConcurrency(value: number) {
-    concurrency = value
+  function updateRuntimePolicy(values: RuntimeSettings) {
+    concurrency = values.analysisConcurrency
+    modelGate.setLimit(values.modelConcurrency)
+    toolGate.setLimit(values.toolConcurrency)
     queueMicrotask(() => void schedule())
   }
-  return { create, get, cancel, research, listResearch, updateResearch, removeResearch, streamEvents, close, updateConcurrency }
+  return { create, get, cancel, research, listResearch, updateResearch, removeResearch, streamEvents, close, updateRuntimePolicy }
 }
 
 const ANALYSIS_SYSTEM_PROMPT = `你是个人美股研究助手，分析周期为未来一至四周。

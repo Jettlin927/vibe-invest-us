@@ -128,53 +128,6 @@ export type PiAgentAdapterState = {
   errorMessage?: string
 }
 
-export function compactPiMessagesAtTurnBoundary(input: {
-  messages: PiAgentAdapterMessage[]
-  contextWindow: number
-  reserveTokens: number
-}) {
-  const settings = {
-    enabled: true,
-    reserveTokens: input.reserveTokens,
-    keepRecentTokens: Math.max(1, Math.min(20_000, Math.floor(
-      Math.max(1, input.contextWindow - input.reserveTokens) / 2,
-    ))),
-  }
-  if (!shouldCompact(
-    estimateContextTokens(toPiMessages(input.messages)).tokens,
-    input.contextWindow,
-    settings,
-  )) return undefined
-  const preparation = prepareCompaction(toCompactionEntries(input.messages), settings)
-  if (!preparation.ok || !preparation.value) return undefined
-  let summarized = fromPiMessages(preparation.value.messagesToSummarize as Message[])
-  let turnPrefix = fromPiMessages(preparation.value.turnPrefixMessages as Message[])
-  let retained = fromPiMessages(preparation.value.retainedTail as Message[])
-  if (!summarized.length) {
-    const latestTurnStart = input.messages.findLastIndex((message) => message.role === 'user')
-    const hasCompletedToolTurn = input.messages.some((message) => message.role === 'toolResult')
-    if (latestTurnStart < 0 || (latestTurnStart === 0 && !hasCompletedToolTurn)) return undefined
-    const cutIndex = latestTurnStart === 0 ? input.messages.length : latestTurnStart
-    summarized = input.messages.slice(0, cutIndex)
-    turnPrefix = []
-    retained = input.messages.slice(cutIndex)
-  }
-  const factIds = [...new Set(JSON.stringify(summarized).match(/fact:[A-Za-z0-9:_-]+/g) ?? [])]
-  const summary: PiAgentAdapterMessage = {
-    role: 'user',
-    content: `Runtime 在安全 Turn 边界压缩了 ${summarized.length} 条早期消息。保留事实 ID：${factIds.join(', ') || '无'}。`,
-    timestamp: Date.now(),
-  }
-  return {
-    messages: [
-      summary,
-      ...turnPrefix,
-      ...retained,
-    ],
-    summarizedCount: summarized.length,
-  }
-}
-
 type TurnBoundaryState = Pick<PiAgentAdapterState, 'systemPrompt' | 'model' | 'messages' | 'tools'>
 
 export type PiAgentAdapterEvent =
