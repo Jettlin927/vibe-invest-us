@@ -5,29 +5,94 @@ import { join } from 'node:path'
 import test from 'node:test'
 
 import {
-  Type,
-  createModels,
-  fauxAssistantMessage,
-  fauxProvider,
-  fauxText,
-  fauxToolCall,
-  type Message,
-} from '@earendil-works/pi-ai'
+  createPiAgentAdapter,
+  type PiAgentAdapterMessage,
+  type PiAgentAdapterModel,
+  type PiAgentAdapterStream,
+  type PiAgentAdapterStreamFn,
+  type PiAgentAdapterTool,
+} from '../src/agent-runtime/pi-agent-adapter.js'
 
-import { createPiAgentAdapter, type PiAgentAdapterTool } from '../src/agent-runtime/pi-agent-adapter.js'
+type AssistantMessage = Extract<PiAgentAdapterMessage, { role: 'assistant' }>
 
-function createFixture(responses: ReturnType<typeof fauxAssistantMessage>[]) {
-  const models = createModels()
-  const faux = fauxProvider({ tokensPerSecond: 10_000 })
-  models.setProvider(faux.provider)
-  faux.setResponses(responses)
+const usage = {
+  input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+}
+
+function assistantMessage(
+  content: AssistantMessage['content'],
+  stopReason: 'stop' | 'toolUse' = 'stop',
+): AssistantMessage {
   return {
-    model: faux.getModel(),
-    streamFn: models.streamSimple.bind(models),
+    role: 'assistant', content, api: 'faux', provider: 'faux', model: 'faux-model',
+    usage, stopReason, timestamp: Date.now(),
   }
 }
 
-function userMessage(content: string): Message {
+function textMessage(text: string) {
+  return assistantMessage([{ type: 'text', text }])
+}
+
+function toolCall(name: string, id: string) {
+  return { type: 'toolCall' as const, id, name, arguments: {} }
+}
+
+function createFixture(
+  responses: AssistantMessage[],
+  fixtureOptions: { blockLongResponse?: boolean; onAbort?: () => void } = {},
+) {
+  const model: PiAgentAdapterModel = {
+    id: 'faux-model', name: 'Faux Model', api: 'faux', provider: 'faux', baseUrl: 'https://example.test',
+    reasoning: false, input: ['text'], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 128_000, maxTokens: 4_096,
+  }
+  let responseIndex = 0
+  const streamFn: PiAgentAdapterStreamFn = async (_model, _context, options) => {
+    const scripted = responses[responseIndex++]
+    if (!scripted) throw new Error('missing_test_response')
+    const result = await abortableResponse(
+      scripted, options?.signal,
+      fixtureOptions.blockLongResponse ?? false, fixtureOptions.onAbort,
+    )
+    return streamOf(result)
+  }
+  return {
+    model,
+    streamFn,
+  }
+}
+
+async function abortableResponse(
+  response: PiAgentAdapterMessage & { role: 'assistant' },
+  signal?: AbortSignal,
+  shouldBlock = false,
+  onAbort?: () => void,
+) {
+  if (!shouldBlock) return response
+  await new Promise<void>((resolve) => {
+    const timeout = setTimeout(resolve, 500)
+    signal?.addEventListener('abort', () => {
+      onAbort?.()
+      clearTimeout(timeout)
+      resolve()
+    }, { once: true })
+  })
+  if (!signal?.aborted) return response
+  return { ...response, stopReason: 'aborted' as const, errorMessage: 'Request was aborted' }
+}
+
+function streamOf(message: AssistantMessage): PiAgentAdapterStream {
+  const event = message.stopReason === 'aborted' || message.stopReason === 'error'
+    ? { type: 'error' as const, reason: message.stopReason, error: message }
+    : { type: 'done' as const, reason: message.stopReason, message }
+  return {
+    async *[Symbol.asyncIterator]() { yield event },
+    async result() { return message },
+  }
+}
+
+function userMessage(content: string): PiAgentAdapterMessage {
   return { role: 'user', content, timestamp: Date.now() }
 }
 
@@ -36,7 +101,7 @@ function textTool(name: string, execute: PiAgentAdapterTool['execute']): PiAgent
     name,
     label: name,
     description: name,
-    parameters: Type.Object({}),
+    parameters: { type: 'object', properties: {}, additionalProperties: false },
     execute,
   }
 }
@@ -46,7 +111,7 @@ test('默认状态没有任何工具，也不会创建文件', async () => {
   const originalDirectory = process.cwd()
   try {
     process.chdir(directory)
-    const fixture = createFixture([fauxAssistantMessage(fauxText('完成'))])
+    const fixture = createFixture([textMessage('完成')])
     const adapter = createPiAgentAdapter({
       initialState: { systemPrompt: 'system', model: fixture.model },
       streamFn: fixture.streamFn,
@@ -63,7 +128,7 @@ test('默认状态没有任何工具，也不会创建文件', async () => {
 test('猜测隐藏工具或文件 Shell 工具时统一不可执行', async () => {
   for (const hiddenName of ['hidden_financial_tool', 'read', 'write', 'edit', 'bash']) {
     const fixture = createFixture([
-      fauxAssistantMessage(fauxToolCall(hiddenName, {}, { id: `call-${hiddenName}` }), { stopReason: 'toolUse' }),
+      assistantMessage([toolCall(hiddenName, `call-${hiddenName}`)], 'toolUse'),
     ])
     const adapter = createPiAgentAdapter({
       initialState: { systemPrompt: 'system', model: fixture.model },
@@ -80,7 +145,7 @@ test('猜测隐藏工具或文件 Shell 工具时统一不可执行', async () =
 })
 
 test('initial state 可以从产品读取模型重建，回收后不保留第二套 Session', async () => {
-  const fixture = createFixture([fauxAssistantMessage(fauxText('继续完成'))])
+  const fixture = createFixture([textMessage('继续完成')])
   const restored = [userMessage('历史问题')]
   const adapter = createPiAgentAdapter({
     initialState: { systemPrompt: 'v2', model: fixture.model, messages: restored },
@@ -95,8 +160,8 @@ test('initial state 可以从产品读取模型重建，回收后不保留第二
 
 test('follow-up 在当前响应结束后触发下一轮', async () => {
   const fixture = createFixture([
-    fauxAssistantMessage(fauxText('首轮')),
-    fauxAssistantMessage(fauxText('追问轮')),
+    textMessage('首轮'),
+    textMessage('追问轮'),
   ])
   const adapter = createPiAgentAdapter({
     initialState: { systemPrompt: 'system', model: fixture.model },
@@ -112,7 +177,11 @@ test('follow-up 在当前响应结束后触发下一轮', async () => {
 })
 
 test('外部 Abort 传播到裸 Agent 并保持 agent_end 先于 idle', async () => {
-  const fixture = createFixture([fauxAssistantMessage(fauxText('很长的输出'.repeat(200)))])
+  let providerAborted = false
+  const fixture = createFixture([textMessage('等待取消')], {
+    blockLongResponse: true,
+    onAbort: () => { providerAborted = true },
+  })
   const controller = new AbortController()
   const events: string[] = []
   const adapter = createPiAgentAdapter({
@@ -133,12 +202,13 @@ test('外部 Abort 传播到裸 Agent 并保持 agent_end 先于 idle', async ()
   await running
   await adapter.waitForIdle()
   events.push('idle')
+  assert.equal(providerAborted, true)
   assert.match(adapter.snapshot().errorMessage ?? '', /abort/i)
   assert.deepEqual(events.slice(-3), ['agent_end', 'agent_end_listener_settled', 'idle'])
 })
 
 test('提交前已 Abort 不会启动 Agent', async () => {
-  const fixture = createFixture([fauxAssistantMessage(fauxText('不应执行'))])
+  const fixture = createFixture([textMessage('不应执行')])
   const controller = new AbortController()
   controller.abort(new Error('stopped'))
   const events: string[] = []
@@ -155,11 +225,8 @@ test('提交前已 Abort 不会启动 Agent', async () => {
 
 test('并行工具真实并发完成，但下一轮结果按原 tool call 顺序稳定排列', async () => {
   const fixture = createFixture([
-    fauxAssistantMessage([
-      fauxToolCall('slow', {}, { id: 'call-slow' }),
-      fauxToolCall('fast', {}, { id: 'call-fast' }),
-    ], { stopReason: 'toolUse' }),
-    fauxAssistantMessage(fauxText('完成')),
+    assistantMessage([toolCall('slow', 'call-slow'), toolCall('fast', 'call-fast')], 'toolUse'),
+    textMessage('完成'),
   ])
   const completed: string[] = []
   let releaseSlow!: () => void
@@ -192,9 +259,9 @@ test('并行工具真实并发完成，但下一轮结果按原 tool call 顺序
 test('工具投影和上下文替换只在完整 turn boundary 后影响下一轮', async () => {
   const seenTools: string[][] = []
   const fixture = createFixture([
-    fauxAssistantMessage(fauxToolCall('visible_now', {}, { id: 'call-now' }), { stopReason: 'toolUse' }),
-    fauxAssistantMessage(fauxToolCall('visible_next', {}, { id: 'call-next' }), { stopReason: 'toolUse' }),
-    fauxAssistantMessage(fauxText('完成')),
+    assistantMessage([toolCall('visible_now', 'call-now')], 'toolUse'),
+    assistantMessage([toolCall('visible_next', 'call-next')], 'toolUse'),
+    textMessage('完成'),
   ])
   const visibleNext = textTool('visible_next', async () => ({
     content: [{ type: 'text', text: 'next' }], details: {},
@@ -224,14 +291,14 @@ test('Pi compaction 阈值只在 turn boundary 切换并保留到后续提交', 
   const seenContents: string[][] = []
   const cuts: Array<{ summarized: string[]; turnPrefix: string[]; retained: string[] }> = []
   const fixture = createFixture([
-    fauxAssistantMessage(fauxToolCall('continue', {}, { id: 'call-continue' }), { stopReason: 'toolUse' }),
-    fauxAssistantMessage(fauxText('完成')),
-    fauxAssistantMessage(fauxText('再次完成')),
+    assistantMessage([toolCall('continue', 'call-continue')], 'toolUse'),
+    textMessage('完成'),
+    textMessage('再次完成'),
   ])
   const adapter = createPiAgentAdapter({
     initialState: {
       systemPrompt: 'system', model: fixture.model,
-      messages: [userMessage('旧问题'), fauxAssistantMessage(fauxText('旧回答'))],
+      messages: [userMessage('旧问题'), textMessage('旧回答')],
       tools: [textTool('continue', async () => ({
         content: [{ type: 'text', text: 'continue' }], details: {},
       }))],
