@@ -28,6 +28,7 @@ type AppDependencies = {
   analysisConcurrency?: number
   modelConfigured?: boolean
   now?: () => Date
+  migrationVerificationToken?: string
 }
 
 export function buildApp(dependencies: AppDependencies) {
@@ -84,6 +85,14 @@ export function buildApp(dependencies: AppDependencies) {
   })
 
   app.get('/api/positions', async () => ({ positions: await portfolio.list() }))
+
+  app.get('/api/migration-verification', async (request, reply) => {
+    const token = dependencies.migrationVerificationToken
+    if (!token || request.headers.authorization !== `Bearer ${token}`) {
+      return reply.status(404).send({ error: 'not_found' })
+    }
+    return dependencies.portfolioRepository.migrationVerificationState()
+  })
 
   app.get('/api/portfolio', async (_request, reply) => {
     const positions = await portfolio.list()

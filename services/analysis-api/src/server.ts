@@ -48,6 +48,7 @@ const app = buildApp({
     modelProvider && process.env.MODEL_NAME && process.env.MODEL_BASE_URL && modelApiKey
     && (modelApiProtocol === 'responses' || modelApiProtocol === 'chat-completions'),
   ),
+  migrationVerificationToken: process.env.MIGRATION_VERIFICATION_TOKEN,
 })
 
 await app.listen({ host, port })

@@ -81,8 +81,10 @@ npm run verify:real-analysis
 ```bash
 LEGACY_SQLITE_PATH=/绝对路径/旧数据库.db npm run migrate:sqlite --workspace @vibe-invest/analysis-api -- plan
 LEGACY_SQLITE_PATH=/绝对路径/旧数据库.db DATABASE_URL='postgresql://...' npm run migrate:sqlite --workspace @vibe-invest/analysis-api -- execute
-LEGACY_SQLITE_PATH=/绝对路径/旧数据库.db DATABASE_URL='postgresql://...' MIGRATION_API_BASE_URL=http://127.0.0.1:3000 npm run migrate:sqlite --workspace @vibe-invest/analysis-api -- verify
+LEGACY_SQLITE_PATH=/绝对路径/旧数据库.db DATABASE_URL='postgresql://...' MIGRATION_API_BASE_URL=http://127.0.0.1:3000 MIGRATION_VERIFICATION_TOKEN='一次性随机令牌' npm run migrate:sqlite --workspace @vibe-invest/analysis-api -- verify
 ```
+
+执行 `verify` 时，以相同的 `MIGRATION_VERIFICATION_TOKEN` 临时启动 Analysis API；未配置该令牌或令牌不匹配时，精确迁移读回端点返回 404。确认后移除该环境变量并重启 API。
 
 Model 模块不内置供应商、模型或服务地址，通过 OpenAI-compatible 协议连接用户在 `.env` 中指定的端点。`MODEL_PROVIDER` 是用于配置和审计的自定义标签；`MODEL_API_PROTOCOL` 可选 `chat-completions` 或 `responses`，其余配置也均无默认值。即使本地端点不校验密钥，也需要手动为 `MODEL_API_KEY` 填写一个非空连接占位值。例如 Docker 访问宿主机 Ollama 时，可配置 `MODEL_API_PROTOCOL=responses` 和 `MODEL_BASE_URL=http://host.docker.internal:11434/v1`。未完整配置模型时，页面仍可维护持仓和查看已有记录，但新分析会明确失败，不会生成伪报告。
 

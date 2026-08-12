@@ -44,6 +44,18 @@ export function createTestProductDatabase() {
         .sort((left, right) => right.marketDay.localeCompare(left.marketDay))
         .slice(0, limit)
     },
+    async migrationVerificationState() {
+      return {
+        positions: [...positions.values()].sort((left, right) => left.symbol.localeCompare(right.symbol)).map((position) => ({
+          symbol: position.symbol, quantity: String(position.quantity), averageCost: String(position.averageCost),
+        })),
+        cash: String(cash),
+        snapshots: [...snapshots.values()].sort((left, right) => left.marketDay.localeCompare(right.marketDay)).map((snapshot) => ({
+          marketDay: snapshot.marketDay, totalEquity: String(snapshot.totalEquity),
+          totalMarketValue: String(snapshot.totalMarketValue), cash: String(snapshot.cash),
+        })),
+      }
+    },
   }
 
   const analysisRepository: AnalysisRepository = {

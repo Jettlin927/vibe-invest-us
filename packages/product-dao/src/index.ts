@@ -163,6 +163,17 @@ export type ProductEquitySnapshot = {
   afterClose: boolean
 }
 
+export type MigrationVerificationState = {
+  positions: Array<{ symbol: string; quantity: string; averageCost: string }>
+  cash: string
+  snapshots: Array<{
+    marketDay: string
+    totalEquity: string
+    totalMarketValue: string
+    cash: string
+  }>
+}
+
 type PositionRow = { symbol: string; quantity: string; average_cost: string }
 type SnapshotRow = {
   market_day: string
@@ -300,6 +311,30 @@ export function createPortfolioRepository(pool: Pool) {
         observedAt: new Date(row.observed_at).toISOString(),
         afterClose: row.after_close,
       }))
+    },
+    async migrationVerificationState(): Promise<MigrationVerificationState> {
+      const [positions, cash, snapshots] = await Promise.all([
+        pool.query<{ symbol: string; quantity: string; average_cost: string }>(
+          'SELECT symbol, quantity::text, average_cost::text FROM positions ORDER BY symbol',
+        ),
+        pool.query<{ cash: string }>('SELECT cash::text FROM portfolio_settings WHERE id = $1', [1]),
+        pool.query<{
+          market_day: string; total_equity: string; total_market_value: string; cash: string
+        }>(
+          `SELECT market_day::text, total_equity::text, total_market_value::text, cash::text
+           FROM portfolio_equity_snapshots ORDER BY market_day`,
+        ),
+      ])
+      return {
+        positions: positions.rows.map((row) => ({
+          symbol: row.symbol, quantity: row.quantity, averageCost: row.average_cost,
+        })),
+        cash: cash.rows[0]?.cash ?? '0',
+        snapshots: snapshots.rows.map((row) => ({
+          marketDay: row.market_day, totalEquity: row.total_equity,
+          totalMarketValue: row.total_market_value, cash: row.cash,
+        })),
+      }
     },
   }
 }

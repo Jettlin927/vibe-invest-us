@@ -17,10 +17,12 @@ if (command === 'plan') {
 } else if (command === 'verify') {
   if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required')
   if (!process.env.MIGRATION_API_BASE_URL) throw new Error('MIGRATION_API_BASE_URL is required')
+  if (!process.env.MIGRATION_VERIFICATION_TOKEN) throw new Error('MIGRATION_VERIFICATION_TOKEN is required')
   result = await verifyMigration({
     source,
     databaseUrl: process.env.DATABASE_URL,
     apiBaseUrl: process.env.MIGRATION_API_BASE_URL,
+    apiToken: process.env.MIGRATION_VERIFICATION_TOKEN,
   })
 } else {
   throw new Error('usage: migrate:sqlite -- plan|execute|verify')

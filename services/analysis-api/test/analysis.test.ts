@@ -139,6 +139,40 @@ test('并发创建多个标的时运行任务数不超过实例上限', async ()
   await app.close()
 })
 
+test('并发调度在队列 claim 阻塞时仍不会超出实例上限', async () => {
+  const database = createTestProductDatabase()
+  const repository = database.analysisRepository
+  const originalClaim = repository.claimNextQueued
+  repository.claimNextQueued = async (updatedAt) => {
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    return originalClaim(updatedAt)
+  }
+  let active = 0
+  let maximumActive = 0
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [], indicators: {} }),
+    model: {
+      async *analyze() {
+        active += 1
+        maximumActive = Math.max(maximumActive, active)
+        await new Promise((resolve) => setTimeout(resolve, 20))
+        active -= 1
+        yield { type: 'completed' as const, report }
+      },
+    },
+    analysisConcurrency: 2,
+  })
+  await app.ready()
+  const created = await Promise.all(Array.from({ length: 12 }, (_, index) => (
+    app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: `C${index}` } })
+  )))
+  await Promise.all(created.map((response) => waitForStatus(app as any, response.json().analysisId, 'completed')))
+  assert.equal(maximumActive, 2)
+  await app.close()
+})
+
 test('取消运行任务会停止模型并保存取消轨迹', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'vibe-analysis-cancel-'))
   const app = await makeApp(join(dir, 'storage'), fakeModel(1000), 1)

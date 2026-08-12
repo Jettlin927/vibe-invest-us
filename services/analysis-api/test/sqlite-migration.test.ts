@@ -14,6 +14,7 @@ import { checkSchema, createPortfolioRepository } from '@vibe-invest/product-dao
 
 const migrationUrl = process.env.TEST_MIGRATION_DATABASE_URL
 const databaseUrl = process.env.TEST_DATABASE_URL
+const verificationToken = 'test-migration-verification-token'
 
 function createLegacyFixture(path: string) {
   const database = new DatabaseSync(path)
@@ -65,6 +66,7 @@ test('SQLite 迁移按 plan→execute→verify 导入且明确放弃旧研究', 
     portfolioRepository: createPortfolioRepository(apiPool),
     analysisRepository: createAnalysisRepository(apiPool),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    migrationVerificationToken: verificationToken,
   })
   await api.listen({ host: '127.0.0.1', port: 0 })
   const address = api.server.address()
@@ -73,6 +75,7 @@ test('SQLite 迁移按 plan→execute→verify 导入且明确放弃旧研究', 
     source,
     databaseUrl: databaseUrl!,
     apiBaseUrl: `http://127.0.0.1:${address.port}`,
+    apiToken: verificationToken,
   })
   assert.deepEqual(verified, { positions: 1, cash: true, equitySnapshots: 1, database: 'verified' })
   await api.close()
@@ -94,21 +97,22 @@ test('SQLite verify 会拒绝 Analysis API 返回的权益金额不一致', {
   await pool.end()
   await executeMigration({ source, databaseUrl: databaseUrl!, apiHealthUrl: 'http://127.0.0.1:1/api/health' })
 
-  const server = createServer((request, response) => {
+  const server = createServer((_request, response) => {
     response.setHeader('content-type', 'application/json')
-    if (request.url === '/api/positions') {
-      response.end('{"positions":[{"symbol":"NVDA","quantity":10.125,"averageCost":100.25}]}')
-    } else if (request.url?.startsWith('/api/portfolio/history')) {
-      response.end('{"currency":"USD","snapshots":[{"marketDay":"2026-08-12","totalEquity":1715.5001,"totalMarketValue":1215,"cash":500.5}]}')
-    } else {
-      response.end('{"cash":500.5}')
-    }
+    response.end(JSON.stringify({
+      positions: [{ symbol: 'NVDA', quantity: '10.125', averageCost: '100.25' }],
+      cash: '500.5',
+      snapshots: [{ marketDay: '2026-08-12', totalEquity: '1715.5001', totalMarketValue: '1215', cash: '500.5' }],
+    }))
   })
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
   const address = server.address()
   assert.ok(address && typeof address === 'object')
   await assert.rejects(
-    verifyMigration({ source, databaseUrl: databaseUrl!, apiBaseUrl: `http://127.0.0.1:${address.port}` }),
+    verifyMigration({
+      source, databaseUrl: databaseUrl!, apiBaseUrl: `http://127.0.0.1:${address.port}`,
+      apiToken: verificationToken,
+    }),
     /legacy_migration_api_verification_failed/,
   )
   await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
@@ -144,7 +148,9 @@ test('SQLite 迁移拒绝 API 运行、目标冲突和验证不一致', {
      VALUES ($1, $2, $3, $4)`, ['NVDA', '99', '100.25', '2026-08-12T00:00:00Z'],
   )
   await verifyPool.end()
-  await assert.rejects(verifyMigration({ source, databaseUrl: databaseUrl! }), /legacy_migration_verification_failed/)
+  await assert.rejects(verifyMigration({
+    source, databaseUrl: databaseUrl!, apiBaseUrl: 'http://127.0.0.1:1', apiToken: verificationToken,
+  }), /legacy_migration_verification_failed/)
 })
 
 test('SQLite 迁移中途失败会回滚目标且保留源文件', {

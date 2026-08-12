@@ -107,7 +107,8 @@ export async function executeMigration(options: {
 export async function verifyMigration(options: {
   source: string
   databaseUrl: string
-  apiBaseUrl?: string
+  apiBaseUrl: string
+  apiToken: string
 }) {
   const source = readLegacy(options.source)
   const pool = createPool(options.databaseUrl)
@@ -136,14 +137,10 @@ export async function verifyMigration(options: {
       || cash.rows[0]?.cash !== decimal(source.cash.cash)
       || JSON.stringify(snapshots.rows) !== JSON.stringify(expectedSnapshots)
     ) throw new Error('legacy_migration_verification_failed')
-    if (options.apiBaseUrl) {
-      await verifyApiReadback(
-        options.apiBaseUrl,
-        expectedPositions,
-        expectedSnapshots,
-        decimal(source.cash.cash),
-      )
-    }
+    await verifyApiReadback(
+      options.apiBaseUrl, options.apiToken, expectedPositions,
+      expectedSnapshots, decimal(source.cash.cash),
+    )
     return {
       positions: expectedPositions.length,
       cash: true,
@@ -157,38 +154,41 @@ export async function verifyMigration(options: {
 
 async function verifyApiReadback(
   apiBaseUrl: string,
+  apiToken: string,
   positions: Array<{ symbol: string; quantity: string; average_cost: string }>,
   snapshots: Array<{
     market_day: string; total_equity: string; total_market_value: string; cash: string
   }>,
   cash: string,
 ) {
-  const listed = await fetchText(`${apiBaseUrl}/api/positions`)
-  const actualPositions = [...listed.matchAll(
-    /\{"symbol":"([^"]+)","quantity":(-?[\d.eE+]+),"averageCost":(-?[\d.eE+]+)\}/g,
-  )].map((match) => ({ symbol: match[1]!, quantity: decimal(match[2]!), average_cost: decimal(match[3]!) }))
+  const state = await fetch(`${apiBaseUrl}/api/migration-verification`, {
+    headers: { authorization: `Bearer ${apiToken}` },
+  }).then(requireOk) as {
+    positions: Array<{ symbol: string; quantity: string; averageCost: string }>
+    cash: string
+    snapshots: Array<{
+      marketDay: string; totalEquity: string; totalMarketValue: string; cash: string
+    }>
+  }
+  const actualPositions = state.positions.map((row) => ({
+    symbol: row.symbol, quantity: decimal(row.quantity), average_cost: decimal(row.averageCost),
+  }))
   if (JSON.stringify(actualPositions) !== JSON.stringify(positions)) {
     throw new Error('legacy_migration_api_verification_failed')
   }
-  const history = await fetchText(`${apiBaseUrl}/api/portfolio/history?limit=365`)
-  const actualSnapshots = [...history.matchAll(
-    /\{"marketDay":"([^"]+)","totalEquity":(-?[\d.eE+]+),"totalMarketValue":(-?[\d.eE+]+),"cash":(-?[\d.eE+]+)/g,
-  )].map((match) => ({
-    market_day: match[1]!, total_equity: decimal(match[2]!),
-    total_market_value: decimal(match[3]!), cash: decimal(match[4]!),
+  const actualSnapshots = state.snapshots.map((row) => ({
+    market_day: row.marketDay, total_equity: decimal(row.totalEquity),
+    total_market_value: decimal(row.totalMarketValue), cash: decimal(row.cash),
   })).sort((left, right) => left.market_day.localeCompare(right.market_day))
   if (JSON.stringify(actualSnapshots) !== JSON.stringify(snapshots)) {
     throw new Error('legacy_migration_api_verification_failed')
   }
-  const portfolio = await fetchText(`${apiBaseUrl}/api/portfolio`)
-  const actualCash = portfolio.match(/"cash":(-?[\d.eE+]+)/)?.[1]
-  if (!actualCash || decimal(actualCash) !== cash) throw new Error('legacy_migration_api_verification_failed')
+  if (decimal(state.cash) !== cash) throw new Error('legacy_migration_api_verification_failed')
 }
 
-async function fetchText(url: string) {
-  const response = await fetch(url)
+async function requireOk(response: Response) {
   if (!response.ok) throw new Error('legacy_migration_api_verification_failed')
-  return response.text()
+  return response.json()
 }
 
 async function assertApiStopped(url: string) {

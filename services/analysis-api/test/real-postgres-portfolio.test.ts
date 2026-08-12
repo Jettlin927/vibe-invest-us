@@ -28,6 +28,7 @@ function createPostgresApp(now?: () => Date) {
     ),
     fetchFinancialContext: async (symbol) => ({ symbol, gaps: [], facts: [] }),
     model: { async *analyze(): AsyncGenerator<ModelEvent> { return } },
+    migrationVerificationToken: 'real-pg-verification-token',
     now,
   })
 }
@@ -149,4 +150,32 @@ test('真实 PostgreSQL HTTP 持仓与研究闭环在重启后持久化', {
   assert.equal(research.json().report.title, '测试报告')
   assert.ok(research.json().trace.length > 0)
   await readback.close()
+})
+
+test('迁移验证 API 保留 PostgreSQL decimal 文本精度且默认受令牌保护', {
+  skip: !databaseUrl,
+  concurrency: false,
+}, async () => {
+  const pool = createPool(databaseUrl!)
+  await pool.query('DELETE FROM positions WHERE symbol = $1', ['DECIMAL'])
+  await pool.query(
+    `INSERT INTO positions (symbol, quantity, average_cost, updated_at)
+     VALUES ($1, $2, $3, $4)`,
+    ['DECIMAL', '0.123456789012345678901', '9876543210.1234567890123456789', '2026-08-13T00:00:00Z'],
+  )
+  await pool.end()
+  const app = createPostgresApp()
+  await app.ready()
+  assert.equal((await app.inject({ method: 'GET', url: '/api/migration-verification' })).statusCode, 404)
+  const response = await app.inject({
+    method: 'GET', url: '/api/migration-verification',
+    headers: { authorization: 'Bearer real-pg-verification-token' },
+  })
+  const decimal = response.json().positions.find((position: { symbol: string }) => position.symbol === 'DECIMAL')
+  assert.deepEqual(decimal, {
+    symbol: 'DECIMAL',
+    quantity: '0.123456789012345678901',
+    averageCost: '9876543210.1234567890123456789',
+  })
+  await app.close()
 })

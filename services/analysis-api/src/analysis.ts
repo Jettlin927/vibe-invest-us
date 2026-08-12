@@ -59,10 +59,10 @@ export function createAnalysisService(options: {
   }
   async function schedule() {
     while (running < options.concurrency) {
+      running += 1
       const now = new Date().toISOString()
       const next = await repository.claimNextQueued(now)
-      if (!next) return
-      running += 1
+      if (!next) { running -= 1; return }
       await appendTrace(next, { type: 'status', status: 'running', at: now })
       const task = run(next).finally(() => { running -= 1; void schedule() })
       tasks.add(task)
