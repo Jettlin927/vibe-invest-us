@@ -1,0 +1,556 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "vibe-invest Financial Data",
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/health": {
+      "get": {
+        "summary": "Health",
+        "operationId": "getHealth",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/financial-context": {
+      "post": {
+        "summary": "Financial Context",
+        "operationId": "createFinancialContext",
+        "parameters": [
+          {
+            "name": "symbol",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Symbol"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FinancialContext"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/quotes": {
+      "post": {
+        "summary": "Quotes",
+        "operationId": "createQuoteBatch",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array",
+                "title": "Symbols"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QuoteBatch"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AtomicFact": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "type": {
+            "type": "string",
+            "title": "Type"
+          },
+          "value": {
+            "title": "Value"
+          },
+          "observedAt": {
+            "type": "string",
+            "title": "Observedat"
+          },
+          "fetchedAt": {
+            "type": "string",
+            "title": "Fetchedat"
+          },
+          "source": {
+            "type": "string",
+            "title": "Source"
+          },
+          "sourceReference": {
+            "type": "string",
+            "title": "Sourcereference"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "type",
+          "value",
+          "observedAt",
+          "fetchedAt",
+          "source",
+          "sourceReference"
+        ],
+        "title": "AtomicFact"
+      },
+      "CapabilityResult": {
+        "properties": {
+          "value": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Value"
+          },
+          "items": {
+            "items": {},
+            "type": "array",
+            "title": "Items",
+            "default": []
+          },
+          "adopted_source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Adopted Source"
+          },
+          "degraded": {
+            "type": "boolean",
+            "title": "Degraded",
+            "default": false
+          },
+          "sources": {
+            "items": {
+              "$ref": "#/components/schemas/SourceStatus"
+            },
+            "type": "array",
+            "title": "Sources"
+          },
+          "observations": {
+            "items": {
+              "$ref": "#/components/schemas/SourceObservation"
+            },
+            "type": "array",
+            "title": "Observations",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "sources"
+        ],
+        "title": "CapabilityResult"
+      },
+      "DataGap": {
+        "properties": {
+          "capability": {
+            "type": "string",
+            "title": "Capability"
+          },
+          "reason": {
+            "type": "string",
+            "title": "Reason"
+          }
+        },
+        "type": "object",
+        "required": [
+          "capability",
+          "reason"
+        ],
+        "title": "DataGap"
+      },
+      "FinancialContext": {
+        "properties": {
+          "symbol": {
+            "type": "string",
+            "title": "Symbol"
+          },
+          "fetched_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Fetched At"
+          },
+          "quote": {
+            "$ref": "#/components/schemas/CapabilityResult"
+          },
+          "history": {
+            "$ref": "#/components/schemas/CapabilityResult"
+          },
+          "news": {
+            "$ref": "#/components/schemas/CapabilityResult"
+          },
+          "fundamentals": {
+            "$ref": "#/components/schemas/CapabilityResult"
+          },
+          "indicators": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Indicators"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "valuation": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Valuation"
+          },
+          "facts": {
+            "items": {
+              "$ref": "#/components/schemas/AtomicFact"
+            },
+            "type": "array",
+            "title": "Facts"
+          },
+          "gaps": {
+            "items": {
+              "$ref": "#/components/schemas/DataGap"
+            },
+            "type": "array",
+            "title": "Gaps"
+          }
+        },
+        "type": "object",
+        "required": [
+          "symbol",
+          "fetched_at",
+          "quote",
+          "history",
+          "news",
+          "fundamentals",
+          "indicators",
+          "facts",
+          "gaps"
+        ],
+        "title": "FinancialContext"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "HealthResponse": {
+        "properties": {
+          "service": {
+            "type": "string",
+            "const": "financial-data",
+            "title": "Service"
+          },
+          "status": {
+            "type": "string",
+            "const": "ok",
+            "title": "Status"
+          }
+        },
+        "type": "object",
+        "required": [
+          "service",
+          "status"
+        ],
+        "title": "HealthResponse"
+      },
+      "Indicators": {
+        "properties": {
+          "ma_5": {
+            "type": "number",
+            "title": "Ma 5"
+          },
+          "ma_20": {
+            "type": "number",
+            "title": "Ma 20"
+          },
+          "macd": {
+            "$ref": "#/components/schemas/Macd"
+          },
+          "rsi_14": {
+            "type": "number",
+            "title": "Rsi 14"
+          },
+          "annualized_volatility": {
+            "type": "number",
+            "title": "Annualized Volatility"
+          },
+          "max_drawdown": {
+            "type": "number",
+            "title": "Max Drawdown"
+          },
+          "volume_ratio_5_to_20": {
+            "type": "number",
+            "title": "Volume Ratio 5 To 20"
+          }
+        },
+        "type": "object",
+        "required": [
+          "ma_5",
+          "ma_20",
+          "macd",
+          "rsi_14",
+          "annualized_volatility",
+          "max_drawdown",
+          "volume_ratio_5_to_20"
+        ],
+        "title": "Indicators"
+      },
+      "Macd": {
+        "properties": {
+          "line": {
+            "type": "number",
+            "title": "Line"
+          },
+          "signal": {
+            "type": "number",
+            "title": "Signal"
+          },
+          "histogram": {
+            "type": "number",
+            "title": "Histogram"
+          }
+        },
+        "type": "object",
+        "required": [
+          "line",
+          "signal",
+          "histogram"
+        ],
+        "title": "Macd"
+      },
+      "QuoteBatch": {
+        "properties": {
+          "quotes": {
+            "items": {
+              "$ref": "#/components/schemas/QuoteSnapshot"
+            },
+            "type": "array",
+            "title": "Quotes"
+          }
+        },
+        "type": "object",
+        "required": [
+          "quotes"
+        ],
+        "title": "QuoteBatch"
+      },
+      "QuoteSnapshot": {
+        "properties": {
+          "symbol": {
+            "type": "string",
+            "title": "Symbol"
+          },
+          "price": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Price"
+          },
+          "observed_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observed At"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source"
+          },
+          "degraded": {
+            "type": "boolean",
+            "title": "Degraded",
+            "default": false
+          },
+          "sources": {
+            "items": {
+              "$ref": "#/components/schemas/SourceStatus"
+            },
+            "type": "array",
+            "title": "Sources"
+          }
+        },
+        "type": "object",
+        "required": [
+          "symbol",
+          "sources"
+        ],
+        "title": "QuoteSnapshot"
+      },
+      "SourceObservation": {
+        "properties": {
+          "source": {
+            "type": "string",
+            "title": "Source"
+          },
+          "value": {
+            "title": "Value"
+          }
+        },
+        "type": "object",
+        "required": [
+          "source",
+          "value"
+        ],
+        "title": "SourceObservation"
+      },
+      "SourceStatus": {
+        "properties": {
+          "source": {
+            "type": "string",
+            "title": "Source"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "failed",
+              "empty"
+            ],
+            "title": "Status"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          }
+        },
+        "type": "object",
+        "required": [
+          "source",
+          "status"
+        ],
+        "title": "SourceStatus"
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      }
+    }
+  }
+}

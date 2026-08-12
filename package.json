@@ -1,0 +1,23 @@
+{
+  "name": "vibe-invest-us",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "services/analysis-api",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev:web",
+    "prototype": "npm run dev --workspace @vibe-invest/web -- --open '/prototype/workbench?variant=A'",
+    "dev:web": "npm run dev --workspace @vibe-invest/web",
+    "dev:api": "npm run dev --workspace @vibe-invest/analysis-api",
+    "dev:data": "services/market-data/.venv/bin/uvicorn app.main:app --app-dir services/market-data --reload --port 8000",
+    "build": "npm run build --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "verify:self-hosted": "sh scripts/verify-self-hosted.sh",
+    "verify:real-analysis": "sh scripts/verify-real-analysis.sh"
+  }
+}

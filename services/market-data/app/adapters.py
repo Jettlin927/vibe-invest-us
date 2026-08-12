@@ -1,0 +1,425 @@
+import json
+import os
+import re
+import time
+from hashlib import sha256
+from pathlib import Path
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+from typing import List
+from urllib.parse import urlencode
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
+from xml.etree import ElementTree
+from zoneinfo import ZoneInfo
+
+from app.models import DailyBar, NewsItem, Quote
+from app.valuation import ValuationInput, calculate_valuation
+
+
+USER_AGENT = "Mozilla/5.0 vibe-invest-us/0.1"
+
+
+_diagnostics = {"enabled": False, "directory": None, "max_bytes": 65536, "retention_seconds": 86400}
+
+
+def configure_diagnostics(enabled: bool, directory: Path, max_bytes: int, retention_hours: int):
+    _diagnostics.update(enabled=enabled, directory=directory, max_bytes=max_bytes,
+                        retention_seconds=retention_hours * 3600)
+
+
+def _read(url: str, params=None, headers=None, timeout=15) -> bytes:
+    target = f"{url}?{urlencode(params)}" if params else url
+    request = Request(target, headers={"User-Agent": USER_AGENT, **(headers or {})})
+    with urlopen(request, timeout=timeout) as response:
+        payload = response.read()
+    _diagnose(target, payload)
+    return payload
+
+
+def _diagnose(target: str, payload: bytes):
+    if not _diagnostics["enabled"]:
+        return
+    directory = _diagnostics["directory"]
+    directory.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    for existing in directory.glob("*.sample"):
+        if now - existing.stat().st_mtime > _diagnostics["retention_seconds"]:
+            existing.unlink(missing_ok=True)
+    name = sha256(f"{target}:{now}".encode()).hexdigest()
+    sanitized = _sanitize_diagnostic(payload[:_diagnostics["max_bytes"]])
+    (directory / f"{name}.sample").write_bytes(sanitized)
+
+
+def _sanitize_diagnostic(payload: bytes) -> bytes:
+    text = payload.decode("utf-8", errors="replace")
+    patterns = (
+        (r'(?i)(api[_-]?key|access[_-]?token|authorization|cookie)(["\']?\s*[:=]\s*["\']?)([^"\'\s,&}]+)', r'\1\2[REDACTED]'),
+        (r'(?i)(bearer\s+)[a-z0-9._~+\-/=]+', r'\1[REDACTED]'),
+        (r'[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}', '[REDACTED_EMAIL]'),
+    )
+    for pattern, replacement in patterns:
+        text = re.sub(pattern, replacement, text)
+    return text.encode("utf-8")[:_diagnostics["max_bytes"]]
+
+
+class TimedSource:
+    def __init__(self, timeout=15):
+        self.timeout = timeout
+
+
+class AlpacaSource(TimedSource):
+    name = "alpaca"
+
+    @property
+    def feed(self) -> str:
+        feed = os.getenv("ALPACA_DATA_FEED", "iex").strip().lower()
+        if feed not in {"iex", "sip"}:
+            raise ValueError("ALPACA_DATA_FEED_invalid")
+        return feed
+
+    def read(self, path: str, params=None):
+        key_id = os.getenv("ALPACA_API_KEY", "").strip()
+        secret_key = os.getenv("ALPACA_API_SECRET", "").strip()
+        if not key_id or not secret_key:
+            raise RuntimeError("alpaca_credentials_missing")
+        try:
+            return json.loads(_read(
+                f"https://data.alpaca.markets{path}",
+                params=params,
+                headers={
+                    "APCA-API-KEY-ID": key_id,
+                    "APCA-API-SECRET-KEY": secret_key,
+                },
+                timeout=self.timeout,
+            ))
+        except HTTPError as error:
+            if error.code == 401:
+                raise RuntimeError("alpaca_authentication_failed") from error
+            if error.code in {403, 422}:
+                raise RuntimeError("alpaca_entitlement_denied") from error
+            if error.code == 429:
+                raise RuntimeError("alpaca_rate_limited") from error
+            raise RuntimeError("alpaca_provider_error") from error
+
+
+class AlpacaQuoteSource(AlpacaSource):
+    def fetch(self, symbol: str) -> Quote:
+        data = self.read(f"/v2/stocks/{symbol}/trades/latest", params={"feed": self.feed})
+        trade = data.get("trade") if isinstance(data, dict) else None
+        if not isinstance(data, dict) or data.get("symbol") != symbol or not isinstance(trade, dict):
+            raise ValueError("invalid_alpaca_trade")
+        observed_at = datetime.fromisoformat(str(trade["t"]).replace("Z", "+00:00"))
+        return Quote(
+            price=float(trade["p"]), observed_at=observed_at,
+            source_reference=f"https://data.alpaca.markets/v2/stocks/{symbol}/trades/latest?feed={self.feed}",
+        )
+
+
+class AlpacaHistorySource(AlpacaSource):
+    def fetch(self, symbol: str) -> List[DailyBar]:
+        now = datetime.now(timezone.utc)
+        params = {
+            "timeframe": "1Day", "start": (now.date() - timedelta(days=365)).isoformat(),
+            "end": now.date().isoformat(), "limit": 10000, "adjustment": "all",
+            "feed": self.feed, "sort": "asc",
+        }
+        result, page_tokens = [], set()
+        while True:
+            data = self.read(f"/v2/stocks/{symbol}/bars", params=params)
+            records = data.get("bars") if isinstance(data, dict) else None
+            if not isinstance(records, list):
+                raise ValueError("invalid_alpaca_history")
+            for item in records:
+                if not isinstance(item, dict):
+                    raise ValueError("invalid_alpaca_history")
+                result.append(DailyBar(
+                    date=datetime.fromisoformat(str(item["t"]).replace("Z", "+00:00")).date().isoformat(),
+                    open=float(item["o"]), high=float(item["h"]), low=float(item["l"]),
+                    close=float(item["c"]), volume=float(item["v"]),
+                ))
+            page_token = data.get("next_page_token")
+            if not page_token:
+                break
+            if not isinstance(page_token, str) or page_token in page_tokens:
+                raise ValueError("invalid_alpaca_history_page_token")
+            page_tokens.add(page_token)
+            params["page_token"] = page_token
+        if not result:
+            raise ValueError("empty_alpaca_history")
+        return result[-180:]
+
+
+class AlpacaNewsSource(AlpacaSource):
+    def fetch(self, symbol: str) -> List[NewsItem]:
+        now, result, page_token, page_tokens = datetime.now(timezone.utc), [], None, set()
+        while len(result) < 30:
+            params = {
+                "symbols": symbol, "start": (now - timedelta(days=30)).isoformat(),
+                "end": now.isoformat(), "sort": "desc", "limit": 50, "include_content": "false",
+            }
+            if page_token:
+                params["page_token"] = page_token
+            data = self.read("/v1beta1/news", params=params)
+            records = data.get("news") if isinstance(data, dict) else None
+            if not isinstance(records, list):
+                raise ValueError("invalid_alpaca_news")
+            for item in records:
+                if not isinstance(item, dict) or not item.get("headline") or not item.get("url"):
+                    raise ValueError("invalid_alpaca_news")
+                symbols = item.get("symbols")
+                if not isinstance(symbols, list):
+                    raise ValueError("invalid_alpaca_news")
+                result.append(NewsItem(
+                    title=item["headline"], source=item.get("source") or "Alpaca News",
+                    published_at=datetime.fromisoformat(str(item["created_at"]).replace("Z", "+00:00")),
+                    fetched_at=now, url=item["url"], summary=str(item.get("summary") or item["headline"])[:500],
+                    symbols=symbols,
+                ))
+            page_token = data.get("next_page_token")
+            if not page_token:
+                break
+            if not isinstance(page_token, str) or page_token in page_tokens:
+                raise ValueError("invalid_alpaca_news_page_token")
+            page_tokens.add(page_token)
+        return result[:30]
+
+
+class SinaQuoteSource(TimedSource):
+    name = "sina"
+
+    def fetch(self, symbol: str) -> Quote:
+        raw = _read(
+            f"https://hq.sinajs.cn/list=gb_{symbol.lower()}",
+            headers={"Referer": "https://finance.sina.com.cn/"},
+            timeout=self.timeout,
+        ).decode("gbk", errors="replace")
+        match = re.search(r'"(.+)"', raw)
+        fields = match.group(1).split(",") if match else []
+        if len(fields) < 27 or not fields[1]:
+            raise ValueError("invalid_sina_quote")
+        observed_at = datetime.strptime(fields[3], "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=ZoneInfo("America/New_York"),
+        ).astimezone(timezone.utc)
+        return Quote(
+            price=float(fields[1]), observed_at=observed_at,
+            source_reference=f"https://finance.sina.com.cn/stock/usstock/quotes/{symbol}.html",
+        )
+
+
+class TencentQuoteSource(TimedSource):
+    name = "tencent"
+
+    def fetch(self, symbol: str) -> Quote:
+        raw = _read(f"https://qt.gtimg.cn/q=us{symbol}", timeout=self.timeout).decode("gbk", errors="replace")
+        match = re.search(r'"(.+)"', raw)
+        fields = match.group(1).split("~") if match else []
+        if len(fields) < 36 or not fields[3]:
+            raise ValueError("invalid_tencent_quote")
+        observed_at = datetime.strptime(fields[30], "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=ZoneInfo("America/New_York"),
+        ).astimezone(timezone.utc)
+        return Quote(
+            price=float(fields[3]), observed_at=observed_at,
+            source_reference=f"https://gu.qq.com/us{symbol}",
+        )
+
+
+class SinaHistorySource(TimedSource):
+    name = "sina"
+
+    def fetch(self, symbol: str) -> List[DailyBar]:
+        raw = _read(
+            "https://stock.finance.sina.com.cn/usstock/api/jsonp.php/var/US_MinKService.getDailyK",
+            params={"symbol": symbol, "num": 180},
+            headers={"Referer": "https://finance.sina.com.cn/"},
+            timeout=self.timeout,
+        ).decode()
+        match = re.search(r"\((\[.+\])\)", raw)
+        if not match:
+            raise ValueError("invalid_sina_history")
+        return [DailyBar(date=item["d"], open=float(item["o"]), high=float(item["h"]),
+                         low=float(item["l"]), close=float(item["c"]), volume=float(item["v"]))
+                for item in json.loads(match.group(1))[-180:]]
+
+
+class YahooHistorySource(TimedSource):
+    name = "yahoo"
+
+    def fetch(self, symbol: str) -> List[DailyBar]:
+        data = json.loads(_read(
+            f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}",
+            params={"interval": "1d", "range": "1y"},
+            timeout=self.timeout,
+        ))
+        chart = data["chart"]["result"][0]
+        quote = chart["indicators"]["quote"][0]
+        result = []
+        for index, timestamp in enumerate(chart["timestamp"]):
+            values = [quote[key][index] for key in ("open", "high", "low", "close", "volume")]
+            if any(value is None for value in values):
+                continue
+            result.append(DailyBar(
+                date=datetime.fromtimestamp(timestamp, timezone.utc).date().isoformat(),
+                open=values[0], high=values[1], low=values[2], close=values[3], volume=values[4],
+            ))
+        if not result:
+            raise ValueError("empty_yahoo_history")
+        return result[-180:]
+
+
+class YahooNewsSource(TimedSource):
+    name = "yahoo"
+
+    def fetch(self, symbol: str) -> List[NewsItem]:
+        data = json.loads(_read(
+            "https://query2.finance.yahoo.com/v1/finance/search",
+            params={"q": symbol, "quotesCount": 0, "newsCount": 20},
+            timeout=self.timeout,
+        ))
+        now = datetime.now(timezone.utc)
+        return [NewsItem(
+            title=item["title"], source=item.get("publisher") or "Yahoo Finance",
+            published_at=datetime.fromtimestamp(item["providerPublishTime"], timezone.utc),
+            fetched_at=now, url=item["link"], summary=item.get("title", "")[:500], symbols=[symbol],
+        ) for item in data.get("news", []) if item.get("title") and item.get("link")]
+
+
+class GoogleNewsSource(TimedSource):
+    name = "google-news"
+
+    def fetch(self, symbol: str) -> List[NewsItem]:
+        raw = _read("https://news.google.com/rss/search", params={
+            "q": f"{symbol} stock", "hl": "en-US", "gl": "US", "ceid": "US:en",
+        }, timeout=self.timeout)
+        now, result = datetime.now(timezone.utc), []
+        for item in ElementTree.fromstring(raw).findall("./channel/item"):
+            title, link, published = item.findtext("title"), item.findtext("link"), item.findtext("pubDate")
+            if title and link and published:
+                result.append(NewsItem(
+                    title=title, source="Google News", published_at=parsedate_to_datetime(published),
+                    fetched_at=now, url=link, summary=title[:500], symbols=[symbol],
+                ))
+        return result
+
+
+class SecFundamentalsSource(TimedSource):
+    name = "sec"
+
+    def fetch(self, symbol: str):
+        user_agent = os.getenv("SEC_USER_AGENT")
+        if not user_agent:
+            raise RuntimeError("SEC_USER_AGENT_missing")
+        mapping = json.loads(_read(
+            "https://www.sec.gov/files/company_tickers.json", headers={"User-Agent": user_agent}, timeout=self.timeout,
+        ))
+        company = next((value for value in mapping.values() if value.get("ticker") == symbol), None)
+        if not company:
+            raise ValueError("sec_ticker_not_found")
+        cik = str(company["cik_str"]).zfill(10)
+        facts = json.loads(_read(
+            f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json",
+            headers={"User-Agent": user_agent, "Accept-Encoding": "gzip, deflate"},
+            timeout=self.timeout,
+        ))
+        gaap = facts.get("facts", {}).get("us-gaap", {})
+        return {
+            "company": facts.get("entityName"), "cik": cik,
+            "period": _latest_period(gaap),
+            "dilutedEps": _latest_fact(gaap, ["EarningsPerShareDiluted"], "USD/shares"),
+            "revenue": _latest_fact(gaap, ["RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues"], "USD"),
+            "netIncome": _latest_fact(gaap, ["NetIncomeLoss"], "USD"),
+            "operatingCashFlow": _latest_fact(gaap, ["NetCashProvidedByUsedInOperatingActivities", "NetCashProvidedByOperatingActivities"], "USD"),
+            "sourceReference": f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json",
+        }
+
+
+COMPARABLES = {
+    "NVDA": ("semiconductor", ["AMD", "AVGO", "QCOM"]),
+    "AMD": ("semiconductor", ["NVDA", "AVGO", "QCOM"]),
+    "AVGO": ("semiconductor", ["NVDA", "AMD", "QCOM"]),
+    "QCOM": ("semiconductor", ["NVDA", "AMD", "AVGO"]),
+    "CRM": ("saas", ["NOW", "ADBE", "ORCL"]),
+    "NOW": ("saas", ["CRM", "ADBE", "ORCL"]),
+    "ADBE": ("saas", ["CRM", "NOW", "ORCL"]),
+    "ORCL": ("saas", ["CRM", "NOW", "ADBE"]),
+}
+
+
+class YahooValuationSource(TimedSource):
+    name = "yahoo-timeseries"
+
+    def fetch(self, symbol: str):
+        industry_and_peers = COMPARABLES.get(symbol)
+        if not industry_and_peers:
+            return calculate_valuation(ValuationInput(
+                symbol=symbol, industry="unsupported", current_price=0, diluted_eps=None,
+                enterprise_value=None, ebitda=None, revenue=None, comparables=[],
+            ))
+        industry, peers = industry_and_peers
+        company = self._metrics(symbol)
+        comparables = []
+        for peer in peers:
+            values = self._metrics(peer)
+            comparables.append({
+                "symbol": peer, "pe": values.get("pe"),
+                "evToEbitda": _ratio(values.get("enterpriseValue"), values.get("ebitda")),
+                "evToRevenue": _ratio(values.get("enterpriseValue"), values.get("revenue")),
+            })
+        eps, pe = company.get("dilutedEps"), company.get("pe")
+        return calculate_valuation(ValuationInput(
+            symbol=symbol, industry=industry,
+            current_price=(eps * pe) if eps and pe else 0,
+            diluted_eps=eps, enterprise_value=company.get("enterpriseValue"),
+            ebitda=company.get("ebitda"), revenue=company.get("revenue"),
+            comparables=comparables,
+            historical_multiples={"pe": company.get("historicalPe", [])},
+            source=self.name,
+            as_of=datetime.now(timezone.utc).isoformat(),
+        ))
+
+    def _metrics(self, symbol: str):
+        now = int(datetime.now(timezone.utc).timestamp())
+        data = json.loads(_read(
+            f"https://query1.finance.yahoo.com/ws/fundamentals-timeseries/v1/finance/timeseries/{symbol}",
+            params={
+                "symbol": symbol,
+                "type": "trailingDilutedEPS,trailingPeRatio,trailingEnterpriseValue,trailingEBITDA,trailingTotalRevenue",
+                "merge": "false", "period1": now - 366 * 24 * 60 * 60, "period2": now,
+            },
+            timeout=self.timeout,
+        ))
+        mapped = {}
+        keys = {
+            "trailingDilutedEPS": "dilutedEps", "trailingPeRatio": "pe",
+            "trailingEnterpriseValue": "enterpriseValue", "trailingEBITDA": "ebitda",
+            "trailingTotalRevenue": "revenue",
+        }
+        for series in data.get("timeseries", {}).get("result", []):
+            source_key = (series.get("meta", {}).get("type") or [None])[0]
+            values = series.get(source_key, [])
+            if source_key == "trailingPeRatio":
+                mapped["historicalPe"] = [item["reportedValue"]["raw"] for item in values if item.get("reportedValue")]
+            if values and source_key in keys:
+                mapped[keys[source_key]] = values[-1]["reportedValue"]["raw"]
+        return mapped
+
+
+def _ratio(numerator, denominator):
+    return numerator / denominator if numerator and denominator else None
+
+
+def _latest_fact(gaap, tags, unit):
+    candidates = []
+    for tag in tags:
+        candidates.extend(gaap.get(tag, {}).get("units", {}).get(unit, []))
+    annual = [item for item in candidates if item.get("form") == "10-K" and item.get("fp") == "FY"]
+    if not annual:
+        return None
+    latest = max(annual, key=lambda item: (item.get("filed", ""), item.get("end", "")))
+    return {"value": latest.get("val"), "observedAt": latest.get("end"), "filedAt": latest.get("filed")}
+
+
+def _latest_period(gaap):
+    facts = _latest_fact(gaap, ["NetIncomeLoss"], "USD")
+    return facts.get("observedAt") if facts else None

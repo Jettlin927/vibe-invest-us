@@ -1,0 +1,62 @@
+services:
+  financial-data:
+    build:
+      context: .
+      dockerfile: services/market-data/Dockerfile
+    expose:
+      - "8000"
+    environment:
+      SEC_USER_AGENT: ${SEC_USER_AGENT:-}
+      ALPACA_API_KEY: ${ALPACA_API_KEY:-}
+      ALPACA_API_SECRET: ${ALPACA_API_SECRET:-}
+      ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-iex}
+      MARKET_DATA_SOURCE_CONFIG: ${MARKET_DATA_SOURCE_CONFIG:-/app/config/sources.json}
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import json, urllib.request; assert json.load(urllib.request.urlopen('http://127.0.0.1:8000/health'))['status'] == 'ok'"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  analysis-api:
+    build:
+      context: .
+      dockerfile: services/analysis-api/Dockerfile
+    depends_on:
+      financial-data:
+        condition: service_healthy
+    environment:
+      FINANCIAL_DATA_URL: http://financial-data:8000
+      DATABASE_PATH: /data/vibe-invest.db
+      WEB_STATIC_DIR: /app/services/analysis-api/public
+      MODEL_PROVIDER: ${MODEL_PROVIDER:-}
+      MODEL_API_PROTOCOL: ${MODEL_API_PROTOCOL:-}
+      MODEL_BASE_URL: ${MODEL_BASE_URL:-}
+      MODEL_NAME: ${MODEL_NAME:-}
+      MODEL_API_KEY: ${MODEL_API_KEY:-}
+      ANALYSIS_CONCURRENCY: ${ANALYSIS_CONCURRENCY:-2}
+    ports:
+      - "${VIBE_INVEST_PORT:-3000}:3000"
+    volumes:
+      - vibe-invest-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/api/health').then(r => { if (!r.ok) process.exit(1) })"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  vibe-invest-data:

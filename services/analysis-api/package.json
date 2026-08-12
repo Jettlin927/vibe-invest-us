@@ -1,0 +1,27 @@
+{
+  "name": "@vibe-invest/analysis-api",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server.js",
+    "test": "tsx --test test/**/*.test.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "0.84.1",
+    "@fastify/static": "10.1.3",
+    "@vibe-invest/contracts": "0.1.0",
+    "fastify": "5.11.3"
+  },
+  "devDependencies": {
+    "@types/node": "24.7.2",
+    "tsx": "4.20.6",
+    "typescript": "5.9.3"
+  }
+}

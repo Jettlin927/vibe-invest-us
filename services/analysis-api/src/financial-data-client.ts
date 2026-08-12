@@ -1,0 +1,80 @@
+import { isFinancialDataHealth, type FinancialDataHealth } from '@vibe-invest/contracts'
+
+export type FinancialFact = {
+  id: string
+  type: string
+  value: unknown
+  observedAt: string
+  fetchedAt: string
+  source: string
+  sourceReference: string
+}
+
+export type FinancialContext = {
+  symbol: string
+  facts: FinancialFact[]
+  gaps?: unknown[]
+  indicators?: unknown
+  valuation?: unknown
+  [key: string]: unknown
+}
+
+export function createFinancialDataClient(baseUrl: string) {
+  return {
+    async health(): Promise<FinancialDataHealth> {
+      const response = await fetch(new URL('/health', baseUrl), {
+        signal: AbortSignal.timeout(2_000),
+      })
+
+      if (!response.ok) throw new Error(`financial_data_http_${response.status}`)
+
+      const value: unknown = await response.json()
+      if (!isFinancialDataHealth(value)) throw new Error('financial_data_contract_invalid')
+      return value
+    },
+    async context(symbol: string, signal?: AbortSignal): Promise<FinancialContext> {
+      const response = await fetch(new URL(`/v1/financial-context?symbol=${encodeURIComponent(symbol)}`, baseUrl), {
+        method: 'POST',
+        signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(30_000)]) : AbortSignal.timeout(30_000),
+      })
+      if (!response.ok) throw new Error(`financial_context_http_${response.status}`)
+      const value: unknown = await response.json()
+      if (!isFinancialContext(value)) {
+        throw new Error('financial_context_contract_invalid')
+      }
+      return value
+    },
+    async quotes(symbols: string[], signal?: AbortSignal): Promise<Record<string, number>> {
+      const response = await fetch(new URL('/v1/quotes', baseUrl), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(symbols),
+        signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(10_000)]) : AbortSignal.timeout(10_000),
+      })
+      if (!response.ok) throw new Error(`financial_data_quotes_http_${response.status}`)
+      const value = await response.json() as { quotes?: Array<{ symbol?: unknown; price?: unknown }> }
+      if (!Array.isArray(value.quotes)) throw new Error('financial_data_quotes_contract_invalid')
+      return Object.fromEntries(value.quotes.flatMap((quote) => (
+        typeof quote.symbol === 'string' && typeof quote.price === 'number'
+          ? [[quote.symbol, quote.price] as const]
+          : []
+      )))
+    },
+  }
+}
+
+function isFinancialContext(value: unknown): value is FinancialContext {
+  if (!value || typeof value !== 'object') return false
+  const candidate = value as Record<string, unknown>
+  return typeof candidate.symbol === 'string'
+    && Array.isArray(candidate.facts)
+    && candidate.facts.every(isFinancialFact)
+}
+
+function isFinancialFact(value: unknown): value is FinancialFact {
+  if (!value || typeof value !== 'object') return false
+  const candidate = value as Record<string, unknown>
+  return ['id', 'type', 'observedAt', 'fetchedAt', 'source', 'sourceReference']
+    .every((field) => typeof candidate[field] === 'string' && candidate[field] !== '')
+    && 'value' in candidate
+}
