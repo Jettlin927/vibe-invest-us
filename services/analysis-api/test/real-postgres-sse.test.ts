@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { fauxAssistantMessage, fauxToolCall } from '@earendil-works/pi-ai'
 
 import {
   checkSchema,
@@ -10,7 +11,7 @@ import {
 } from '@vibe-invest/product-dao'
 
 import { buildApp } from '../src/app.js'
-import type { ModelEvent } from '../src/model.js'
+import { createPiModel, type ModelEvent } from '../src/model.js'
 
 const databaseUrl = process.env.TEST_DATABASE_URL
 
@@ -24,6 +25,7 @@ test('真实 PostgreSQL 与真实 HTTP SSE 断线后先 catch-up 再继续 live'
   let finishModel: (() => void) | undefined
   const missedEventMayWrite = new Promise<void>((resolve) => { writeMissedEvent = resolve })
   const modelMayFinish = new Promise<void>((resolve) => { finishModel = resolve })
+  let runtimeExecutionId: string | undefined
   const app = buildApp({
     productDatabase: { checkSchema: () => checkSchema(pool), close: () => pool.end() },
     portfolioRepository: createPortfolioRepository(pool),
@@ -32,8 +34,11 @@ test('真实 PostgreSQL 与真实 HTTP SSE 断线后先 catch-up 再继续 live'
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({ symbol, gaps: [], facts: [] }),
     model: {
-      async *analyze(): AsyncGenerator<ModelEvent> {
-        yield { type: 'text_delta', text: 'first-connection' }
+      async *analyze(input): AsyncGenerator<ModelEvent> {
+        runtimeExecutionId = input.executionId
+        const replayedOperationId = `execution:${input.executionId}:model-attempt:1:event:1:text`
+        yield { type: 'text_delta', text: 'first-connection', operationId: replayedOperationId }
+        yield { type: 'text_delta', text: 'first-connection', operationId: replayedOperationId }
         await missedEventMayWrite
         yield { type: 'text_delta', text: 'persisted-while-disconnected' }
         await modelMayFinish
@@ -53,23 +58,25 @@ test('真实 PostgreSQL 与真实 HTTP SSE 断线后先 catch-up 再继续 live'
   const created = await fetch(`${baseUrl}/api/analyses`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ symbol: 'PGSSE' }),
-  }).then((response) => response.json()) as { analysisId: string }
+  }).then((response) => response.json()) as { analysisId: string; sessionId: string }
 
   try {
+    const persistedSession = await eventRepository.getSession(created.sessionId)
     const firstController = new AbortController()
-    const firstResponse = await fetch(`${baseUrl}/api/analyses/${created.analysisId}/events`, {
+    const firstResponse = await fetch(`${baseUrl}/api/agent-sessions/${created.sessionId}/events`, {
       signal: firstController.signal,
     })
     const first = await readThrough(firstResponse, 'first-connection')
-    const lastEventId = Number([...first.matchAll(/id: (\d+)/g)].at(-1)?.[1])
-    assert.ok(Number.isSafeInteger(lastEventId))
+    assert.equal(runtimeExecutionId, persistedSession?.executionId)
+    const lastEventId = [...first.matchAll(/id: ([^\n]+)/g)].at(-1)?.[1]
+    assert.match(lastEventId ?? '', new RegExp(`^${created.sessionId}:\\d+$`))
     firstController.abort()
 
     writeMissedEvent!()
-    await waitForPersistedEvent(eventRepository, created.analysisId, 'persisted-while-disconnected')
+    await waitForPersistedEvent(eventRepository, created.sessionId, 'persisted-while-disconnected')
 
-    const secondResponse = await fetch(`${baseUrl}/api/analyses/${created.analysisId}/events`, {
-      headers: { 'last-event-id': String(lastEventId) },
+    const secondResponse = await fetch(`${baseUrl}/api/agent-sessions/${created.sessionId}/events`, {
+      headers: { 'last-event-id': lastEventId! },
     })
     const secondReader = secondResponse.body!.getReader()
     const catchUp = await readThroughReader(secondReader, 'persisted-while-disconnected')
@@ -80,12 +87,124 @@ test('真实 PostgreSQL 与真实 HTTP SSE 断线后先 catch-up 再继续 live'
     const live = await readThroughReader(secondReader, 'event: partial')
     assert.match(live, /event: model_completed/)
     assert.match(live, /event: partial/)
-    const ids = [...`${catchUp}${live}`.matchAll(/id: (\d+)/g)].map((match) => Number(match[1]))
-    assert.ok(ids.every((id) => id > lastEventId))
-    assert.deepEqual(ids, [...ids].sort((left, right) => left - right))
+    const cursorSequence = Number(lastEventId!.split(':').at(-1))
+    const ids = [...`${catchUp}${live}`.matchAll(/id: ([^\n]+)/g)].map((match) => match[1]!)
+    assert.ok(ids.every((id) => id.startsWith(`${created.sessionId}:`)
+      && Number(id.split(':').at(-1)) > cursorSequence))
+    const replayed = (await eventRepository.list(created.sessionId, 0)).filter(({ operationId }) => (
+      operationId.endsWith(':model-attempt:1:event:1:text')
+    ))
+    assert.equal(replayed.length, 1)
   } finally {
     writeMissedEvent!()
     finishModel!()
+    await app.close()
+  }
+})
+
+test('真实 PostgreSQL 重启恢复在 API、Session ledger 与 SSE 中一致终止', {
+  skip: !databaseUrl,
+  concurrency: false,
+}, async () => {
+  const pool = createPool(databaseUrl!)
+  const events = createAgentEventRepository(pool)
+  const analyses = createAnalysisRepository(pool)
+  const analysisId = 'restart-event-analysis'
+  const sessionId = 'restart-event-session'
+  await analyses.removeResearch(analysisId)
+  const beforeRestart = '2026-08-13T00:00:00.000Z'
+  await events.createResearch({
+    analysisId,
+    sessionId,
+    executionId: 'before-restart',
+    symbol: 'RESTART-EVENT',
+    status: 'running',
+    operationId: 'execution:before-restart:running',
+    event: { type: 'status', status: 'running', at: beforeRestart },
+    createdAt: beforeRestart,
+  })
+  const app = buildApp({
+    productDatabase: { checkSchema: () => checkSchema(pool), close: () => pool.end() },
+    portfolioRepository: createPortfolioRepository(pool),
+    analysisRepository: analyses,
+    agentEventRepository: events,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, gaps: [], facts: [] }),
+    model: { async *analyze(): AsyncGenerator<ModelEvent> { return } },
+  })
+  await app.listen({ host: '127.0.0.1', port: 0 })
+  const address = app.server.address()
+  assert.ok(address && typeof address === 'object')
+  const baseUrl = `http://127.0.0.1:${address.port}`
+  try {
+    const status = await fetch(`${baseUrl}/api/analyses/${analysisId}`).then((response) => response.json())
+    assert.equal(status.status, 'interrupted')
+    assert.equal((await events.getSession(sessionId))?.status, 'interrupted')
+    const ledger = await events.list(sessionId, 0)
+    assert.deepEqual(ledger.map(({ sequence }) => sequence), [1, 2])
+    assert.equal(ledger[1]?.operationId, `startup:interrupt:${sessionId}:2`)
+    const response = await fetch(`${baseUrl}/api/agent-sessions/${sessionId}/events`, {
+      headers: { 'last-event-id': `${sessionId}:1` },
+    })
+    const replay = await response.text()
+    assert.match(replay, new RegExp(`id: ${sessionId}:2`))
+    assert.match(replay, /event: interrupted/)
+    assert.doesNotMatch(replay, /event: running/)
+  } finally {
+    await app.close()
+  }
+})
+
+test('Pi Runtime 使用持久 executionId 派生工具 operationId 且真实 PostgreSQL 重放幂等', {
+  skip: !databaseUrl,
+  concurrency: false,
+}, async () => {
+  const pool = createPool(databaseUrl!)
+  const events = createAgentEventRepository(pool)
+  const analyses = createAnalysisRepository(pool)
+  const callId = 'replayed-provider-call'
+  const reportCallId = 'stable-report-call'
+  const report = {
+    title: '稳定 operationId 测试', marketState: '未知', trend: '未知', drivers: [],
+    supportingEvidence: [], contraryEvidence: [], keyJudgments: [], scenarios: [],
+    invalidationConditions: [], valuation: null, personalImpact: null,
+    conditionalSuggestion: null, limitations: ['测试上下文为空'],
+  }
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage([
+      fauxToolCall('fetch_financial_context', { symbol: 'PGOPID' }, { id: callId }),
+      fauxToolCall('fetch_financial_context', { symbol: 'PGOPID' }, { id: callId }),
+    ], { stopReason: 'toolUse' }),
+    fauxAssistantMessage(
+      fauxToolCall('submit_analysis_report', report, { id: reportCallId }),
+      { stopReason: 'toolUse' },
+    ),
+  ] })
+  const app = buildApp({
+    productDatabase: { checkSchema: () => checkSchema(pool), close: () => pool.end() },
+    portfolioRepository: createPortfolioRepository(pool),
+    analysisRepository: analyses,
+    agentEventRepository: events,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, gaps: [], facts: [] }),
+    model,
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'PGOPID' },
+  })).json() as { analysisId: string; sessionId: string }
+  try {
+    await waitForAnalysisStatus(app, created.analysisId, 'partial')
+    const session = await events.getSession(created.sessionId)
+    assert.ok(session)
+    const ledger = await events.list(created.sessionId, 0)
+    const toolPrefix = `execution:${session.executionId}:tool:${callId}`
+    assert.equal(ledger.filter(({ operationId }) => operationId === `${toolPrefix}:call`).length, 1)
+    assert.equal(ledger.filter(({ operationId }) => operationId === `${toolPrefix}:result`).length, 1)
+    assert.equal(ledger.filter(({ operationId }) => (
+      operationId === `execution:${session.executionId}:tool:${reportCallId}:report`
+    )).length, 1)
+  } finally {
     await app.close()
   }
 })
@@ -115,4 +234,15 @@ async function waitForPersistedEvent(
     await new Promise((resolve) => setTimeout(resolve, 5))
   }
   throw new Error('agent_event_not_persisted')
+}
+
+async function waitForAnalysisStatus(
+  app: ReturnType<typeof buildApp>, analysisId: string, expected: string,
+) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const response = await app.inject({ method: 'GET', url: `/api/analyses/${analysisId}` })
+    if (response.json().status === expected) return
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  throw new Error(`analysis_status_not_reached:${expected}`)
 }

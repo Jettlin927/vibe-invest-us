@@ -40,9 +40,9 @@ test('真实 HTTP SSE 断线后用 Last-Event-ID 补回事件再继续 live', as
   const baseUrl = `http://127.0.0.1:${address.port}`
   const created = await fetch(`${baseUrl}/api/analyses`, {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ symbol: 'NVDA' }),
-  }).then((response) => response.json()) as { analysisId: string }
+  }).then((response) => response.json()) as { analysisId: string; sessionId: string }
   const firstController = new AbortController()
-  const firstResponse = await fetch(`${baseUrl}/api/analyses/${created.analysisId}/events`, {
+  const firstResponse = await fetch(`${baseUrl}/api/agent-sessions/${created.sessionId}/events`, {
     signal: firstController.signal,
   })
   const reader = firstResponse.body!.getReader()
@@ -54,13 +54,13 @@ test('真实 HTTP SSE 断线后用 Last-Event-ID 补回事件再继续 live', as
     firstStream += decoder.decode(chunk.value, { stream: true })
   }
   firstController.abort()
-  const textDeltaId = Number([...firstStream.matchAll(/id: (\d+)\nevent: text_delta/g)].at(-1)?.[1])
+  const textDeltaId = [...firstStream.matchAll(/id: ([^\n]+)\nevent: text_delta/g)].at(-1)?.[1]
   try {
-    assert.ok(Number.isInteger(textDeltaId))
+    assert.match(textDeltaId ?? '', new RegExp(`^${created.sessionId}:\\d+$`))
     finishModel!()
 
-    const response = await fetch(`${baseUrl}/api/analyses/${created.analysisId}/events`, {
-      headers: { 'last-event-id': String(textDeltaId) },
+    const response = await fetch(`${baseUrl}/api/agent-sessions/${created.sessionId}/events`, {
+      headers: { 'last-event-id': textDeltaId! },
     })
     const replayed = await response.text()
 
@@ -68,9 +68,15 @@ test('真实 HTTP SSE 断线后用 Last-Event-ID 补回事件再继续 live', as
     assert.doesNotMatch(replayed, /event: queued|event: running|event: text_delta/)
     assert.match(replayed, /event: model_completed/)
     assert.match(replayed, /event: completed/)
-    const replayedIds = [...replayed.matchAll(/id: (\d+)/g)].map((match) => Number(match[1]))
-    assert.ok(replayedIds.every((id) => id > textDeltaId))
-    assert.deepEqual(replayedIds, [...replayedIds].sort((left, right) => left - right))
+    const cursorSequence = Number(textDeltaId!.split(':').at(-1))
+    const replayedIds = [...replayed.matchAll(/id: ([^\n]+)/g)].map((match) => match[1]!)
+    assert.ok(replayedIds.every((id) => id.startsWith(`${created.sessionId}:`)
+      && Number(id.split(':').at(-1)) > cursorSequence))
+    const wrongSession = await fetch(`${baseUrl}/api/agent-sessions/${created.sessionId}/events`, {
+      headers: { 'last-event-id': `another-session:${cursorSequence}` },
+    })
+    assert.equal(wrongSession.status, 400)
+    assert.deepEqual(await wrongSession.json(), { error: 'invalid_last_event_id' })
   } finally {
     finishModel!()
     await app.close()
@@ -117,13 +123,13 @@ test('SSE 在 PostgreSQL catch-up 与 live 交接窗口不会漏掉终态', asyn
   const created = await fetch(`${baseUrl}/api/analyses`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ symbol: 'HANDOFF' }),
-  }).then((response) => response.json()) as { analysisId: string }
-  while ((await database.agentEventRepository.getSession(created.analysisId))?.status !== 'running') {
+  }).then((response) => response.json()) as { analysisId: string; sessionId: string }
+  while ((await database.agentEventRepository.getSession(created.sessionId))?.status !== 'running') {
     await new Promise((resolve) => setTimeout(resolve, 1))
   }
   closeCatchUpWindow = true
   try {
-    const response = await fetch(`${baseUrl}/api/analyses/${created.analysisId}/events`)
+    const response = await fetch(`${baseUrl}/api/agent-sessions/${created.sessionId}/events`)
     assert.match(await response.text(), /event: partial/)
   } finally {
     finishModel!()

@@ -75,7 +75,7 @@ test('创建分析立即返回标识并自动保存完成报告、快照、事�
   const app = await makeApp(join(dir, 'storage'))
   const created = await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' } })
   assert.equal(created.statusCode, 202)
-  const { analysisId } = created.json()
+  const { analysisId, sessionId } = created.json()
   const completed = await waitForStatus(app, analysisId, 'completed')
   assert.equal(completed.report.title, report.title)
 
@@ -86,7 +86,7 @@ test('创建分析立即返回标识并自动保存完成报告、快照、事�
   assert.equal(research.json().facts[0].source, 'sina')
   assert.ok(research.json().trace.some((entry: { type: string }) => entry.type === 'status'))
 
-  const events = await app.inject({ method: 'GET', url: `/api/analyses/${analysisId}/events` })
+  const events = await app.inject({ method: 'GET', url: `/api/agent-sessions/${sessionId}/events` })
   assert.match(events.headers['content-type'] ?? '', /text\/event-stream/)
   assert.match(events.body, /event: completed/)
   await app.close()
@@ -246,12 +246,19 @@ test('重启后未完成任务标记为中断且不会自动执行', async () =>
   const dir = await mkdtemp(join(tmpdir(), 'vibe-analysis-restart-'))
   const storageKey = join(dir, 'restart')
   const first = await makeApp(storageKey, fakeModel(1000), 0)
-  const { analysisId } = (await first.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' } })).json()
+  const { analysisId, sessionId } = (await first.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' },
+  })).json()
   await first.close()
   let calls = 0
   const second = await makeApp(storageKey, { async *analyze() { calls += 1; yield { type: 'completed' as const, report } } })
   const status = (await second.inject({ method: 'GET', url: `/api/analyses/${analysisId}` })).json()
   assert.equal(status.status, 'interrupted')
+  const replay = await second.inject({
+    method: 'GET', url: `/api/agent-sessions/${sessionId}/events`,
+  })
+  assert.match(replay.body, /event: interrupted/)
+  assert.match(replay.body, new RegExp(`id: ${sessionId}:2`))
   assert.equal(calls, 0)
   await second.close()
 })
@@ -395,6 +402,38 @@ test('工具补查返回的事实进入研究证据集合', async () => {
   await waitForStatus(app as any, created.json().analysisId, 'completed')
   const research = await app.inject({ method: 'GET', url: `/api/research/${created.json().analysisId}` })
   assert.ok(research.json().facts.some((item: { id: string }) => item.id === extraFact.id))
+  await app.close()
+})
+
+test('Runtime 重放同一 operationId 不追加第二条业务事件', async () => {
+  const app = buildApp({
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [] }),
+    model: {
+      async *analyze(): AsyncGenerator<ModelEvent> {
+        const replayed = {
+          type: 'tool_call' as const,
+          name: 'fetch_financial_context',
+          input: { symbol: 'NVDA' },
+          operationId: 'tool:provider-call-1:call',
+        }
+        yield { type: 'trace', entry: replayed }
+        yield { type: 'trace', entry: replayed }
+        yield { type: 'completed', report, operationId: 'tool:provider-report-1:report' }
+      },
+    },
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' },
+  })).json() as { analysisId: string }
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  const research = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  assert.equal(research.trace.filter((entry: { operationId?: string }) => (
+    entry.operationId === 'tool:provider-call-1:call'
+  )).length, 1)
   await app.close()
 })
 

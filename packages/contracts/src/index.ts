@@ -13,7 +13,7 @@ export type SystemHealth = {
 }
 
 export type SseEventEnvelope = {
-  id: number
+  id: string
   event: string
   data: Record<string, unknown>
 }

@@ -17,7 +17,7 @@ test('真实 PostgreSQL migration 幂等且 application role 没有 DDL 权限',
   await migrate(migrationUrl!)
 
   const pool = createPool(applicationUrl!)
-  assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 5 })
+  assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 7 })
   const privileges = await pool.query<{ can_create: boolean; can_temp: boolean }>(
     `SELECT has_schema_privilege(current_user, 'public', 'CREATE') AS can_create,
             has_database_privilege(current_user, current_database(), 'TEMP') AS can_temp`,
@@ -39,6 +39,61 @@ test('真实 PostgreSQL migration 幂等且 application role 没有 DDL 权限',
     /permission denied/,
   )
   await pool.end()
+})
+
+test('真实 PostgreSQL 从 v5 升级会移除 Session 一对一约束并回填 primary', {
+  skip: !migrationUrl || !applicationUrl,
+  concurrency: false,
+}, async () => {
+  const migrationPool = createPool(migrationUrl!)
+  const analysisId = 'schema-v5-upgrade-analysis'
+  const oldSessionId = 'schema-v5-upgrade-main'
+  try {
+    await migrationPool.query('DELETE FROM analyses WHERE id = $1', [analysisId])
+    await migrationPool.query('DROP INDEX IF EXISTS agent_sessions_one_primary_per_analysis')
+    await migrationPool.query('ALTER TABLE agent_sessions DROP COLUMN IF EXISTS is_primary')
+    await migrationPool.query('ALTER TABLE agent_sessions DROP COLUMN IF EXISTS execution_id')
+    await migrationPool.query(
+      'ALTER TABLE agent_sessions ADD CONSTRAINT agent_sessions_analysis_id_key UNIQUE (analysis_id)',
+    )
+    await migrationPool.query('DELETE FROM product_schema_migrations WHERE version = 6')
+    await migrationPool.query('DELETE FROM product_schema_migrations WHERE version = 7')
+    await migrationPool.query(
+      `INSERT INTO analyses (id, symbol, status, created_at, updated_at)
+       VALUES ($1, 'UPGRADE', 'interrupted', now(), now())`,
+      [analysisId],
+    )
+    await migrationPool.query(
+      `INSERT INTO agent_sessions (
+         id, analysis_id, status, latest_sequence, created_at, updated_at
+       ) VALUES ($1, $2, 'interrupted', 1, now(), now())`,
+      [oldSessionId, analysisId],
+    )
+  } finally {
+    await migrationPool.end()
+  }
+
+  await migrate(migrationUrl!)
+  const applicationPool = createPool(applicationUrl!)
+  const events = createAgentEventRepository(applicationPool)
+  try {
+    assert.equal((await events.findPrimarySession(analysisId))?.id, oldSessionId)
+    await events.createSession({
+      id: 'schema-v5-upgrade-specialist',
+      analysisId,
+      executionId: 'schema-v5-upgrade-specialist-execution',
+      status: 'queued',
+      operationId: 'create-upgraded-specialist',
+      event: { type: 'status', status: 'queued' },
+      createdAt: '2026-08-13T00:00:00.000Z',
+    })
+    assert.equal((await events.listSessions(analysisId)).length, 2)
+  } finally {
+    await applicationPool.end()
+    const cleanup = createPool(migrationUrl!)
+    await cleanup.query('DELETE FROM analyses WHERE id = $1', [analysisId])
+    await cleanup.end()
+  }
 })
 
 test('application role 的事务失败会回滚产品写入', {
@@ -207,8 +262,10 @@ test('真实 PostgreSQL Agent Session 事件 sequence 严格递增且 operationI
   try {
     await analyses.removeResearch(sessionId)
     const now = '2026-08-13T00:00:00.000Z'
-    const created = await events.createSession({
-      id: sessionId,
+    const created = await events.createResearch({
+      analysisId: sessionId,
+      sessionId,
+      executionId: 'ledger-execution',
       symbol: 'LEDGER',
       status: 'queued',
       operationId: 'create-session',
@@ -228,6 +285,7 @@ test('真实 PostgreSQL Agent Session 事件 sequence 严格递增且 operationI
     )))
     const first = await events.append({
       sessionId,
+      executionId: 'rollback-event-execution',
       operationId: 'complete-session',
       event: { type: 'status', status: 'completed', at: now },
       projection: { status: 'completed' },
@@ -280,8 +338,10 @@ test('真实 PostgreSQL 事件与 Session 读取投影在投影失败时一起�
   try {
     await analyses.removeResearch(sessionId)
     const now = '2026-08-13T00:00:00.000Z'
-    await events.createSession({
-      id: sessionId,
+    await events.createResearch({
+      analysisId: sessionId,
+      sessionId,
+      executionId: 'rollback-event-execution',
       symbol: 'ROLLBACK-EVENT',
       status: 'queued',
       operationId: 'create-session',
@@ -303,6 +363,112 @@ test('真实 PostgreSQL 事件与 Session 读取投影在投影失败时一起�
     assert.deepEqual((await analyses.research(sessionId))?.facts, [])
   } finally {
     await analyses.removeResearch(sessionId)
+    await pool.end()
+  }
+})
+
+test('真实 PostgreSQL 同一 analysis 可拥有多个独立 Agent Session 账本', {
+  skip: !applicationUrl,
+  concurrency: false,
+}, async () => {
+  const pool = createPool(applicationUrl!)
+  const analyses = createAnalysisRepository(pool)
+  const events = createAgentEventRepository(pool)
+  const analysisId = 'multi-session-analysis'
+  try {
+    await analyses.removeResearch(analysisId)
+    const now = '2026-08-13T00:00:00.000Z'
+    const created = await events.createResearch({
+      analysisId,
+      sessionId: 'multi-session-main',
+      executionId: 'multi-session-main-execution',
+      symbol: 'MULTI',
+      status: 'queued',
+      operationId: 'create-main-session',
+      event: { type: 'status', status: 'queued', at: now },
+      createdAt: now,
+    })
+    assert.equal(created.sessionId, 'multi-session-main')
+    for (const sessionId of ['multi-session-news', 'multi-session-fundamental', 'multi-session-technical']) {
+      await events.createSession({
+        id: sessionId,
+        analysisId,
+        executionId: `${sessionId}-execution`,
+        status: 'queued',
+        operationId: `create:${sessionId}`,
+        event: { type: 'status', status: 'queued', at: now },
+        createdAt: now,
+      })
+      await events.append({
+        sessionId,
+        operationId: `run:${sessionId}`,
+        event: { type: 'status', status: 'running', at: now },
+        projection: { status: 'running' },
+        createdAt: now,
+      })
+    }
+
+    const sessions = await events.listSessions(analysisId)
+    assert.deepEqual(sessions.map(({ id }) => id), [
+      'multi-session-main', 'multi-session-fundamental', 'multi-session-news', 'multi-session-technical',
+    ])
+    for (const session of sessions) {
+      assert.deepEqual((await events.list(session.id, 0)).map(({ sequence }) => sequence),
+        session.isPrimary ? [1] : [1, 2])
+    }
+  } finally {
+    await analyses.removeResearch(analysisId)
+    await pool.end()
+  }
+})
+
+test('真实 PostgreSQL 启动恢复在一个事务内中断全部活跃 Session', {
+  skip: !applicationUrl,
+  concurrency: false,
+}, async () => {
+  const pool = createPool(applicationUrl!)
+  const analyses = createAnalysisRepository(pool)
+  const events = createAgentEventRepository(pool)
+  const analysisId = 'interrupt-all-analysis'
+  const now = '2026-08-13T00:00:00.000Z'
+  try {
+    await analyses.removeResearch(analysisId)
+    await events.createResearch({
+      analysisId,
+      sessionId: 'interrupt-all-main',
+      executionId: 'interrupt-all-main-execution',
+      symbol: 'INTERRUPT-ALL',
+      status: 'running',
+      operationId: 'execution:main:running',
+      event: { type: 'status', status: 'running', at: now },
+      createdAt: now,
+    })
+    await events.createSession({
+      id: 'interrupt-all-specialist',
+      analysisId,
+      executionId: 'interrupt-all-specialist-execution',
+      status: 'running',
+      operationId: 'execution:specialist:running',
+      event: { type: 'status', status: 'running', at: now },
+      createdAt: now,
+    })
+
+    const interrupted = await events.interruptActiveSessions('2026-08-13T00:00:01.000Z')
+
+    assert.deepEqual(interrupted.map(({ sessionId, sequence, operationId }) => ({
+      sessionId, sequence, operationId,
+    })), [{
+      sessionId: 'interrupt-all-main', sequence: 2,
+      operationId: 'startup:interrupt:interrupt-all-main:2',
+    }, {
+      sessionId: 'interrupt-all-specialist', sequence: 2,
+      operationId: 'startup:interrupt:interrupt-all-specialist:2',
+    }])
+    assert.deepEqual((await events.listSessions(analysisId)).map(({ status }) => status),
+      ['interrupted', 'interrupted'])
+    assert.equal((await analyses.get(analysisId))?.status, 'interrupted')
+  } finally {
+    await analyses.removeResearch(analysisId)
     await pool.end()
   }
 })

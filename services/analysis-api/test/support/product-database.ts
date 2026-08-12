@@ -140,30 +140,53 @@ export function createTestProductDatabase() {
   }
 
   const agentEventRepository: AgentEventRepository = {
-    async createSession(input) {
+    async createResearch(input) {
       const existing = [...analyses.values()]
         .find((record) => record.symbol === input.symbol && ['queued', 'running'].includes(record.status))
       if (existing) {
-        const session = agentSessions.get(existing.id)
-        const event = agentEvents.get(existing.id)?.[0]
+        const session = [...agentSessions.values()].find((candidate) => (
+          candidate.analysisId === existing.id && candidate.isPrimary
+        ))
+        const event = session ? agentEvents.get(session.id)?.[0] : undefined
         if (!session || !event) throw new Error('agent_session_not_found')
-        return { analysisId: existing.id, sequence: event.sequence, created: false, event }
+        return {
+          analysisId: existing.id, sessionId: session.id,
+          sequence: event.sequence, created: false, event,
+        }
       }
+      const event = {
+        sessionId: input.sessionId, sequence: 1, operationId: input.operationId,
+        payload: input.event, createdAt: input.createdAt,
+      }
+      agentSessions.set(input.sessionId, {
+        id: input.sessionId, analysisId: input.analysisId, status: input.status, isPrimary: true,
+        executionId: input.executionId,
+        latestSequence: 1, createdAt: input.createdAt, updatedAt: input.createdAt,
+      })
+      agentEvents.set(input.sessionId, [event])
+      analyses.set(input.analysisId, {
+        id: input.analysisId, symbol: input.symbol, status: input.status,
+        createdAt: input.createdAt, updatedAt: input.createdAt,
+        snapshot: null, report: null, error: null, starred: false, note: '',
+      })
+      return {
+        analysisId: input.analysisId, sessionId: input.sessionId,
+        sequence: 1, created: true, event,
+      }
+    },
+    async createSession(input) {
+      if (!analyses.has(input.analysisId)) throw new Error('analysis_not_found')
       const event = {
         sessionId: input.id, sequence: 1, operationId: input.operationId,
         payload: input.event, createdAt: input.createdAt,
       }
       agentSessions.set(input.id, {
-        id: input.id, analysisId: input.id, status: input.status,
+        id: input.id, analysisId: input.analysisId, status: input.status, isPrimary: false,
+        executionId: input.executionId,
         latestSequence: 1, createdAt: input.createdAt, updatedAt: input.createdAt,
       })
       agentEvents.set(input.id, [event])
-      analyses.set(input.id, {
-        id: input.id, symbol: input.symbol, status: input.status,
-        createdAt: input.createdAt, updatedAt: input.createdAt,
-        snapshot: null, report: null, error: null, starred: false, note: '',
-      })
-      return { analysisId: input.id, sequence: 1, created: true, event }
+      return { sequence: 1, created: true, event }
     },
     async append(input) {
       const events = agentEvents.get(input.sessionId) ?? []
@@ -189,7 +212,7 @@ export function createTestProductDatabase() {
           analysisFacts.set(analysisId, ids)
         }
         const record = analyses.get(analysisId)
-        if (record) analyses.set(analysisId, {
+        if (record && session.isPrimary) analyses.set(analysisId, {
           ...record, status: input.projection.status ?? record.status, updatedAt: input.createdAt,
           report: input.projection.report ?? record.report,
           snapshot: input.projection.snapshot ?? record.snapshot,
@@ -202,11 +225,43 @@ export function createTestProductDatabase() {
       return (agentEvents.get(sessionId) ?? []).filter(({ sequence }) => sequence > afterSequence)
     },
     async getSession(id) { return agentSessions.get(id) ?? null },
+    async findPrimarySession(analysisId) {
+      return [...agentSessions.values()].find((session) => (
+        session.analysisId === analysisId && session.isPrimary
+      )) ?? null
+    },
+    async listSessions(analysisId) {
+      return [...agentSessions.values()].filter((session) => session.analysisId === analysisId)
+        .sort((left, right) => Number(right.isPrimary) - Number(left.isPrimary)
+          || left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id))
+    },
+    async interruptActiveSessions(createdAt) {
+      const interrupted: AgentEvent[] = []
+      for (const [id, session] of [...agentSessions.entries()].sort(([left], [right]) => left.localeCompare(right))) {
+        if (!['queued', 'running'].includes(session.status)) continue
+        const sequence = session.latestSequence + 1
+        const operationId = `startup:interrupt:${id}:${sequence}`
+        const payload = { type: 'status', status: 'interrupted', at: createdAt }
+        const event = { sessionId: id, sequence, operationId, payload, createdAt }
+        agentEvents.set(id, [...(agentEvents.get(id) ?? []), event])
+        agentSessions.set(id, {
+          ...session, status: 'interrupted', latestSequence: sequence, updatedAt: createdAt,
+        })
+        if (session.isPrimary) {
+          const record = analyses.get(session.analysisId)
+          if (record) analyses.set(session.analysisId, {
+            ...record, status: 'interrupted', updatedAt: createdAt,
+          })
+        }
+        interrupted.push(event)
+      }
+      return interrupted
+    },
   }
 
   return {
     productDatabase: {
-      checkSchema: async () => ({ status: 'ok' as const, version: 5 }),
+      checkSchema: async () => ({ status: 'ok' as const, version: 6 }),
       close: async () => {},
     },
     portfolioRepository,
