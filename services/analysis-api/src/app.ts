@@ -1,8 +1,8 @@
 import fastifyStatic from '@fastify/static'
 import Fastify from 'fastify'
 
-import type { FinancialDataHealth } from '@vibe-invest/contracts'
-import type { AnalysisRepository, PortfolioRepository } from '@vibe-invest/product-dao'
+import { formatSseEvent, type FinancialDataHealth } from '@vibe-invest/contracts'
+import type { AgentEventRepository, AnalysisRepository, PortfolioRepository } from '@vibe-invest/product-dao'
 
 import { createAnalysisService } from './analysis.js'
 import type { ModelEvent } from './model.js'
@@ -16,6 +16,7 @@ type AppDependencies = {
   }
   portfolioRepository: PortfolioRepository
   analysisRepository: AnalysisRepository
+  agentEventRepository: AgentEventRepository
   financialDataHealth: () => Promise<FinancialDataHealth>
   staticDir?: string
   fetchFinancialContext?: (symbol: string, signal: AbortSignal) => Promise<FinancialContext>
@@ -37,6 +38,7 @@ export function buildApp(dependencies: AppDependencies) {
   const analysis = dependencies.fetchFinancialContext && dependencies.model
     ? createAnalysisService({
         repository: dependencies.analysisRepository,
+        eventRepository: dependencies.agentEventRepository,
         fetchFinancialContext: dependencies.fetchFinancialContext,
         searchNews: dependencies.searchNews,
         fetchTechnicalIndicators: dependencies.fetchTechnicalIndicators,
@@ -194,11 +196,14 @@ export function buildApp(dependencies: AppDependencies) {
     const result = await analysis?.get(request.params.id)
     return result ?? reply.status(404).send({ error: 'analysis_not_found' })
   })
-  app.get<{ Params: { id: string } }>('/api/analyses/:id/events', async (request, reply) => {
+  app.get<{ Params: { id: string }; Headers: { 'last-event-id'?: string } }>(
+    '/api/agent-sessions/:id/events', async (request, reply) => {
     const currentAnalysis = analysis
-    if (!currentAnalysis || !await currentAnalysis.get(request.params.id)) {
-      return reply.status(404).send({ error: 'analysis_not_found' })
+    if (!currentAnalysis || !await dependencies.agentEventRepository.getSession(request.params.id)) {
+      return reply.status(404).send({ error: 'agent_session_not_found' })
     }
+    const cursor = parseLastEventId(request.headers['last-event-id'], request.params.id)
+    if (cursor === null) return reply.status(400).send({ error: 'invalid_last_event_id' })
     reply.hijack()
     reply.raw.writeHead(200, {
       'content-type': 'text/event-stream; charset=utf-8',
@@ -207,9 +212,14 @@ export function buildApp(dependencies: AppDependencies) {
     })
     const controller = new AbortController()
     request.raw.on('close', () => controller.abort())
-    for await (const entry of currentAnalysis.streamEvents(request.params.id, controller.signal)) {
-      const event = entry.type === 'status' ? entry.status : entry.type
-      reply.raw.write(`event: ${event}\ndata: ${JSON.stringify(entry)}\n\n`)
+    for await (const entry of currentAnalysis.streamEvents(
+      request.params.id, cursor, controller.signal,
+    )) {
+      const payload = entry.payload
+      const event = payload.type === 'status' ? payload.status : payload.type
+      reply.raw.write(formatSseEvent({
+        id: `${entry.sessionId}:${entry.sequence}`, event: String(event), data: payload,
+      }))
     }
     reply.raw.end()
   })
@@ -241,4 +251,12 @@ export function buildApp(dependencies: AppDependencies) {
   })
 
   return app
+}
+
+function parseLastEventId(value: string | undefined, sessionId: string) {
+  if (value === undefined) return 0
+  const match = value.match(/^(.+):(0|[1-9]\d*)$/)
+  if (!match || match[1] !== sessionId) return null
+  const sequence = Number(match[2])
+  return Number.isSafeInteger(sequence) ? sequence : null
 }

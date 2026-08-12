@@ -125,19 +125,19 @@ export function App() {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ symbol: analysisSymbol.trim().toUpperCase() }),
     })
-    const { analysisId } = await response.json()
+    const { analysisId, sessionId } = await response.json()
     if (!response.ok || !analysisId) { setError('分析任务创建失败'); return }
     setAnalysisStatus('queued')
     setAnalysisStages(['queued'])
     setActiveAnalysisId(analysisId)
-    if ('EventSource' in globalThis) streamAnalysis(analysisId)
+    if ('EventSource' in globalThis && sessionId) streamAnalysis(sessionId, analysisId)
     else await pollAnalysis(analysisId)
   }
   function addStage(stage: string) {
     setAnalysisStages((current) => current.includes(stage) ? current : [...current, stage])
   }
-  function streamAnalysis(id: string) {
-    const source = new EventSource(`/api/analyses/${id}/events`)
+  function streamAnalysis(sessionId: string, analysisId: string) {
+    const source = new EventSource(`/api/agent-sessions/${sessionId}/events`)
     const eventNames = ['queued', 'running', 'financial_context', 'model_event', 'text_delta', 'model_completed', 'completed', 'partial', 'failed', 'cancelled', 'interrupted']
     for (const name of eventNames) source.addEventListener(name, (event) => {
       const entry = JSON.parse((event as MessageEvent).data) as Record<string, unknown>
@@ -147,10 +147,10 @@ export function App() {
         if (name === 'failed' && typeof entry.error === 'string') setError(friendlyError(entry.error))
         source.close()
         setActiveAnalysisId(null)
-        void openResearch(id).then(() => { setPage('research'); return loadResearch() })
+        void openResearch(analysisId).then(() => { setPage('research'); return loadResearch() })
       }
     })
-    source.onerror = () => { source.close(); void pollAnalysis(id) }
+    source.onerror = () => { source.close(); void pollAnalysis(analysisId) }
   }
   async function pollAnalysis(id: string) {
     for (let attempt = 0; attempt < 120; attempt += 1) {

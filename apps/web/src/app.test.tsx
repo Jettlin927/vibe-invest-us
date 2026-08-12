@@ -143,7 +143,9 @@ test('用户创建分析并打开研究记录后能看到报告依据', async ()
     if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
     if (url === '/api/portfolio') return Response.json(portfolioResponse([]))
     if (url === '/api/research') return Response.json({ records: [] })
-    if (url === '/api/analyses' && init?.method === 'POST') return Response.json({ analysisId: 'analysis-1' }, { status: 202 })
+    if (url === '/api/analyses' && init?.method === 'POST') {
+      return Response.json({ analysisId: 'analysis-1', sessionId: 'session-1' }, { status: 202 })
+    }
     if (url === '/api/analyses/analysis-1') {
       statusCalls += 1
       return Response.json(statusCalls > 1 ? { id: 'analysis-1', symbol: 'NVDA', status: 'completed', report: { title: 'NVDA 综合分析' } } : { id: 'analysis-1', symbol: 'NVDA', status: 'running' })
@@ -217,7 +219,9 @@ test('坏报告依据被拒绝时用户看到可理解的失败原因', async ()
     if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
     if (url === '/api/portfolio') return Response.json(portfolioResponse([]))
     if (url === '/api/research') return Response.json({ records: [] })
-    if (url === '/api/analyses' && init?.method === 'POST') return Response.json({ analysisId: 'failed-1' }, { status: 202 })
+    if (url === '/api/analyses' && init?.method === 'POST') {
+      return Response.json({ analysisId: 'failed-1', sessionId: 'failed-session-1' }, { status: 202 })
+    }
     if (url === '/api/analyses/failed-1') {
       statusCalls += 1
       return Response.json(statusCalls > 1

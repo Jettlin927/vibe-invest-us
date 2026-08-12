@@ -91,6 +91,7 @@ test('Pi Model 通过只读工具流式生成结构化报告和完整轨迹', as
   const model = createPiModel({ fauxResponses: successResponses(), log: (entry) => logs.push(entry) })
   const events = []
   for await (const event of model.analyze({
+    executionId: 'pi-model-test-execution',
     symbol: 'NVDA', systemPrompt: '只引用给定事实。', userPrompt: '分析 NVDA。',
     knownFacts: facts, fetchFinancialContext: async () => ({ facts }),
   })) events.push(event)
@@ -99,6 +100,8 @@ test('Pi Model 通过只读工具流式生成结构化报告和完整轨迹', as
   assert.equal(completed?.type, 'completed')
   if (completed?.type === 'completed') assert.deepEqual(completed.report, validReport)
   assert.ok(events.some((event) => event.type === 'trace' && event.entry.type === 'tool_call'))
+  assert.ok(events.some((event) => event.type === 'trace'
+    && event.entry.operationId.startsWith('execution:pi-model-test-execution:tool:')))
   assert.ok(events.some((event) => event.type === 'text_delta'))
   assert.equal(JSON.stringify(logs).includes('217.5'), false)
 })

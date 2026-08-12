@@ -1,14 +1,15 @@
 import { randomUUID } from 'node:crypto'
-import type { AnalysisRepository } from '@vibe-invest/product-dao'
+import type { AgentEvent, AgentEventRepository, AnalysisRepository } from '@vibe-invest/product-dao'
 
 import type { AnalysisReport, ModelEvent } from './model.js'
 import type { FactQueryResult, FinancialContext, FinancialFact } from './financial-data-client.js'
 
 type Fact = FinancialFact
-type Model = { analyze(input: Record<string, unknown>): AsyncIterable<ModelEvent> }
+type Model = { analyze(input: Record<string, unknown> & { executionId: string }): AsyncIterable<ModelEvent> }
 
 export function createAnalysisService(options: {
   repository: AnalysisRepository
+  eventRepository: AgentEventRepository
   model: Model
   fetchFinancialContext: (symbol: string, signal: AbortSignal) => Promise<FinancialContext>
   searchNews?: (keyword: string, signal: AbortSignal) => Promise<FactQueryResult>
@@ -22,40 +23,72 @@ export function createAnalysisService(options: {
 }) {
   const { repository } = options
   const controllers = new Map<string, AbortController>()
-  const listeners = new Map<string, Set<(entry: Record<string, unknown>) => void>>()
+  const listeners = new Map<string, Set<(entry: AgentEvent) => void>>()
   const tasks = new Set<Promise<void>>()
   let running = 0
-  const initialized = repository.interruptRunning(new Date().toISOString())
+  const initialized = options.eventRepository.interruptActiveSessions(new Date().toISOString())
 
-  async function persistFact(analysisId: string, fact: Fact) {
-    await repository.saveFact(analysisId, fact)
+  async function appendEvent(
+    sessionId: string,
+    operationId: string,
+    payload: Record<string, unknown>,
+    projection?: {
+      status?: string; report?: unknown; snapshot?: unknown; error?: string; facts?: Fact[]
+    },
+  ) {
+    const result = await options.eventRepository.append({
+      sessionId, operationId, event: payload, projection, createdAt: new Date().toISOString(),
+    })
+    if (result.created) for (const listener of listeners.get(sessionId) ?? []) listener(result.event)
+    return result.event
   }
-  async function appendTrace(id: string, payload: unknown) {
-    await repository.appendTrace(id, payload)
-    if (payload && typeof payload === 'object') {
-      for (const listener of listeners.get(id) ?? []) listener(payload as Record<string, unknown>)
-    }
+  async function appendTrace(sessionId: string, payload: unknown) {
+    if (!payload || typeof payload !== 'object') return
+    const entry = payload as Record<string, unknown>
+    if (entry.type === 'model_event'
+      && (entry.event as Record<string, unknown> | undefined)?.type === 'thinking_delta') return
+    if (typeof entry.operationId !== 'string') throw new Error('agent_event_operation_id_required')
+    const facts = entry.type === 'tool_result'
+      ? ((entry.result as { facts?: Fact[] } | undefined)?.facts ?? [])
+      : []
+    await appendEvent(sessionId, entry.operationId, entry, facts.length ? { facts } : undefined)
   }
-  async function setStatus(id: string, status: string, extra: { report?: unknown; snapshot?: unknown; error?: string } = {}) {
-    await repository.setStatus(id, status, new Date().toISOString(), extra)
-    await appendTrace(id, {
+  async function setStatus(
+    sessionId: string,
+    operationId: string,
+    status: string,
+    extra: { report?: unknown; snapshot?: unknown; error?: string } = {},
+  ) {
+    await appendEvent(sessionId, operationId, {
       type: 'status', status, at: new Date().toISOString(),
       ...(extra.error ? { error: extra.error } : {}),
-    })
+    }, { status, ...extra })
   }
-  async function get(id: string) {
+  async function get(analysisId: string) {
     await initialized
-    return repository.get(id)
+    return repository.get(analysisId)
   }
   async function create(symbolInput: string) {
     await initialized
     const symbol = symbolInput.trim().toUpperCase()
-    const id = randomUUID(), now = new Date().toISOString()
-    const result = await repository.createOrReturn({ id, symbol, status: 'queued', createdAt: now, updatedAt: now })
-    if (!result.created) return { analysisId: result.analysisId, existing: true }
-    await appendTrace(result.analysisId, { type: 'status', status: 'queued', at: now })
+    const analysisId = randomUUID(), now = new Date().toISOString()
+    const sessionId = randomUUID()
+    const executionId = randomUUID()
+    const result = await options.eventRepository.createResearch({
+      analysisId,
+      sessionId,
+      executionId,
+      symbol,
+      status: 'queued',
+      operationId: `session:${sessionId}:created`,
+      event: { type: 'status', status: 'queued', at: now },
+      createdAt: now,
+    })
+    if (!result.created) return {
+      analysisId: result.analysisId, sessionId: result.sessionId, existing: true,
+    }
     queueMicrotask(() => void schedule())
-    return { analysisId: result.analysisId, existing: false }
+    return { analysisId: result.analysisId, sessionId: result.sessionId, existing: false }
   }
   async function schedule() {
     while (running < options.concurrency) {
@@ -69,27 +102,43 @@ export function createAnalysisService(options: {
         return
       }
       if (!next) { running -= 1; return }
+      const session = await options.eventRepository.findPrimarySession(next)
+      if (!session) { running -= 1; continue }
+      const executionId = session.executionId
       try {
-        await appendTrace(next, { type: 'status', status: 'running', at: now })
+        await appendEvent(
+          session.id,
+          `execution:${executionId}:running`,
+          { type: 'status', status: 'running', at: now },
+          { status: 'running' },
+        )
       } catch {
         try {
-          await setStatus(next, 'interrupted', { error: 'analysis_running_trace_failed' })
+          await setStatus(
+            session.id, `execution:${executionId}:running-failed`, 'interrupted',
+            { error: 'analysis_running_trace_failed' },
+          )
         } catch {
           // The claimed task must never proceed when its critical audit write failed.
         }
         running -= 1
         continue
       }
-      const task = run(next).finally(() => { running -= 1; void schedule() })
+      const task = run(next, session.id, executionId).finally(() => { running -= 1; void schedule() })
       tasks.add(task)
       void task.then(() => tasks.delete(task), () => tasks.delete(task))
     }
   }
-  async function run(id: string) {
-    const job = await get(id)
+  async function run(analysisId: string, sessionId: string, executionId: string) {
+    const job = await get(analysisId)
     if (!job) return
     const controller = new AbortController()
-    controllers.set(id, controller)
+    controllers.set(analysisId, controller)
+    const operationId = (kind: string) => `execution:${executionId}:${kind}`
+    let modelEventSequence = 0
+    const nextModelOperationId = (kind: string) => (
+      `execution:${executionId}:model:${++modelEventSequence}:${kind}`
+    )
     try {
       const context = await options.fetchFinancialContext(job.symbol, controller.signal)
       const quoteFact = context.facts.find((fact) => fact.type === 'quote' && typeof fact.value === 'number')
@@ -113,16 +162,15 @@ export function createAnalysisService(options: {
         ...(portfolioPriceGap ? [{ capability: 'portfolio_prices', reason: 'source_unavailable' }] : []),
       ]
       const snapshot = { ...context, gaps, portfolioContext, createdAt: new Date().toISOString() }
-      for (const fact of context.facts) await persistFact(id, fact)
-      await repository.saveSnapshot(id, snapshot)
-      await appendTrace(id, {
+      await appendEvent(sessionId, operationId('financial-context'), {
         type: 'financial_context',
         gaps,
         capabilities: sourceDiagnostics(context),
         degradedSources: sourceDegradations(context),
-      })
+      }, { snapshot, facts: context.facts })
       const modelContext = createModelContext(snapshot)
       for await (const event of options.model.analyze({
+        executionId,
         symbol: job.symbol,
         systemPrompt: ANALYSIS_SYSTEM_PROMPT,
         userPrompt: `分析 ${job.symbol}。个人语境：${JSON.stringify(portfolioContext)}`,
@@ -132,16 +180,21 @@ export function createAnalysisService(options: {
         fetchTechnicalIndicators: options.fetchTechnicalIndicators,
       })) {
         if (event.type === 'trace') {
-          if (event.entry.type === 'tool_result') {
-            const toolResult = event.entry.result as { facts?: Fact[] }
-            for (const fact of toolResult.facts ?? []) await persistFact(id, fact)
-          }
-          await appendTrace(id, event.entry)
+          await appendTrace(sessionId, event.entry.operationId ? event.entry : {
+            ...event.entry, operationId: nextModelOperationId(event.entry.type),
+          })
         }
-        else if (event.type === 'text_delta') await appendTrace(id, event)
-        else if (event.type === 'cancelled') { await setStatus(id, 'cancelled'); return }
+        else if (event.type === 'text_delta') await appendTrace(sessionId, event.operationId ? event : {
+          ...event, operationId: nextModelOperationId('text-delta'),
+        })
+        else if (event.type === 'cancelled') {
+          await setStatus(
+            sessionId, event.operationId ?? nextModelOperationId('cancelled'), 'cancelled',
+          ); return
+        }
         else if (event.type === 'completed') {
-          await appendTrace(id, {
+          await appendTrace(sessionId, {
+            operationId: event.operationId ?? nextModelOperationId('completed'),
             type: 'model_completed',
             usage: event.usage ?? null,
             stopReason: event.stopReason ?? null,
@@ -154,85 +207,116 @@ export function createAnalysisService(options: {
           }
           const report = enforceDataGaps(personalized, gaps)
           const status = report.limitations.length ? 'partial' : 'completed'
-          await setStatus(id, status, { report })
+          await setStatus(sessionId, operationId(`status-${status}`), status, { report })
           return
         }
       }
     } catch (error) {
-      if (controller.signal.aborted) await setStatus(id, 'cancelled')
-      else await setStatus(id, 'failed', { error: error instanceof Error ? error.message : String(error) })
+      if (controller.signal.aborted) {
+        await setStatus(sessionId, operationId('status-cancelled'), 'cancelled')
+      } else {
+        await setStatus(sessionId, operationId('status-failed'), 'failed', {
+          error: error instanceof Error ? error.message : String(error),
+        })
+      }
     } finally {
-      controllers.delete(id)
+      controllers.delete(analysisId)
     }
   }
-  async function cancel(id: string) {
-    const job = await get(id)
+  async function cancel(analysisId: string) {
+    const job = await get(analysisId)
     if (!job || !['queued', 'running'].includes(job.status)) return false
-    controllers.get(id)?.abort()
-    if (job.status === 'queued') await setStatus(id, 'cancelled')
+    controllers.get(analysisId)?.abort()
+    if (job.status === 'queued') {
+      const session = await options.eventRepository.findPrimarySession(analysisId)
+      if (session) await setStatus(session.id, `session:${session.id}:queued-cancelled`, 'cancelled')
+    }
     return true
   }
-  async function research(id: string) {
+  async function research(analysisId: string) {
     await initialized
-    return repository.research(id)
+    const record = await repository.research(analysisId)
+    if (!record) return null
+    const session = await options.eventRepository.findPrimarySession(analysisId)
+    const trace = session
+      ? (await options.eventRepository.list(session.id, 0)).map(({ payload }) => payload)
+      : []
+    return { ...record, trace }
   }
   async function listResearch(symbol?: string) {
     await initialized
     return repository.listResearch(symbol)
   }
-  async function updateResearch(id: string, values: { starred?: boolean; note?: string }) {
+  async function updateResearch(analysisId: string, values: { starred?: boolean; note?: string }) {
     await initialized
-    return repository.updateResearch(id, values, new Date().toISOString())
+    return repository.updateResearch(analysisId, values, new Date().toISOString())
   }
-  async function removeResearch(id: string) {
+  async function removeResearch(analysisId: string) {
     await initialized
-    return repository.removeResearch(id)
+    return repository.removeResearch(analysisId)
   }
-  async function events(id: string) {
-    const record = await research(id)
-    if (!record) return null
-    return record.trace.map((value) => {
-      const entry = value as Record<string, unknown>
-      const event = entry.type === 'status' ? entry.status : entry.type
-      return `event: ${event}\ndata: ${JSON.stringify(entry)}\n\n`
-    }).join('')
-  }
-  async function *streamEvents(id: string, signal?: AbortSignal) {
-    const record = await research(id)
-    if (!record) return
-    const queue: Record<string, unknown>[] = []
+  async function *streamEvents(sessionId: string, afterSequence: number, signal?: AbortSignal) {
+    await initialized
+    const session = await options.eventRepository.getSession(sessionId)
+    if (!session) return
+    const queue: AgentEvent[] = []
     let wake: (() => void) | undefined
-    const listener = (entry: Record<string, unknown>) => {
+    const listener = (entry: AgentEvent) => {
       queue.push(entry)
       wake?.()
     }
-    const subscriptions = listeners.get(id) ?? new Set()
+    const subscriptions = listeners.get(sessionId) ?? new Set()
     subscriptions.add(listener)
-    listeners.set(id, subscriptions)
+    listeners.set(sessionId, subscriptions)
     try {
-      const current = await research(id)
+      let cursor = afterSequence
+      const catchUp = await options.eventRepository.list(sessionId, afterSequence)
+      for (const entry of catchUp) {
+        cursor = entry.sequence
+        yield entry
+      }
+      while (queue.length) {
+        const entry = queue.shift()!
+        if (entry.sequence <= cursor) continue
+        cursor = entry.sequence
+        yield entry
+        if (entry.payload.type === 'status' && isTerminal(String(entry.payload.status))) return
+      }
+      const current = await options.eventRepository.getSession(sessionId)
       if (!current) return
-      for (const entry of current.trace) yield entry as Record<string, unknown>
-      if (isTerminal(current.status)) return
+      if (isTerminal(current.status)) {
+        for (const entry of await options.eventRepository.list(sessionId, cursor)) {
+          cursor = entry.sequence
+          yield entry
+        }
+        return
+      }
       while (!signal?.aborted) {
-        if (!queue.length) await new Promise<void>((resolve) => { wake = resolve })
+        if (!queue.some(({ sequence }) => sequence > cursor)) {
+          await new Promise<void>((resolve) => {
+            wake = resolve
+            signal?.addEventListener('abort', () => resolve(), { once: true })
+          })
+        }
         wake = undefined
         while (queue.length) {
           const entry = queue.shift()!
+          if (entry.sequence <= cursor) continue
+          cursor = entry.sequence
           yield entry
-          if (entry.type === 'status' && isTerminal(String(entry.status))) return
+          if (entry.payload.type === 'status' && isTerminal(String(entry.payload.status))) return
         }
       }
     } finally {
       subscriptions.delete(listener)
-      if (!subscriptions.size) listeners.delete(id)
+      if (!subscriptions.size) listeners.delete(sessionId)
     }
   }
   async function close() {
     for (const controller of controllers.values()) controller.abort()
     await Promise.allSettled(tasks)
   }
-  return { create, get, cancel, research, listResearch, updateResearch, removeResearch, events, streamEvents, close }
+  return { create, get, cancel, research, listResearch, updateResearch, removeResearch, streamEvents, close }
 }
 
 const ANALYSIS_SYSTEM_PROMPT = `你是个人美股研究助手，分析周期为未来一至四周。

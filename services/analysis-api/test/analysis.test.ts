@@ -75,7 +75,7 @@ test('创建分析立即返回标识并自动保存完成报告、快照、事�
   const app = await makeApp(join(dir, 'storage'))
   const created = await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' } })
   assert.equal(created.statusCode, 202)
-  const { analysisId } = created.json()
+  const { analysisId, sessionId } = created.json()
   const completed = await waitForStatus(app, analysisId, 'completed')
   assert.equal(completed.report.title, report.title)
 
@@ -86,7 +86,7 @@ test('创建分析立即返回标识并自动保存完成报告、快照、事�
   assert.equal(research.json().facts[0].source, 'sina')
   assert.ok(research.json().trace.some((entry: { type: string }) => entry.type === 'status'))
 
-  const events = await app.inject({ method: 'GET', url: `/api/analyses/${analysisId}/events` })
+  const events = await app.inject({ method: 'GET', url: `/api/agent-sessions/${sessionId}/events` })
   assert.match(events.headers['content-type'] ?? '', /text\/event-stream/)
   assert.match(events.body, /event: completed/)
   await app.close()
@@ -200,15 +200,15 @@ test('队列 claim 瞬时失败会归还槽位且后续创建可恢复调度', a
 
 test('running 轨迹写入失败会中断已领取任务并恢复后续调度', async () => {
   const database = createTestProductDatabase()
-  const repository = database.analysisRepository
-  const originalAppendTrace = repository.appendTrace
+  const repository = database.agentEventRepository
+  const originalAppend = repository.append
   let failOnce = true
-  repository.appendTrace = async (analysisId, payload) => {
-    if (failOnce && (payload as { status?: string }).status === 'running') {
+  repository.append = async (input) => {
+    if (failOnce && input.event.status === 'running') {
       failOnce = false
       throw new Error('running_trace_write_failed')
     }
-    return originalAppendTrace(analysisId, payload)
+    return originalAppend(input)
   }
   let modelCalls = 0
   const model = fakeModel()
@@ -246,12 +246,19 @@ test('重启后未完成任务标记为中断且不会自动执行', async () =>
   const dir = await mkdtemp(join(tmpdir(), 'vibe-analysis-restart-'))
   const storageKey = join(dir, 'restart')
   const first = await makeApp(storageKey, fakeModel(1000), 0)
-  const { analysisId } = (await first.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' } })).json()
+  const { analysisId, sessionId } = (await first.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' },
+  })).json()
   await first.close()
   let calls = 0
   const second = await makeApp(storageKey, { async *analyze() { calls += 1; yield { type: 'completed' as const, report } } })
   const status = (await second.inject({ method: 'GET', url: `/api/analyses/${analysisId}` })).json()
   assert.equal(status.status, 'interrupted')
+  const replay = await second.inject({
+    method: 'GET', url: `/api/agent-sessions/${sessionId}/events`,
+  })
+  assert.match(replay.body, /event: interrupted/)
+  assert.match(replay.body, new RegExp(`id: ${sessionId}:2`))
   assert.equal(calls, 0)
   await second.close()
 })
@@ -398,6 +405,38 @@ test('工具补查返回的事实进入研究证据集合', async () => {
   await app.close()
 })
 
+test('Runtime 重放同一 operationId 不追加第二条业务事件', async () => {
+  const app = buildApp({
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [] }),
+    model: {
+      async *analyze(): AsyncGenerator<ModelEvent> {
+        const replayed = {
+          type: 'tool_call' as const,
+          name: 'fetch_financial_context',
+          input: { symbol: 'NVDA' },
+          operationId: 'tool:provider-call-1:call',
+        }
+        yield { type: 'trace', entry: replayed }
+        yield { type: 'trace', entry: replayed }
+        yield { type: 'completed', report, operationId: 'tool:provider-report-1:report' }
+      },
+    },
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' },
+  })).json() as { analysisId: string }
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  const research = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  assert.equal(research.trace.filter((entry: { operationId?: string }) => (
+    entry.operationId === 'tool:provider-call-1:call'
+  )).length, 1)
+  await app.close()
+})
+
 test('分析轨迹永久保存系统指令、用户语境、模型用量和最终状态', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'vibe-analysis-trace-'))
   const app = buildApp({
@@ -408,6 +447,9 @@ test('分析轨迹永久保存系统指令、用户语境、模型用量和最�
       async *analyze(input: any) {
         yield { type: 'trace' as const, entry: { type: 'system_prompt' as const, content: input.systemPrompt } }
         yield { type: 'trace' as const, entry: { type: 'user_input' as const, content: input.userPrompt } }
+        yield { type: 'trace' as const, entry: {
+          type: 'model_event' as const, event: { type: 'thinking_delta', delta: '隐藏推理' },
+        } }
         yield { type: 'completed' as const, report, usage: { input: 100, output: 20, cost: 0.01 }, stopReason: 'toolUse' }
       },
     },
@@ -420,6 +462,7 @@ test('分析轨迹永久保存系统指令、用户语境、模型用量和最�
   assert.ok(research.trace.some((entry: { type: string }) => entry.type === 'user_input'))
   assert.ok(research.trace.some((entry: { type: string; stopReason?: string }) => entry.type === 'model_completed' && entry.stopReason === 'toolUse'))
   assert.equal(JSON.stringify(research.trace).includes('"cost":0.01'), true)
+  assert.equal(JSON.stringify(research.trace).includes('隐藏推理'), false)
   await app.close()
 })
 

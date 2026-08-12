@@ -1,6 +1,6 @@
 import { Pool } from 'pg'
 
-export const schemaVersion = 4
+export const schemaVersion = 7
 
 const migrationSql = `
 CREATE TABLE IF NOT EXISTS product_schema_migrations (
@@ -74,6 +74,40 @@ CREATE TABLE IF NOT EXISTS analysis_trace (
   PRIMARY KEY (analysis_id, sequence)
 );
 
+CREATE TABLE IF NOT EXISTS agent_sessions (
+  id text PRIMARY KEY,
+  analysis_id text NOT NULL REFERENCES analyses(id) ON DELETE CASCADE,
+  is_primary boolean NOT NULL DEFAULT false,
+  execution_id text NOT NULL,
+  status text NOT NULL CHECK (status <> ''),
+  latest_sequence integer NOT NULL DEFAULT 0 CHECK (latest_sequence >= 0),
+  created_at timestamptz NOT NULL,
+  updated_at timestamptz NOT NULL
+);
+
+ALTER TABLE agent_sessions DROP CONSTRAINT IF EXISTS agent_sessions_analysis_id_key;
+ALTER TABLE agent_sessions ADD COLUMN IF NOT EXISTS is_primary boolean NOT NULL DEFAULT false;
+ALTER TABLE agent_sessions ADD COLUMN IF NOT EXISTS execution_id text;
+UPDATE agent_sessions SET execution_id = 'legacy:' || id WHERE execution_id IS NULL;
+ALTER TABLE agent_sessions ALTER COLUMN execution_id SET NOT NULL;
+UPDATE agent_sessions SET is_primary = true
+WHERE NOT EXISTS (
+  SELECT 1 FROM agent_sessions primary_session
+  WHERE primary_session.analysis_id = agent_sessions.analysis_id AND primary_session.is_primary
+);
+CREATE UNIQUE INDEX IF NOT EXISTS agent_sessions_one_primary_per_analysis
+ON agent_sessions (analysis_id) WHERE is_primary;
+
+CREATE TABLE IF NOT EXISTS agent_events (
+  session_id text NOT NULL REFERENCES agent_sessions(id) ON DELETE CASCADE,
+  sequence integer NOT NULL CHECK (sequence > 0),
+  operation_id text NOT NULL,
+  payload_json jsonb NOT NULL,
+  created_at timestamptz NOT NULL,
+  PRIMARY KEY (session_id, sequence),
+  UNIQUE (session_id, operation_id)
+);
+
 WITH duplicate_active AS (
   SELECT id, row_number() OVER (PARTITION BY symbol ORDER BY created_at, id) AS position
   FROM analyses WHERE status IN ('queued', 'running')
@@ -101,12 +135,26 @@ INSERT INTO product_schema_migrations (version)
 VALUES (4)
 ON CONFLICT (version) DO NOTHING;
 
+INSERT INTO product_schema_migrations (version)
+VALUES (5)
+ON CONFLICT (version) DO NOTHING;
+
+INSERT INTO product_schema_migrations (version)
+VALUES (6)
+ON CONFLICT (version) DO NOTHING;
+
+INSERT INTO product_schema_migrations (version)
+VALUES (7)
+ON CONFLICT (version) DO NOTHING;
+
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM vibe_invest_app;
 REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM vibe_invest_app;
 GRANT SELECT ON product_schema_migrations TO vibe_invest_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON positions, portfolio_settings, portfolio_equity_snapshots TO vibe_invest_app;
 GRANT SELECT, INSERT ON legacy_portfolio_migrations TO vibe_invest_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON analyses, atomic_facts, analysis_facts, analysis_trace TO vibe_invest_app;
+GRANT SELECT, INSERT, UPDATE ON agent_sessions TO vibe_invest_app;
+GRANT SELECT, INSERT ON agent_events TO vibe_invest_app;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO vibe_invest_app;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM vibe_invest_app;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON SEQUENCES FROM vibe_invest_app;
@@ -586,6 +634,327 @@ export function createAnalysisRepository(pool: Pool) {
 }
 
 export type AnalysisRepository = ReturnType<typeof createAnalysisRepository>
+
+export type AgentEvent = {
+  sessionId: string
+  sequence: number
+  operationId: string
+  payload: Record<string, unknown>
+  createdAt: string
+}
+
+export type AgentSession = {
+  id: string
+  analysisId: string
+  status: string
+  isPrimary: boolean
+  executionId: string
+  latestSequence: number
+  createdAt: string
+  updatedAt: string
+}
+
+type AgentEventRow = {
+  session_id: string
+  sequence: number
+  operation_id: string
+  payload_json: Record<string, unknown>
+  created_at: string
+}
+
+type AgentSessionRow = {
+  id: string
+  analysis_id: string
+  status: string
+  is_primary: boolean
+  execution_id: string
+  latest_sequence: number
+  created_at: string
+  updated_at: string
+}
+
+export function createAgentEventRepository(pool: Pool) {
+  return {
+    async createResearch(input: {
+      analysisId: string
+      sessionId: string
+      executionId: string
+      symbol: string
+      status: string
+      operationId: string
+      event: Record<string, unknown>
+      createdAt: string
+    }) {
+      const client = await pool.connect()
+      try {
+        await client.query('BEGIN')
+        const analysis = await client.query<{ id: string; created: boolean }>(
+          `INSERT INTO analyses (id, symbol, status, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $4)
+           ON CONFLICT (symbol) WHERE status IN ('queued', 'running')
+           DO UPDATE SET symbol = excluded.symbol
+           RETURNING id, id = $1 AS created`,
+          [input.analysisId, input.symbol, input.status, input.createdAt],
+        )
+        const analysisId = analysis.rows[0]!.id
+        if (!analysis.rows[0]!.created) {
+          await client.query('COMMIT')
+          const existing = await this.findPrimarySession(analysisId)
+          if (!existing) throw new Error('agent_session_not_found')
+          const event = (await this.list(existing.id, 0))[0]!
+          return { analysisId, sessionId: existing.id, sequence: event.sequence, created: false, event }
+        }
+        await client.query(
+          `INSERT INTO agent_sessions (
+             id, analysis_id, is_primary, execution_id, status, latest_sequence, created_at, updated_at
+           ) VALUES ($1, $2, true, $3, $4, 1, $5, $5)`,
+          [input.sessionId, analysisId, input.executionId, input.status, input.createdAt],
+        )
+        await client.query(
+          `INSERT INTO agent_events (
+             session_id, sequence, operation_id, payload_json, created_at
+           ) VALUES ($1, 1, $2, $3, $4)`,
+          [input.sessionId, input.operationId, JSON.stringify(input.event), input.createdAt],
+        )
+        await client.query('COMMIT')
+        return { analysisId, sessionId: input.sessionId, sequence: 1, created: true, event: {
+          sessionId: input.sessionId, sequence: 1, operationId: input.operationId,
+          payload: input.event, createdAt: input.createdAt,
+        } }
+      } catch (error) {
+        await client.query('ROLLBACK')
+        throw error
+      } finally {
+        client.release()
+      }
+    },
+    async createSession(input: {
+      id: string
+      analysisId: string
+      executionId: string
+      status: string
+      operationId: string
+      event: Record<string, unknown>
+      createdAt: string
+    }) {
+      const client = await pool.connect()
+      try {
+        await client.query('BEGIN')
+        const analysis = await client.query('SELECT id FROM analyses WHERE id = $1 FOR KEY SHARE', [input.analysisId])
+        if (!analysis.rowCount) throw new Error('analysis_not_found')
+        await client.query(
+          `INSERT INTO agent_sessions (
+             id, analysis_id, is_primary, execution_id, status, latest_sequence, created_at, updated_at
+           ) VALUES ($1, $2, false, $3, $4, 1, $5, $5)`,
+          [input.id, input.analysisId, input.executionId, input.status, input.createdAt],
+        )
+        await client.query(
+          `INSERT INTO agent_events (
+             session_id, sequence, operation_id, payload_json, created_at
+           ) VALUES ($1, 1, $2, $3, $4)`,
+          [input.id, input.operationId, JSON.stringify(input.event), input.createdAt],
+        )
+        await client.query('COMMIT')
+        return { sequence: 1, created: true, event: {
+          sessionId: input.id, sequence: 1, operationId: input.operationId,
+          payload: input.event, createdAt: input.createdAt,
+        } }
+      } catch (error) {
+        await client.query('ROLLBACK')
+        throw error
+      } finally {
+        client.release()
+      }
+    },
+    async append(input: {
+      sessionId: string
+      operationId: string
+      event: Record<string, unknown>
+      projection?: {
+        status?: string
+        report?: unknown
+        snapshot?: unknown
+        error?: string
+        facts?: Array<{ id: string } & Record<string, unknown>>
+      }
+      createdAt: string
+    }) {
+      const client = await pool.connect()
+      try {
+        await client.query('BEGIN')
+        const session = await client.query<{
+          latest_sequence: number; analysis_id: string; is_primary: boolean
+        }>(
+          'SELECT latest_sequence, analysis_id, is_primary FROM agent_sessions WHERE id = $1 FOR UPDATE',
+          [input.sessionId],
+        )
+        if (!session.rows[0]) throw new Error('agent_session_not_found')
+        const existing = await client.query<{ sequence: number }>(
+          `SELECT sequence FROM agent_events
+           WHERE session_id = $1 AND operation_id = $2`,
+          [input.sessionId, input.operationId],
+        )
+        if (existing.rows[0]) {
+          const event = await client.query<AgentEventRow>(
+            `SELECT session_id, sequence, operation_id, payload_json, created_at::text
+             FROM agent_events WHERE session_id = $1 AND operation_id = $2`,
+            [input.sessionId, input.operationId],
+          )
+          await client.query('COMMIT')
+          return { sequence: existing.rows[0].sequence, created: false, event: mapAgentEventRow(event.rows[0]!) }
+        }
+        const sequence = session.rows[0].latest_sequence + 1
+        await client.query(
+          `INSERT INTO agent_events (
+             session_id, sequence, operation_id, payload_json, created_at
+           ) VALUES ($1, $2, $3, $4, $5)`,
+          [input.sessionId, sequence, input.operationId, JSON.stringify(input.event), input.createdAt],
+        )
+        for (const fact of input.projection?.facts ?? []) {
+          await client.query(
+            `INSERT INTO atomic_facts (id, payload_json, is_public) VALUES ($1, $2, true)
+             ON CONFLICT (id) DO NOTHING`,
+            [fact.id, JSON.stringify(fact)],
+          )
+          await client.query(
+            `INSERT INTO analysis_facts (analysis_id, fact_id) VALUES ($1, $2)
+             ON CONFLICT DO NOTHING`,
+            [session.rows[0].analysis_id, fact.id],
+          )
+        }
+        await client.query(
+          `UPDATE agent_sessions SET latest_sequence = $1,
+             status = COALESCE($2, status), updated_at = $3 WHERE id = $4`,
+          [sequence, input.projection?.status ?? null, input.createdAt, input.sessionId],
+        )
+        if (input.projection && session.rows[0].is_primary) {
+          await client.query(
+            `UPDATE analyses SET status = COALESCE($1, status), updated_at = $2,
+               report_json = COALESCE($3::jsonb, report_json),
+               snapshot_json = COALESCE($4::jsonb, snapshot_json),
+               error = COALESCE($5, error) WHERE id = $6`,
+            [input.projection.status, input.createdAt,
+              input.projection.report ? JSON.stringify(input.projection.report) : null,
+              input.projection.snapshot ? JSON.stringify(input.projection.snapshot) : null,
+              input.projection.error ?? null, session.rows[0].analysis_id],
+          )
+        }
+        await client.query('COMMIT')
+        return { sequence, created: true, event: {
+          sessionId: input.sessionId, sequence, operationId: input.operationId,
+          payload: input.event, createdAt: input.createdAt,
+        } }
+      } catch (error) {
+        await client.query('ROLLBACK')
+        throw error
+      } finally {
+        client.release()
+      }
+    },
+    async interruptActiveSessions(createdAt: string) {
+      const client = await pool.connect()
+      try {
+        await client.query('BEGIN')
+        const sessions = await client.query<{
+          id: string; analysis_id: string; is_primary: boolean; latest_sequence: number
+        }>(
+          `SELECT id, analysis_id, is_primary, latest_sequence FROM agent_sessions
+           WHERE status IN ('queued', 'running') ORDER BY id FOR UPDATE`,
+        )
+        const interrupted: AgentEvent[] = []
+        for (const session of sessions.rows) {
+          const sequence = session.latest_sequence + 1
+          const operationId = `startup:interrupt:${session.id}:${sequence}`
+          const payload = { type: 'status', status: 'interrupted', at: createdAt }
+          await client.query(
+            `INSERT INTO agent_events (
+               session_id, sequence, operation_id, payload_json, created_at
+             ) VALUES ($1, $2, $3, $4, $5)`,
+            [session.id, sequence, operationId, JSON.stringify(payload), createdAt],
+          )
+          await client.query(
+            `UPDATE agent_sessions SET status = 'interrupted', latest_sequence = $1, updated_at = $2
+             WHERE id = $3`,
+            [sequence, createdAt, session.id],
+          )
+          if (session.is_primary) {
+            await client.query(
+              `UPDATE analyses SET status = 'interrupted', updated_at = $1 WHERE id = $2`,
+              [createdAt, session.analysis_id],
+            )
+          }
+          interrupted.push({
+            sessionId: session.id, sequence, operationId, payload, createdAt,
+          })
+        }
+        await client.query('COMMIT')
+        return interrupted
+      } catch (error) {
+        await client.query('ROLLBACK')
+        throw error
+      } finally {
+        client.release()
+      }
+    },
+    async list(sessionId: string, afterSequence: number): Promise<AgentEvent[]> {
+      const result = await pool.query<AgentEventRow>(
+        `SELECT session_id, sequence, operation_id, payload_json, created_at::text
+         FROM agent_events WHERE session_id = $1 AND sequence > $2 ORDER BY sequence`,
+        [sessionId, afterSequence],
+      )
+      return result.rows.map(mapAgentEventRow)
+    },
+    async getSession(id: string): Promise<AgentSession | null> {
+      const result = await pool.query<AgentSessionRow>(
+        `SELECT id, analysis_id, is_primary, execution_id, status, latest_sequence, created_at::text, updated_at::text
+         FROM agent_sessions WHERE id = $1`,
+        [id],
+      )
+      return result.rows[0] ? mapAgentSessionRow(result.rows[0]) : null
+    },
+    async findPrimarySession(analysisId: string): Promise<AgentSession | null> {
+      const result = await pool.query<AgentSessionRow>(
+        `SELECT id, analysis_id, is_primary, execution_id, status, latest_sequence, created_at::text, updated_at::text
+         FROM agent_sessions WHERE analysis_id = $1 AND is_primary`,
+        [analysisId],
+      )
+      return result.rows[0] ? mapAgentSessionRow(result.rows[0]) : null
+    },
+    async listSessions(analysisId: string): Promise<AgentSession[]> {
+      const result = await pool.query<AgentSessionRow>(
+        `SELECT id, analysis_id, is_primary, execution_id, status, latest_sequence, created_at::text, updated_at::text
+         FROM agent_sessions WHERE analysis_id = $1 ORDER BY is_primary DESC, created_at, id`,
+        [analysisId],
+      )
+      return result.rows.map(mapAgentSessionRow)
+    },
+  }
+}
+
+export type AgentEventRepository = ReturnType<typeof createAgentEventRepository>
+
+function mapAgentEventRow(row: AgentEventRow): AgentEvent {
+  return {
+    sessionId: row.session_id,
+    sequence: row.sequence,
+    operationId: row.operation_id,
+    payload: row.payload_json,
+    createdAt: new Date(row.created_at).toISOString(),
+  }
+}
+
+function mapAgentSessionRow(row: AgentSessionRow): AgentSession {
+  return {
+    id: row.id,
+    analysisId: row.analysis_id,
+    status: row.status,
+    isPrimary: row.is_primary,
+    executionId: row.execution_id,
+    latestSequence: row.latest_sequence,
+    createdAt: new Date(row.created_at).toISOString(),
+    updatedAt: new Date(row.updated_at).toISOString(),
+  }
+}
 
 function mapAnalysisRow(row: AnalysisRow): AnalysisRecord {
   return {

@@ -12,6 +12,16 @@ export type SystemHealth = {
   }
 }
 
+export type SseEventEnvelope = {
+  id: string
+  event: string
+  data: Record<string, unknown>
+}
+
+export function formatSseEvent(event: SseEventEnvelope) {
+  return `id: ${event.id}\nevent: ${event.event}\ndata: ${JSON.stringify(event.data)}\n\n`
+}
+
 export function isFinancialDataHealth(value: unknown): value is FinancialDataHealth {
   if (!value || typeof value !== 'object') return false
   const candidate = value as Record<string, unknown>

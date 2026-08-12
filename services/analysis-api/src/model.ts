@@ -40,20 +40,21 @@ export type AnalysisReport = {
 }
 
 type TraceEntry =
-  | { type: 'system_prompt'; content: string }
-  | { type: 'user_input'; content: string }
-  | { type: 'model_event'; event: unknown }
-  | { type: 'tool_call'; name: string; input: unknown }
-  | { type: 'tool_result'; name: string; result: unknown; isError: boolean }
-  | { type: 'cancelled' }
+  | { type: 'system_prompt'; content: string; operationId?: string }
+  | { type: 'user_input'; content: string; operationId?: string }
+  | { type: 'model_event'; event: unknown; operationId?: string }
+  | { type: 'tool_call'; name: string; input: unknown; operationId: string }
+  | { type: 'tool_result'; name: string; result: unknown; isError: boolean; operationId: string }
+  | { type: 'cancelled'; operationId?: string }
 
 export type ModelEvent =
-  | { type: 'text_delta'; text: string }
+  | { type: 'text_delta'; text: string; operationId?: string }
   | { type: 'trace'; entry: TraceEntry }
-  | { type: 'completed'; report: AnalysisReport; usage?: unknown; stopReason?: string }
-  | { type: 'cancelled' }
+  | { type: 'completed'; report: AnalysisReport; usage?: unknown; stopReason?: string; operationId?: string }
+  | { type: 'cancelled'; operationId?: string }
 
 type AnalyzeInput = {
+  executionId: string
   symbol: string
   systemPrompt: string
   userPrompt: string
@@ -139,10 +140,18 @@ export function createPiModel(options: ModelOptions = {}) {
         }
         return frozenContext
       }
-      yield { type: 'trace', entry: { type: 'system_prompt', content: input.systemPrompt } }
-      yield { type: 'trace', entry: { type: 'user_input', content: input.userPrompt } }
+      yield { type: 'trace', entry: {
+        type: 'system_prompt', content: input.systemPrompt,
+        operationId: `execution:${input.executionId}:system-prompt`,
+      } }
+      yield { type: 'trace', entry: {
+        type: 'user_input', content: input.userPrompt,
+        operationId: `execution:${input.executionId}:user-input`,
+      } }
 
       for (let turn = 0; turn < 6; turn += 1) {
+        const attemptId = `execution:${input.executionId}:model-attempt:${turn + 1}`
+        let attemptEventSequence = 0
         const stream = models.stream(selectedModel, context, { signal: input.signal, apiKey: options.apiKey })
         const iterator = stream[Symbol.asyncIterator]()
         try {
@@ -150,17 +159,24 @@ export function createPiModel(options: ModelOptions = {}) {
             const item = await nextEvent(iterator, input.signal)
             if (item.done) break
             const event = item.value
-            yield { type: 'trace', entry: { type: 'model_event', event: compactModelEvent(event) } }
+            const eventId = `${attemptId}:event:${++attemptEventSequence}`
+            yield { type: 'trace', entry: {
+              type: 'model_event', event: compactModelEvent(event), operationId: eventId,
+            } }
             options.log?.({
               type: event.type,
               toolName: event.type === 'toolcall_end' ? event.toolCall.name : undefined,
             })
-            if (event.type === 'text_delta') yield { type: 'text_delta', text: event.delta }
+            if (event.type === 'text_delta') yield {
+              type: 'text_delta', text: event.delta, operationId: `${eventId}:text`,
+            }
           }
         } catch (error) {
           if (input.signal?.aborted) {
-            yield { type: 'trace', entry: { type: 'cancelled' } }
-            yield { type: 'cancelled' }
+            yield { type: 'trace', entry: {
+              type: 'cancelled', operationId: `${attemptId}:cancelled-trace`,
+            } }
+            yield { type: 'cancelled', operationId: `${attemptId}:cancelled` }
             return
           }
           throw error
@@ -169,7 +185,7 @@ export function createPiModel(options: ModelOptions = {}) {
         const message = await stream.result()
         context.messages.push(message)
         if (message.stopReason === 'aborted') {
-          yield { type: 'cancelled' }
+          yield { type: 'cancelled', operationId: `${attemptId}:cancelled` }
           return
         }
         if (message.stopReason === 'error') throw new Error(message.errorMessage || 'model_error')
@@ -185,12 +201,19 @@ export function createPiModel(options: ModelOptions = {}) {
 
         for (const call of calls) {
           const toolInput = validateToolCall([...analysisModelTools], call)
-          yield { type: 'trace', entry: { type: 'tool_call', name: call.name, input: toolInput } }
+          const toolOperationId = `execution:${input.executionId}:tool:${call.id}`
+          yield { type: 'trace', entry: {
+            type: 'tool_call', name: call.name, input: toolInput,
+            operationId: `${toolOperationId}:call`,
+          } }
           if (call.name === 'submit_analysis_report') {
             const report = normalizeReport(toolInput)
             try {
               validateEvidence(report, knownFactIds)
-              yield { type: 'completed', report, usage: message.usage, stopReason: message.stopReason }
+              yield {
+                type: 'completed', report, usage: message.usage, stopReason: message.stopReason,
+                operationId: `${toolOperationId}:report`,
+              }
               return
             } catch (error) {
               const result = {
@@ -201,7 +224,10 @@ export function createPiModel(options: ModelOptions = {}) {
                 role: 'toolResult', toolCallId: call.id, toolName: call.name,
                 content: [{ type: 'text', text: JSON.stringify(result) }], isError: true, timestamp: Date.now(),
               })
-              yield { type: 'trace', entry: { type: 'tool_result', name: call.name, result, isError: true } }
+              yield { type: 'trace', entry: {
+                type: 'tool_result', name: call.name, result, isError: true,
+                operationId: `${toolOperationId}:result`,
+              } }
               continue
             }
           }
@@ -251,7 +277,10 @@ export function createPiModel(options: ModelOptions = {}) {
             role: 'toolResult', toolCallId: call.id, toolName: call.name,
             content: [{ type: 'text', text: JSON.stringify(result) }], isError, timestamp: Date.now(),
           })
-          yield { type: 'trace', entry: { type: 'tool_result', name: call.name, result, isError } }
+          yield { type: 'trace', entry: {
+            type: 'tool_result', name: call.name, result, isError,
+            operationId: `${toolOperationId}:result`,
+          } }
           options.log?.({ type: 'tool_result', toolName: call.name, isError })
         }
       }
