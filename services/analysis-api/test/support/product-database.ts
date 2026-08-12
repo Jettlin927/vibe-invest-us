@@ -89,6 +89,7 @@ export function createTestProductDatabase() {
       analyses.set(id, {
         ...record, status, updatedAt,
         report: extra.report ?? record.report,
+        reportCreatedAt: extra.report ? updatedAt : record.reportCreatedAt,
         snapshot: extra.snapshot ?? record.snapshot,
         error: extra.error ?? record.error,
       })
@@ -99,7 +100,7 @@ export function createTestProductDatabase() {
         .filter((candidate) => candidate.symbol === record.symbol && ['queued', 'running'].includes(candidate.status))
         .sort((left, right) => left.createdAt.localeCompare(right.createdAt))[0]
       if (existing) return { analysisId: existing.id, created: false }
-      analyses.set(record.id, { ...record, snapshot: null, report: null, error: null, starred: false, note: '' })
+      analyses.set(record.id, { ...record, snapshot: null, report: null, reportCreatedAt: null, error: null, starred: false, note: '' })
       return { analysisId: record.id, created: true }
     },
     async claimNextQueued(updatedAt) {
@@ -179,7 +180,7 @@ export function createTestProductDatabase() {
       analyses.set(input.analysisId, {
         id: input.analysisId, symbol: input.symbol, status: input.status,
         createdAt: input.createdAt, updatedAt: input.createdAt,
-        snapshot: null, report: null, error: null, starred: false, note: '',
+        snapshot: null, report: null, reportCreatedAt: null, error: null, starred: false, note: '',
       })
       return {
         analysisId: input.analysisId, sessionId: input.sessionId,
@@ -234,6 +235,7 @@ export function createTestProductDatabase() {
         if (record && session.isPrimary) analyses.set(analysisId, {
           ...record, status: input.projection.status ?? record.status, updatedAt: input.createdAt,
           report: input.projection.report ?? record.report,
+          reportCreatedAt: input.projection.report ? input.createdAt : record.reportCreatedAt,
           snapshot: input.projection.snapshot ?? record.snapshot,
           error: input.projection.error ?? record.error,
         })

@@ -25,6 +25,8 @@ export function createAnalysisService(options: {
   listPortfolioSymbols?: () => Promise<string[]>
   getPortfolioContext?: (symbol: string, marketPrices: Record<string, number>) => Promise<unknown>
   runtimeMinuteMs?: number
+  activeNow?: () => number
+  activeTimeoutSignal?: (timeoutMs: number) => AbortSignal
 }) {
   const { repository } = options
   const controllers = new Map<string, AbortController>()
@@ -176,6 +178,8 @@ export function createAnalysisService(options: {
     const executionSignal = AbortSignal.any([controller.signal, wallDeadline])
     const activeBudget = createActiveBudget(
       runtimeSettings.researchActiveMinutes * (options.runtimeMinuteMs ?? 60_000),
+      options.activeNow,
+      options.activeTimeoutSignal,
     )
     let processing = activeBudget.start(executionSignal)
     const pauseProcessing = () => processing.stop()
@@ -183,10 +187,10 @@ export function createAnalysisService(options: {
     const assertPolicy = () => {
       if (controller.signal.aborted) throw controller.signal.reason
       if (wallDeadline.aborted) throw new Error('execution_runtime_timeout')
-      if (activeBudget.exhausted()) throw new Error('research_active_timeout')
     }
     const operationId = (kind: string) => `execution:${executionId}:${kind}`
     let modelEventSequence = 0
+    let context: FinancialContext | undefined
     const nextModelOperationId = (kind: string) => (
       `execution:${executionId}:model:${++modelEventSequence}:${kind}`
     )
@@ -194,7 +198,6 @@ export function createAnalysisService(options: {
       pauseProcessing()
       const releaseContextSlot = await toolGate.acquire(executionSignal)
       const contextActive = activeBudget.start(executionSignal)
-      let context: FinancialContext
       try {
         context = await options.fetchFinancialContext(job.symbol, contextActive.signal)
       } finally {
@@ -203,6 +206,7 @@ export function createAnalysisService(options: {
       }
       resumeProcessing()
       assertPolicy()
+      if (!context) throw new Error('financial_context_unavailable')
       const quoteFact = context.facts.find((fact) => fact.type === 'quote' && typeof fact.value === 'number')
       let portfolioPrices: Record<string, number> = {}
       let portfolioPriceGap = false
@@ -255,7 +259,7 @@ export function createAnalysisService(options: {
         knownFacts: modelContext.facts,
         fetchFinancialContext: async () => modelContext, signal: controller.signal,
         executionDeadlineSignal: wallDeadline,
-        activeElapsedMs: activeBudget.elapsedMs(),
+        activeBudget,
         acquireModelSlot: (signal) => modelGate.acquire(signal),
         acquireToolSlot: (signal) => toolGate.acquire(signal),
         searchNews: options.searchNews,
@@ -305,9 +309,37 @@ export function createAnalysisService(options: {
           error: 'execution_runtime_timeout',
         })
       } else if (activeBudget.exhausted()) {
-        await setStatus(sessionId, operationId('status-failed'), 'failed', {
-          error: 'research_active_timeout',
-        })
+        const limitedContext = context ?? {
+          symbol: job.symbol, facts: [], gaps: [{ capability: 'research_active', reason: 'budget_exhausted' }],
+          indicators: {},
+        }
+        try {
+          pauseProcessing()
+          for await (const event of options.model.analyze({
+            executionId, runtimeSettings, symbol: job.symbol,
+            systemPrompt: ANALYSIS_SYSTEM_PROMPT,
+            userPrompt: `研究 active time 已耗尽，请仅生成确定性受限报告。`,
+            knownFacts: limitedContext.facts,
+            fetchFinancialContext: async () => limitedContext,
+            signal: controller.signal, executionDeadlineSignal: wallDeadline, activeBudget,
+            acquireModelSlot: (signal) => modelGate.acquire(signal),
+            acquireToolSlot: (signal) => toolGate.acquire(signal),
+          })) {
+            if (event.type === 'trace') await appendTrace(sessionId, event.entry.operationId ? event.entry : {
+              ...event.entry, operationId: nextModelOperationId(event.entry.type),
+            })
+            if (event.type === 'completed') {
+              const report = enforceDataGaps(event.report, limitedContext.gaps ?? [])
+              await setStatus(sessionId, operationId('status-partial'), 'partial', { report })
+              return
+            }
+          }
+          throw new Error('research_active_closure_required')
+        } catch (closureError) {
+          await setStatus(sessionId, operationId('status-failed'), 'failed', {
+            error: closureError instanceof Error ? closureError.message : String(closureError),
+          })
+        }
       } else {
         await setStatus(sessionId, operationId('status-failed'), 'failed', {
           error: error instanceof Error ? error.message : String(error),

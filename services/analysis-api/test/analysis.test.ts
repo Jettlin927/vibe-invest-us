@@ -89,12 +89,20 @@ test('创建分析立即返回标识并自动保存完成报告、快照、事�
   assert.equal(research.statusCode, 200)
   assert.equal(research.json().snapshot.symbol, 'NVDA')
   assert.equal(research.json().snapshot.portfolioContext.position, null)
+  assert.equal(typeof research.json().reportCreatedAt, 'string')
+  const reportCreatedAt = research.json().reportCreatedAt
   assert.equal(research.json().facts[0].source, 'sina')
   assert.ok(research.json().trace.some((entry: { type: string }) => entry.type === 'status'))
 
   const events = await app.inject({ method: 'GET', url: `/api/agent-sessions/${sessionId}/events` })
   assert.match(events.headers['content-type'] ?? '', /text\/event-stream/)
   assert.match(events.body, /event: completed/)
+  await app.inject({
+    method: 'PATCH', url: `/api/research/${analysisId}`, payload: { note: '新备注' },
+  })
+  const afterNote = await app.inject({ method: 'GET', url: `/api/research/${analysisId}` })
+  assert.equal(afterNote.json().reportCreatedAt, reportCreatedAt)
+  assert.deepEqual(afterNote.json().report, research.json().report)
   await app.close()
 })
 
@@ -218,20 +226,22 @@ test('即时 model/tool concurrency 对新旧 execution 使用同一全局上限
   await app.close()
 })
 
-test('初始工具 active policy 到期后 fail closed 且不再进入模型', async () => {
+test('Runtime processing 单独耗尽 active budget 后进入确定性收口', async () => {
   const database = createTestProductDatabase()
   await database.runtimeSettingsRepository.save({ researchActiveMinutes: 1 }, new Date().toISOString())
+  let activeNow = 0
   let modelCalls = 0
   let toolCalls = 0
   const app = buildProductionApp({
     ...database,
-    runtimeMinuteMs: 5,
+    runtimeMinuteMs: 10,
+    activeNow: () => activeNow,
+    activeTimeoutSignal: () => new AbortController().signal,
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
-    fetchFinancialContext: async (_symbol, signal) => {
+    fetchFinancialContext: async () => {
       toolCalls += 1
-      await new Promise((resolve) => setTimeout(resolve, 8))
-      signal.throwIfAborted()
-      return { symbol: 'ABORT', facts: [fact], gaps: [], indicators: {} }
+      activeNow = 11
+      throw new Error('research_active_timeout')
     },
     model: {
       async *analyze() {
@@ -242,10 +252,48 @@ test('初始工具 active policy 到期后 fail closed 且不再进入模型', a
   })
   await app.ready()
   const created = (await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'ABORT' } })).json()
-  const failed = await waitForStatus(app as any, created.analysisId, 'failed')
-  assert.equal(failed.error, 'research_active_timeout')
+  const partial = await waitForStatus(app as any, created.analysisId, 'partial')
+  assert.equal(partial.report.title, report.title)
   assert.equal(toolCalls, 1)
-  assert.equal(modelCalls, 0)
+  assert.equal(modelCalls, 1)
+  await app.close()
+})
+
+test('8 分钟 Runtime 加 8 分钟 provider 共用 10 分钟 active budget 并进入收口', async () => {
+  const database = createTestProductDatabase()
+  await database.runtimeSettingsRepository.save({ researchActiveMinutes: 1 }, new Date().toISOString())
+  let activeNow = 0
+  let requests = 0
+  const model = createPiModel({ fauxResponses: [
+    () => {
+      requests += 1
+      activeNow = 16
+      return fauxAssistantMessage('研究预算已经耗尽。')
+    },
+    () => {
+      requests += 1
+      return fauxAssistantMessage(fauxToolCall('submit_analysis_report', report), { stopReason: 'toolUse' })
+    },
+  ] })
+  const app = buildProductionApp({
+    ...database,
+    runtimeMinuteMs: 10,
+    activeNow: () => activeNow,
+    activeTimeoutSignal: () => new AbortController().signal,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => {
+      activeNow = 8
+      return { symbol, facts: [fact], gaps: [], indicators: {} }
+    },
+    model,
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'SHARED' },
+  })).json()
+  const completed = await waitForStatus(app as any, created.analysisId, 'completed')
+  assert.equal(completed.report.title, report.title)
+  assert.equal(requests, 2)
   await app.close()
 })
 

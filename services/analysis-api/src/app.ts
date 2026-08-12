@@ -34,6 +34,8 @@ type AppDependencies = {
   modelConfigured?: boolean
   now?: () => Date
   runtimeMinuteMs?: number
+  activeNow?: () => number
+  activeTimeoutSignal?: (timeoutMs: number) => AbortSignal
   migrationVerificationToken?: string
 }
 
@@ -53,6 +55,8 @@ export function buildApp(dependencies: AppDependencies) {
         model: dependencies.model,
         getPortfolioContext: (symbol, marketPrices) => portfolio.context(symbol, marketPrices),
         runtimeMinuteMs: dependencies.runtimeMinuteMs,
+        activeNow: dependencies.activeNow,
+        activeTimeoutSignal: dependencies.activeTimeoutSignal,
       })
     : null
 

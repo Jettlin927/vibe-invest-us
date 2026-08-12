@@ -228,7 +228,8 @@ test('报告 freshness 按报告年龄提示且不因历史事实改写报告内
   const oldLimitations = ['原始限制']
   const oldRecord = {
     id: 'old-report', symbol: 'NVDA', status: 'completed',
-    createdAt: new Date(Date.now() - 10 * 86_400_000).toISOString(),
+    createdAt: new Date().toISOString(),
+    reportCreatedAt: new Date(Date.now() - 10 * 86_400_000).toISOString(),
     report: { title: oldTitle, trend: '中性', limitations: oldLimitations },
     facts: [{
       id: 'old-financial', type: 'reported_financial', value: {},
@@ -238,7 +239,7 @@ test('报告 freshness 按报告年龄提示且不因历史事实改写报告内
   }
   globalThis.fetch = async (input) => {
     const url = String(input)
-    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok', engine: 'postgresql', schemaVersion: 8 }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok', engine: 'postgresql', schemaVersion: 9 }, financialData: { service: 'financial-data', status: 'ok' } } })
     if (url === '/api/settings') return Response.json(settingsResponse({ reportFreshnessDays: 7 }))
     if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
     if (url === '/api/portfolio') return Response.json(portfolioResponse([]))
@@ -257,14 +258,16 @@ test('报告 freshness 按报告年龄提示且不因历史事实改写报告内
 test('刚生成报告即使引用历史财报也不显示 freshness 过期提示', async () => {
   setupDom()
   const freshRecord = {
-    id: 'fresh-report', symbol: 'NVDA', status: 'completed', createdAt: new Date().toISOString(),
+    id: 'fresh-report', symbol: 'NVDA', status: 'completed',
+    createdAt: new Date(Date.now() - 30 * 86_400_000).toISOString(),
+    reportCreatedAt: new Date().toISOString(),
     report: { title: '刚生成的报告', trend: '中性', limitations: [] },
     facts: [{ id: 'historical', type: 'reported_financial', value: {}, observedAt: '2019-01-01T00:00:00.000Z', source: 'sec', sourceReference: 'https://example.com' }],
     trace: [],
   }
   globalThis.fetch = async (input) => {
     const url = String(input)
-    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok', engine: 'postgresql', schemaVersion: 8 }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok', engine: 'postgresql', schemaVersion: 9 }, financialData: { service: 'financial-data', status: 'ok' } } })
     if (url === '/api/settings') return Response.json(settingsResponse({ reportFreshnessDays: 1 }))
     if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
     if (url === '/api/portfolio') return Response.json(portfolioResponse([]))
@@ -277,6 +280,32 @@ test('刚生成报告即使引用历史财报也不显示 freshness 过期提示
   await user.click(await view.findByRole('button', { name: '研究记录' }))
   await view.findByRole('heading', { name: '刚生成的报告' })
   assert.equal(view.queryByText(/此报告已超过当前/), null)
+})
+
+test('备注更新不改变报告 freshness 年龄', async () => {
+  setupDom()
+  const reportCreatedAt = new Date(Date.now() - 10 * 86_400_000).toISOString()
+  const record = {
+    id: 'noted-report', symbol: 'NVDA', status: 'completed',
+    createdAt: new Date(Date.now() - 20 * 86_400_000).toISOString(),
+    updatedAt: new Date().toISOString(), reportCreatedAt,
+    report: { title: '备注后的旧报告', trend: '中性', limitations: [] }, facts: [], trace: [],
+  }
+  globalThis.fetch = async (input) => {
+    const url = String(input)
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok', engine: 'postgresql', schemaVersion: 9 }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/settings') return Response.json(settingsResponse({ reportFreshnessDays: 7 }))
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+    if (url === '/api/portfolio') return Response.json(portfolioResponse([]))
+    if (url === '/api/research') return Response.json({ records: [record] })
+    if (url === '/api/research/noted-report') return Response.json(record)
+    throw new Error(`unexpected_fetch:${url}`)
+  }
+  const view = render(React.createElement(App))
+  await userEvent.setup({ document: window.document }).click(await view.findByRole('button', { name: '研究记录' }))
+  await view.findByText('此报告已超过当前 7 天有效期，请重新生成后再据此判断。')
+  assert.equal(record.reportCreatedAt, reportCreatedAt)
+  assert.equal(record.report.title, '备注后的旧报告')
 })
 
 test('坏报告依据被拒绝时用户看到可理解的失败原因', async () => {
@@ -400,7 +429,7 @@ test('设置页展示当前、默认、修改时间与运行 execution 冻结值
   })
   globalThis.fetch = async (input, init) => {
     const url = String(input)
-    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok', engine: 'postgresql', schemaVersion: 8 }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok', engine: 'postgresql', schemaVersion: 9 }, financialData: { service: 'financial-data', status: 'ok' } } })
     if (url === '/api/settings' && (!init?.method || init.method === 'GET')) return Response.json(settingsResponse())
     if (url === '/api/settings' && init?.method === 'PUT') {
       requests.push({ url, method: init.method })
@@ -450,7 +479,7 @@ test('设置写入失败可见且提交期间禁用并防止重复请求', async
   let operation: 'save' | 'field' | 'defaults' = 'save'
   globalThis.fetch = async (input, init) => {
     const url = String(input)
-    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok', engine: 'postgresql', schemaVersion: 8 }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok', engine: 'postgresql', schemaVersion: 9 }, financialData: { service: 'financial-data', status: 'ok' } } })
     if (url === '/api/settings' && (!init?.method || init.method === 'GET')) return Response.json({
       model: { configured: true },
       current: { id: 2, createdAt: '2026-08-13T03:00:00.000Z', values: runtimeSettings() },

@@ -193,7 +193,7 @@ test('真实 PostgreSQL migration 幂等且 application role 没有 DDL 权限',
   await migrate(migrationUrl!)
 
   const pool = createPool(applicationUrl!)
-  assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 8 })
+  assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 9 })
   const privileges = await pool.query<{ can_create: boolean; can_temp: boolean }>(
     `SELECT has_schema_privilege(current_user, 'public', 'CREATE') AS can_create,
             has_database_privilege(current_user, current_database(), 'TEMP') AS can_temp`,
@@ -336,12 +336,65 @@ test('真实 PostgreSQL 研究 DAO 保存任务、事实、轨迹并安全删除
     assert.equal(research?.status, 'completed')
     assert.deepEqual(research?.snapshot, { symbol: 'NVDA' })
     assert.deepEqual(research?.report, { title: 'DAO 测试' })
+    assert.equal(research?.reportCreatedAt, now)
+    await repository.updateResearch(id, { note: '更新备注' }, '2026-08-20T00:00:00.000Z')
+    assert.equal((await repository.research(id))?.reportCreatedAt, now)
     assert.deepEqual(research?.facts, [{ id: 'dao-fact-test', type: 'quote', value: 100 }])
     assert.deepEqual(research?.trace, [{ type: 'status', status: 'queued' }])
     assert.equal(await repository.removeResearch(id), true)
     assert.equal(await repository.get(id), null)
   } finally {
     await pool.end()
+  }
+})
+
+test('真实 PostgreSQL v9 按报告完成事件回填 reportCreatedAt 且无事件时回退更新时间', {
+  skip: !migrationUrl || !applicationUrl,
+  concurrency: false,
+}, async () => {
+  const migrationPool = createPool(migrationUrl!)
+  const applicationPool = createPool(applicationUrl!)
+  const repository = createAnalysisRepository(applicationPool)
+  const eventTime = '2026-08-10T03:00:00.000Z'
+  const fallbackTime = '2026-08-11T04:00:00.000Z'
+  try {
+    await migrationPool.query(`
+      INSERT INTO analyses (
+        id, symbol, status, created_at, updated_at, report_json, report_created_at
+      ) VALUES
+        ('report-created-at-event', 'RCAEVENT', 'completed', '2026-08-01T00:00:00Z',
+         '2026-08-12T00:00:00Z', '{"title":"事件报告"}', NULL),
+        ('report-created-at-fallback', 'RCAFALLBACK', 'completed', '2026-08-01T00:00:00Z',
+         $1, '{"title":"回退报告"}', NULL)
+      ON CONFLICT (id) DO UPDATE SET report_created_at = NULL
+    `, [fallbackTime])
+    await migrationPool.query(`
+      INSERT INTO agent_sessions (
+        id, analysis_id, is_primary, execution_id, status, latest_sequence, created_at, updated_at
+      ) VALUES (
+        'report-created-at-session', 'report-created-at-event', true,
+        'report-created-at-execution', 'completed', 1, '2026-08-01T00:00:00Z', $1::timestamptz
+      ) ON CONFLICT (id) DO NOTHING
+    `, [eventTime])
+    await migrationPool.query(`
+      INSERT INTO agent_events (
+        session_id, sequence, operation_id, payload_json, created_at
+      ) VALUES (
+        'report-created-at-session', 1, 'report-created-at-completed',
+        '{"type":"status","status":"completed"}', $1::timestamptz
+      ) ON CONFLICT (session_id, operation_id) DO NOTHING
+    `, [eventTime])
+
+    await migrate(migrationUrl!)
+
+    assert.equal((await repository.get('report-created-at-event'))?.reportCreatedAt, eventTime)
+    assert.equal((await repository.get('report-created-at-fallback'))?.reportCreatedAt, fallbackTime)
+  } finally {
+    await migrationPool.query(
+      `DELETE FROM analyses WHERE id IN ('report-created-at-event', 'report-created-at-fallback')`,
+    )
+    await applicationPool.end()
+    await migrationPool.end()
   }
 })
 

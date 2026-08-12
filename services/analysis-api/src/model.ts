@@ -6,13 +6,14 @@ import {
   contentText,
   type AssistantMessage,
   type Context,
+  type FauxResponseStep,
   type Model,
   type Api,
 } from '@earendil-works/pi-ai'
 import { openAICompletionsApi } from '@earendil-works/pi-ai/api/openai-completions.lazy'
 import { openAIResponsesApi } from '@earendil-works/pi-ai/api/openai-responses.lazy'
 import type { RuntimeSettings } from '@vibe-invest/contracts'
-import { createActiveBudget, createConcurrencyGate, deadlineSignal } from './runtime-policy.js'
+import { createActiveBudget, createConcurrencyGate, deadlineSignal, type ActiveBudget } from './runtime-policy.js'
 import { analysisModelTools, financialSpecialistTools } from './tools.js'
 
 type Fact = {
@@ -74,13 +75,13 @@ export type AnalyzeInput = {
   ) => Promise<{ facts: Fact[]; [key: string]: unknown }>
   signal?: AbortSignal
   executionDeadlineSignal?: AbortSignal
-  activeElapsedMs?: number
+  activeBudget?: ActiveBudget
   acquireModelSlot?: (signal: AbortSignal) => Promise<() => void>
   acquireToolSlot?: (signal: AbortSignal) => Promise<() => void>
 }
 
 type ModelOptions = {
-  fauxResponses?: AssistantMessage[]
+  fauxResponses?: FauxResponseStep[]
   fauxTokensPerSecond?: number
   toolTimeoutMs?: number
   log?: (entry: Record<string, unknown>) => void
@@ -90,6 +91,8 @@ type ModelOptions = {
   baseUrl?: string
   apiKey?: string
   runtimeMinuteMs?: number
+  activeNow?: () => number
+  activeTimeoutSignal?: (timeoutMs: number) => AbortSignal
 }
 
 export function createPiModel(options: ModelOptions = {}) {
@@ -105,8 +108,9 @@ export function createPiModel(options: ModelOptions = {}) {
         input.signal, runtimeSettings.executionWallClockMinutes * runtimeMinuteMs,
         input.executionDeadlineSignal,
       )
-      const activeBudget = createActiveBudget(
-        runtimeSettings.researchActiveMinutes * runtimeMinuteMs - (input.activeElapsedMs ?? 0),
+      const activeBudget = input.activeBudget ?? createActiveBudget(
+        runtimeSettings.researchActiveMinutes * runtimeMinuteMs, options.activeNow,
+        options.activeTimeoutSignal,
       )
       const models = createModels()
       let selectedModel: Model<Api>
@@ -260,24 +264,37 @@ export function createPiModel(options: ModelOptions = {}) {
           }
           throw policyError
         }
+        let runtimeWork = activeBudget.start(executionSignal)
         context.messages.push(message)
         if (message.stopReason === 'aborted') {
+          runtimeWork.stop()
           yield { type: 'cancelled', operationId: `${attemptId}:cancelled` }
           return
         }
-        if (message.stopReason === 'error') throw new Error(message.errorMessage || 'model_error')
+        if (message.stopReason === 'error') {
+          runtimeWork.stop()
+          throw new Error(message.errorMessage || 'model_error')
+        }
         const calls = message.content.filter((block) => block.type === 'toolCall')
-        if (closing && !calls.some(({ name }) => name === 'submit_analysis_report')) continue
+        if (closing && !calls.some(({ name }) => name === 'submit_analysis_report')) {
+          runtimeWork.stop()
+          continue
+        }
         if (!calls.length) {
           context.messages.push({
             role: 'user',
             content: '请继续自主规划。可按需使用受限工具；准备好后提交结构化报告。',
             timestamp: Date.now(),
           })
+          runtimeWork.stop()
           continue
         }
         if (!closing) {
-          if (toolRounds >= runtimeSettings.mainAgentToolRounds) { closing = true; continue }
+          if (toolRounds >= runtimeSettings.mainAgentToolRounds) {
+            closing = true
+            runtimeWork.stop()
+            continue
+          }
           toolRounds += 1
         }
 
@@ -297,6 +314,7 @@ export function createPiModel(options: ModelOptions = {}) {
                 type: 'completed', report, usage: message.usage, stopReason: message.stopReason,
                 operationId: `${toolOperationId}:report`,
               }
+              runtimeWork.stop()
               return
             } catch (error) {
               const result = {
@@ -320,6 +338,11 @@ export function createPiModel(options: ModelOptions = {}) {
 
           let result: { facts: Fact[]; [key: string]: unknown } | { error: string; facts: Fact[] }
           let isError = false
+          runtimeWork.stop()
+          let resumeRuntimeWork = () => {
+            runtimeWork = activeBudget.start(executionSignal)
+            resumeRuntimeWork = () => {}
+          }
           try {
             const toolSymbol = (toolInput as { symbol?: string }).symbol ?? input.symbol
             const financialContext = await loadFrozenContext(toolSymbol)
@@ -341,14 +364,53 @@ export function createPiModel(options: ModelOptions = {}) {
                 models, selectedModel, specialistContext, input, options,
                 runtimeSettings, executionSignal, activeBudget, modelGate, toolGate,
               )
+              for (const entry of specialist.traces) yield { type: 'trace', entry }
+              if (specialist.policyError === 'cancelled') {
+                yield { type: 'trace', entry: {
+                  type: 'cancelled', operationId: `${toolOperationId}:specialist-cancelled-trace`,
+                } }
+                yield { type: 'cancelled', operationId: `${toolOperationId}:specialist-cancelled` }
+                return
+              }
+              if (specialist.policyError === 'execution_runtime_timeout') {
+                throw new Error('execution_runtime_timeout')
+              }
               for (const fact of specialist.facts) knownFactIds.add(fact.id)
               result = { facts: specialist.facts, analysis: specialist.analysis }
             } else {
               result = financialContext
             }
+            assertExecutionPolicy(input, executionSignal, activeBudget)
           } catch (error) {
-            if (executionSignal.aborted) throw error
-            if (activeBudget.exhausted()) { closing = true; break }
+            resumeRuntimeWork()
+            if (executionSignal.aborted || activeBudget.exhausted()) {
+              const pendingCalls = calls.slice(calls.indexOf(call))
+              for (const pending of pendingCalls) {
+                if (pending !== call) {
+                  yield { type: 'trace', entry: {
+                    type: 'tool_call', name: pending.name,
+                    input: validateToolCall([...analysisModelTools], pending),
+                    operationId: `execution:${input.executionId}:tool:${pending.id}:call`,
+                  } }
+                }
+                const cancelledResult = policyToolResult(input, executionSignal, activeBudget)
+                context.messages.push(toolResultMessage(pending, cancelledResult, true))
+                yield { type: 'trace', entry: {
+                  type: 'tool_result', name: pending.name, result: cancelledResult, isError: true,
+                  operationId: `execution:${input.executionId}:tool:${pending.id}:result`,
+                } }
+              }
+              if (input.signal?.aborted) {
+                yield { type: 'trace', entry: {
+                  type: 'cancelled', operationId: `${attemptId}:tool-batch-cancelled-trace`,
+                } }
+                yield { type: 'cancelled', operationId: `${attemptId}:tool-batch-cancelled` }
+                runtimeWork.stop()
+                return
+              }
+              if (activeBudget.exhausted()) { closing = true; break }
+              throw error
+            }
             isError = true
             const factId = `fact:tool-error:${call.name}:${toolRounds}`
             const timestamp = new Date().toISOString()
@@ -359,16 +421,15 @@ export function createPiModel(options: ModelOptions = {}) {
             knownFactIds.add(factId)
             result = { error: error instanceof Error ? error.message : String(error), facts: [failureFact] }
           }
-          context.messages.push({
-            role: 'toolResult', toolCallId: call.id, toolName: call.name,
-            content: [{ type: 'text', text: JSON.stringify(result) }], isError, timestamp: Date.now(),
-          })
+          resumeRuntimeWork()
+          context.messages.push(toolResultMessage(call, result, isError))
           yield { type: 'trace', entry: {
             type: 'tool_result', name: call.name, result, isError,
             operationId: `${toolOperationId}:result`,
           } }
           options.log?.({ type: 'tool_result', toolName: call.name, isError })
         }
+        runtimeWork.stop()
         if (!closing && toolRounds >= runtimeSettings.mainAgentToolRounds) closing = true
       }
     },
@@ -388,12 +449,13 @@ async function runFinancialSpecialist(
   toolGate: ReturnType<typeof createConcurrencyGate>,
 ) {
   const facts: Fact[] = []
+  const traces: TraceEntry[] = []
   let toolRounds = 0
   let closing = false
   let closingAttempts = 0
   while (true) {
     if (activeBudget.exhausted()) closing = true
-    if (closing && closingAttempts >= 2) return { analysis: '专项研究预算已到限，未形成额外结论。', facts }
+    if (closing && closingAttempts >= 2) return { analysis: '专项研究预算已到限，未形成额外结论。', facts, traces }
     if (closing) {
       closingAttempts += 1
       context.tools = []
@@ -431,23 +493,42 @@ async function runFinancialSpecialist(
       }
       throw policyError
     }
+    let runtimeWork = activeBudget.start(executionSignal)
     context.messages.push(message)
-    if (message.stopReason === 'error') throw new Error(message.errorMessage || 'financial_specialist_error')
+    if (message.stopReason === 'error') {
+      runtimeWork.stop()
+      throw new Error(message.errorMessage || 'financial_specialist_error')
+    }
     const calls = message.content.filter((block) => block.type === 'toolCall')
-    if (!calls.length) return { analysis: contentText(message.content), facts }
-    if (closing) continue
+    if (!calls.length) {
+      runtimeWork.stop()
+      return { analysis: contentText(message.content), facts, traces }
+    }
+    if (closing) {
+      runtimeWork.stop()
+      continue
+    }
     if (toolRounds >= runtimeSettings.specialistAgentToolRounds) {
       closing = true
+      runtimeWork.stop()
       continue
     }
     toolRounds += 1
     for (const call of calls) {
       const toolInput = validateToolCall([...financialSpecialistTools], call)
+      const toolOperationId = `execution:${input.executionId}:specialist-tool:${call.id}`
+      traces.push({
+        type: 'tool_call', name: call.name, input: toolInput,
+        operationId: `${toolOperationId}:call`,
+      })
       let result: { facts: Fact[]; [key: string]: unknown }
       let isError = false
-      const releaseTool = await acquireToolSlot(input, toolGate, executionSignal)
-      const activeTool = activeBudget.start(executionSignal)
+      runtimeWork.stop()
+      let releaseTool: (() => void) | undefined
+      let activeTool: ReturnType<ActiveBudget['start']> | undefined
       try {
+        releaseTool = await acquireToolSlot(input, toolGate, executionSignal)
+        activeTool = activeBudget.start(executionSignal)
         options.log?.({ type: 'tool_request_start', executionId: input.executionId, toolName: call.name })
         if (call.name === 'search_news_by_keyword') {
           if (!input.searchNews) throw new Error('news_search_unavailable')
@@ -467,23 +548,85 @@ async function runFinancialSpecialist(
         } else {
           throw new Error(`tool_not_allowed:${call.name}`)
         }
+        assertExecutionPolicy(input, executionSignal, activeBudget)
         facts.push(...result.facts)
       } catch (error) {
-        if (executionSignal.aborted) throw error
-        if (activeTool.exhausted() || activeBudget.exhausted()) { closing = true; break }
+        if (executionSignal.aborted || activeTool?.exhausted() || activeBudget.exhausted()) {
+          for (const pending of calls.slice(calls.indexOf(call))) {
+            if (pending !== call) {
+              traces.push({
+                type: 'tool_call', name: pending.name,
+                input: validateToolCall([...financialSpecialistTools], pending),
+                operationId: `execution:${input.executionId}:specialist-tool:${pending.id}:call`,
+              })
+            }
+            const cancelledResult = policyToolResult(input, executionSignal, activeBudget)
+            context.messages.push(toolResultMessage(pending, cancelledResult, true))
+            traces.push({
+              type: 'tool_result', name: pending.name, result: cancelledResult, isError: true,
+              operationId: `execution:${input.executionId}:specialist-tool:${pending.id}:result`,
+            })
+          }
+          if (input.signal?.aborted) {
+            return {
+              analysis: '专项研究已取消。', facts, traces,
+              policyError: 'cancelled' as const,
+            }
+          }
+          if (executionSignal.aborted && !activeBudget.exhausted()) {
+            return {
+              analysis: '专项研究超过 execution wall。', facts, traces,
+              policyError: 'execution_runtime_timeout' as const,
+            }
+          }
+          closing = true
+          break
+        }
         isError = true
         result = { error: error instanceof Error ? error.message : String(error), facts: [] }
       } finally {
         options.log?.({ type: 'tool_request_end', executionId: input.executionId, toolName: call.name })
-        activeTool.stop()
-        releaseTool()
+        activeTool?.stop()
+        releaseTool?.()
       }
-      context.messages.push({
-        role: 'toolResult', toolCallId: call.id, toolName: call.name,
-        content: [{ type: 'text', text: JSON.stringify(result) }], isError, timestamp: Date.now(),
+      runtimeWork = activeBudget.start(executionSignal)
+      context.messages.push(toolResultMessage(call, result, isError))
+      traces.push({
+        type: 'tool_result', name: call.name, result, isError,
+        operationId: `${toolOperationId}:result`,
       })
     }
+    runtimeWork.stop()
     if (toolRounds >= runtimeSettings.specialistAgentToolRounds) closing = true
+  }
+}
+
+function assertExecutionPolicy(
+  input: AnalyzeInput, executionSignal: AbortSignal, activeBudget: ActiveBudget,
+) {
+  if (input.signal?.aborted) throw input.signal.reason
+  if (executionSignal.aborted) throw new Error('execution_runtime_timeout')
+  if (activeBudget.exhausted()) throw new Error('research_active_timeout')
+}
+
+function policyToolResult(
+  input: AnalyzeInput, executionSignal: AbortSignal, activeBudget: ActiveBudget,
+) {
+  const error = input.signal?.aborted
+    ? 'cancelled'
+    : executionSignal.aborted && !activeBudget.exhausted()
+      ? 'execution_runtime_timeout'
+      : 'research_active_timeout'
+  return { error, cancelled: true, facts: [] as Fact[] }
+}
+
+function toolResultMessage(
+  call: { id: string; name: string }, result: unknown, isError: boolean,
+) {
+  return {
+    role: 'toolResult' as const, toolCallId: call.id, toolName: call.name,
+    content: [{ type: 'text' as const, text: JSON.stringify(result) }],
+    isError, timestamp: Date.now(),
   }
 }
 

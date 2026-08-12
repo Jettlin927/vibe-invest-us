@@ -4,7 +4,7 @@ import {
   type ExecutionSettingsSnapshot, type RuntimeSettings, type RuntimeSettingsRevision,
 } from '@vibe-invest/contracts'
 
-export const schemaVersion = 8
+export const schemaVersion = 9
 
 const migrationSql = `
 CREATE TABLE IF NOT EXISTS product_schema_migrations (
@@ -54,10 +54,13 @@ CREATE TABLE IF NOT EXISTS analyses (
   updated_at timestamptz NOT NULL,
   snapshot_json jsonb,
   report_json jsonb,
+  report_created_at timestamptz,
   error text,
   starred boolean NOT NULL DEFAULT false,
   note text NOT NULL DEFAULT ''
 );
+
+ALTER TABLE analyses ADD COLUMN IF NOT EXISTS report_created_at timestamptz;
 
 CREATE TABLE IF NOT EXISTS atomic_facts (
   id text PRIMARY KEY,
@@ -111,6 +114,22 @@ CREATE TABLE IF NOT EXISTS agent_events (
   PRIMARY KEY (session_id, sequence),
   UNIQUE (session_id, operation_id)
 );
+
+UPDATE analyses analysis
+SET report_created_at = COALESCE(
+  (
+    SELECT max(event.created_at)
+    FROM agent_sessions session
+    JOIN agent_events event ON event.session_id = session.id
+    WHERE session.analysis_id = analysis.id
+      AND session.is_primary
+      AND event.payload_json->>'type' = 'status'
+      AND event.payload_json->>'status' IN ('completed', 'partial')
+  ),
+  analysis.updated_at
+)
+WHERE analysis.report_json IS NOT NULL
+  AND analysis.report_created_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS runtime_settings_revisions (
   id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -170,6 +189,10 @@ ON CONFLICT (version) DO NOTHING;
 
 INSERT INTO product_schema_migrations (version)
 VALUES (8)
+ON CONFLICT (version) DO NOTHING;
+
+INSERT INTO product_schema_migrations (version)
+VALUES (9)
 ON CONFLICT (version) DO NOTHING;
 
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM vibe_invest_app;
@@ -639,6 +662,7 @@ export type AnalysisRecord = {
   updatedAt: string
   snapshot: unknown
   report: unknown
+  reportCreatedAt: string | null
   error: string | null
   starred: boolean
   note: string
@@ -646,7 +670,8 @@ export type AnalysisRecord = {
 
 type AnalysisRow = {
   id: string; symbol: string; status: string; created_at: string; updated_at: string
-  snapshot_json: unknown; report_json: unknown; error: string | null; starred: boolean; note: string
+  snapshot_json: unknown; report_json: unknown; report_created_at: string | null
+  error: string | null; starred: boolean; note: string
 }
 
 export function createAnalysisRepository(pool: Pool) {
@@ -699,6 +724,7 @@ export function createAnalysisRepository(pool: Pool) {
       await pool.query(
         `UPDATE analyses SET status = $1, updated_at = $2,
            report_json = COALESCE($3::jsonb, report_json),
+           report_created_at = CASE WHEN $3::jsonb IS NULL THEN report_created_at ELSE $2 END,
            snapshot_json = COALESCE($4::jsonb, snapshot_json),
            error = COALESCE($5, error) WHERE id = $6`,
         [status, updatedAt, extra.report ? JSON.stringify(extra.report) : null,
@@ -985,6 +1011,7 @@ export function createAgentEventRepository(pool: Pool) {
           await client.query(
             `UPDATE analyses SET status = COALESCE($1, status), updated_at = $2,
                report_json = COALESCE($3::jsonb, report_json),
+               report_created_at = CASE WHEN $3::jsonb IS NULL THEN report_created_at ELSE $2 END,
                snapshot_json = COALESCE($4::jsonb, snapshot_json),
                error = COALESCE($5, error) WHERE id = $6`,
             [input.projection.status, input.createdAt,
@@ -1115,6 +1142,7 @@ function mapAnalysisRow(row: AnalysisRow): AnalysisRecord {
     id: row.id, symbol: row.symbol, status: row.status,
     createdAt: new Date(row.created_at).toISOString(), updatedAt: new Date(row.updated_at).toISOString(),
     snapshot: row.snapshot_json, report: row.report_json, error: row.error,
+    reportCreatedAt: row.report_created_at ? new Date(row.report_created_at).toISOString() : null,
     starred: row.starred, note: row.note,
   }
 }

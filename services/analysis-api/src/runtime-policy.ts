@@ -45,25 +45,47 @@ export function createConcurrencyGate() {
   }
 }
 
-export function createActiveBudget(totalMs: number) {
+export type ActiveBudget = ReturnType<typeof createActiveBudget>
+
+export function createActiveBudget(
+  totalMs: number,
+  now: () => number = () => performance.now(),
+  timeoutSignal: (timeoutMs: number) => AbortSignal = (timeoutMs) => AbortSignal.timeout(timeoutMs),
+) {
   let remainingMs = Math.max(0, totalMs)
+  let activeCount = 0
+  let activeStartedAt = 0
+  let activeTimeout: AbortSignal | undefined
+  const currentRemaining = () => Math.max(
+    0,
+    remainingMs - (activeCount > 0 ? now() - activeStartedAt : 0),
+  )
   return {
     start(parent: AbortSignal) {
-      const startedAt = performance.now()
-      const activeTimeout = AbortSignal.timeout(Math.max(1, Math.ceil(remainingMs)))
+      if (activeCount === 0) {
+        activeStartedAt = now()
+        activeTimeout = timeoutSignal(Math.max(1, Math.ceil(remainingMs)))
+      }
+      const segmentTimeout = activeTimeout!
+      activeCount += 1
       let stopped = false
       return {
-        signal: AbortSignal.any([parent, activeTimeout]),
-        exhausted: () => activeTimeout.aborted || remainingMs <= 0,
+        signal: AbortSignal.any([parent, segmentTimeout]),
+        exhausted: () => segmentTimeout.aborted || currentRemaining() <= 0,
         stop() {
           if (stopped) return
           stopped = true
-          remainingMs = Math.max(0, remainingMs - (performance.now() - startedAt))
+          const remainingAtStop = currentRemaining()
+          activeCount -= 1
+          if (activeCount === 0) {
+            remainingMs = remainingAtStop
+            activeTimeout = undefined
+          }
         },
       }
     },
-    exhausted: () => remainingMs <= 0,
-    elapsedMs: () => Math.max(0, totalMs - remainingMs),
+    exhausted: () => activeTimeout?.aborted === true || currentRemaining() <= 0,
+    elapsedMs: () => Math.max(0, totalMs - currentRemaining()),
   }
 }
 

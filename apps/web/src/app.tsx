@@ -21,7 +21,7 @@ type PortfolioEquitySnapshot = {
   holdingsCount: number; pricedCount: number; observedAt: string; afterClose: boolean
   dailyChange: number | null; dailyReturn: number | null
 }
-type ResearchSummary = { id: string; symbol: string; status: string; createdAt?: string; error?: string | null; starred?: boolean; note?: string; report?: { title?: string; trend?: string } }
+type ResearchSummary = { id: string; symbol: string; status: string; createdAt?: string; reportCreatedAt?: string | null; error?: string | null; starred?: boolean; note?: string; report?: { title?: string; trend?: string } }
 type Fact = { id: string; type: string; value: unknown; observedAt: string; source: string; sourceReference: string }
 type Report = {
   title?: string; marketState?: string; trend?: string; drivers?: string[]
@@ -289,7 +289,7 @@ function ResearchReport({ record, onUpdate, onDelete, freshnessDays }: {
   const indicatorFact = record.facts.find((fact) => fact.type === 'indicators')
   const indicator = asRecord(indicatorFact?.value)
   const valuationFact = record.facts.find((fact) => fact.type === 'valuation')
-  const stale = freshnessDays !== null && isReportOlderThan(record.createdAt, freshnessDays)
+  const stale = freshnessDays !== null && isReportOlderThan(record.reportCreatedAt, freshnessDays)
   return <article className="research-report">
     <header className="report-title"><div><p className="micro">{record.symbol} · {statusLabel(record.status)}</p><h2>{report?.title ?? '受限分析'}</h2>{stale && <p role="status" className="data-warning">此报告已超过当前 {freshnessDays} 天有效期，请重新生成后再据此判断。</p>}</div><span className={`verdict ${record.status}`}>{trendVerdict(report?.trend)}<small>未来 1—4 周</small></span></header>
     {record.error && <p role="alert" className="error-banner">{friendlyError(record.error)}</p>}
@@ -591,7 +591,7 @@ function valueTone(value?: number | null) { return value === undefined || value 
 function emptyPortfolio(): PortfolioOverview { return { cash: 0, totalCost: 0, totalMarketValue: 0, totalEquity: 0, totalUnrealizedProfitLoss: 0, totalUnrealizedReturn: null, pricedPositionCount: 0, unpricedPositionCount: 0, positions: [] } }
 function friendlyError(value: string) { if (value.startsWith('unknown_evidence:')) return 'AI 引用了一条不存在的报告依据，本次报告已被拒绝。'; if (value.includes('report_tool_required')) return 'AI 没有返回规定格式的报告，本次分析未保存为完成报告。'; if (value.includes('model_not_configured')) return '尚未配置 AI 模型，暂时不能创建新分析。'; if (value.includes('model_')) return 'AI 模型调用失败，请检查模型配置后重试。'; if (value.includes('financial_context')) return '金融数据格式不完整，本次分析已停止以避免生成错误结论。'; return `分析没有完成：${value}` }
 
-function isReportOlderThan(createdAt: string | undefined, freshnessDays: number) {
+function isReportOlderThan(createdAt: string | null | undefined, freshnessDays: number) {
   if (!createdAt) return false
   const createdTime = Date.parse(createdAt)
   return Number.isFinite(createdTime) && Date.now() - createdTime > freshnessDays * 86_400_000

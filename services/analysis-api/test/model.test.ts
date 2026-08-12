@@ -5,6 +5,7 @@ import { fauxAssistantMessage, fauxText, fauxToolCall } from '@earendil-works/pi
 import { defaultRuntimeSettings } from '@vibe-invest/contracts'
 
 import { createPiModel } from '../src/model.js'
+import { createActiveBudget } from '../src/runtime-policy.js'
 import { analysisModelTools, financialSpecialistTools } from '../src/tools.js'
 
 const facts = [{
@@ -209,6 +210,115 @@ test('Pi Model 工具超时形成可引用失败事实', async () => {
     },
   })) events.push(event)
   assert.ok(events.some((event) => event.type === 'trace' && event.entry.type === 'tool_result' && event.entry.isError))
+})
+
+test('主 Agent policy abort 为同批全部工具按原顺序补齐 toolResult 后收口', async () => {
+  let now = 0
+  const budget = createActiveBudget(10, () => now, () => new AbortController().signal)
+  const first = fauxToolCall('fetch_financial_context', { symbol: 'NVDA' }, { id: 'main-first' })
+  const second = fauxToolCall('fetch_financial_context', { symbol: 'NVDA' }, { id: 'main-second' })
+  const observedPairs: string[][] = []
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage([first, second], { stopReason: 'toolUse' }),
+    (context) => {
+      observedPairs.push(context.messages.map((message) => message.role === 'toolResult'
+        ? `toolResult:${message.toolCallId}` : message.role))
+      return fauxAssistantMessage(fauxToolCall('submit_analysis_report', validReport), { stopReason: 'toolUse' })
+    },
+  ] })
+  const events = []
+  for await (const event of model.analyze({
+    executionId: 'main-policy', runtimeSettings: runtimeSettings(), activeBudget: budget,
+    symbol: 'NVDA', systemPrompt: 'system', userPrompt: 'user', knownFacts: facts,
+    fetchFinancialContext: async () => { now = 11; return { facts } },
+  })) events.push(event)
+  assert.deepEqual(observedPairs, [['user', 'assistant', 'toolResult:main-first', 'toolResult:main-second']])
+  assert.deepEqual(events.filter((event) => event.type === 'trace'
+    && (event.entry.type === 'tool_call' || event.entry.type === 'tool_result'))
+    .filter((event) => event.type === 'trace' && /main-(first|second)/.test(event.entry.operationId))
+    .map((event) => event.type === 'trace' ? event.entry.operationId : ''), [
+      'execution:main-policy:tool:main-first:call',
+      'execution:main-policy:tool:main-first:result',
+      'execution:main-policy:tool:main-second:call',
+      'execution:main-policy:tool:main-second:result',
+    ])
+  assert.ok(events.some((event) => event.type === 'completed'))
+})
+
+test('专项 Agent policy abort 为同批全部工具按原顺序补齐 toolResult 后再返回主 Agent', async () => {
+  let now = 0
+  const budget = createActiveBudget(10, () => now, () => new AbortController().signal)
+  const specialistPairs: string[][] = []
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall('analyze_financials', {}, { id: 'specialist' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage([
+      fauxToolCall('search_news_by_keyword', { keyword: 'NVDA' }, { id: 'specialist-first' }),
+      fauxToolCall('get_technical_indicators', { symbol: 'NVDA' }, { id: 'specialist-second' }),
+    ], { stopReason: 'toolUse' }),
+    (context) => {
+      specialistPairs.push(context.messages.filter(({ role }) => role === 'toolResult')
+        .map((message) => message.role === 'toolResult' ? message.toolCallId : ''))
+      return fauxAssistantMessage(fauxText('专项收口'))
+    },
+    fauxAssistantMessage(fauxToolCall('submit_analysis_report', validReport), { stopReason: 'toolUse' }),
+  ] })
+  const events = []
+  for await (const event of model.analyze({
+    executionId: 'specialist-policy', runtimeSettings: runtimeSettings(), activeBudget: budget,
+    symbol: 'NVDA', systemPrompt: 'system', userPrompt: 'user', knownFacts: facts,
+    fetchFinancialContext: async () => ({ facts, financials: { quarters: [] } }),
+    searchNews: async () => { now = 11; return { facts: [] } },
+    fetchTechnicalIndicators: async () => ({ facts: [] }),
+  })) events.push(event)
+  assert.deepEqual(specialistPairs, [['specialist-first', 'specialist-second']])
+  assert.deepEqual(events.filter((event) => event.type === 'trace'
+    && (event.entry.type === 'tool_call' || event.entry.type === 'tool_result')
+    && event.entry.operationId.includes('specialist-tool'))
+    .map((event) => event.type === 'trace' ? event.entry.operationId : ''), [
+      'execution:specialist-policy:specialist-tool:specialist-first:call',
+      'execution:specialist-policy:specialist-tool:specialist-first:result',
+      'execution:specialist-policy:specialist-tool:specialist-second:call',
+      'execution:specialist-policy:specialist-tool:specialist-second:result',
+    ])
+  assert.ok(events.some((event) => event.type === 'completed'))
+})
+
+test('专项 Agent 在工具并发槽等待期 abort 仍为同批全部调用补齐 toolResult', async () => {
+  const controller = new AbortController()
+  let acquireCount = 0
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall('analyze_financials', {}, { id: 'waiting-specialist' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage([
+      fauxToolCall('search_news_by_keyword', {}, { id: 'waiting-first' }),
+      fauxToolCall('get_technical_indicators', {}, { id: 'waiting-second' }),
+    ], { stopReason: 'toolUse' }),
+  ] })
+  const events = []
+  for await (const event of model.analyze({
+    runtimeSettings: runtimeSettings(), signal: controller.signal, executionId: 'gate-wait',
+    symbol: 'NVDA', systemPrompt: 'system', userPrompt: 'user', knownFacts: facts,
+    fetchFinancialContext: async () => ({ facts, financials: { quarters: [] } }),
+    acquireToolSlot: async (signal) => {
+      acquireCount += 1
+      if (acquireCount === 1) return () => {}
+      controller.abort(new Error('cancelled'))
+      signal.throwIfAborted()
+      return () => {}
+    },
+    searchNews: async () => ({ facts: [] }),
+  })) {
+    events.push(event)
+  }
+  assert.deepEqual(events.filter((event) => event.type === 'trace'
+    && (event.entry.type === 'tool_call' || event.entry.type === 'tool_result')
+    && event.entry.operationId.includes('specialist-tool'))
+    .map((event) => event.type === 'trace' ? event.entry.operationId : ''), [
+    'execution:gate-wait:specialist-tool:waiting-first:call',
+    'execution:gate-wait:specialist-tool:waiting-first:result',
+    'execution:gate-wait:specialist-tool:waiting-second:call',
+    'execution:gate-wait:specialist-tool:waiting-second:result',
+  ])
+  assert.ok(events.some((event) => event.type === 'cancelled'))
 })
 
 test('Pi Model 不允许工具越过当前分析标的', async () => {
