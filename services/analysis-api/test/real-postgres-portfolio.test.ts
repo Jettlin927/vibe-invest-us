@@ -1,52 +1,50 @@
 import assert from 'node:assert/strict'
-import { mkdtemp } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
 import test from 'node:test'
 
 import {
   checkSchema,
+  createAnalysisRepository,
   createPool,
   createPortfolioRepository,
 } from '@vibe-invest/product-dao'
 
 import { buildApp } from '../src/app.js'
-import { openDatabase } from '../src/database.js'
 import type { ModelEvent } from '../src/model.js'
 
 const databaseUrl = process.env.TEST_DATABASE_URL
 
-function createPostgresApp(databasePath: string, now?: () => Date) {
+function createPostgresApp(now?: () => Date) {
   const pool = createPool(databaseUrl!)
   return buildApp({
-    databasePath,
     productDatabase: {
       checkSchema: () => checkSchema(pool),
       close: () => pool.end(),
     },
     portfolioRepository: createPortfolioRepository(pool),
+    analysisRepository: createAnalysisRepository(pool),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchMarketPrices: async (symbols) => Object.fromEntries(
       symbols.map((symbol) => [symbol, symbol === 'NVDA' ? 120 : 240]),
     ),
+    fetchFinancialContext: async (symbol) => ({ symbol, gaps: [], facts: [] }),
+    model: { async *analyze(): AsyncGenerator<ModelEvent> { return } },
     now,
   })
 }
 
-test('真实 PostgreSQL HTTP 持仓闭环持久化且不双写 SQLite', {
+test('真实 PostgreSQL HTTP 持仓与研究闭环在重启后持久化', {
   skip: !databaseUrl,
   concurrency: false,
 }, async () => {
-  const dataDir = await mkdtemp(join(tmpdir(), 'vibe-real-pg-portfolio-'))
-  const sqlitePath = join(dataDir, 'research.db')
   const cleanupPool = createPool(databaseUrl!)
+  await cleanupPool.query('DELETE FROM analyses')
   await cleanupPool.query('DELETE FROM portfolio_equity_snapshots')
   await cleanupPool.query('DELETE FROM positions')
   await cleanupPool.query('UPDATE portfolio_settings SET cash = 0 WHERE id = 1')
   await cleanupPool.end()
 
   let observedAt = new Date('2026-08-11T19:00:00Z')
-  const first = createPostgresApp(sqlitePath, () => observedAt)
+  const first = createPostgresApp(() => observedAt)
   await first.ready()
   await first.inject({
     method: 'PUT', url: '/api/positions/NVDA',
@@ -72,7 +70,7 @@ test('真实 PostgreSQL HTTP 持仓闭环持久化且不双写 SQLite', {
   await first.inject({ method: 'GET', url: '/api/portfolio' })
   await first.close()
 
-  const second = createPostgresApp(sqlitePath)
+  const second = createPostgresApp()
   await second.ready()
   assert.deepEqual((await second.inject({ method: 'GET', url: '/api/positions' })).json(), {
     positions: [
@@ -98,12 +96,12 @@ test('真实 PostgreSQL HTTP 持仓闭环持久化且不双写 SQLite', {
   let capturedPortfolioContext: unknown
   const analysisPool = createPool(databaseUrl!)
   const analysis = buildApp({
-    databasePath: sqlitePath,
     productDatabase: {
       checkSchema: () => checkSchema(analysisPool),
       close: () => analysisPool.end(),
     },
     portfolioRepository: createPortfolioRepository(analysisPool),
+    analysisRepository: createAnalysisRepository(analysisPool),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({
       symbol, gaps: [], facts: [{
@@ -144,8 +142,11 @@ test('真实 PostgreSQL HTTP 持仓闭环持久化且不双写 SQLite', {
   assert.doesNotMatch(JSON.stringify(capturedPortfolioContext), /MSFT/)
   await analysis.close()
 
-  const sqlite = openDatabase(sqlitePath)
-  assert.equal((sqlite.prepare('SELECT COUNT(*) AS count FROM positions').get() as { count: number }).count, 0)
-  assert.equal((sqlite.prepare('SELECT cash FROM portfolio_settings WHERE id = 1').get() as { cash: number }).cash, 0)
-  sqlite.close()
+  const readback = createPostgresApp()
+  await readback.ready()
+  const research = await readback.inject({ method: 'GET', url: `/api/research/${created.analysisId}` })
+  assert.equal(research.statusCode, 200)
+  assert.equal(research.json().report.title, '测试报告')
+  assert.ok(research.json().trace.length > 0)
+  await readback.close()
 })

@@ -1,6 +1,6 @@
 import { resolve } from 'node:path'
 
-import { checkSchema, createPool, createPortfolioRepository } from '@vibe-invest/product-dao'
+import { checkSchema, createAnalysisRepository, createPool, createPortfolioRepository } from '@vibe-invest/product-dao'
 
 import { buildApp } from './app.js'
 import { createFinancialDataClient } from './financial-data-client.js'
@@ -8,7 +8,6 @@ import { createPiModel } from './model.js'
 
 const port = Number(process.env.PORT ?? 3000)
 const host = process.env.HOST ?? '0.0.0.0'
-const databasePath = process.env.DATABASE_PATH ?? resolve('data/vibe-invest.db')
 const productDatabaseUrl = process.env.DATABASE_URL
 if (!productDatabaseUrl) throw new Error('DATABASE_URL is required')
 const productPool = createPool(productDatabaseUrl)
@@ -29,12 +28,12 @@ const model = createPiModel({
 })
 
 const app = buildApp({
-  databasePath,
   productDatabase: {
     checkSchema: () => checkSchema(productPool),
     close: () => productPool.end(),
   },
   portfolioRepository: createPortfolioRepository(productPool),
+  analysisRepository: createAnalysisRepository(productPool),
   staticDir,
   financialDataHealth: () => financialData.health(),
   fetchFinancialContext: (symbol, signal) => financialData.context(symbol, signal),

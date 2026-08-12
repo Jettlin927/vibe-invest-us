@@ -68,7 +68,6 @@ services:
         condition: service_healthy
     environment:
       FINANCIAL_DATA_URL: http://financial-data:8000
-      DATABASE_PATH: /data/vibe-invest.db
       DATABASE_URL: postgresql://vibe_invest_app:${DATABASE_PASSWORD:-local-application-only}@postgres:5432/vibe_invest
       WEB_STATIC_DIR: /app/services/analysis-api/public
       MODEL_PROVIDER: ${MODEL_PROVIDER:-}
@@ -79,8 +78,6 @@ services:
       ANALYSIS_CONCURRENCY: ${ANALYSIS_CONCURRENCY:-2}
     ports:
       - "${VIBE_INVEST_HOST:-127.0.0.1}:${VIBE_INVEST_PORT:-3000}:3000"
-    volumes:
-      - vibe-invest-data:/data
     healthcheck:
       test:
         - CMD
@@ -96,5 +93,4 @@ services:
       - "host.docker.internal:host-gateway"
 
 volumes:
-  vibe-invest-data:
   vibe-invest-postgres:

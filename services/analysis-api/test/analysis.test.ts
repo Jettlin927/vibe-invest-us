@@ -8,8 +8,13 @@ import type { ModelEvent } from '../src/model.js'
 import { buildApp as buildProductionApp } from '../src/app.js'
 import { createTestProductDatabase } from './support/product-database.js'
 
-function buildApp(dependencies: Parameters<typeof buildProductionApp>[0]) {
-  return buildProductionApp({ ...createTestProductDatabase(), ...dependencies })
+const testDatabases = new Map<string, ReturnType<typeof createTestProductDatabase>>()
+
+function buildApp(dependencies: Parameters<typeof buildProductionApp>[0] & { storageKey?: string }) {
+  const { storageKey = crypto.randomUUID(), ...appDependencies } = dependencies
+  const database = testDatabases.get(storageKey) ?? createTestProductDatabase()
+  testDatabases.set(storageKey, database)
+  return buildProductionApp({ ...database, ...appDependencies })
 }
 
 const fact = {
@@ -44,9 +49,9 @@ function fakeModel(delay = 0) {
   }
 }
 
-async function makeApp(databasePath: string, model = fakeModel(), concurrency = 2) {
+async function makeApp(storageKey: string, model = fakeModel(), concurrency = 2) {
   const app = buildApp({
-    databasePath,
+    storageKey,
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [], indicators: {} }),
     model,
@@ -67,7 +72,7 @@ async function waitForStatus(app: Awaited<ReturnType<typeof makeApp>>, id: strin
 
 test('创建分析立即返回标识并自动保存完成报告、快照、事实和轨迹', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'vibe-analysis-'))
-  const app = await makeApp(join(dir, 'app.db'))
+  const app = await makeApp(join(dir, 'storage'))
   const created = await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' } })
   assert.equal(created.statusCode, 202)
   const { analysisId } = created.json()
@@ -92,7 +97,7 @@ test('同一标的运行中重复创建返回原任务且不重复调用模型',
   let calls = 0
   const model = fakeModel(50)
   const counted = { analyze(input: Parameters<typeof model.analyze>[0]) { calls += 1; return model.analyze(input) } }
-  const app = await makeApp(join(dir, 'app.db'), counted)
+  const app = await makeApp(join(dir, 'storage'), counted)
   const first = (await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' } })).json()
   const second = (await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'nvda' } })).json()
   assert.equal(first.analysisId, second.analysisId)
@@ -103,7 +108,7 @@ test('同一标的运行中重复创建返回原任务且不重复调用模型',
 
 test('实例并发上限使额外任务排队', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'vibe-analysis-queue-'))
-  const app = await makeApp(join(dir, 'app.db'), fakeModel(60), 1)
+  const app = await makeApp(join(dir, 'storage'), fakeModel(60), 1)
   const first = (await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' } })).json()
   const second = (await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'AMD' } })).json()
   const secondStatus = (await app.inject({ method: 'GET', url: `/api/analyses/${second.analysisId}` })).json()
@@ -115,7 +120,7 @@ test('实例并发上限使额外任务排队', async () => {
 
 test('取消运行任务会停止模型并保存取消轨迹', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'vibe-analysis-cancel-'))
-  const app = await makeApp(join(dir, 'app.db'), fakeModel(1000), 1)
+  const app = await makeApp(join(dir, 'storage'), fakeModel(1000), 1)
   const { analysisId } = (await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' } })).json()
   await new Promise((resolve) => setTimeout(resolve, 10))
   const cancelled = await app.inject({ method: 'POST', url: `/api/analyses/${analysisId}/cancel` })
@@ -128,12 +133,12 @@ test('取消运行任务会停止模型并保存取消轨迹', async () => {
 
 test('重启后未完成任务标记为中断且不会自动执行', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'vibe-analysis-restart-'))
-  const databasePath = join(dir, 'app.db')
-  const first = await makeApp(databasePath, fakeModel(1000), 0)
+  const storageKey = join(dir, 'restart')
+  const first = await makeApp(storageKey, fakeModel(1000), 0)
   const { analysisId } = (await first.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' } })).json()
   await first.close()
   let calls = 0
-  const second = await makeApp(databasePath, { async *analyze() { calls += 1; yield { type: 'completed' as const, report } } })
+  const second = await makeApp(storageKey, { async *analyze() { calls += 1; yield { type: 'completed' as const, report } } })
   const status = (await second.inject({ method: 'GET', url: `/api/analyses/${analysisId}` })).json()
   assert.equal(status.status, 'interrupted')
   assert.equal(calls, 0)
@@ -142,7 +147,7 @@ test('重启后未完成任务标记为中断且不会自动执行', async () =>
 
 test('研究记录可以查询、标记、备注并按共享引用安全删除事实', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'vibe-research-'))
-  const app = await makeApp(join(dir, 'app.db'))
+  const app = await makeApp(join(dir, 'storage'))
   const first = (await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' } })).json()
   await waitForStatus(app, first.analysisId, 'completed')
   const second = (await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' } })).json()
@@ -176,7 +181,7 @@ test('无持仓时宿主移除个性化建议且限制报告保存为部分完�
     conditionalSuggestion: '若下跌则减仓',
     limitations: ['财报输入缺失'],
   }
-  const app = await makeApp(join(dir, 'app.db'), {
+  const app = await makeApp(join(dir, 'storage'), {
     async *analyze() { yield { type: 'completed' as const, report: partialReport } },
   })
   const { analysisId } = (await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' } })).json()
@@ -191,7 +196,7 @@ test('分析持仓语境使用组合内全部标的行情计算占比但不披�
   const dir = await mkdtemp(join(tmpdir(), 'vibe-analysis-portfolio-'))
   let capturedContext: any
   const app = buildApp({
-    databasePath: join(dir, 'app.db'),
+    storageKey: join(dir, 'storage'),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [] }),
     fetchMarketPrices: async (symbols) => {
@@ -223,7 +228,7 @@ test('分析持仓语境使用组合内全部标的行情计算占比但不披�
 test('组合辅助行情失败时保留当前标的分析并明确个性化限制', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'vibe-analysis-portfolio-gap-'))
   const app = buildApp({
-    databasePath: join(dir, 'app.db'),
+    storageKey: join(dir, 'storage'),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [] }),
     fetchMarketPrices: async () => { throw new Error('quotes_down') },
@@ -243,7 +248,7 @@ test('组合辅助行情失败时保留当前标的分析并明确个性化限�
 test('关键行情、财报和新闻缺失时宿主强制形成受限报告', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'vibe-analysis-gaps-'))
   const app = buildApp({
-    databasePath: join(dir, 'app.db'),
+    storageKey: join(dir, 'storage'),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({
       symbol, facts: [],
@@ -264,7 +269,7 @@ test('工具补查返回的事实进入研究证据集合', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'vibe-analysis-tool-fact-'))
   const extraFact = { ...fact, id: 'fact:tool:extra', type: 'news' }
   const app = buildApp({
-    databasePath: join(dir, 'app.db'),
+    storageKey: join(dir, 'storage'),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [] }),
     model: {
@@ -285,7 +290,7 @@ test('工具补查返回的事实进入研究证据集合', async () => {
 test('分析轨迹永久保存系统指令、用户语境、模型用量和最终状态', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'vibe-analysis-trace-'))
   const app = buildApp({
-    databasePath: join(dir, 'app.db'),
+    storageKey: join(dir, 'storage'),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [] }),
     model: {
@@ -315,7 +320,7 @@ test('完整历史写入冻结快照但只向模型提供最近十条日线', as
   }))
   let modelFactCount = 0
   const app = buildApp({
-    databasePath: join(dir, 'app.db'),
+    storageKey: join(dir, 'storage'),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact, ...bars], gaps: [], indicators: {} }),
     model: {
@@ -354,7 +359,7 @@ test('完整多期财报写入快照但模型只收到决策窗口和可追溯�
   }))
   let modelContext: any
   const app = buildApp({
-    databasePath: join(dir, 'app.db'),
+    storageKey: join(dir, 'storage'),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({
       symbol, facts: [fact, ...financialFacts, derived], gaps: [],
@@ -391,7 +396,7 @@ test('完整多期财报写入快照但模型只收到决策窗口和可追溯�
 test('金融上下文事件包含主备来源切换信息', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'vibe-analysis-degraded-event-'))
   const app = buildApp({
-    databasePath: join(dir, 'app.db'),
+    storageKey: join(dir, 'storage'),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({
       symbol, facts: [fact], gaps: [],
@@ -418,7 +423,7 @@ test('系统指令要求先取冻结上下文、逐项引用依据并按缺口�
   const dir = await mkdtemp(join(tmpdir(), 'vibe-analysis-prompt-'))
   let systemPrompt = ''
   const app = buildApp({
-    databasePath: join(dir, 'app.db'),
+    storageKey: join(dir, 'storage'),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [] }),
     model: {

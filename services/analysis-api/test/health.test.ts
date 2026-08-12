@@ -11,13 +11,11 @@ function buildApp(dependencies: Parameters<typeof buildProductionApp>[0]) {
   return buildProductionApp({ ...createTestProductDatabase(), ...dependencies })
 }
 
-test('聚合健康状态包含 Analysis API、PostgreSQL schema、SQLite 和 Financial Data', async () => {
-  const dataDir = await mkdtemp(join(tmpdir(), 'vibe-invest-health-'))
+test('聚合健康状态包含 Analysis API、PostgreSQL schema 和 Financial Data', async () => {
   let schemaChecks = 0
   const app = buildApp({
-    databasePath: join(dataDir, 'app.db'),
     productDatabase: {
-      checkSchema: async () => { schemaChecks += 1; return { status: 'ok', version: 2 } },
+      checkSchema: async () => { schemaChecks += 1; return { status: 'ok', version: 3 } },
       close: async () => {},
     },
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
@@ -30,8 +28,7 @@ test('聚合健康状态包含 Analysis API、PostgreSQL schema、SQLite 和 Fin
     service: 'analysis-api',
     status: 'ok',
     dependencies: {
-      database: { status: 'ok', engine: 'sqlite' },
-      productDatabase: { status: 'ok', engine: 'postgresql', schemaVersion: 2 },
+      productDatabase: { status: 'ok', engine: 'postgresql', schemaVersion: 3 },
       financialData: { service: 'financial-data', status: 'ok' },
     },
   })
@@ -47,7 +44,6 @@ test('生产入口由 Analysis API 托管编译后的 Web', async () => {
   await writeFile(join(staticDir, 'index.html'), '<h1>vibe-invest health</h1>')
 
   const app = buildApp({
-    databasePath: join(dataDir, 'app.db'),
     staticDir,
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
   })
@@ -62,9 +58,7 @@ test('生产入口由 Analysis API 托管编译后的 Web', async () => {
 })
 
 test('Settings 只暴露模型是否可用且不返回凭据', async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'vibe-settings-'))
   const app = buildApp({
-    databasePath: join(directory, 'app.db'),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     modelConfigured: true,
   })

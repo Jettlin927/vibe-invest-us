@@ -14,26 +14,25 @@ const healthyFinancialData = async () => ({
 
 const testDatabases = new Map<string, ReturnType<typeof createTestProductDatabase>>()
 
-function productDatabaseFor(databasePath: string) {
-  const existing = testDatabases.get(databasePath)
+function productDatabaseFor(storageKey: string) {
+  const existing = testDatabases.get(storageKey)
   if (existing) return existing
   const created = createTestProductDatabase()
-  testDatabases.set(databasePath, created)
+  testDatabases.set(storageKey, created)
   return created
 }
 
-async function createTestApp(databasePath: string) {
+async function createTestApp(storageKey: string) {
   const app = buildApp({
-    databasePath, ...productDatabaseFor(databasePath), financialDataHealth: healthyFinancialData,
+    ...productDatabaseFor(storageKey), financialDataHealth: healthyFinancialData,
   })
   await app.ready()
   return app
 }
 
-async function createPricedTestApp(databasePath: string, prices: Record<string, number>) {
+async function createPricedTestApp(storageKey: string, prices: Record<string, number>) {
   const app = buildApp({
-    databasePath,
-    ...productDatabaseFor(databasePath),
+    ...productDatabaseFor(storageKey),
     financialDataHealth: healthyFinancialData,
     fetchMarketPrices: async (symbols) => Object.fromEntries(
       symbols.flatMap((symbol) => prices[symbol] === undefined ? [] : [[symbol, prices[symbol]]]),
@@ -43,10 +42,9 @@ async function createPricedTestApp(databasePath: string, prices: Record<string, 
   return app
 }
 
-async function createHistoricalTestApp(databasePath: string, prices: Record<string, number>, now: () => Date) {
+async function createHistoricalTestApp(storageKey: string, prices: Record<string, number>, now: () => Date) {
   const app = buildApp({
-    databasePath,
-    ...productDatabaseFor(databasePath),
+    ...productDatabaseFor(storageKey),
     financialDataHealth: healthyFinancialData,
     fetchMarketPrices: async (symbols) => Object.fromEntries(
       symbols.flatMap((symbol) => prices[symbol] === undefined ? [] : [[symbol, prices[symbol]]]),
@@ -59,7 +57,7 @@ async function createHistoricalTestApp(databasePath: string, prices: Record<stri
 
 test('用户可以新增、修改、查看和删除手工持仓', async () => {
   const dataDir = await mkdtemp(join(tmpdir(), 'vibe-invest-portfolio-'))
-  const app = await createTestApp(join(dataDir, 'app.db'))
+  const app = await createTestApp(join(dataDir, 'storage'))
 
   const created = await app.inject({
     method: 'PUT',
@@ -92,7 +90,7 @@ test('用户可以新增、修改、查看和删除手工持仓', async () => {
 
 test('用户可以维护现金并查看组合总值、仓位和未实现盈亏', async () => {
   const dataDir = await mkdtemp(join(tmpdir(), 'vibe-invest-overview-'))
-  const app = await createPricedTestApp(join(dataDir, 'app.db'), { NVDA: 120, MSFT: 180 })
+  const app = await createPricedTestApp(join(dataDir, 'storage'), { NVDA: 120, MSFT: 180 })
   await app.inject({ method: 'PUT', url: '/api/positions/NVDA', payload: { quantity: 10, averageCost: 100 } })
   await app.inject({ method: 'PUT', url: '/api/positions/MSFT', payload: { quantity: 5, averageCost: 200 } })
 
@@ -121,7 +119,7 @@ test('用户可以维护现金并查看组合总值、仓位和未实现盈亏',
 
 test('减仓按成交价增加现金并保留平均成本', async () => {
   const dataDir = await mkdtemp(join(tmpdir(), 'vibe-invest-reduce-'))
-  const app = await createPricedTestApp(join(dataDir, 'app.db'), { NVDA: 120 })
+  const app = await createPricedTestApp(join(dataDir, 'storage'), { NVDA: 120 })
   await app.inject({ method: 'PUT', url: '/api/positions/NVDA', payload: { quantity: 10, averageCost: 100 } })
   await app.inject({ method: 'PUT', url: '/api/portfolio/cash', payload: { cash: 500 } })
 
@@ -143,10 +141,10 @@ test('减仓按成交价增加现金并保留平均成本', async () => {
 
 test('组合行情形成每日权益快照，同日盘中覆盖且收盘快照不被盘中值回退', async () => {
   const dataDir = await mkdtemp(join(tmpdir(), 'vibe-invest-history-'))
-  const databasePath = join(dataDir, 'app.db')
+  const storageKey = join(dataDir, 'history')
   const prices = { NVDA: 110 }
   let observedAt = new Date('2026-08-11T19:00:00Z')
-  const app = await createHistoricalTestApp(databasePath, prices, () => observedAt)
+  const app = await createHistoricalTestApp(storageKey, prices, () => observedAt)
   await app.inject({ method: 'PUT', url: '/api/positions/NVDA', payload: { quantity: 10, averageCost: 100 } })
   await app.inject({ method: 'PUT', url: '/api/portfolio/cash', payload: { cash: 100 } })
   await app.inject({ method: 'GET', url: '/api/portfolio' })
@@ -181,7 +179,7 @@ test('组合行情形成每日权益快照，同日盘中覆盖且收盘快照�
 
 test('减仓数量不能超过当前持仓且现金不能为负数', async () => {
   const dataDir = await mkdtemp(join(tmpdir(), 'vibe-invest-reduce-invalid-'))
-  const app = await createTestApp(join(dataDir, 'app.db'))
+  const app = await createTestApp(join(dataDir, 'storage'))
   await app.inject({ method: 'PUT', url: '/api/positions/NVDA', payload: { quantity: 2, averageCost: 100 } })
   assert.equal((await app.inject({ method: 'POST', url: '/api/positions/NVDA/reduce', payload: { quantity: 3, price: 120 } })).statusCode, 400)
   assert.equal((await app.inject({ method: 'PUT', url: '/api/portfolio/cash', payload: { cash: -1 } })).statusCode, 400)
@@ -190,7 +188,7 @@ test('减仓数量不能超过当前持仓且现金不能为负数', async () =>
 
 test('持仓语境计算市值盈亏和组合集中度且不返回其他持仓明细', async () => {
   const dataDir = await mkdtemp(join(tmpdir(), 'vibe-invest-context-'))
-  const app = await createTestApp(join(dataDir, 'app.db'))
+  const app = await createTestApp(join(dataDir, 'storage'))
   await app.inject({ method: 'PUT', url: '/api/positions/NVDA', payload: { quantity: 10, averageCost: 100 } })
   await app.inject({ method: 'PUT', url: '/api/positions/MSFT', payload: { quantity: 5, averageCost: 200 } })
 
@@ -227,7 +225,7 @@ test('持仓语境计算市值盈亏和组合集中度且不返回其他持仓�
 
 test('没有当前标的持仓时返回公共分析语境', async () => {
   const dataDir = await mkdtemp(join(tmpdir(), 'vibe-invest-no-position-'))
-  const app = await createTestApp(join(dataDir, 'app.db'))
+  const app = await createTestApp(join(dataDir, 'storage'))
 
   const response = await app.inject({
     method: 'POST',
@@ -253,7 +251,7 @@ test('没有当前标的持仓时返回公共分析语境', async () => {
 
 test('部分持仓缺少行情时不伪造组合权重或集中度', async () => {
   const dataDir = await mkdtemp(join(tmpdir(), 'vibe-invest-partial-prices-'))
-  const app = await createTestApp(join(dataDir, 'app.db'))
+  const app = await createTestApp(join(dataDir, 'storage'))
   await app.inject({ method: 'PUT', url: '/api/positions/NVDA', payload: { quantity: 10, averageCost: 100 } })
   await app.inject({ method: 'PUT', url: '/api/positions/MSFT', payload: { quantity: 5, averageCost: 200 } })
   const response = await app.inject({
@@ -270,12 +268,12 @@ test('部分持仓缺少行情时不伪造组合权重或集中度', async () =>
 
 test('持仓在 Analysis API 重新打开数据库后仍然存在', async () => {
   const dataDir = await mkdtemp(join(tmpdir(), 'vibe-invest-persistence-'))
-  const databasePath = join(dataDir, 'app.db')
-  const firstApp = await createTestApp(databasePath)
+  const storageKey = join(dataDir, 'persistence')
+  const firstApp = await createTestApp(storageKey)
   await firstApp.inject({ method: 'PUT', url: '/api/positions/AMD', payload: { quantity: 8, averageCost: 90 } })
   await firstApp.close()
 
-  const secondApp = await createTestApp(databasePath)
+  const secondApp = await createTestApp(storageKey)
   const response = await secondApp.inject({ method: 'GET', url: '/api/positions' })
   assert.deepEqual(response.json(), {
     positions: [{ symbol: 'AMD', quantity: 8, averageCost: 90 }],
@@ -285,7 +283,7 @@ test('持仓在 Analysis API 重新打开数据库后仍然存在', async () => 
 
 test('持仓接口拒绝无效数量和成本', async () => {
   const dataDir = await mkdtemp(join(tmpdir(), 'vibe-invest-validation-'))
-  const app = await createTestApp(join(dataDir, 'app.db'))
+  const app = await createTestApp(join(dataDir, 'storage'))
 
   const response = await app.inject({
     method: 'PUT',

@@ -7,7 +7,7 @@ export type SystemHealth = {
   service: 'analysis-api'
   status: 'ok'
   dependencies: {
-    database: { status: 'ok' }
+    productDatabase: { status: 'ok'; engine: 'postgresql'; schemaVersion: number }
     financialData: FinancialDataHealth
   }
 }
@@ -24,11 +24,13 @@ export function isSystemHealth(value: unknown): value is SystemHealth {
   const dependencies = candidate.dependencies
   if (!dependencies || typeof dependencies !== 'object') return false
   const dependencyValues = dependencies as Record<string, unknown>
-  const database = dependencyValues.database
+  const database = dependencyValues.productDatabase
   return candidate.service === 'analysis-api'
     && candidate.status === 'ok'
     && !!database
     && typeof database === 'object'
     && (database as Record<string, unknown>).status === 'ok'
+    && (database as Record<string, unknown>).engine === 'postgresql'
+    && typeof (database as Record<string, unknown>).schemaVersion === 'number'
     && isFinancialDataHealth(dependencyValues.financialData)
 }

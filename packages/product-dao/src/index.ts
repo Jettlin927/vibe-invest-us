@@ -1,6 +1,6 @@
 import { Pool } from 'pg'
 
-export const schemaVersion = 2
+export const schemaVersion = 3
 
 const migrationSql = `
 CREATE TABLE IF NOT EXISTS product_schema_migrations (
@@ -36,10 +36,36 @@ CREATE TABLE IF NOT EXISTS portfolio_equity_snapshots (
   after_close boolean NOT NULL DEFAULT false
 );
 
-CREATE TABLE IF NOT EXISTS legacy_portfolio_migrations (
-  source_sha256 text PRIMARY KEY,
-  source_path text NOT NULL,
-  migrated_at timestamptz NOT NULL DEFAULT now()
+CREATE TABLE IF NOT EXISTS analyses (
+  id text PRIMARY KEY,
+  symbol text NOT NULL,
+  status text NOT NULL,
+  created_at timestamptz NOT NULL,
+  updated_at timestamptz NOT NULL,
+  snapshot_json jsonb,
+  report_json jsonb,
+  error text,
+  starred boolean NOT NULL DEFAULT false,
+  note text NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS atomic_facts (
+  id text PRIMARY KEY,
+  payload_json jsonb NOT NULL,
+  is_public boolean NOT NULL DEFAULT true
+);
+
+CREATE TABLE IF NOT EXISTS analysis_facts (
+  analysis_id text NOT NULL REFERENCES analyses(id) ON DELETE CASCADE,
+  fact_id text NOT NULL REFERENCES atomic_facts(id),
+  PRIMARY KEY (analysis_id, fact_id)
+);
+
+CREATE TABLE IF NOT EXISTS analysis_trace (
+  analysis_id text NOT NULL REFERENCES analyses(id) ON DELETE CASCADE,
+  sequence integer NOT NULL,
+  payload_json jsonb NOT NULL,
+  PRIMARY KEY (analysis_id, sequence)
 );
 
 INSERT INTO product_schema_migrations (version)
@@ -50,11 +76,17 @@ INSERT INTO product_schema_migrations (version)
 VALUES (2)
 ON CONFLICT (version) DO NOTHING;
 
+INSERT INTO product_schema_migrations (version)
+VALUES (3)
+ON CONFLICT (version) DO NOTHING;
+
+DROP TABLE IF EXISTS legacy_portfolio_migrations;
+
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM vibe_invest_app;
 REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM vibe_invest_app;
 GRANT SELECT ON product_schema_migrations TO vibe_invest_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON positions, portfolio_settings, portfolio_equity_snapshots TO vibe_invest_app;
-GRANT SELECT, INSERT ON legacy_portfolio_migrations TO vibe_invest_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON analyses, atomic_facts, analysis_facts, analysis_trace TO vibe_invest_app;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO vibe_invest_app;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM vibe_invest_app;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON SEQUENCES FROM vibe_invest_app;
@@ -253,6 +285,154 @@ export function createPortfolioRepository(pool: Pool) {
 }
 
 export type PortfolioRepository = ReturnType<typeof createPortfolioRepository>
+
+export type AnalysisRecord = {
+  id: string
+  symbol: string
+  status: string
+  createdAt: string
+  updatedAt: string
+  snapshot: unknown
+  report: unknown
+  error: string | null
+  starred: boolean
+  note: string
+}
+
+type AnalysisRow = {
+  id: string; symbol: string; status: string; created_at: string; updated_at: string
+  snapshot_json: unknown; report_json: unknown; error: string | null; starred: boolean; note: string
+}
+
+export function createAnalysisRepository(pool: Pool) {
+  const terminal = ['completed', 'partial', 'failed', 'cancelled', 'interrupted']
+  return {
+    async interruptRunning(updatedAt: string) {
+      await pool.query(
+        `UPDATE analyses SET status = 'interrupted', updated_at = $1
+         WHERE status IN ('queued', 'running')`, [updatedAt],
+      )
+    },
+    async saveFact(analysisId: string, fact: { id: string } & Record<string, unknown>) {
+      const client = await pool.connect()
+      try {
+        await client.query('BEGIN')
+        await client.query(
+          `INSERT INTO atomic_facts (id, payload_json, is_public) VALUES ($1, $2, true)
+           ON CONFLICT (id) DO NOTHING`, [fact.id, JSON.stringify(fact)],
+        )
+        await client.query(
+          `INSERT INTO analysis_facts (analysis_id, fact_id) VALUES ($1, $2)
+           ON CONFLICT DO NOTHING`, [analysisId, fact.id],
+        )
+        await client.query('COMMIT')
+      } catch (error) {
+        await client.query('ROLLBACK'); throw error
+      } finally { client.release() }
+    },
+    async appendTrace(analysisId: string, payload: unknown) {
+      await pool.query(
+        `INSERT INTO analysis_trace (analysis_id, sequence, payload_json)
+         SELECT $1, COALESCE(max(sequence), 0) + 1, $2
+         FROM analysis_trace WHERE analysis_id = $1`,
+        [analysisId, JSON.stringify(payload)],
+      )
+    },
+    async setStatus(id: string, status: string, updatedAt: string, extra: {
+      report?: unknown; snapshot?: unknown; error?: string
+    } = {}) {
+      await pool.query(
+        `UPDATE analyses SET status = $1, updated_at = $2,
+           report_json = COALESCE($3::jsonb, report_json),
+           snapshot_json = COALESCE($4::jsonb, snapshot_json),
+           error = COALESCE($5, error) WHERE id = $6`,
+        [status, updatedAt, extra.report ? JSON.stringify(extra.report) : null,
+          extra.snapshot ? JSON.stringify(extra.snapshot) : null, extra.error ?? null, id],
+      )
+    },
+    async get(id: string) {
+      const result = await pool.query<AnalysisRow>('SELECT * FROM analyses WHERE id = $1', [id])
+      return result.rows[0] ? mapAnalysisRow(result.rows[0]) : null
+    },
+    async findActive(symbol: string) {
+      const result = await pool.query<{ id: string }>(
+        `SELECT id FROM analyses WHERE symbol = $1 AND status IN ('queued', 'running')
+         ORDER BY created_at LIMIT 1`, [symbol],
+      )
+      return result.rows[0]?.id ?? null
+    },
+    async create(record: { id: string; symbol: string; status: string; createdAt: string; updatedAt: string }) {
+      await pool.query(
+        `INSERT INTO analyses (id, symbol, status, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [record.id, record.symbol, record.status, record.createdAt, record.updatedAt],
+      )
+    },
+    async nextQueued() {
+      const result = await pool.query<{ id: string }>(
+        `SELECT id FROM analyses WHERE status = 'queued' ORDER BY created_at LIMIT 1`,
+      )
+      return result.rows[0]?.id ?? null
+    },
+    async saveSnapshot(id: string, snapshot: unknown) {
+      await pool.query('UPDATE analyses SET snapshot_json = $1 WHERE id = $2', [JSON.stringify(snapshot), id])
+    },
+    async research(id: string) {
+      const analysis = await this.get(id)
+      if (!analysis) return null
+      const [facts, trace] = await Promise.all([
+        pool.query<{ payload_json: unknown }>(
+          `SELECT f.payload_json FROM atomic_facts f
+           JOIN analysis_facts af ON af.fact_id = f.id WHERE af.analysis_id = $1`, [id],
+        ),
+        pool.query<{ payload_json: unknown }>(
+          'SELECT payload_json FROM analysis_trace WHERE analysis_id = $1 ORDER BY sequence', [id],
+        ),
+      ])
+      return { ...analysis, facts: facts.rows.map((row) => row.payload_json), trace: trace.rows.map((row) => row.payload_json) }
+    },
+    async listResearch(symbol?: string) {
+      const params: unknown[] = [terminal]
+      const condition = symbol ? 'symbol = $2 AND status = ANY($1)' : 'status = ANY($1)'
+      if (symbol) params.push(symbol.toUpperCase())
+      const result = await pool.query<AnalysisRow>(
+        `SELECT * FROM analyses WHERE ${condition} ORDER BY created_at DESC`, params,
+      )
+      return result.rows.map(mapAnalysisRow)
+    },
+    async updateResearch(id: string, values: { starred?: boolean; note?: string }, updatedAt: string) {
+      const result = await pool.query<AnalysisRow>(
+        `UPDATE analyses SET starred = COALESCE($1, starred), note = COALESCE($2, note), updated_at = $3
+         WHERE id = $4 RETURNING *`, [values.starred ?? null, values.note ?? null, updatedAt, id],
+      )
+      return result.rows[0] ? mapAnalysisRow(result.rows[0]) : null
+    },
+    async removeResearch(id: string) {
+      const client = await pool.connect()
+      try {
+        await client.query('BEGIN')
+        const removed = await client.query('DELETE FROM analyses WHERE id = $1', [id])
+        if (!removed.rowCount) { await client.query('ROLLBACK'); return false }
+        await client.query('DELETE FROM atomic_facts WHERE id NOT IN (SELECT fact_id FROM analysis_facts)')
+        await client.query('COMMIT')
+        return true
+      } catch (error) {
+        await client.query('ROLLBACK'); throw error
+      } finally { client.release() }
+    },
+  }
+}
+
+export type AnalysisRepository = ReturnType<typeof createAnalysisRepository>
+
+function mapAnalysisRow(row: AnalysisRow): AnalysisRecord {
+  return {
+    id: row.id, symbol: row.symbol, status: row.status,
+    createdAt: new Date(row.created_at).toISOString(), updatedAt: new Date(row.updated_at).toISOString(),
+    snapshot: row.snapshot_json, report: row.report_json, error: row.error,
+    starred: row.starred, note: row.note,
+  }
+}
 
 function toPosition(row: PositionRow): ProductPosition {
   return {

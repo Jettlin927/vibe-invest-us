@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import type { DatabaseSync } from 'node:sqlite'
+import type { AnalysisRepository } from '@vibe-invest/product-dao'
 
 import type { AnalysisReport, ModelEvent } from './model.js'
 import type { FactQueryResult, FinancialContext, FinancialFact } from './financial-data-client.js'
@@ -8,7 +8,7 @@ type Fact = FinancialFact
 type Model = { analyze(input: Record<string, unknown>): AsyncIterable<ModelEvent> }
 
 export function createAnalysisService(options: {
-  database: DatabaseSync
+  repository: AnalysisRepository
   model: Model
   fetchFinancialContext: (symbol: string, signal: AbortSignal) => Promise<FinancialContext>
   searchNews?: (keyword: string, signal: AbortSignal) => Promise<FactQueryResult>
@@ -20,70 +20,60 @@ export function createAnalysisService(options: {
   getPortfolioContext?: (symbol: string, marketPrices: Record<string, number>) => Promise<unknown>
   concurrency: number
 }) {
-  const { database } = options
+  const { repository } = options
   const controllers = new Map<string, AbortController>()
   const listeners = new Map<string, Set<(entry: Record<string, unknown>) => void>>()
+  const tasks = new Set<Promise<void>>()
   let running = 0
-  database.prepare(`UPDATE analyses SET status = 'interrupted', updated_at = ? WHERE status IN ('queued', 'running')`)
-    .run(new Date().toISOString())
+  const initialized = repository.interruptRunning(new Date().toISOString())
 
-  const traceCount = database.prepare('SELECT COUNT(*) AS count FROM analysis_trace WHERE analysis_id = ?')
-  const insertTrace = database.prepare(
-    'INSERT INTO analysis_trace (analysis_id, sequence, payload_json) VALUES (?, ?, ?)',
-  )
-  function persistFact(analysisId: string, fact: Fact) {
-    database.prepare('INSERT OR IGNORE INTO atomic_facts (id, payload_json, is_public) VALUES (?, ?, 1)')
-      .run(fact.id, JSON.stringify(fact))
-    database.prepare('INSERT OR IGNORE INTO analysis_facts (analysis_id, fact_id) VALUES (?, ?)')
-      .run(analysisId, fact.id)
+  async function persistFact(analysisId: string, fact: Fact) {
+    await repository.saveFact(analysisId, fact)
   }
-  function appendTrace(id: string, payload: unknown) {
-    const row = traceCount.get(id) as { count: number }
-    insertTrace.run(id, row.count + 1, JSON.stringify(payload))
+  async function appendTrace(id: string, payload: unknown) {
+    await repository.appendTrace(id, payload)
     if (payload && typeof payload === 'object') {
       for (const listener of listeners.get(id) ?? []) listener(payload as Record<string, unknown>)
     }
   }
-  function setStatus(id: string, status: string, extra: { report?: unknown; snapshot?: unknown; error?: string } = {}) {
-    database.prepare(`UPDATE analyses SET status = ?, updated_at = ?, report_json = COALESCE(?, report_json), snapshot_json = COALESCE(?, snapshot_json), error = COALESCE(?, error) WHERE id = ?`)
-      .run(status, new Date().toISOString(), extra.report ? JSON.stringify(extra.report) : null,
-        extra.snapshot ? JSON.stringify(extra.snapshot) : null, extra.error ?? null, id)
-    appendTrace(id, {
+  async function setStatus(id: string, status: string, extra: { report?: unknown; snapshot?: unknown; error?: string } = {}) {
+    await repository.setStatus(id, status, new Date().toISOString(), extra)
+    await appendTrace(id, {
       type: 'status', status, at: new Date().toISOString(),
       ...(extra.error ? { error: extra.error } : {}),
     })
   }
-  function get(id: string) {
-    const row = database.prepare('SELECT * FROM analyses WHERE id = ?').get(id) as Record<string, unknown> | undefined
-    return row ? mapAnalysis(row) : null
+  async function get(id: string) {
+    await initialized
+    return repository.get(id)
   }
-  function create(symbolInput: string) {
+  async function create(symbolInput: string) {
+    await initialized
     const symbol = symbolInput.trim().toUpperCase()
-    const existing = database.prepare(`SELECT id FROM analyses WHERE symbol = ? AND status IN ('queued', 'running') ORDER BY created_at LIMIT 1`)
-      .get(symbol) as { id: string } | undefined
-    if (existing) return { analysisId: existing.id, existing: true }
+    const existing = await repository.findActive(symbol)
+    if (existing) return { analysisId: existing, existing: true }
     const id = randomUUID(), now = new Date().toISOString()
-    database.prepare('INSERT INTO analyses (id, symbol, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?)')
-      .run(id, symbol, 'queued', now, now)
-    appendTrace(id, { type: 'status', status: 'queued', at: now })
-    queueMicrotask(schedule)
+    await repository.create({ id, symbol, status: 'queued', createdAt: now, updatedAt: now })
+    await appendTrace(id, { type: 'status', status: 'queued', at: now })
+    queueMicrotask(() => void schedule())
     return { analysisId: id, existing: false }
   }
-  function schedule() {
+  async function schedule() {
     while (running < options.concurrency) {
-      const next = database.prepare(`SELECT id FROM analyses WHERE status = 'queued' ORDER BY created_at LIMIT 1`)
-        .get() as { id: string } | undefined
+      const next = await repository.nextQueued()
       if (!next) return
       running += 1
-      void run(next.id).finally(() => { running -= 1; schedule() })
+      await setStatus(next, 'running')
+      const task = run(next).finally(() => { running -= 1; void schedule() })
+      tasks.add(task)
+      void task.then(() => tasks.delete(task), () => tasks.delete(task))
     }
   }
   async function run(id: string) {
-    const job = get(id)
+    const job = await get(id)
     if (!job) return
     const controller = new AbortController()
     controllers.set(id, controller)
-    setStatus(id, 'running')
     try {
       const context = await options.fetchFinancialContext(job.symbol, controller.signal)
       const quoteFact = context.facts.find((fact) => fact.type === 'quote' && typeof fact.value === 'number')
@@ -107,9 +97,9 @@ export function createAnalysisService(options: {
         ...(portfolioPriceGap ? [{ capability: 'portfolio_prices', reason: 'source_unavailable' }] : []),
       ]
       const snapshot = { ...context, gaps, portfolioContext, createdAt: new Date().toISOString() }
-      for (const fact of context.facts) persistFact(id, fact)
-      database.prepare('UPDATE analyses SET snapshot_json = ? WHERE id = ?').run(JSON.stringify(snapshot), id)
-      appendTrace(id, {
+      for (const fact of context.facts) await persistFact(id, fact)
+      await repository.saveSnapshot(id, snapshot)
+      await appendTrace(id, {
         type: 'financial_context',
         gaps,
         capabilities: sourceDiagnostics(context),
@@ -128,14 +118,14 @@ export function createAnalysisService(options: {
         if (event.type === 'trace') {
           if (event.entry.type === 'tool_result') {
             const toolResult = event.entry.result as { facts?: Fact[] }
-            for (const fact of toolResult.facts ?? []) persistFact(id, fact)
+            for (const fact of toolResult.facts ?? []) await persistFact(id, fact)
           }
-          appendTrace(id, event.entry)
+          await appendTrace(id, event.entry)
         }
-        else if (event.type === 'text_delta') appendTrace(id, event)
-        else if (event.type === 'cancelled') { setStatus(id, 'cancelled'); return }
+        else if (event.type === 'text_delta') await appendTrace(id, event)
+        else if (event.type === 'cancelled') { await setStatus(id, 'cancelled'); return }
         else if (event.type === 'completed') {
-          appendTrace(id, {
+          await appendTrace(id, {
             type: 'model_completed',
             usage: event.usage ?? null,
             stopReason: event.stopReason ?? null,
@@ -148,69 +138,51 @@ export function createAnalysisService(options: {
           }
           const report = enforceDataGaps(personalized, gaps)
           const status = report.limitations.length ? 'partial' : 'completed'
-          setStatus(id, status, { report })
+          await setStatus(id, status, { report })
           return
         }
       }
     } catch (error) {
-      if (controller.signal.aborted) setStatus(id, 'cancelled')
-      else setStatus(id, 'failed', { error: error instanceof Error ? error.message : String(error) })
+      if (controller.signal.aborted) await setStatus(id, 'cancelled')
+      else await setStatus(id, 'failed', { error: error instanceof Error ? error.message : String(error) })
     } finally {
       controllers.delete(id)
     }
   }
-  function cancel(id: string) {
-    const job = get(id)
+  async function cancel(id: string) {
+    const job = await get(id)
     if (!job || !['queued', 'running'].includes(job.status)) return false
     controllers.get(id)?.abort()
-    if (job.status === 'queued') setStatus(id, 'cancelled')
+    if (job.status === 'queued') await setStatus(id, 'cancelled')
     return true
   }
-  function research(id: string) {
-    const analysis = get(id)
-    if (!analysis) return null
-    const facts = (database.prepare(`SELECT f.payload_json FROM atomic_facts f JOIN analysis_facts af ON af.fact_id = f.id WHERE af.analysis_id = ?`).all(id) as Array<{ payload_json: string }>)
-      .map((row) => JSON.parse(row.payload_json))
-    const trace = (database.prepare('SELECT payload_json FROM analysis_trace WHERE analysis_id = ? ORDER BY sequence').all(id) as Array<{ payload_json: string }>)
-      .map((row) => JSON.parse(row.payload_json))
-    return { ...analysis, facts, trace }
+  async function research(id: string) {
+    await initialized
+    return repository.research(id)
   }
-  function listResearch(symbol?: string) {
-    const rows = symbol
-      ? database.prepare(`SELECT * FROM analyses WHERE symbol = ? AND status IN ('completed', 'partial', 'failed', 'cancelled', 'interrupted') ORDER BY created_at DESC`).all(symbol.toUpperCase())
-      : database.prepare(`SELECT * FROM analyses WHERE status IN ('completed', 'partial', 'failed', 'cancelled', 'interrupted') ORDER BY created_at DESC`).all()
-    return (rows as Record<string, unknown>[]).map(mapAnalysis)
+  async function listResearch(symbol?: string) {
+    await initialized
+    return repository.listResearch(symbol)
   }
-  function updateResearch(id: string, values: { starred?: boolean; note?: string }) {
-    if (!get(id)) return null
-    const current = get(id)!
-    database.prepare('UPDATE analyses SET starred = ?, note = ?, updated_at = ? WHERE id = ?')
-      .run(values.starred ?? current.starred ? 1 : 0, values.note ?? current.note, new Date().toISOString(), id)
-    return get(id)
+  async function updateResearch(id: string, values: { starred?: boolean; note?: string }) {
+    await initialized
+    return repository.updateResearch(id, values, new Date().toISOString())
   }
-  function removeResearch(id: string) {
-    if (!get(id)) return false
-    database.exec('BEGIN')
-    try {
-      database.prepare('DELETE FROM analyses WHERE id = ?').run(id)
-      database.exec(`DELETE FROM atomic_facts WHERE id NOT IN (SELECT fact_id FROM analysis_facts)`)
-      database.exec('COMMIT')
-      return true
-    } catch (error) {
-      database.exec('ROLLBACK')
-      throw error
-    }
+  async function removeResearch(id: string) {
+    await initialized
+    return repository.removeResearch(id)
   }
-  function events(id: string) {
-    const record = research(id)
+  async function events(id: string) {
+    const record = await research(id)
     if (!record) return null
-    return record.trace.map((entry: Record<string, unknown>) => {
+    return record.trace.map((value) => {
+      const entry = value as Record<string, unknown>
       const event = entry.type === 'status' ? entry.status : entry.type
       return `event: ${event}\ndata: ${JSON.stringify(entry)}\n\n`
     }).join('')
   }
   async function *streamEvents(id: string, signal?: AbortSignal) {
-    const record = research(id)
+    const record = await research(id)
     if (!record) return
     const queue: Record<string, unknown>[] = []
     let wake: (() => void) | undefined
@@ -222,7 +194,7 @@ export function createAnalysisService(options: {
     subscriptions.add(listener)
     listeners.set(id, subscriptions)
     try {
-      const current = research(id)
+      const current = await research(id)
       if (!current) return
       for (const entry of current.trace) yield entry as Record<string, unknown>
       if (isTerminal(current.status)) return
@@ -240,7 +212,10 @@ export function createAnalysisService(options: {
       if (!subscriptions.size) listeners.delete(id)
     }
   }
-  function close() { for (const controller of controllers.values()) controller.abort() }
+  async function close() {
+    for (const controller of controllers.values()) controller.abort()
+    await Promise.allSettled(tasks)
+  }
   return { create, get, cancel, research, listResearch, updateResearch, removeResearch, events, streamEvents, close }
 }
 
@@ -404,15 +379,4 @@ function periodName(value: unknown) {
 
 function asStrings(value: unknown) {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
-}
-
-function mapAnalysis(row: Record<string, unknown>) {
-  return {
-    id: row.id as string, symbol: row.symbol as string, status: row.status as string,
-    createdAt: row.created_at as string, updatedAt: row.updated_at as string,
-    snapshot: row.snapshot_json ? JSON.parse(row.snapshot_json as string) : null,
-    report: row.report_json ? JSON.parse(row.report_json as string) : null,
-    error: row.error as string | null,
-    starred: Boolean(row.starred), note: row.note as string,
-  }
 }

@@ -40,7 +40,6 @@ COPY --from=build /workspace/apps/web/dist ./services/analysis-api/public
 ENV HOST=0.0.0.0
 ENV PORT=3000
 ENV WEB_STATIC_DIR=/app/services/analysis-api/public
-ENV DATABASE_PATH=/data/vibe-invest.db
 ENV FINANCIAL_DATA_URL=http://financial-data:8000
 
 EXPOSE 3000

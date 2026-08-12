@@ -363,7 +363,7 @@ function ReduceDialog({ position, cash, onCancel, onSubmit }: { position: Portfo
 }
 
 function SettingsPage({ health, modelConfigured }: { health: SystemHealth | null; modelConfigured: boolean }) {
-  return <><PageHeader eyebrow="INSTANCE SETTINGS" title="系统设置" description="这里仅显示当前实例能力是否就绪，密钥值永远不会返回浏览器。" /><div className="settings-grid"><Setting title="Analysis API" description="分析任务、研究记录与持仓管理" ready={health?.status === 'ok'} /><Setting title="Financial Data" description="行情、新闻、财报与确定性计算" ready={health?.dependencies.financialData.status === 'ok'} /><Setting title="AI Model" description="由 .env 指定的兼容模型端点" ready={modelConfigured} /><Setting title="SQLite" description="私有持仓、快照、事实与研究轨迹" ready={health?.dependencies.database.status === 'ok'} /></div></>
+  return <><PageHeader eyebrow="INSTANCE SETTINGS" title="系统设置" description="这里仅显示当前实例能力是否就绪，密钥值永远不会返回浏览器。" /><div className="settings-grid"><Setting title="Analysis API" description="分析任务、研究记录与持仓管理" ready={health?.status === 'ok'} /><Setting title="Financial Data" description="行情、新闻、财报与确定性计算" ready={health?.dependencies.financialData.status === 'ok'} /><Setting title="AI Model" description="由 .env 指定的兼容模型端点" ready={modelConfigured} /><Setting title="PostgreSQL" description="持仓、权益历史、事实与研究轨迹" ready={health?.dependencies.productDatabase.status === 'ok'} /></div></>
 }
 
 function PriceChart({ facts, compact = false }: { facts: Fact[]; compact?: boolean }) {

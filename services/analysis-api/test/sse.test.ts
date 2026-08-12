@@ -1,7 +1,4 @@
 import assert from 'node:assert/strict'
-import { mkdtemp } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
 import test from 'node:test'
 
 import { buildApp as buildProductionApp } from '../src/app.js'
@@ -12,9 +9,7 @@ function buildApp(dependencies: Parameters<typeof buildProductionApp>[0]) {
 }
 
 test('真实 HTTP SSE 在任务完成前依次发送运行进度和终态', async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'vibe-sse-'))
   const app = buildApp({
-    databasePath: join(directory, 'app.db'),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({
       symbol, gaps: [], facts: [{

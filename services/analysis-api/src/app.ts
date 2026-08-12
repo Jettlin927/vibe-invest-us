@@ -2,21 +2,20 @@ import fastifyStatic from '@fastify/static'
 import Fastify from 'fastify'
 
 import type { FinancialDataHealth } from '@vibe-invest/contracts'
-import type { PortfolioRepository } from '@vibe-invest/product-dao'
+import type { AnalysisRepository, PortfolioRepository } from '@vibe-invest/product-dao'
 
 import { createAnalysisService } from './analysis.js'
-import { openDatabase } from './database.js'
 import type { ModelEvent } from './model.js'
 import type { FactQueryResult, FinancialContext } from './financial-data-client.js'
 import { createPortfolio, isValidSymbol, normalizeSymbol } from './portfolio.js'
 
 type AppDependencies = {
-  databasePath: string
   productDatabase: {
     checkSchema: () => Promise<{ status: 'ok'; version: number }>
     close: () => Promise<void>
   }
   portfolioRepository: PortfolioRepository
+  analysisRepository: AnalysisRepository
   financialDataHealth: () => Promise<FinancialDataHealth>
   staticDir?: string
   fetchFinancialContext?: (symbol: string, signal: AbortSignal) => Promise<FinancialContext>
@@ -33,11 +32,10 @@ type AppDependencies = {
 
 export function buildApp(dependencies: AppDependencies) {
   const app = Fastify({ logger: false })
-  const database = openDatabase(dependencies.databasePath)
   const portfolio = createPortfolio(dependencies.portfolioRepository)
   const analysis = dependencies.fetchFinancialContext && dependencies.model
     ? createAnalysisService({
-        database,
+        repository: dependencies.analysisRepository,
         fetchFinancialContext: dependencies.fetchFinancialContext,
         searchNews: dependencies.searchNews,
         fetchTechnicalIndicators: dependencies.fetchTechnicalIndicators,
@@ -50,8 +48,7 @@ export function buildApp(dependencies: AppDependencies) {
     : null
 
   app.addHook('onClose', async () => {
-    analysis?.close()
-    database.close()
+    await analysis?.close()
     await dependencies.productDatabase.close()
   })
 
@@ -63,7 +60,6 @@ export function buildApp(dependencies: AppDependencies) {
 
   app.get('/api/health', async (_request, reply) => {
     try {
-      database.exec('PRAGMA user_version')
       const productDatabase = await dependencies.productDatabase.checkSchema()
       const financialData = await dependencies.financialDataHealth()
 
@@ -71,7 +67,6 @@ export function buildApp(dependencies: AppDependencies) {
         service: 'analysis-api',
         status: 'ok',
         dependencies: {
-          database: { status: 'ok', engine: 'sqlite' },
           productDatabase: {
             status: productDatabase.status,
             engine: 'postgresql',
@@ -183,15 +178,18 @@ export function buildApp(dependencies: AppDependencies) {
     if (!analysis || typeof request.body?.symbol !== 'string') return reply.status(400).send({ error: 'invalid_analysis' })
     const symbol = normalizeSymbol(request.body.symbol)
     if (!isValidSymbol(symbol)) return reply.status(400).send({ error: 'invalid_symbol' })
-    const result = analysis.create(symbol)
+    const result = await analysis.create(symbol)
     return reply.status(202).send(result)
   })
   app.get<{ Params: { id: string } }>('/api/analyses/:id', async (request, reply) => {
-    const result = analysis?.get(request.params.id)
+    const result = await analysis?.get(request.params.id)
     return result ?? reply.status(404).send({ error: 'analysis_not_found' })
   })
   app.get<{ Params: { id: string } }>('/api/analyses/:id/events', async (request, reply) => {
-    if (!analysis?.get(request.params.id)) return reply.status(404).send({ error: 'analysis_not_found' })
+    const currentAnalysis = analysis
+    if (!currentAnalysis || !await currentAnalysis.get(request.params.id)) {
+      return reply.status(404).send({ error: 'analysis_not_found' })
+    }
     reply.hijack()
     reply.raw.writeHead(200, {
       'content-type': 'text/event-stream; charset=utf-8',
@@ -200,22 +198,22 @@ export function buildApp(dependencies: AppDependencies) {
     })
     const controller = new AbortController()
     request.raw.on('close', () => controller.abort())
-    for await (const entry of analysis.streamEvents(request.params.id, controller.signal)) {
+    for await (const entry of currentAnalysis.streamEvents(request.params.id, controller.signal)) {
       const event = entry.type === 'status' ? entry.status : entry.type
       reply.raw.write(`event: ${event}\ndata: ${JSON.stringify(entry)}\n\n`)
     }
     reply.raw.end()
   })
   app.post<{ Params: { id: string } }>('/api/analyses/:id/cancel', async (request, reply) => {
-    if (!analysis?.cancel(request.params.id)) return reply.status(409).send({ error: 'analysis_not_cancellable' })
+    if (!await analysis?.cancel(request.params.id)) return reply.status(409).send({ error: 'analysis_not_cancellable' })
     return reply.status(202).send({ status: 'cancelling' })
   })
   app.get<{ Params: { id: string } }>('/api/research/:id', async (request, reply) => {
-    const result = analysis?.research(request.params.id)
+    const result = await analysis?.research(request.params.id)
     return result ?? reply.status(404).send({ error: 'research_not_found' })
   })
   app.get<{ Querystring: { symbol?: string } }>('/api/research', async (request) => ({
-    records: analysis?.listResearch(request.query.symbol) ?? [],
+    records: await analysis?.listResearch(request.query.symbol) ?? [],
   }))
   app.patch<{
     Params: { id: string }
@@ -225,11 +223,11 @@ export function buildApp(dependencies: AppDependencies) {
     if ((starred !== undefined && typeof starred !== 'boolean') || (note !== undefined && typeof note !== 'string')) {
       return reply.status(400).send({ error: 'invalid_research_update' })
     }
-    const result = analysis?.updateResearch(request.params.id, { starred, note })
+    const result = await analysis?.updateResearch(request.params.id, { starred, note })
     return result ?? reply.status(404).send({ error: 'research_not_found' })
   })
   app.delete<{ Params: { id: string } }>('/api/research/:id', async (request, reply) => {
-    if (!analysis?.removeResearch(request.params.id)) return reply.status(404).send({ error: 'research_not_found' })
+    if (!await analysis?.removeResearch(request.params.id)) return reply.status(404).send({ error: 'research_not_found' })
     return reply.status(204).send()
   })
 

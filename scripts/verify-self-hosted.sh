@@ -12,6 +12,7 @@ docker compose up -d --wait
 
 health="$(curl -fsS http://127.0.0.1:${VIBE_INVEST_PORT:-3000}/api/health)"
 printf '%s' "$health" | grep -q '"service":"analysis-api"'
+printf '%s' "$health" | grep -q '"engine":"postgresql"'
 printf '%s' "$health" | grep -q '"financialData":{"service":"financial-data","status":"ok"}'
 
 curl -fsS http://127.0.0.1:${VIBE_INVEST_PORT:-3000}/ | grep -q '<div id="root"></div>'
@@ -43,6 +44,10 @@ if docker inspect --format '{{with (index .NetworkSettings.Ports "8000/tcp")}}{{
   exit 1
 fi
 
-docker compose exec -T analysis-api test -f /data/vibe-invest.db
+postgres_container="$(docker compose ps -q postgres)"
+if docker inspect --format '{{with (index .NetworkSettings.Ports "5432/tcp")}}{{println .}}{{end}}' "$postgres_container" | grep -q .; then
+  echo "postgres must not publish a host port by default" >&2
+  exit 1
+fi
 
 echo "self-hosted verification passed"
