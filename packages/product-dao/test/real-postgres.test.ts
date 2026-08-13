@@ -819,6 +819,139 @@ test('真实 PostgreSQL migration 幂等且 application role 没有 DDL 权限',
   await pool.end()
 })
 
+test('真实 PostgreSQL v12 无 Tool Batch 的历史工具事件原样升级到 v15', {
+  skip: !migrationUrl,
+  concurrency: false,
+}, async () => {
+  const pool = createPool(migrationUrl!)
+  const suffix = crypto.randomUUID()
+  const analysisId = `v12-analysis-${suffix}`
+  const sessionId = `v12-session-${suffix}`
+  const executionId = `v12-execution-${suffix}`
+  const callEvent = {
+    type: 'tool_call', name: 'fetch_financial_context', input: { symbol: 'AAPL' },
+  }
+  const resultEvent = {
+    type: 'tool_result', name: 'fetch_financial_context', result: { facts: [] }, isError: false,
+  }
+  try {
+    await migrate(migrationUrl!)
+    await pool.query('DROP TABLE tool_batch_calls, tool_call_batches, model_requests, tool_projection_versions')
+    await pool.query('DELETE FROM product_schema_migrations WHERE version > 12')
+    await pool.query(
+      `INSERT INTO analyses (id, symbol, status, active, created_at, updated_at)
+       VALUES ($1, 'V12LEGACY', 'completed', false, now(), now())`, [analysisId],
+    )
+    await pool.query(
+      `INSERT INTO agent_sessions (id, analysis_id, is_primary, execution_id, status,
+         latest_sequence, created_at, updated_at) VALUES ($1, $2, true, $3, 'completed', 2, now(), now())`,
+      [sessionId, analysisId, executionId],
+    )
+    await pool.query(
+      `INSERT INTO agent_executions (id, session_id, generation, status, terminal, created_at, updated_at)
+       VALUES ($1, $2, 1, 'completed', true, now(), now())`, [executionId, sessionId],
+    )
+    await pool.query(
+      `INSERT INTO agent_events (session_id, sequence, operation_id, payload_json, created_at) VALUES
+       ($1, 1, $2, $3, now()), ($1, 2, $4, $5, now())`,
+      [sessionId, `execution:${executionId}:tool:legacy-call:call`, JSON.stringify(callEvent),
+        `execution:${executionId}:tool:legacy-call:result`, JSON.stringify(resultEvent)],
+    )
+
+    await migrate(migrationUrl!)
+
+    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 15 })
+    assert.deepEqual((await createAgentEventRepository(pool).list(sessionId, 0))
+      .map(({ operationId, payload }) => ({ operationId, payload })), [
+      { operationId: `execution:${executionId}:tool:legacy-call:call`, payload: callEvent },
+      { operationId: `execution:${executionId}:tool:legacy-call:result`, payload: resultEvent },
+    ])
+  } finally {
+    await pool.query('DELETE FROM analyses WHERE id = $1', [analysisId])
+    await pool.end()
+  }
+})
+
+test('真实 PostgreSQL 同 execution 混合历史只回填 Batch 建立后的 Tool 事件', {
+  skip: !migrationUrl,
+  concurrency: false,
+}, async () => {
+  const pool = createPool(migrationUrl!)
+  const suffix = crypto.randomUUID()
+  const analysisId = `mixed-analysis-${suffix}`
+  const sessionId = `mixed-session-${suffix}`
+  const executionId = `mixed-execution-${suffix}`
+  const projectionId = `mixed-projection-${suffix}`
+  const batchId = `mixed-batch-${suffix}`
+  const legacyCallId = `legacy-${suffix}`
+  const batchCallId = `batch-${suffix}`
+  const legacyCall = { type: 'tool_call', name: 'fetch_financial_context', input: { symbol: 'AAPL' } }
+  const legacyResult = {
+    type: 'tool_result', name: 'fetch_financial_context', result: { facts: [] }, isError: false,
+  }
+  try {
+    await migrate(migrationUrl!)
+    await pool.query(
+      `INSERT INTO analyses (id, symbol, status, active, created_at, updated_at)
+       VALUES ($1, 'MIXED', 'completed', false, $2, $3)`,
+      [analysisId, '2026-08-13T00:00:00.000Z', '2026-08-13T00:03:00.000Z'],
+    )
+    await pool.query(
+      `INSERT INTO agent_sessions (id, analysis_id, is_primary, execution_id, status,
+         latest_sequence, created_at, updated_at) VALUES ($1, $2, true, $3, 'completed', 4, $4, $5)`,
+      [sessionId, analysisId, executionId,
+        '2026-08-13T00:00:00.000Z', '2026-08-13T00:03:00.000Z'],
+    )
+    await pool.query(
+      `INSERT INTO agent_executions (id, session_id, generation, status, terminal, created_at, updated_at)
+       VALUES ($1, $2, 1, 'completed', true, $3, $4)`,
+      [executionId, sessionId, '2026-08-13T00:00:00.000Z', '2026-08-13T00:03:00.000Z'],
+    )
+    await pool.query(
+      `INSERT INTO tool_projection_versions (id, execution_id, version, role, stage, schema_hash,
+         projected_tools_json, visible_tool_names_json, reasons_json, created_at)
+       VALUES ($1, $2, 1, 'main', 'research', 'mixed-hash', '[]',
+         '["fetch_financial_context"]', '{}', $3)`,
+      [projectionId, executionId, '2026-08-13T00:01:00.000Z'],
+    )
+    await pool.query(
+      `INSERT INTO tool_call_batches (id, execution_id, projection_id, turn_index, status,
+         created_at, completed_at) VALUES ($1, $2, $3, 1, 'completed', $4, $5)`,
+      [batchId, executionId, projectionId,
+        '2026-08-13T00:01:00.000Z', '2026-08-13T00:03:00.000Z'],
+    )
+    await pool.query(
+      `INSERT INTO tool_batch_calls (batch_id, tool_call_id, tool_name, position, status,
+         started_at, completed_at, completion_order, result_payload_json)
+       VALUES ($1, $2, 'fetch_financial_context', 1, 'completed', $3, $4, 1,
+         '{"result":{"facts":[]},"isError":false}')`,
+      [batchId, batchCallId, '2026-08-13T00:02:00.000Z', '2026-08-13T00:03:00.000Z'],
+    )
+    await pool.query(
+      `INSERT INTO agent_events (session_id, sequence, operation_id, payload_json, created_at) VALUES
+       ($1, 1, $2, $3, $8), ($1, 2, $4, $5, $8),
+       ($1, 3, $6, '{"type":"tool_call","name":"fetch_financial_context"}', $9),
+       ($1, 4, $7, '{"type":"tool_result","name":"fetch_financial_context"}', $10)`,
+      [sessionId,
+        `execution:${executionId}:tool:${legacyCallId}:call`, JSON.stringify(legacyCall),
+        `execution:${executionId}:tool:${legacyCallId}:result`, JSON.stringify(legacyResult),
+        `execution:${executionId}:tool:${batchCallId}:call`,
+        `execution:${executionId}:tool:${batchCallId}:result`,
+        '2026-08-13T00:00:00.000Z', '2026-08-13T00:02:00.000Z', '2026-08-13T00:03:00.000Z'],
+    )
+    await pool.query('DELETE FROM product_schema_migrations WHERE version = 15')
+
+    await migrate(migrationUrl!)
+
+    const stored = (await createAgentEventRepository(pool).list(sessionId, 0)).map(({ payload }) => payload)
+    assert.deepEqual(stored.slice(0, 2), [legacyCall, legacyResult])
+    assert.deepEqual(stored.slice(2).map(({ toolCallId }) => toolCallId), [batchCallId, batchCallId])
+  } finally {
+    await pool.query('DELETE FROM analyses WHERE id = $1', [analysisId])
+    await pool.end()
+  }
+})
+
 test('真实 PostgreSQL v14 升级回填 Tool call payload 与可确定关联事件', {
   skip: !migrationUrl,
   concurrency: false,

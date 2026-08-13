@@ -20,6 +20,86 @@ import { createPiModel, type ModelEvent, type ToolRuntime } from '../src/model.j
 const databaseUrl = process.env.TEST_DATABASE_URL
 const migrationDatabaseUrl = process.env.TEST_MIGRATION_DATABASE_URL
 
+test('真实 v12 历史 Tool 事件升级后经 DAO、HTTP 与 SSE 原样读取', {
+  skip: !databaseUrl || !migrationDatabaseUrl,
+  concurrency: false,
+}, async () => {
+  const migrationPool = createPool(migrationDatabaseUrl!)
+  const suffix = crypto.randomUUID()
+  const analysisId = `v12-http-analysis-${suffix}`
+  const sessionId = `v12-http-session-${suffix}`
+  const executionId = `v12-http-execution-${suffix}`
+  const callEvent = { type: 'tool_call', name: 'fetch_financial_context', input: { symbol: 'AAPL' } }
+  const resultEvent = {
+    type: 'tool_result', name: 'fetch_financial_context', result: { facts: [] }, isError: false,
+  }
+  await migrate(migrationDatabaseUrl!)
+  try {
+    await migrationPool.query(
+      'DROP TABLE tool_batch_calls, tool_call_batches, model_requests, tool_projection_versions',
+    )
+    await migrationPool.query('DELETE FROM product_schema_migrations WHERE version > 12')
+    await migrationPool.query(
+      `INSERT INTO analyses (id, symbol, status, active, created_at, updated_at)
+       VALUES ($1, 'V12HTTP', 'completed', false, now(), now())`, [analysisId],
+    )
+    await migrationPool.query(
+      `INSERT INTO agent_sessions (id, analysis_id, is_primary, execution_id, status,
+         latest_sequence, created_at, updated_at) VALUES ($1, $2, true, $3, 'completed', 2, now(), now())`,
+      [sessionId, analysisId, executionId],
+    )
+    await migrationPool.query(
+      `INSERT INTO agent_executions (id, session_id, generation, status, terminal, created_at, updated_at)
+       VALUES ($1, $2, 1, 'completed', true, now(), now())`, [executionId, sessionId],
+    )
+    await migrationPool.query(
+      `INSERT INTO agent_events (session_id, sequence, operation_id, payload_json, created_at) VALUES
+       ($1, 1, $2, $3, now()), ($1, 2, $4, $5, now())`,
+      [sessionId, `execution:${executionId}:tool:legacy-call:call`, JSON.stringify(callEvent),
+        `execution:${executionId}:tool:legacy-call:result`, JSON.stringify(resultEvent)],
+    )
+
+    await migrate(migrationDatabaseUrl!)
+
+    const pool = createPool(databaseUrl!)
+    const events = createAgentEventRepository(pool)
+    const app = buildApp({
+      productDatabase: { checkSchema: () => checkSchema(pool), close: () => pool.end() },
+      portfolioRepository: createPortfolioRepository(pool),
+      analysisRepository: createAnalysisRepository(pool),
+      agentEventRepository: events,
+      runtimeSettingsRepository: createRuntimeSettingsRepository(pool),
+      toolProjectionRepository: createToolProjectionRepository(pool),
+      financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+      fetchFinancialContext: async (symbol) => ({ symbol, gaps: [], facts: [] }),
+      model: createPiModel({ fauxResponses: [] }),
+    })
+    await app.listen({ host: '127.0.0.1', port: 0 })
+    const address = app.server.address()
+    assert.ok(address && typeof address === 'object')
+    const baseUrl = `http://127.0.0.1:${address.port}`
+    try {
+      assert.deepEqual((await events.list(sessionId, 0)).map(({ payload }) => payload),
+        [callEvent, resultEvent])
+      const research = await fetch(`${baseUrl}/api/research/${analysisId}`)
+        .then((response) => response.json())
+      assert.deepEqual(research.trace, [callEvent, resultEvent])
+      const response = await fetch(`${baseUrl}/api/agent-sessions/${sessionId}/events`)
+      const reader = response.body!.getReader()
+      const sse = await readThroughReader(reader, 'event: tool_result')
+      await reader.cancel()
+      assert.match(sse, /event: tool_call/)
+      assert.match(sse, /event: tool_result/)
+      assert.doesNotMatch(sse, /toolCallId/)
+    } finally {
+      await app.close()
+    }
+  } finally {
+    await migrationPool.query('DELETE FROM analyses WHERE id = $1', [analysisId])
+    await migrationPool.end()
+  }
+})
+
 test('真实 v14 Tool 事件迁移后经 DAO、HTTP 与 SSE 只公开稳定调用标识', {
   skip: !databaseUrl || !migrationDatabaseUrl,
   concurrency: false,

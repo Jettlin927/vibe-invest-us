@@ -333,11 +333,12 @@ DO $$
 DECLARE
   target record;
   candidate_count integer;
+  relevant_batch_count integer;
   authoritative_call_id text;
   authoritative_name text;
 BEGIN
   FOR target IN
-    SELECT event.session_id, event.sequence, event.operation_id, event.payload_json
+    SELECT event.session_id, event.sequence, event.operation_id, event.payload_json, event.created_at
     FROM agent_events event
     WHERE event.payload_json->>'type' IN ('tool_call', 'tool_result')
   LOOP
@@ -349,6 +350,7 @@ BEGIN
     JOIN tool_projection_versions projection ON projection.id = batch.projection_id
     JOIN tool_batch_calls call ON call.batch_id = batch.id
     WHERE session.id = target.session_id
+      AND target.created_at >= batch.created_at
       AND target.operation_id IN (
         'execution:' || batch.execution_id || ':'
           || CASE projection.role WHEN 'main' THEN 'tool' WHEN 'fundamental' THEN 'specialist-tool' END
@@ -359,6 +361,18 @@ BEGIN
           || ':' || call.tool_call_id
       )
       AND (projection.visible_tool_names_json ? call.tool_name OR call.tool_name = 'tool_not_available');
+    IF candidate_count = 0 THEN
+      SELECT count(*) INTO relevant_batch_count
+      FROM agent_executions execution
+      JOIN tool_call_batches batch ON batch.execution_id = execution.id
+      WHERE execution.session_id = target.session_id
+        AND target.created_at >= batch.created_at
+        AND (
+          target.operation_id LIKE 'execution:' || execution.id || ':%'
+          OR target.operation_id LIKE batch.id || ':cancelled-%'
+        );
+      IF relevant_batch_count = 0 THEN CONTINUE; END IF;
+    END IF;
     IF candidate_count <> 1 THEN
       RAISE EXCEPTION 'tool_event_call_association_failed:%:%', target.session_id, target.sequence;
     END IF;
