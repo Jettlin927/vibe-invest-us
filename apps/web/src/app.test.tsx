@@ -430,6 +430,54 @@ test('研究页独立展示技术面专项的多周期报告与工具轨迹', as
   assert.match(specialist.textContent ?? '', /长期历史不足.*长期置信度受限/)
 })
 
+test('研究页同时展示主 Agent 等待目标和完整三专项树', async () => {
+  setupDom()
+  const sessions = [
+    ['news', 'news-session'],
+    ['fundamental_valuation', 'fundamental-session'],
+    ['technical', 'technical-session'],
+  ] as const
+  const record = {
+    id: 'parallel-tree', symbol: 'NVDA', status: 'waiting_for_specialists',
+    report: null, facts: [], trace: [],
+    mainAgent: {
+      id: 'main-session', status: 'waiting_for_specialists',
+      waitReason: {
+        kind: 'specialists', target: `专项 Session：${sessions.map(([, id]) => id).join('、')}`,
+        startedAt: '2026-08-14T01:00:00Z',
+      },
+      execution: { id: 'main-execution', generation: 1, status: 'waiting_for_specialists' },
+      segments: [{ id: 'main-segment', ordinal: 1, createdAt: '2026-08-14T00:59:00Z' }],
+      events: [],
+    },
+    specialistAgents: sessions.map(([domain, id]) => ({
+      id, domain, status: 'running_model', researchQuestion: `${domain} question`,
+      reason: `${domain} reason`, execution: { id: `${id}-execution`, generation: 1, status: 'running_model' },
+      events: [],
+    })),
+  }
+  globalThis.fetch = async (input) => {
+    const url = String(input)
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok' }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/settings') return Response.json({ ...settingsResponse(), model: { configured: false } })
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+    if (url === '/api/portfolio') return Response.json(portfolioResponse([]))
+    if (url === '/api/research') return Response.json({ records: [{ id: record.id, symbol: record.symbol, status: record.status }] })
+    if (url === '/api/research/parallel-tree') return Response.json(record)
+    throw new Error(`unexpected_fetch:${url}`)
+  }
+  const view = render(React.createElement(App))
+  const user = userEvent.setup({ document: window.document })
+  await user.click(await view.findByRole('button', { name: '新建分析' }))
+  await user.click(await view.findByRole('button', { name: /打开 NVDA/ }))
+
+  for (const name of ['消息面专项 Agent', '基本面专项 Agent', '技术面专项 Agent']) {
+    assert.ok(await view.findByRole('region', { name }))
+  }
+  const main = await view.findByRole('region', { name: '主 Agent Runtime' })
+  for (const [, id] of sessions) assert.match(main.textContent ?? '', new RegExp(id))
+})
+
 test('模型未配置时首次研究创建后立即打开主 Agent 生命周期', async () => {
   setupDom()
   let created = false

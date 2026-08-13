@@ -249,8 +249,45 @@ export function createTestProductDatabase() {
         session.analysisId === input.analysisId
         && (agentEvents.get(session.id)?.[0]?.payload as Record<string, unknown> | undefined)?.domain === input.domain
       ))
-      if (existing) return {
-        sessionId: existing.id, executionId: existing.executionId, created: false,
+      if (existing) {
+        const replay = (agentEvents.get(existing.id) ?? []).find(
+          ({ operationId }) => operationId === input.operationId,
+        )
+        if (replay) {
+          if (existing.executionId !== input.executionId
+            || JSON.stringify(replay.payload) !== JSON.stringify(input.event)
+            || replay.createdAt !== input.createdAt) throw new Error('agent_operation_conflict')
+          return { sessionId: existing.id, executionId: input.executionId, created: false }
+        }
+        const lifecycle = lifecycles.get(existing.id)!
+        if (!['completed', 'partial', 'failed', 'cancelled', 'budget_exhausted', 'stopped',
+          'interrupted'].includes(lifecycle.execution.status)) return {
+            sessionId: existing.id, executionId: existing.executionId, created: false,
+          }
+        const sequence = existing.latestSequence + 1
+        agentEvents.set(existing.id, [...(agentEvents.get(existing.id) ?? []), {
+          sessionId: existing.id, sequence, operationId: input.operationId,
+          payload: input.event, createdAt: input.createdAt,
+        }])
+        agentSessions.set(existing.id, {
+          ...existing, executionId: input.executionId, status: 'planning',
+          latestSequence: sequence, updatedAt: input.createdAt,
+        })
+        lifecycles.set(existing.id, {
+          execution: { id: input.executionId, generation: lifecycle.execution.generation + 1,
+            status: 'planning', createdAt: input.createdAt, updatedAt: input.createdAt },
+          waitReason: { kind: 'database', target: '专项研究规划', startedAt: input.createdAt },
+          segments: [...lifecycle.segments, {
+            id: input.segmentId ?? `${existing.id}:segment:${lifecycle.segments.length + 1}`,
+            ordinal: lifecycle.segments.length + 1, createdAt: input.createdAt,
+          }],
+        })
+        const current = runtimeSettingsRevisions.at(-1)!
+        executionSettingsSnapshots.set(input.executionId, {
+          executionId: input.executionId, id: current.id,
+          values: { ...current.values }, createdAt: input.createdAt,
+        })
+        return { sessionId: existing.id, executionId: input.executionId, created: true }
       }
       await this.createSession(input)
       return { sessionId: input.id, executionId: input.executionId, created: true }
@@ -315,10 +352,11 @@ export function createTestProductDatabase() {
         const analysisId = session.analysisId
         if (input.projection.reportVersion) {
           const versions = reportVersions.get(analysisId) ?? []
+          const sessionVersion = versions.filter(({ sessionId }) => sessionId === input.sessionId).length + 1
           reportVersions.set(analysisId, [...versions, {
             ...input.projection.reportVersion,
             analysisId, sessionId: input.sessionId, executionId: input.executionId,
-            version: versions.length + 1, createdAt: input.createdAt,
+            version: sessionVersion, createdAt: input.createdAt,
           }])
         }
         for (const fact of input.projection.facts ?? []) {

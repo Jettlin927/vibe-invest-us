@@ -1598,6 +1598,41 @@ test('真实 PostgreSQL 每个研究只允许一个长期消息面 Session', {
     assert.equal(first.created, true)
     assert.equal(replay.created, false)
     assert.equal(replay.sessionId, first.sessionId)
+    await events.append({
+      sessionId: first.sessionId, executionId: first.executionId,
+      operationId: 'complete-news', event: { type: 'status', status: 'completed' },
+      projection: { status: 'completed', executionStatus: 'completed', terminal: true },
+      createdAt: '2026-08-13T13:00:01.000Z',
+    })
+    const followUp = await events.createSpecialistSession({
+      id: `${analysisId}:news:another-session`, analysisId, domain: 'news',
+      executionId: `${analysisId}:news:follow-up-execution`, status: 'planning',
+      operationId: 'follow-up-news', event: {
+        type: 'specialist_context', domain: 'news', researchQuestion: '后续问题',
+      }, createdAt: '2026-08-13T13:00:02.000Z',
+    })
+
+    assert.equal(followUp.created, true)
+    assert.equal(followUp.sessionId, first.sessionId)
+    assert.equal(followUp.executionId, `${analysisId}:news:follow-up-execution`)
+    const lifecycle = await events.sessionLifecycle(first.sessionId)
+    assert.equal(lifecycle?.execution.generation, 2)
+    assert.equal(lifecycle?.segments.length, 2)
+    await events.append({
+      sessionId: followUp.sessionId, executionId: followUp.executionId,
+      operationId: 'complete-follow-up-news', event: { type: 'status', status: 'completed' },
+      projection: { status: 'completed', executionStatus: 'completed', terminal: true },
+      createdAt: '2026-08-13T13:00:03.000Z',
+    })
+    const replayedFollowUp = await events.createSpecialistSession({
+      id: `${analysisId}:news:replayed-session`, analysisId, domain: 'news',
+      executionId: followUp.executionId, status: 'planning',
+      operationId: 'follow-up-news', event: {
+        type: 'specialist_context', domain: 'news', researchQuestion: '后续问题',
+      }, createdAt: '2026-08-13T13:00:02.000Z',
+    })
+    assert.equal(replayedFollowUp.created, false)
+    assert.equal((await events.sessionLifecycle(first.sessionId))?.execution.generation, 2)
     assert.equal((await events.listSessions(analysisId)).filter(({ isPrimary }) => !isPrimary).length, 1)
   } finally {
     await analyses.removeResearch(analysisId)

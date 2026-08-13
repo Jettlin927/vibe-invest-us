@@ -428,41 +428,68 @@ export function createAnalysisService(options: {
         && options.getTechnicalEvidence && options.getPriceWindow)
       type SpecialistRequest = {
         launch: boolean; researchQuestion: string; reason: string
+        prepared?: { sessionId: string; executionId: string; created: boolean }
       }
-      const runSpecialistLifecycle = async (config: {
-        domain: 'news' | 'fundamental_valuation' | 'technical'
-        label: string
-        request: SpecialistRequest
-        events: (executionId: string, runtime: ToolRuntime) => AsyncIterable<ModelEvent>
+      type SpecialistDomain = 'news' | 'fundamental_valuation' | 'technical'
+      const prepareSpecialist = async (request: {
+        domain: SpecialistDomain; researchQuestion: string; reason: string
       }) => {
-        const slug = config.domain === 'fundamental_valuation' ? 'fundamental' : config.domain
-        await setStatus(
-          sessionId, executionId, `execution:${executionId}:${slug}-specialist:waiting`,
-          'waiting_for_specialists', {}, `${config.label}专项分析`,
-        )
         const requestedSessionId = randomUUID()
         const requestedExecutionId = randomUUID()
         const createdAt = new Date().toISOString()
-        const specialistSession = await options.eventRepository.createSpecialistSession({
+        const prepared = await options.eventRepository.createSpecialistSession({
           id: requestedSessionId, analysisId, executionId: requestedExecutionId,
-          domain: config.domain, segmentId: randomUUID(), status: 'planning',
-          operationId: `session:${requestedSessionId}:created`,
+          domain: request.domain, segmentId: randomUUID(), status: 'planning',
+          operationId: `execution:${requestedExecutionId}:specialist-context`,
           event: {
-            type: 'specialist_context', domain: config.domain, launch: config.request.launch,
-            researchQuestion: config.request.researchQuestion, reason: config.request.reason,
+            type: 'specialist_context', domain: request.domain, launch: true,
+            researchQuestion: request.researchQuestion, reason: request.reason,
             status: 'planning', at: createdAt,
           },
           createdAt,
         })
+        return { domain: request.domain, ...prepared }
+      }
+      const prepareSpecialistBatch = async (requests: Array<{
+        domain: SpecialistDomain; researchQuestion: string; reason: string
+      }>, batchId: string) => {
+        const domains = requests.map(({ domain }) => domain)
+        if (new Set(domains).size !== domains.length) {
+          throw new Error('duplicate_specialist_domain_in_batch')
+        }
+        const prepared = await Promise.all(requests.map(prepareSpecialist))
+        await setStatus(
+          sessionId, executionId, `${batchId}:waiting-for-specialists`,
+          'waiting_for_specialists', {},
+          `专项 Session：${prepared.map(({ sessionId }) => sessionId).join('、')}`,
+        )
+        return prepared
+      }
+      const runSpecialistLifecycle = async (config: {
+        domain: SpecialistDomain
+        label: string
+        request: SpecialistRequest
+        events: (
+          executionId: string, runtime: ToolRuntime, activeBudget: ReturnType<typeof createActiveBudget>,
+          executionDeadlineSignal: AbortSignal,
+        ) => AsyncIterable<ModelEvent>
+      }) => {
+        const specialistSession = config.request.prepared ?? await (async () => {
+          const prepared = await prepareSpecialist({
+            domain: config.domain, researchQuestion: config.request.researchQuestion,
+            reason: config.request.reason,
+          })
+          await setStatus(
+            sessionId, executionId, `execution:${executionId}:${config.domain}:waiting`,
+            'waiting_for_specialists', {}, `专项 Session：${prepared.sessionId}`,
+          )
+          return prepared
+        })()
         if (!specialistSession.created) {
           const versions = await options.eventRepository.listReportVersions(analysisId)
           const existing = versions.filter(
             ({ sessionId }) => sessionId === specialistSession.sessionId,
           ).at(-1)
-          await setStatus(
-            sessionId, executionId,
-            `execution:${executionId}:${slug}-specialist:resumed`, 'running_tools', {},
-          )
           return {
             launched: true, status: existing ? 'completed' : 'not_started',
             sessionId: specialistSession.sessionId, executionId: specialistSession.executionId,
@@ -471,17 +498,29 @@ export function createAnalysisService(options: {
             keyFactIds: [], contraryFactIds: [], gaps: [],
           }
         }
+        const specialistSessionId = specialistSession.sessionId
+        const specialistExecutionId = specialistSession.executionId
         let specialistStatus = 'failed'
         let specialistReportVersion: ReturnType<typeof finalReportVersion> | undefined
+        let specialistReportNumber: number | undefined
+        const specialistActiveBudget = createActiveBudget(
+          runtimeSettings.researchActiveMinutes * (options.runtimeMinuteMs ?? 60_000),
+          options.activeNow, options.activeTimeoutSignal,
+        )
+        const specialistWallDeadline = AbortSignal.timeout(
+          runtimeSettings.executionWallClockMinutes * (options.runtimeMinuteMs ?? 60_000),
+        )
         try {
           await setStatus(
-            requestedSessionId, requestedExecutionId,
-            `execution:${requestedExecutionId}:running-model`,
+            specialistSessionId, specialistExecutionId,
+            `execution:${specialistExecutionId}:running-model`,
             'running_model', {}, `${config.label}专项模型`,
           )
-          for await (const specialistEvent of config.events(requestedExecutionId, toolRuntime)) {
+          for await (const specialistEvent of config.events(
+            specialistExecutionId, toolRuntime, specialistActiveBudget, specialistWallDeadline,
+          )) {
             if (specialistEvent.type === 'lifecycle') await setStatus(
-              requestedSessionId, requestedExecutionId, specialistEvent.operationId,
+              specialistSessionId, specialistExecutionId, specialistEvent.operationId,
               specialistEvent.status, {
                 terminal: specialistEvent.status === 'budget_exhausted' ? false : undefined,
               }, specialistEvent.waitTarget,
@@ -489,13 +528,13 @@ export function createAnalysisService(options: {
             else if (specialistEvent.type === 'trace'
               && (specialistEvent.entry.type !== 'tool_result'
                 || typeof specialistEvent.entry.operationId !== 'string')) {
-              await appendTrace(requestedSessionId, requestedExecutionId, specialistEvent.entry)
+              await appendTrace(specialistSessionId, specialistExecutionId, specialistEvent.entry)
             }
             else if (specialistEvent.type === 'text_delta') await appendTrace(
-              requestedSessionId, requestedExecutionId, specialistEvent.operationId
+              specialistSessionId, specialistExecutionId, specialistEvent.operationId
                 ? specialistEvent : {
                     ...specialistEvent,
-                    operationId: `execution:${requestedExecutionId}:text:${Date.now()}`,
+                    operationId: `execution:${specialistExecutionId}:text:${Date.now()}`,
                   },
             )
             else if (specialistEvent.type === 'completed' && specialistEvent.reportVersion) {
@@ -504,32 +543,53 @@ export function createAnalysisService(options: {
               const status = candidateReport.status === 'partial' ? 'partial' : 'completed'
               specialistStatus = status
               specialistReportVersion = finalReportVersion(
-                requestedExecutionId, candidate, specialistEvent.report, status, [],
+                specialistExecutionId, candidate, specialistEvent.report, status, [],
               )
               await setStatus(
-                requestedSessionId, requestedExecutionId,
-                `execution:${requestedExecutionId}:status-${status}`, status,
+                specialistSessionId, specialistExecutionId,
+                `execution:${specialistExecutionId}:status-${status}`, status,
                 { reportVersion: specialistReportVersion },
               )
+              specialistReportNumber = (await options.eventRepository.listReportVersions(analysisId))
+                .find(({ id }) => id === specialistReportVersion!.id)?.version
+              if (!specialistReportNumber) throw new Error('specialist_report_version_not_found')
+            }
+            else if (specialistEvent.type === 'cancelled') {
+              specialistStatus = 'cancelled'
+              await setStatus(
+                specialistSessionId, specialistExecutionId,
+                `execution:${specialistExecutionId}:status-cancelled`, 'cancelled',
+              )
+              return {
+                launched: true, status: 'cancelled', sessionId: specialistSessionId,
+                executionId: specialistExecutionId, summary: `${config.label}专项已取消`,
+                keyFactIds: [], contraryFactIds: [],
+                gaps: [{
+                  capability: config.domain, reason: 'specialist_execution_cancelled',
+                  impact: '该专项未形成报告',
+                }],
+              }
             }
           }
           if (!specialistReportVersion) throw new Error('specialist_report_required')
         } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
           await setStatus(
-            requestedSessionId, requestedExecutionId,
-            `execution:${requestedExecutionId}:status-failed`, 'failed',
-            { error: error instanceof Error ? error.message : String(error) },
+            specialistSessionId, specialistExecutionId,
+            `execution:${specialistExecutionId}:status-failed`, 'failed',
+            { error: message },
           )
-          throw error
+          return {
+            launched: true, status: 'failed', sessionId: specialistSessionId,
+            executionId: specialistExecutionId,
+            summary: `${config.label}专项失败`, keyFactIds: [], contraryFactIds: [],
+            gaps: [{ capability: config.domain, reason: message, impact: '该专项无法形成报告' }],
+          }
         }
-        await setStatus(
-          sessionId, executionId,
-          `execution:${executionId}:${slug}-specialist:completed`, 'running_tools', {},
-        )
         return {
-          launched: true, status: specialistStatus, sessionId: requestedSessionId,
-          executionId: requestedExecutionId, reportId: specialistReportVersion.id,
-          reportVersion: 1,
+          launched: true, status: specialistStatus, sessionId: specialistSessionId,
+          executionId: specialistExecutionId, reportId: specialistReportVersion.id,
+          reportVersion: specialistReportNumber!,
           ...specialistResultProjection(
             specialistReportVersion.report, config.request.researchQuestion,
           ),
@@ -542,7 +602,10 @@ export function createAnalysisService(options: {
         }
         return runSpecialistLifecycle({
           domain: 'news', label: '消息面', request,
-          events: (specialistExecutionId, specialistRuntime) => options.model.analyzeNews!({
+          events: (
+            specialistExecutionId, specialistRuntime, specialistActiveBudget,
+            specialistWallDeadline,
+          ) => options.model.analyzeNews!({
             executionId: specialistExecutionId, runtimeSettings, symbol: job.symbol,
             systemPrompt: '你是独立消息面 Agent。只使用新闻候选、新闻文档和公司事件工具；每项判断引用合格事实 ID，禁止个人买卖或仓位建议。',
             researchQuestion: request.researchQuestion, knownFacts: modelContext.facts,
@@ -550,7 +613,8 @@ export function createAnalysisService(options: {
             searchWebEvidence: options.searchWebEvidence,
             readNewsDocument: options.readNewsDocument!,
             listCompanyEvents: options.listCompanyEvents!,
-            signal: controller.signal, executionDeadlineSignal: wallDeadline, activeBudget,
+            signal: controller.signal, executionDeadlineSignal: specialistWallDeadline,
+            activeBudget: specialistActiveBudget,
             acquireModelSlot: (signal) => modelGate.acquire(signal),
             acquireToolSlot: (signal) => toolGate.acquire(signal), toolRuntime: specialistRuntime,
           }),
@@ -565,7 +629,10 @@ export function createAnalysisService(options: {
         }
         return runSpecialistLifecycle({
           domain: 'fundamental_valuation', label: '基本面', request,
-          events: (specialistExecutionId, specialistRuntime) => options.model.analyzeFundamental!({
+          events: (
+            specialistExecutionId, specialistRuntime, specialistActiveBudget,
+            specialistWallDeadline,
+          ) => options.model.analyzeFundamental!({
             executionId: specialistExecutionId, runtimeSettings, symbol: job.symbol,
             systemPrompt: '你是独立基本面 Agent。只使用财务概览、指标序列、Filing 和官方公司事件；每项判断引用正式或确定性财务事实，禁止个人买卖或仓位建议。',
             researchQuestion: request.researchQuestion, knownFacts: modelContext.facts,
@@ -574,7 +641,8 @@ export function createAnalysisService(options: {
             getValuationEvidence: options.getValuationEvidence!,
             readFilingDocument: options.readFilingDocument!,
             listCompanyEvents: options.listOfficialCompanyEvents!,
-            signal: controller.signal, executionDeadlineSignal: wallDeadline, activeBudget,
+            signal: controller.signal, executionDeadlineSignal: specialistWallDeadline,
+            activeBudget: specialistActiveBudget,
             acquireModelSlot: (signal) => modelGate.acquire(signal),
             acquireToolSlot: (signal) => toolGate.acquire(signal), toolRuntime: specialistRuntime,
           }),
@@ -587,13 +655,17 @@ export function createAnalysisService(options: {
         }
         return runSpecialistLifecycle({
           domain: 'technical', label: '技术面', request,
-          events: (specialistExecutionId, specialistRuntime) => options.model.analyzeTechnical!({
+          events: (
+            specialistExecutionId, specialistRuntime, specialistActiveBudget,
+            specialistWallDeadline,
+          ) => options.model.analyzeTechnical!({
             executionId: specialistExecutionId, runtimeSettings, symbol: job.symbol,
             systemPrompt: '你是独立技术面 Agent。只使用宿主确定性技术证据和受控价格窗口；不得把模型上下文裁剪长度称为数据源总历史长度，不自行计算新指标；每项判断保留反方证据与失效条件，禁止个人买卖或仓位建议。',
             researchQuestion: request.researchQuestion, knownFacts: modelContext.facts,
             getTechnicalEvidence: options.getTechnicalEvidence!,
             getPriceWindow: options.getPriceWindow!,
-            signal: controller.signal, executionDeadlineSignal: wallDeadline, activeBudget,
+            signal: controller.signal, executionDeadlineSignal: specialistWallDeadline,
+            activeBudget: specialistActiveBudget,
             acquireModelSlot: (signal) => modelGate.acquire(signal),
             acquireToolSlot: (signal) => toolGate.acquire(signal), toolRuntime: specialistRuntime,
           }),
@@ -614,6 +686,7 @@ export function createAnalysisService(options: {
         knownFacts: modelContext.facts,
         fetchFinancialContext: async () => modelContext,
         financialContextToolViews: { model: modelContext, retained: snapshot },
+        prepareSpecialistBatch,
         signal: controller.signal,
         executionDeadlineSignal: wallDeadline,
         activeBudget,
@@ -779,7 +852,7 @@ export function createAnalysisService(options: {
     const specialistAgents = await Promise.all(specialistSessions.map(async (specialist) => {
       const lifecycle = await options.eventRepository.sessionLifecycle(specialist.id)
       const events = lifecycle?.events as Array<Record<string, unknown>> | undefined
-      const created = events?.find((event) => event.type === 'specialist_context')
+      const created = events?.filter((event) => event.type === 'specialist_context').at(-1)
       const reportVersion = reportVersions.filter(({ sessionId }) => sessionId === specialist.id).at(-1)
       return lifecycle ? {
         ...lifecycle, domain: created?.domain ?? 'unknown',

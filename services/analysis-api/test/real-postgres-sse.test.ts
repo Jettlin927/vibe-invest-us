@@ -1891,6 +1891,129 @@ test('同一 execution 两次专项 invocation 在真实 PostgreSQL 各自封存
   }
 })
 
+test('三个专项经真实 PostgreSQL、HTTP 与 SSE 并行重叠且整批终态后唤醒主 Agent', {
+  skip: !databaseUrl || !migrationDatabaseUrl,
+  concurrency: false,
+}, async () => {
+  await migrate(migrationDatabaseUrl!)
+  const pool = createPool(databaseUrl!)
+  const events = createAgentEventRepository(pool)
+  const domains = ['news', 'fundamental_valuation', 'technical'] as const
+  const intervals = new Map<string, { start: number; end: number }>()
+  let release!: () => void
+  const barrier = new Promise<void>((resolve) => { release = resolve })
+  const specialistReport = (domain: typeof domains[number]) => ({
+    kind: 'specialist' as const, domain, availability: 'partial' as const,
+    status: 'partial' as const, gaps: [{
+      capability: domain, reason: 'bounded_test', impact: '纵向测试不执行领域数据工具',
+    }],
+    limitations: ['纵向测试受限报告'], keyJudgments: [],
+  })
+  const specialistModel = (domain: typeof domains[number]) => createPiModel({ fauxResponses: [
+    async () => {
+      intervals.set(domain, { start: Date.now(), end: 0 })
+      if (intervals.size === domains.length) release()
+      await barrier
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      intervals.get(domain)!.end = Date.now()
+      return fauxAssistantMessage(fauxToolCall(
+        'submit_specialist_report', specialistReport(domain),
+      ), { stopReason: 'toolUse' })
+    },
+  ] })
+  const compactResults: Array<Record<string, unknown>> = []
+  const mainModel = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(domains.map((domain) => fauxToolCall(({
+      news: 'run_news_analysis', fundamental_valuation: 'run_fundamental_analysis',
+      technical: 'run_technical_analysis',
+    } as const)[domain], {
+      launch: true, researchQuestion: `${domain} question`, reason: `${domain} reason`,
+    }, { id: `${domain}-call` })), { stopReason: 'toolUse' }),
+    (context) => {
+      for (const message of context.messages.filter(({ role }) => role === 'toolResult').slice(-3)) {
+        if (message.role !== 'toolResult') continue
+        const text = message.content.find(({ type }) => type === 'text')
+        if (text?.type === 'text') compactResults.push(JSON.parse(text.text))
+      }
+      return fauxAssistantMessage(fauxToolCall('submit_analysis_report', integratedReport({
+        title: '三专项并行闭环', marketState: '数据有限', trend: '震荡', drivers: [],
+        supportingEvidence: [], contraryEvidence: [], keyJudgments: [], scenarios: [],
+        invalidationConditions: [], valuation: null, personalImpact: null,
+        conditionalSuggestion: null, limitations: [],
+      })), { stopReason: 'toolUse' })
+    },
+  ] })
+  const news = specialistModel('news')
+  const fundamental = specialistModel('fundamental_valuation')
+  const technical = specialistModel('technical')
+  const model = {
+    ...mainModel, analyzeNews: news.analyzeNews,
+    analyzeFundamental: fundamental.analyzeFundamental,
+    analyzeTechnical: technical.analyzeTechnical,
+  }
+  const emptyFacts = async () => ({ facts: [] })
+  const app = buildApp({
+    productDatabase: { checkSchema: () => checkSchema(pool), close: () => pool.end() },
+    portfolioRepository: createPortfolioRepository(pool),
+    analysisRepository: createAnalysisRepository(pool), agentEventRepository: events,
+    runtimeSettingsRepository: createRuntimeSettingsRepository(pool),
+    toolProjectionRepository: createToolProjectionRepository(pool),
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, gaps: [], facts: [] }),
+    searchNewsCandidates: emptyFacts, readNewsDocument: emptyFacts,
+    listCompanyEvents: emptyFacts, getFinancialOverview: emptyFacts,
+    getFinancialMetricSeries: emptyFacts, getValuationEvidence: emptyFacts,
+    readFilingDocument: emptyFacts, listOfficialCompanyEvents: emptyFacts,
+    getTechnicalEvidence: emptyFacts, getPriceWindow: emptyFacts, model,
+  } as any)
+  await app.listen({ host: '127.0.0.1', port: 0 })
+  const address = app.server.address()
+  assert.ok(address && typeof address === 'object')
+  const baseUrl = `http://127.0.0.1:${address.port}`
+  const created = await fetch(`${baseUrl}/api/analyses`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ symbol: 'PAR3' }),
+  }).then((response) => response.json()) as { analysisId: string; sessionId: string }
+  try {
+    await waitForAnalysisStatus(app, created.analysisId, 'completed')
+    const research = await fetch(`${baseUrl}/api/research/${created.analysisId}`)
+      .then((response) => response.json())
+    assert.equal(research.specialistAgents.length, 3)
+    assert.deepEqual(new Set(research.specialistAgents.map((agent: any) => agent.domain)),
+      new Set(domains))
+    assert.ok(research.specialistAgents.every((agent: any) => agent.execution.status === 'partial'))
+    const waiting = research.mainAgent.events.filter((event: any) => (
+      event.status === 'waiting_for_specialists'
+    ))
+    assert.equal(waiting.length, 1)
+    for (const agent of research.specialistAgents) {
+      assert.match(waiting[0].waitReason.target, new RegExp(agent.id))
+      const replay = await fetch(`${baseUrl}/api/agent-sessions/${agent.id}/events`)
+        .then((response) => response.text())
+      assert.match(replay, /event: partial/)
+    }
+    const mainReplay = await fetch(`${baseUrl}/api/agent-sessions/${created.sessionId}/events`)
+      .then((response) => response.text())
+    assert.equal((mainReplay.match(/event: waiting_for_specialists/g) ?? []).length, 1)
+    const versions = await fetch(`${baseUrl}/api/research/${created.analysisId}/report-versions`)
+      .then((response) => response.json())
+    assert.equal(versions.items.filter((item: any) => item.kind === 'specialist').length, 3)
+    assert.equal(compactResults.length, 3)
+    assert.ok(compactResults.every((result) => result.reportVersion === 1
+      && typeof result.sessionId === 'string' && !('events' in result)))
+    const latestStart = Math.max(...[...intervals.values()].map(({ start }) => start))
+    const earliestEnd = Math.min(...[...intervals.values()].map(({ end }) => end))
+    assert.ok(latestStart < earliestEnd, `specialists_not_overlapping:${JSON.stringify([...intervals])}`)
+    const runResults = research.mainAgent.events.filter((event: any) => (
+      event.type === 'tool_result' && String(event.name).startsWith('run_')
+    ))
+    assert.equal(runResults.length, 3)
+    const latestToolStart = Math.max(...runResults.map((event: any) => Date.parse(event.startedAt)))
+    const earliestToolEnd = Math.min(...runResults.map((event: any) => Date.parse(event.completedAt)))
+    assert.ok(latestToolStart < earliestToolEnd)
+  } finally { await app.close() }
+})
+
 async function readThrough(response: Response, marker: string) {
   return readThroughReader(response.body!.getReader(), marker)
 }

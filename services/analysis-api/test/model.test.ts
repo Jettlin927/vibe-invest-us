@@ -222,6 +222,117 @@ test('技术面能力可用时主 Agent 未作启动决定不能直接提交综�
   assert.equal(events.filter((event) => event.type === 'completed').length, 1)
 })
 
+test('主 Agent 同一 Turn 启动三个专项时真实重叠且全部终态后才进入下一 Turn', async () => {
+  const started: string[] = []
+  const preparedRequests: unknown[] = []
+  let release!: () => void
+  const barrier = new Promise<void>((resolve) => { release = resolve })
+  let allStarted!: () => void
+  const allStartedPromise = new Promise<void>((resolve) => { allStarted = resolve })
+  let secondTurnAt = 0
+  const compactResults: Array<Record<string, unknown>> = []
+  const specialist = (domain: string) => async () => {
+    started.push(domain)
+    if (started.length === 3) allStarted()
+    await barrier
+    return {
+      launched: true, status: 'completed', sessionId: `${domain}-session`,
+      executionId: `${domain}-execution`, reportId: `${domain}-report`, reportVersion: 1,
+      summary: `${domain} summary`, keyFactIds: [], contraryFactIds: [], gaps: [],
+    }
+  }
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage([
+      fauxToolCall('run_news_analysis', {
+        launch: true, researchQuestion: '消息面？', reason: '需要消息面证据',
+      }, { id: 'news-call' }),
+      fauxToolCall('run_fundamental_analysis', {
+        launch: true, researchQuestion: '基本面？', reason: '需要基本面证据',
+      }, { id: 'fundamental-call' }),
+      fauxToolCall('run_technical_analysis', {
+        launch: true, researchQuestion: '技术面？', reason: '需要技术面证据',
+      }, { id: 'technical-call' }),
+    ], { stopReason: 'toolUse' }),
+    (context) => {
+      secondTurnAt = Date.now()
+      for (const message of context.messages.filter(({ role }) => role === 'toolResult').slice(-3)) {
+        if (message.role !== 'toolResult') continue
+        const value = message.content.find(({ type }) => type === 'text')
+        if (value?.type === 'text') compactResults.push(JSON.parse(value.text))
+      }
+      return fauxAssistantMessage(fauxToolCall('submit_analysis_report', validReport), {
+        stopReason: 'toolUse',
+      })
+    },
+  ] })
+  const lifecycleEvents: Array<{ status?: string; waitTarget?: string }> = []
+  const consumed = (async () => {
+    for await (const event of model.analyze({
+      executionId: 'parallel-specialists', runtimeSettings: runtimeSettings(), symbol: 'NVDA',
+      systemPrompt: 'system', knownFacts: facts, fetchFinancialContext: async () => ({ facts }),
+      prepareSpecialistBatch: async (requests) => {
+        preparedRequests.push(...requests)
+        return requests.map((request) => ({
+          domain: request.domain, sessionId: `${request.domain}-session`,
+          executionId: `${request.domain}-execution`, created: true,
+        }))
+      },
+      runNewsSpecialist: specialist('news'),
+      runFundamentalSpecialist: specialist('fundamental'),
+      runTechnicalSpecialist: specialist('technical'),
+    })) if (event.type === 'lifecycle') lifecycleEvents.push(event)
+  })()
+  const overlapped = await Promise.race([
+    allStartedPromise.then(() => true),
+    new Promise<false>((resolve) => setTimeout(() => resolve(false), 100)),
+  ])
+  assert.equal(secondTurnAt, 0)
+  release()
+  await consumed
+
+  assert.equal(overlapped, true)
+  assert.deepEqual(new Set(started), new Set(['news', 'fundamental', 'technical']))
+  assert.ok(secondTurnAt > 0)
+  assert.equal(preparedRequests.length, 3)
+  const waiting = lifecycleEvents.filter(({ status }) => status === 'waiting_for_specialists')
+  assert.equal(waiting.length, 1)
+  assert.match(waiting[0]!.waitTarget ?? '', /news-session/)
+  assert.match(waiting[0]!.waitTarget ?? '', /fundamental_valuation-session/)
+  assert.match(waiting[0]!.waitTarget ?? '', /technical-session/)
+  assert.equal(compactResults.length, 3)
+  assert.deepEqual(new Set(compactResults.map(({ status }) => status)), new Set(['completed']))
+  assert.deepEqual(new Set(compactResults.map(({ reportVersion }) => reportVersion)), new Set([1]))
+  assert.ok(compactResults.every(({ sessionId, executionId, reportId }) => (
+    typeof sessionId === 'string' && typeof executionId === 'string' && typeof reportId === 'string'
+  )))
+  assert.ok(compactResults.every((result) => !('events' in result) && !('trace' in result)))
+})
+
+test('主 Agent 不会为参数校验失败的专项调用预创建 Session', async () => {
+  let prepared = 0
+  let launched = 0
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall('run_news_analysis', {
+      launch: true, researchQuestion: '', reason: '缺少问题',
+    }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('run_news_analysis', {
+      launch: false, researchQuestion: '是否需要消息面？', reason: '非法调用后明确不启动',
+    }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('submit_analysis_report', validReport), { stopReason: 'toolUse' }),
+  ] })
+  const events = []
+  for await (const event of model.analyze({
+    executionId: 'invalid-specialist-batch', runtimeSettings: runtimeSettings(), symbol: 'NVDA',
+    systemPrompt: 'system', knownFacts: facts, fetchFinancialContext: async () => ({ facts }),
+    prepareSpecialistBatch: async (requests) => { prepared += requests.length; return [] },
+    runNewsSpecialist: async () => { launched += 1; return {} },
+  })) events.push(event)
+
+  assert.equal(prepared, 0)
+  assert.equal(launched, 0)
+  assert.match(JSON.stringify(events), /invalid_tool_arguments/)
+})
+
 test('消息面正文只能读取当前专项候选工具返回的 Fact', async () => {
   const priorCandidate = { ...facts[0]!, id: 'fact:prior-news', type: 'news', evidenceLevel: 'title_only' }
   let reads = 0

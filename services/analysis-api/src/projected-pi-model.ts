@@ -78,6 +78,9 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
       let newsDecisionRecorded = false
       let fundamentalDecisionRecorded = false
       let technicalDecisionRecorded = false
+      const preparedSpecialists = new Map<string, {
+        sessionId: string; executionId: string; created: boolean
+      }>()
       const reportValidationState = { failures: 0, exhausted: false }
 
       const loadFrozenContext = async (symbol: string) => {
@@ -141,6 +144,30 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
         systemPrompt: input.systemPrompt,
         userPrompt: input.runtimeContext ? runtimeContextMessage(input.runtimeContext) : input.userPrompt ?? '',
         shouldRejectNextTurn: () => reportValidationState.exhausted,
+        prepareSpecialistBatch: input.prepareSpecialistBatch ? async (calls, batchId) => {
+          const domainByTool = {
+            run_news_analysis: 'news', run_fundamental_analysis: 'fundamental_valuation',
+            run_technical_analysis: 'technical',
+          } as const
+          const requests = calls.flatMap((call) => {
+            const domain = domainByTool[call.toolName as keyof typeof domainByTool]
+            if (!domain) return []
+            let params: Record<string, unknown>
+            try {
+              params = asRecord(validateToolCall([toolRegistry.definition(call.toolName)!.model], {
+                type: 'toolCall', id: call.toolCallId, name: call.toolName,
+                arguments: asRecord(call.input),
+              }))
+            } catch { return [] }
+            return domain && params.launch === true ? [{
+              domain, researchQuestion: asString(params.researchQuestion), reason: asString(params.reason),
+            }] : []
+          })
+          if (!requests.length) return []
+          const prepared = await input.prepareSpecialistBatch!(requests, batchId)
+          for (const item of prepared) preparedSpecialists.set(item.domain, item)
+          return prepared.map(({ sessionId }) => sessionId)
+        } : undefined,
         execute: async (name, params, signal, onStart) => {
           if (name === unavailableToolName) { await onStart(); return failed('tool_not_available') }
           if (name === 'fetch_financial_context') {
@@ -180,7 +207,10 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
               return succeeded({ launched: false, status: 'not_started', reason, researchQuestion })
             }
             if (!input.runFundamentalSpecialist) return failed('fundamental_specialist_runtime_unavailable')
-            return succeeded(await input.runFundamentalSpecialist({ launch: true, researchQuestion, reason }))
+            const prepared = preparedSpecialists.get('fundamental_valuation')
+            return succeeded(await input.runFundamentalSpecialist({
+              launch: true, researchQuestion, reason, ...(prepared ? { prepared } : {}),
+            }))
           }
           if (name === 'run_news_analysis') {
             await onStart()
@@ -194,8 +224,9 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
               return succeeded({ launched: false, status: 'not_started', reason, researchQuestion })
             }
             if (!input.runNewsSpecialist) return failed('news_specialist_runtime_unavailable')
+            const prepared = preparedSpecialists.get('news')
             return succeeded(await input.runNewsSpecialist({
-              launch: true, researchQuestion, reason,
+              launch: true, researchQuestion, reason, ...(prepared ? { prepared } : {}),
             }))
           }
           if (name === 'run_technical_analysis') {
@@ -210,8 +241,9 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
               return succeeded({ launched: false, status: 'not_started', reason, researchQuestion })
             }
             if (!input.runTechnicalSpecialist) return failed('technical_specialist_runtime_unavailable')
+            const prepared = preparedSpecialists.get('technical')
             return succeeded(await input.runTechnicalSpecialist({
-              launch: true, researchQuestion, reason,
+              launch: true, researchQuestion, reason, ...(prepared ? { prepared } : {}),
             }))
           }
           if (name === 'submit_analysis_report') {
@@ -617,6 +649,7 @@ async function runProjectedAgent(config: {
   shouldRejectNextTurn?: () => boolean
   nextResearchTools?: () => Tool[]
   beforeNextProjection?: () => Extract<ModelEvent, { type: 'trace' }>['entry'] | undefined
+  prepareSpecialistBatch?: (calls: Batch['calls'], batchId: string) => Promise<string[]>
   execute: (
     name: string, params: unknown, signal: AbortSignal, onStart: () => Promise<void>,
   ) => Promise<ExecutedTool>
@@ -711,7 +744,9 @@ async function runProjectedAgent(config: {
         }],
         details: { audit }, terminate: executed.terminate,
       }
-    }, config.role === 'main' ? 'sequential' : undefined)),
+    }, config.role === 'main'
+      && !['run_news_analysis', 'run_fundamental_analysis', 'run_technical_analysis']
+        .includes(definition.name) ? 'sequential' : undefined)),
     toAdapterTool({
       name: unavailableToolName, description: 'Unavailable tool',
       parameters: { type: 'object', additionalProperties: true },
@@ -958,9 +993,13 @@ async function runProjectedAgent(config: {
         id: batch.id, executionId: input.executionId, projectionId: activeProjection.id,
         turnIndex, calls: batch.calls, createdAt: new Date().toISOString(),
       })
-      config.queue.push({
-        type: 'lifecycle', status: 'running_tools',
-        operationId: `${batch.id}:running-tools`,
+      const specialistSessionIds = await config.prepareSpecialistBatch?.(batch.calls, batch.id) ?? []
+      config.queue.push(specialistSessionIds.length ? {
+        type: 'lifecycle', status: 'waiting_for_specialists',
+        waitTarget: `专项 Session：${specialistSessionIds.join('、')}`,
+        operationId: `${batch.id}:waiting-for-specialists`,
+      } : {
+        type: 'lifecycle', status: 'running_tools', operationId: `${batch.id}:running-tools`,
       })
     }
     if (event.type === 'tool_execution_end' && currentBatch
@@ -1231,6 +1270,8 @@ function modelToolResult(name: string, result: Record<string, unknown>) {
   }
   const allowed = [
     'facts', 'gaps', 'summary', 'analysis', 'error', 'source', 'sources',
+    'launched', 'status', 'sessionId', 'executionId', 'reportId', 'reportVersion',
+    'keyFactIds', 'contraryFactIds',
     'cursor', 'nextCursor', 'pagination', 'truncated', 'resultCount',
     'returnedCount', 'totalCount', 'items', 'overview',
     'symbol', 'authorizedComparables', 'comparables',

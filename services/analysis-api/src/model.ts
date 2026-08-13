@@ -99,20 +99,33 @@ export type AnalyzeInput = {
     signal: AbortSignal,
   ) => Promise<{ facts: Fact[]; [key: string]: unknown }>
   financialContextToolViews?: FinancialContextToolViews
+  prepareSpecialistBatch?: (requests: Array<{
+    domain: 'news' | 'fundamental_valuation' | 'technical'
+    researchQuestion: string
+    reason: string
+  }>, batchId: string) => Promise<Array<{
+    domain: 'news' | 'fundamental_valuation' | 'technical'
+    sessionId: string
+    executionId: string
+    created: boolean
+  }>>
   runNewsSpecialist?: (input: {
     launch: boolean
     researchQuestion: string
     reason: string
+    prepared?: { sessionId: string; executionId: string; created: boolean }
   }) => Promise<Record<string, unknown>>
   runFundamentalSpecialist?: (input: {
     launch: boolean
     researchQuestion: string
     reason: string
+    prepared?: { sessionId: string; executionId: string; created: boolean }
   }) => Promise<Record<string, unknown>>
   runTechnicalSpecialist?: (input: {
     launch: boolean
     researchQuestion: string
     reason: string
+    prepared?: { sessionId: string; executionId: string; created: boolean }
   }) => Promise<Record<string, unknown>>
   signal?: AbortSignal
   executionDeadlineSignal?: AbortSignal

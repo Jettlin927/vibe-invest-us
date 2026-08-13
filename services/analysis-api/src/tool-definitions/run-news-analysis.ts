@@ -15,5 +15,5 @@ export const runNewsAnalysisDefinition: RegisteredToolDefinition = {
   }),
   allowedRoles: ['main'], allowedStages: ['research'], sideEffect: 'read_only',
   externalNetwork: 'none', resultRetention: 'research_record',
-  modelProjection: 'bounded_summary', executionMode: 'sequential', countsAsToolRound: true,
+  modelProjection: 'bounded_summary', executionMode: 'parallel', countsAsToolRound: true,
 }

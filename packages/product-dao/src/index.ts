@@ -1404,15 +1404,71 @@ export function createAgentEventRepository(pool: Pool) {
           [input.id, input.analysisId, input.domain, input.executionId, input.status, input.createdAt],
         )
         if (!inserted.rows[0]) {
-          const existing = await client.query<{ id: string; execution_id: string }>(
-            `SELECT id, execution_id FROM agent_sessions
-             WHERE analysis_id = $1 AND domain = $2`, [input.analysisId, input.domain],
+          const existing = await client.query<{
+            id: string; execution_id: string; latest_sequence: number
+          }>(
+            `SELECT id, execution_id, latest_sequence FROM agent_sessions
+             WHERE analysis_id = $1 AND domain = $2 FOR UPDATE`, [input.analysisId, input.domain],
+          )
+          const session = existing.rows[0]!
+          const replay = await client.query<AgentEventRow>(
+            `SELECT session_id, sequence, operation_id, payload_json, created_at::text
+             FROM agent_events WHERE session_id = $1 AND operation_id = $2`,
+            [session.id, input.operationId],
+          )
+          if (replay.rows[0]) {
+            const replayExecution = await client.query<{ session_id: string }>(
+              'SELECT session_id FROM agent_executions WHERE id = $1', [input.executionId],
+            )
+            if (replayExecution.rows[0]?.session_id !== session.id
+              || !jsonValuesEqual(replay.rows[0].payload_json, input.event)
+              || !sameInstant(replay.rows[0].created_at, input.createdAt)) {
+              throw new Error('agent_operation_conflict')
+            }
+            await client.query('COMMIT')
+            return { sessionId: session.id, executionId: input.executionId, created: false }
+          }
+          const current = await client.query<{ generation: number; terminal: boolean }>(
+            `SELECT generation, terminal FROM agent_executions
+             WHERE id = $1 FOR UPDATE`, [session.execution_id],
+          )
+          if (!current.rows[0]?.terminal) {
+            await client.query('COMMIT')
+            return { sessionId: session.id, executionId: session.execution_id, created: false }
+          }
+          const sequence = session.latest_sequence + 1
+          const generation = current.rows[0].generation + 1
+          const segment = await client.query<{ next_ordinal: number }>(
+            `SELECT COALESCE(max(ordinal), 0)::integer + 1 AS next_ordinal
+             FROM conversation_segments WHERE session_id = $1`, [session.id],
+          )
+          const ordinal = segment.rows[0]!.next_ordinal
+          const waitReason = { kind: 'database', target: '专项研究规划', startedAt: input.createdAt }
+          await client.query(
+            `INSERT INTO agent_executions (
+               id, session_id, generation, status, wait_reason_json, terminal, created_at, updated_at
+             ) VALUES ($1, $2, $3, 'planning', $4, false, $5, $5)`,
+            [input.executionId, session.id, generation, JSON.stringify(waitReason), input.createdAt],
+          )
+          await client.query(
+            `INSERT INTO conversation_segments (id, session_id, ordinal, created_at)
+             VALUES ($1, $2, $3, $4)`,
+            [input.segmentId ?? `${session.id}:segment:${ordinal}`, session.id, ordinal, input.createdAt],
+          )
+          await client.query(
+            `INSERT INTO agent_events (
+               session_id, sequence, operation_id, payload_json, created_at
+             ) VALUES ($1, $2, $3, $4, $5)`,
+            [session.id, sequence, input.operationId, JSON.stringify(input.event), input.createdAt],
+          )
+          await freezeExecutionSettings(client, input.executionId, input.createdAt)
+          await client.query(
+            `UPDATE agent_sessions SET execution_id = $1, status = 'planning',
+               latest_sequence = $2, updated_at = $3 WHERE id = $4`,
+            [input.executionId, sequence, input.createdAt, session.id],
           )
           await client.query('COMMIT')
-          return {
-            sessionId: existing.rows[0]!.id, executionId: existing.rows[0]!.execution_id,
-            created: false,
-          }
+          return { sessionId: session.id, executionId: input.executionId, created: true }
         }
         await client.query(
           `INSERT INTO agent_events (
