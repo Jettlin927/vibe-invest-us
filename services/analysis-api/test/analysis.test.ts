@@ -34,6 +34,17 @@ const report = {
   keyJudgments: [{ judgment: '短期偏强', evidence: [fact.id] }],
 }
 
+const reportCandidate = {
+  kind: 'integrated' as const, availability: 'available' as const,
+  status: 'completed' as const, gaps: [], ...report,
+  keyJudgments: report.keyJudgments.map(({ judgment, evidence }) => ({
+    type: 'market' as const, statement: judgment, direction: 'bullish' as const,
+    confidence: 'medium' as const, supportingEvidence: evidence,
+    contraryEvidence: [], contraryEvidenceStatus: 'none_found' as const,
+    invalidationConditions: report.invalidationConditions,
+  })),
+}
+
 function fakeModel(delay = 0) {
   return {
     async *analyze({ signal, fetchFinancialContext }: { signal?: AbortSignal; fetchFinancialContext?: () => Promise<any> }): AsyncGenerator<ModelEvent> {
@@ -46,7 +57,16 @@ function fakeModel(delay = 0) {
         const timer = setTimeout(resolve, delay)
         signal?.addEventListener('abort', () => { clearTimeout(timer); reject(signal.reason) }, { once: true })
       })
-      yield { type: 'completed', report }
+      yield {
+        type: 'completed', report,
+        reportVersion: {
+          kind: 'integrated',
+          report: {
+            kind: 'integrated', availability: 'available', status: 'completed',
+            gaps: [], limitations: [], title: report.title,
+          },
+        },
+      }
     },
   }
 }
@@ -93,6 +113,16 @@ test('创建分析立即返回标识并自动保存完成报告、快照、事�
   const reportCreatedAt = research.json().reportCreatedAt
   assert.equal(research.json().facts[0].source, 'sina')
   assert.ok(research.json().trace.some((entry: { type: string }) => entry.type === 'status'))
+
+  const versions = await app.inject({
+    method: 'GET', url: `/api/research/${analysisId}/report-versions`,
+  })
+  assert.equal(versions.statusCode, 200)
+  assert.equal(versions.json().items.length, 1)
+  assert.equal(versions.json().items[0].version, 1)
+  assert.equal(versions.json().items[0].kind, 'integrated')
+  assert.equal(versions.json().items[0].report.title, report.title)
+  assert.match(versions.json().items[0].payloadHash, /^[a-f0-9]{64}$/)
 
   const events = await app.inject({ method: 'GET', url: `/api/agent-sessions/${sessionId}/events` })
   assert.match(events.headers['content-type'] ?? '', /text\/event-stream/)
@@ -371,7 +401,9 @@ test('8 分钟 Runtime 加 8 分钟 provider 共用 10 分钟 active budget 并�
     },
     () => {
       requests += 1
-      return fauxAssistantMessage(fauxToolCall('submit_analysis_report', report), { stopReason: 'toolUse' })
+      return fauxAssistantMessage(
+        fauxToolCall('submit_analysis_report', reportCandidate), { stopReason: 'toolUse' },
+      )
     },
   ] })
   const app = buildProductionApp({
@@ -464,7 +496,9 @@ test('真实 Pi execution 冻结后修改 current 不改变运行轮次', async 
     model: createPiModel({
       fauxResponses: [
         fauxAssistantMessage(fauxToolCall('fetch_financial_context', {}), { stopReason: 'toolUse' }),
-        fauxAssistantMessage(fauxToolCall('submit_analysis_report', report), { stopReason: 'toolUse' }),
+        fauxAssistantMessage(
+          fauxToolCall('submit_analysis_report', reportCandidate), { stopReason: 'toolUse' },
+        ),
       ],
       fauxTokensPerSecond: 1000,
     }),

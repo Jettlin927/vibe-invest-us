@@ -49,6 +49,10 @@ function createTestToolRuntime(): ToolRuntime {
 }
 
 const validReport = {
+  kind: 'integrated' as const,
+  availability: 'available' as const,
+  status: 'completed' as const,
+  gaps: [],
   title: 'NVDA 一至四周综合分析',
   marketState: '价格处于短期均线之上。',
   trend: '未来一至四周偏强震荡。',
@@ -61,7 +65,11 @@ const validReport = {
   personalImpact: null,
   conditionalSuggestion: null,
   limitations: [],
-  keyJudgments: [{ judgment: '短期趋势偏强', evidence: ['fact:nvda:price:2026-08-12'] }],
+  keyJudgments: [{
+    type: 'market', statement: '短期趋势偏强', direction: 'bullish', confidence: 'medium',
+    supportingEvidence: ['fact:nvda:price:2026-08-12'], contraryEvidence: [],
+    contraryEvidenceStatus: 'none_found', invalidationConditions: ['跌破关键均线'],
+  }],
 }
 
 function runtimeSettings(overrides: Partial<typeof defaultRuntimeSettings> = {}) {
@@ -118,23 +126,26 @@ test('宽松报告允许证据和情景数组为空', async () => {
   assert.ok(events.some((event) => event.type === 'completed'))
 })
 
-test('所有工具参数均可省略且宿主提供当前任务默认值', async () => {
+test('报告工具稳定外壳缺失返回机器错误并只允许两轮修复', async () => {
   const model = createPiModel({ fauxResponses: [
     fauxAssistantMessage(fauxToolCall('fetch_financial_context', {}), { stopReason: 'toolUse' }),
     fauxAssistantMessage(fauxToolCall('submit_analysis_report', {}), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('submit_analysis_report', {}), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('submit_analysis_report', {}), { stopReason: 'toolUse' }),
   ] })
-  const events = []
-  for await (const event of model.analyze({
+  const events: Array<{ type: string; entry?: Record<string, unknown> }> = []
+  await assert.rejects(async () => { for await (const event of model.analyze({
     runtimeSettings: runtimeSettings(),
     symbol: 'NVDA', systemPrompt: 'system', userPrompt: 'user', knownFacts: facts,
     fetchFinancialContext: async (symbol) => ({ facts, symbol }),
-  })) events.push(event)
-  const completed = events.find((event) => event.type === 'completed')
-  assert.equal(completed?.type, 'completed')
-  if (completed?.type === 'completed') {
-    assert.equal(completed.report.title, '')
-    assert.deepEqual(completed.report.keyJudgments, [])
-  }
+  })) events.push(event as (typeof events)[number]) }, /report_validation_repair_exhausted/)
+  const results = events.filter((event) => event.type === 'trace'
+    && event.entry?.type === 'tool_result'
+    && event.entry.name === 'submit_analysis_report').map((event) => event.entry!.result)
+  assert.equal(results.length, 3)
+  assert.match(JSON.stringify(results), /"path":"\/kind"/)
+  assert.match(JSON.stringify(results), /"rule":"required"/)
+  assert.match(JSON.stringify(results), /candidatePayloadHash/)
 })
 
 function successResponses(report = validReport) {
@@ -160,7 +171,13 @@ test('Pi Model 通过只读工具流式生成结构化报告和完整轨迹', as
 
   const completed = events.find((event) => event.type === 'completed')
   assert.equal(completed?.type, 'completed')
-  if (completed?.type === 'completed') assert.deepEqual(completed.report, validReport)
+  if (completed?.type === 'completed') {
+    assert.equal(completed.report.title, validReport.title)
+    assert.deepEqual(completed.report.keyJudgments, [{
+      judgment: '短期趋势偏强', evidence: ['fact:nvda:price:2026-08-12'],
+    }])
+    assert.deepEqual(completed.reportVersion?.report, validReport)
+  }
   assert.ok(events.some((event) => event.type === 'trace' && event.entry.type === 'tool_call'))
   assert.ok(events.some((event) => event.type === 'trace'
     && event.entry.operationId.startsWith('execution:pi-model-test-execution:tool:')))
@@ -218,10 +235,59 @@ test('Pi Model 拒绝不存在的报告依据并允许模型修正后重交', as
   assert.ok(events.some((event) => event.type === 'completed'))
 })
 
+test('报告校验失败返回机器可读错误且最多允许两轮收口修复', async () => {
+  const badReport = {
+    ...validReport,
+    keyJudgments: [{
+      ...validReport.keyJudgments[0],
+      statement: '无法追溯的结论', supportingEvidence: ['fact:not-found'],
+    }],
+  }
+  const validationResults: string[] = []
+  const events: Array<{ type: string; entry?: Record<string, unknown> }> = []
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall('fetch_financial_context', { symbol: 'NVDA' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('submit_analysis_report', badReport), { stopReason: 'toolUse' }),
+    (context) => {
+      validationResults.push(JSON.stringify(context.messages.filter(({ role }) => role === 'toolResult').at(-1)))
+      return fauxAssistantMessage(fauxToolCall('submit_analysis_report', badReport), { stopReason: 'toolUse' })
+    },
+    (context) => {
+      validationResults.push(JSON.stringify(context.messages.filter(({ role }) => role === 'toolResult').at(-1)))
+      return fauxAssistantMessage(fauxToolCall('submit_analysis_report', badReport), { stopReason: 'toolUse' })
+    },
+  ] })
+
+  await assert.rejects(async () => {
+    for await (const _event of model.analyze({
+      runtimeSettings: runtimeSettings({ mainAgentToolRounds: 20 }),
+      symbol: 'NVDA', systemPrompt: 'system', userPrompt: 'user', knownFacts: facts,
+      fetchFinancialContext: async () => ({ facts }),
+    })) events.push(_event as (typeof events)[number])
+  }, /report_validation_repair_exhausted/)
+  assert.equal(validationResults.length, 2)
+  for (const result of validationResults) {
+    assert.match(result, /reference_integrity/)
+    assert.match(result, /\/keyJudgments\/0\/supportingEvidence\/0/)
+    assert.match(result, /allowedEvidenceTypes/)
+  }
+  const rejectionHashes = events.flatMap((event) => event.type === 'trace'
+    && event.entry?.type === 'tool_result'
+    && event.entry.name === 'submit_analysis_report'
+    ? [String((event.entry.result as Record<string, unknown>).candidatePayloadHash ?? '')]
+    : [])
+  assert.equal(rejectionHashes.length, 3)
+  assert.ok(rejectionHashes.every((hash) => /^[a-f0-9]{64}$/.test(hash)))
+  assert.equal(new Set(rejectionHashes).size, 1)
+})
+
 test('Pi Model 在关键判断依据不存在时不接受报告', async () => {
   const badReport = {
     ...validReport,
-    keyJudgments: [{ judgment: '无法追溯的结论', evidence: ['fact:not-found'] }],
+    keyJudgments: [{
+      ...validReport.keyJudgments[0], statement: '无法追溯的结论',
+      supportingEvidence: ['fact:not-found'],
+    }],
   }
   const model = createPiModel({ fauxResponses: [
     fauxAssistantMessage(fauxToolCall('fetch_financial_context', { symbol: 'NVDA' }), { stopReason: 'toolUse' }),
@@ -237,7 +303,7 @@ test('Pi Model 在关键判断依据不存在时不接受报告', async () => {
       symbol: 'NVDA', systemPrompt: 'system', userPrompt: 'user',
       knownFacts: facts, fetchFinancialContext: async () => ({ facts }),
     })) { /* consume */ }
-  }, /report_tool_required/)
+  }, /report_validation_repair_exhausted/)
 })
 
 test('Pi Model 为结构不完整的报告补齐安全默认值', async () => {
@@ -339,7 +405,10 @@ test('Pi Model 工具超时形成可引用失败事实', async () => {
     trend: '关键行情不可用，无法判断趋势。',
     supportingEvidence: [timeoutFact],
     contraryEvidence: [timeoutFact],
-    keyJudgments: [{ judgment: '数据不可用', evidence: [timeoutFact] }],
+    keyJudgments: [{
+      ...validReport.keyJudgments[0], type: 'operational', statement: '数据不可用',
+      direction: 'neutral', supportingEvidence: [timeoutFact],
+    }],
     limitations: ['金融数据工具超时'],
   }
   const model = createPiModel({ fauxResponses: successResponses(report), toolTimeoutMs: 10 })
@@ -1161,7 +1230,10 @@ test('Pi Model 不允许工具越过当前分析标的', async () => {
   const deniedReport = {
     ...validReport,
     supportingEvidence: [deniedFact], contraryEvidence: [deniedFact],
-    keyJudgments: [{ judgment: '越权补查已拒绝', evidence: [deniedFact] }],
+    keyJudgments: [{
+      ...validReport.keyJudgments[0], type: 'operational', statement: '越权补查已拒绝',
+      direction: 'neutral', supportingEvidence: [deniedFact],
+    }],
     limitations: ['只允许补查当前标的'],
   }
   const model = createPiModel({ fauxResponses: [
@@ -1208,8 +1280,12 @@ test('Pi Model 允许自由思考并按需调用独立财报专家后提交报�
 test('财报专家可自由调用新闻和技术指标工具并把新增事实交回主模型', async () => {
   const newsFact = {
     ...facts[0]!, id: 'fact:news:query', type: 'news', observedAt: '2026-08-01T00:00:00.000Z',
+    evidenceLevel: 'verified_news',
   }
-  const indicatorFact = { ...facts[0]!, id: 'fact:indicator:query', type: 'indicators' }
+  const indicatorFact = {
+    ...facts[0]!, id: 'fact:indicator:query', type: 'indicators',
+    evidenceLevel: 'deterministic_technical',
+  }
   const model = createPiModel({ fauxResponses: [
     fauxAssistantMessage(fauxToolCall('analyze_financials', {}), { stopReason: 'toolUse' }),
     fauxAssistantMessage(fauxToolCall('search_news_by_keyword', { keyword: 'NAND' }), { stopReason: 'toolUse' }),
@@ -1218,7 +1294,10 @@ test('财报专家可自由调用新闻和技术指标工具并把新增事实�
     fauxAssistantMessage(fauxToolCall('submit_analysis_report', {
       ...validReport,
       supportingEvidence: [newsFact.id],
-      keyJudgments: [{ judgment: '补查结果可追溯', evidence: [indicatorFact.id] }],
+      keyJudgments: [{
+        ...validReport.keyJudgments[0], type: 'technical', statement: '补查结果可追溯',
+        supportingEvidence: [indicatorFact.id],
+      }],
     }), { stopReason: 'toolUse' }),
   ] })
   const events = []
@@ -1688,7 +1767,7 @@ test('compaction/freshness 仅进入审计 seam 且不注入普通模型文本�
   const completed = events.find((event) => event.type === 'completed')
   assert.equal(completed?.type, 'completed')
   if (completed?.type === 'completed') {
-    assert.deepEqual(completed.report, validReport)
+    assert.deepEqual(completed.reportVersion?.report, validReport)
   }
 })
 

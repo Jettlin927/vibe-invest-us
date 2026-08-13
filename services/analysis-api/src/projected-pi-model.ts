@@ -2,6 +2,7 @@ import {
   createModels, createProvider, fauxProvider, contentText, validateToolCall,
   type Api, type FauxResponseStep, type Model, type Tool,
 } from '@earendil-works/pi-ai'
+import { createHash } from 'node:crypto'
 import { openAICompletionsApi } from '@earendil-works/pi-ai/api/openai-completions.lazy'
 import { openAIResponsesApi } from '@earendil-works/pi-ai/api/openai-responses.lazy'
 import type { RuntimeSettings } from '@vibe-invest/contracts'
@@ -16,6 +17,7 @@ import {
 } from './runtime-policy.js'
 import { toolRegistry } from './tool-registry.js'
 import { analysisModelTools, finalizationModelTools, financialSpecialistTools } from './tools.js'
+import { validateReportCandidate } from './report-validation.js'
 
 type Fact = AnalyzeInput['knownFacts'][number]
 type Role = 'main' | 'fundamental'
@@ -62,9 +64,13 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
       const provider = createProviderRuntime(options)
       const queue = createAsyncQueue<ModelEvent>()
       let policyFailure: Error | undefined
-      const knownFactIds = new Set(input.knownFacts.map(({ id }) => id))
+      const knownFacts = new Map(input.knownFacts.map((fact) => [fact.id, fact]))
+      const rememberFacts = (facts: Fact[]) => {
+        for (const fact of facts) knownFacts.set(fact.id, fact)
+      }
       let frozenContext: Awaited<ReturnType<AnalyzeInput['fetchFinancialContext']>> | undefined
       let specialistInvocation = 0
+      const reportValidationState = { failures: 0, exhausted: false }
 
       const loadFrozenContext = async (symbol: string) => {
         if (symbol.trim().toUpperCase() !== input.symbol.trim().toUpperCase()) {
@@ -72,7 +78,7 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
         }
         if (!frozenContext) {
           frozenContext = await input.fetchFinancialContext(symbol, executionSignal)
-          for (const fact of frozenContext.facts) knownFactIds.add(fact.id)
+          rememberFacts(frozenContext.facts)
         }
         return frozenContext
       }
@@ -99,7 +105,7 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
           id, type: 'tool_error', value: 'unavailable', observedAt: timestamp,
           fetchedAt: timestamp, source: 'system', sourceReference: 'internal://tool-error',
         }
-        knownFactIds.add(id)
+        knownFacts.set(id, fact)
         return { result: { error: error instanceof Error ? error.message : String(error), facts: [fact] }, isError: true }
       }
 
@@ -126,6 +132,7 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
         modelGate, toolGate, provider, queue, initialTools: analysisModelTools,
         systemPrompt: input.systemPrompt,
         userPrompt: input.runtimeContext ? runtimeContextMessage(input.runtimeContext) : input.userPrompt ?? '',
+        shouldRejectNextTurn: () => reportValidationState.exhausted,
         execute: async (name, params, signal, onStart) => {
           if (name === unavailableToolName) { await onStart(); return failed('tool_not_available') }
           if (name === 'fetch_financial_context') {
@@ -139,7 +146,7 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
                     }
                     if (!frozenContext) {
                       frozenContext = await input.fetchFinancialContext(symbol, toolSignal)
-                      for (const fact of frozenContext.facts) knownFactIds.add(fact.id)
+                      rememberFacts(frozenContext.facts)
                     }
                     return frozenContext
                   },
@@ -164,7 +171,7 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
                 }
                 if (!frozenContext) {
                   frozenContext = await input.fetchFinancialContext(symbol, toolSignal)
-                  for (const fact of frozenContext.facts) knownFactIds.add(fact.id)
+                  rememberFacts(frozenContext.facts)
                 }
                 return frozenContext
               })
@@ -196,7 +203,7 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
               type: 'lifecycle', status: 'running_tools',
               operationId: `execution:${input.executionId}:specialist:${invocationId}:completed`,
             })
-            for (const fact of specialist.facts) knownFactIds.add(fact.id)
+            rememberFacts(specialist.facts)
             return succeeded({ analysis: specialist.text, facts: specialist.facts })
           }
           if (name === 'submit_analysis_report') {
@@ -204,9 +211,20 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
               await onStart()
               return await toolRegistry.handler(name)!(params, {
                 submitAnalysisReport: async (submitted) => {
-                  const report = normalizeReport(submitted)
-                  validateEvidence(report, knownFactIds)
-                  return { ...succeeded({ submitted: true }), report, terminate: true }
+                  const validation = validateReportCandidate(submitted, {
+                    role: 'main', knownFacts: [...knownFacts.values()],
+                  })
+                  if (!validation.ok) {
+                    reportValidationState.failures += 1
+                    if (reportValidationState.failures >= 3) reportValidationState.exhausted = true
+                    return failedReportValidation(validation.errors, submitted)
+                  }
+                  const report = legacyReport(validation.report)
+                  return {
+                    ...succeeded({ submitted: true }), report,
+                    reportVersion: { kind: validation.report.kind, report: validation.report },
+                    terminate: true,
+                  }
                 },
               }) as ExecutedTool
             } catch (error) {
@@ -222,6 +240,7 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
         if (!outcome.report) throw new Error('report_tool_required')
         queue.push({
           type: 'completed', report: outcome.report, usage: outcome.usage,
+          reportVersion: outcome.reportVersion,
           stopReason: outcome.stopReason, operationId: `execution:${input.executionId}:report`,
         })
       }).then(() => queue.end(), (error) => {
@@ -247,6 +266,7 @@ async function runProjectedAgent(config: {
   provider: ReturnType<typeof createProviderRuntime>; queue: ReturnType<typeof createAsyncQueue<ModelEvent>>
   initialTools: Tool[]; systemPrompt: string; userPrompt: string
   invocationId?: string
+  shouldRejectNextTurn?: () => boolean
   execute: (
     name: string, params: unknown, signal: AbortSignal, onStart: () => Promise<void>,
   ) => Promise<ExecutedTool>
@@ -264,6 +284,7 @@ async function runProjectedAgent(config: {
   })
   let currentBatch: Batch | undefined
   let completedReport: AnalysisReport | undefined
+  let completedReportVersion: ExecutedTool['reportVersion']
   let finalText = ''
   let finalUsage: unknown
   let finalStopReason: string | undefined
@@ -295,11 +316,16 @@ async function runProjectedAgent(config: {
       let executed: ExecutedTool
       let validatedParams = params
       try {
+        if (definition.name === 'submit_analysis_report') throw new Error('report_schema_validated_by_runtime')
         validatedParams = validateToolCall([definition], {
           type: 'toolCall', id: callId, name: definition.name,
           arguments: params as Record<string, unknown>,
         })
-      } catch { await start(); executed = failed('invalid_tool_arguments') }
+      } catch (error) {
+        if (error instanceof Error && error.message === 'report_schema_validated_by_runtime') {
+          validatedParams = params
+        } else { await start(); executed = failed('invalid_tool_arguments') }
+      }
       if (executed!) { /* validation failure is already normalized */ }
       else if (completedReport) executed = {
         ...failed('cancelled_after_report_submission'), terminate: true,
@@ -328,6 +354,7 @@ async function runProjectedAgent(config: {
       }
       currentBatch?.results.set(callId, audit)
       if (executed.report) completedReport = executed.report
+      if (executed.reportVersion) completedReportVersion = executed.reportVersion
       return {
         content: [{
           type: 'text', text: JSON.stringify(modelToolResult(definition.name, executed.result)),
@@ -460,6 +487,7 @@ async function runProjectedAgent(config: {
       : Boolean(finalText),
     prepareNextTurn: async () => {
       if (completedReport || finalText) return undefined
+      if (config.shouldRejectNextTurn?.()) throw new Error('report_validation_repair_exhausted')
       if (lastAssistantHadCalls) toolRounds += 1
       const limit = config.role === 'main'
         ? config.settings.mainAgentToolRounds : config.settings.specialistAgentToolRounds
@@ -583,13 +611,14 @@ async function runProjectedAgent(config: {
   const facts = snapshot.messages.filter((message) => message.role === 'toolResult')
     .flatMap((message) => parseFacts(message))
   return {
-    report: completedReport, text: finalText, facts,
+    report: completedReport, reportVersion: completedReportVersion, text: finalText, facts,
     usage: finalUsage, stopReason: finalStopReason,
   }
 }
 
 type ExecutedTool = {
   result: Record<string, unknown>; isError: boolean; terminate?: boolean; report?: AnalysisReport
+  reportVersion?: { kind: 'integrated' | 'specialist'; report: Record<string, unknown> }
   completedAt?: string
 }
 
@@ -911,8 +940,7 @@ function adapterToolResult(value: unknown): Record<string, unknown> {
   return asRecord(tool.details)
 }
 
-function normalizeReport(value: unknown): AnalysisReport {
-  const report = asRecord(value)
+function legacyReport(report: Record<string, unknown>): AnalysisReport {
   return {
     title: asString(report.title), marketState: asString(report.marketState), trend: asString(report.trend),
     drivers: asStringArray(report.drivers), supportingEvidence: asStringArray(report.supportingEvidence),
@@ -926,16 +954,26 @@ function normalizeReport(value: unknown): AnalysisReport {
     conditionalSuggestion: asNullableString(report.conditionalSuggestion), limitations: asStringArray(report.limitations),
     keyJudgments: Array.isArray(report.keyJudgments) ? report.keyJudgments.map((item) => {
       const judgment = asRecord(item)
-      return { judgment: asString(judgment.judgment), evidence: asStringArray(judgment.evidence) }
+      return {
+        judgment: asString(judgment.statement),
+        evidence: asStringArray(judgment.supportingEvidence),
+      }
     }) : [],
   }
 }
-function validateEvidence(report: AnalysisReport, known: Set<string>) {
-  for (const id of [...report.supportingEvidence, ...report.contraryEvidence,
-    ...report.keyJudgments.flatMap(({ evidence }) => evidence)]) {
-    if (!known.has(id)) throw new Error(`unknown_fact_id:${id}`)
+function failedReportValidation(
+  errors: import('./report-validation.js').ReportValidationError[], candidate: unknown,
+): ExecutedTool {
+  return {
+    result: {
+      error: 'report_validation_failed', errors,
+      candidatePayloadHash: reportPayloadHash(candidate), facts: [],
+    },
+    isError: true,
   }
-  for (const item of report.keyJudgments) if (!item.evidence.length) throw new Error('key_judgment_evidence_required')
+}
+function reportPayloadHash(candidate: unknown) {
+  return createHash('sha256').update(JSON.stringify(candidate)).digest('hex')
 }
 function asString(value: unknown) { return typeof value === 'string' ? value : '' }
 function asStringArray(value: unknown) { return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [] }

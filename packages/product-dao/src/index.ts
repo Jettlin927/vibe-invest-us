@@ -6,7 +6,7 @@ import {
   type ExecutionSettingsSnapshot, type RuntimeSettings, type RuntimeSettingsRevision,
 } from '@vibe-invest/contracts'
 
-export const schemaVersion = 16
+export const schemaVersion = 17
 
 const migrationSql = `
 CREATE TABLE IF NOT EXISTS product_schema_migrations (
@@ -144,6 +144,20 @@ CREATE TABLE IF NOT EXISTS conversation_segments (
   ordinal integer NOT NULL CHECK (ordinal > 0),
   created_at timestamptz NOT NULL,
   UNIQUE (session_id, ordinal)
+);
+
+CREATE TABLE IF NOT EXISTS report_versions (
+  id text PRIMARY KEY,
+  analysis_id text NOT NULL REFERENCES analyses(id) ON DELETE CASCADE,
+  session_id text NOT NULL REFERENCES agent_sessions(id) ON DELETE CASCADE,
+  execution_id text NOT NULL REFERENCES agent_executions(id) ON DELETE CASCADE,
+  version integer NOT NULL CHECK (version > 0),
+  kind text NOT NULL CHECK (kind IN ('integrated', 'specialist')),
+  payload_hash text NOT NULL CHECK (payload_hash ~ '^[a-f0-9]{64}$'),
+  report_json jsonb NOT NULL,
+  created_at timestamptz NOT NULL,
+  UNIQUE (session_id, version),
+  UNIQUE (execution_id, payload_hash)
 );
 
 INSERT INTO agent_executions (
@@ -421,6 +435,10 @@ INSERT INTO product_schema_migrations (version)
 VALUES (16)
 ON CONFLICT (version) DO NOTHING;
 
+INSERT INTO product_schema_migrations (version)
+VALUES (17)
+ON CONFLICT (version) DO NOTHING;
+
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM vibe_invest_app;
 REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM vibe_invest_app;
 GRANT SELECT ON product_schema_migrations TO vibe_invest_app;
@@ -433,6 +451,7 @@ GRANT SELECT, INSERT, UPDATE ON agent_executions TO vibe_invest_app;
 GRANT SELECT, INSERT ON conversation_segments TO vibe_invest_app;
 GRANT SELECT, INSERT ON runtime_settings_revisions, execution_settings_snapshots TO vibe_invest_app;
 GRANT SELECT, INSERT ON tool_projection_versions, model_requests, tool_call_batches, tool_batch_calls TO vibe_invest_app;
+GRANT SELECT, INSERT ON report_versions TO vibe_invest_app;
 GRANT UPDATE (status, started_at, completed_at, completion_order, result_payload_json)
   ON tool_batch_calls TO vibe_invest_app;
 GRANT UPDATE (status, completed_at) ON tool_call_batches TO vibe_invest_app;
@@ -1362,6 +1381,12 @@ export function createAgentEventRepository(pool: Pool) {
         snapshot?: unknown
         error?: string
         facts?: Array<{ id: string } & Record<string, unknown>>
+        reportVersion?: {
+          id: string
+          kind: 'integrated' | 'specialist'
+          payloadHash: string
+          report: unknown
+        }
       }
       createdAt: string
     }) {
@@ -1416,6 +1441,23 @@ export function createAgentEventRepository(pool: Pool) {
            ) VALUES ($1, $2, $3, $4, $5)`,
           [input.sessionId, sequence, input.operationId, JSON.stringify(input.event), input.createdAt],
         )
+        if (input.projection?.reportVersion) {
+          const reportVersion = input.projection.reportVersion
+          const nextVersion = await client.query<{ version: number }>(
+            `SELECT COALESCE(max(version), 0)::integer + 1 AS version
+             FROM report_versions WHERE session_id = $1`,
+            [input.sessionId],
+          )
+          await client.query(
+            `INSERT INTO report_versions (
+               id, analysis_id, session_id, execution_id, version,
+               kind, payload_hash, report_json, created_at
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+            [reportVersion.id, session.rows[0].analysis_id, input.sessionId, input.executionId,
+              nextVersion.rows[0]!.version, reportVersion.kind, reportVersion.payloadHash,
+              JSON.stringify(reportVersion.report), input.createdAt],
+          )
+        }
         if (input.projection?.executionStatus) {
           const waitReason = input.event.waitReason ?? null
           const terminal = input.projection.terminal
@@ -1471,6 +1513,24 @@ export function createAgentEventRepository(pool: Pool) {
       } finally {
         client.release()
       }
+    },
+    async listReportVersions(analysisId: string) {
+      const result = await pool.query<{
+        id: string; analysis_id: string; session_id: string; execution_id: string
+        version: number; kind: 'integrated' | 'specialist'; payload_hash: string
+        report_json: unknown; created_at: string
+      }>(
+        `SELECT id, analysis_id, session_id, execution_id, version, kind,
+                payload_hash, report_json, created_at::text
+         FROM report_versions WHERE analysis_id = $1 ORDER BY created_at, id`,
+        [analysisId],
+      )
+      return result.rows.map((row) => ({
+        id: row.id, analysisId: row.analysis_id, sessionId: row.session_id,
+        executionId: row.execution_id, version: row.version, kind: row.kind,
+        payloadHash: row.payload_hash, report: row.report_json,
+        createdAt: new Date(row.created_at).toISOString(),
+      }))
     },
     async interruptActiveSessions(createdAt: string) {
       const client = await pool.connect()

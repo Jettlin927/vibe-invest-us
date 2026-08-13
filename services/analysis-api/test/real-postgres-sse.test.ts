@@ -20,7 +20,17 @@ import { createPiModel, type ModelEvent, type ToolRuntime } from '../src/model.j
 const databaseUrl = process.env.TEST_DATABASE_URL
 const migrationDatabaseUrl = process.env.TEST_MIGRATION_DATABASE_URL
 
-test('真实 v12 历史 Tool 事件升级到 v16 后经 DAO、HTTP 与 SSE 原样读取', {
+function integratedReport<T extends Record<string, unknown>>(report: T) {
+  return {
+    kind: 'integrated' as const, availability: report.limitations instanceof Array
+      && report.limitations.length ? 'partial' as const : 'available' as const,
+    status: report.limitations instanceof Array && report.limitations.length
+      ? 'partial' as const : 'completed' as const,
+    gaps: [], ...report,
+  }
+}
+
+test('真实 v12 历史 Tool 事件升级到 v17 后经 DAO、HTTP 与 SSE 原样读取', {
   skip: !databaseUrl || !migrationDatabaseUrl,
   concurrency: false,
 }, async () => {
@@ -183,12 +193,12 @@ test('真实 OpenAI HTTP provider 经生产 Pi bridge 在 Turn 边界原子封�
         writeOpenAiToolCalls(response, [{ id: 'provider-specialist', name: 'analyze_financials', arguments: '{}' }])
       } else {
         writeOpenAiToolCalls(response, [{
-          id: 'provider-report', name: 'submit_analysis_report', arguments: JSON.stringify({
+          id: 'provider-report', name: 'submit_analysis_report', arguments: JSON.stringify(integratedReport({
             title: '真实生产 Pi bridge', marketState: '数据不足', trend: '未知', drivers: [],
             supportingEvidence: [], contraryEvidence: [], keyJudgments: [], scenarios: [],
             invalidationConditions: [], valuation: null, personalImpact: null,
             conditionalSuggestion: null, limitations: ['真实 HTTP provider 验收'],
-          }),
+          })),
         }])
       }
     } else if (toolResults.length === 0) {
@@ -721,12 +731,12 @@ test('首次研究经真实 PostgreSQL 与 HTTP SSE 展示 Runtime Context、工
       }])
     } else {
       writeOpenAiToolCalls(response, [{
-        id: 'first-research-report', name: 'submit_analysis_report', arguments: JSON.stringify({
+        id: 'first-research-report', name: 'submit_analysis_report', arguments: JSON.stringify(integratedReport({
           title: '首次研究候选报告', marketState: '数据充足', trend: '震荡', drivers: [],
           supportingEvidence: [], contraryEvidence: [], keyJudgments: [], scenarios: [],
           invalidationConditions: [], valuation: null, personalImpact: null,
           conditionalSuggestion: null, limitations: [],
-        }),
+        })),
       }])
     }
   })
@@ -796,6 +806,13 @@ test('首次研究经真实 PostgreSQL 与 HTTP SSE 展示 Runtime Context、工
     const research = await fetch(`${baseUrl}/api/research/${created.analysisId}`)
       .then((response) => response.json())
     assert.equal(research.report.title, '首次研究候选报告')
+    const versions = await fetch(`${baseUrl}/api/research/${created.analysisId}/report-versions`)
+      .then((response) => response.json())
+    assert.equal(versions.items.length, 1)
+    assert.equal(versions.items[0].version, 1)
+    assert.equal(versions.items[0].kind, 'integrated')
+    assert.equal(versions.items[0].report.title, '首次研究候选报告')
+    assert.match(versions.items[0].payloadHash, /^[a-f0-9]{64}$/)
   } finally {
     await app.close()
     await closeHttp(provider)
@@ -824,7 +841,7 @@ test('生产 Pi 经 HTTP、SSE 与真实 PostgreSQL 留存工具及预算收口�
       { stopReason: 'toolUse' },
     ),
     fauxAssistantMessage(
-      fauxToolCall('submit_analysis_report', report, { id: 'budget-report' }),
+      fauxToolCall('submit_analysis_report', integratedReport(report), { id: 'budget-report' }),
       { stopReason: 'toolUse' },
     ),
   ] })
@@ -919,7 +936,7 @@ test('Pi Runtime 使用持久 executionId 派生工具 operationId 且真实 Pos
       fauxToolCall('fetch_financial_context', { symbol: 'PGOPID' }, { id: callId }),
     ], { stopReason: 'toolUse' }),
     fauxAssistantMessage([
-      fauxToolCall('submit_analysis_report', report, { id: reportCallId }),
+      fauxToolCall('submit_analysis_report', integratedReport(report), { id: reportCallId }),
       fauxToolCall('fetch_financial_context', { symbol: 'PGOPID' }, { id: cancelledAfterReportCallId }),
     ], { stopReason: 'toolUse' }),
   ] })
@@ -1058,7 +1075,7 @@ test('主 Agent 校验失败与合法调用在下一轮前按原序封存到真�
       providerObservedSealedLedger = true
       assert.doesNotMatch(JSON.stringify(sealed), /hidden_main_tool|must-not-leak/)
       return fauxAssistantMessage(
-        fauxToolCall('submit_analysis_report', report, { id: reportCallId }),
+        fauxToolCall('submit_analysis_report', integratedReport(report), { id: reportCallId }),
         { stopReason: 'toolUse' },
       )
     },
@@ -1106,6 +1123,66 @@ test('主 Agent 校验失败与合法调用在下一轮前按原序封存到真�
     assert.equal(publicUnknown.toolCallId,
       `${unknownCallId}:main-attempt:1:position:1`)
     assert.doesNotMatch(sseResponse.body, /hidden_main_tool|must-not-leak/)
+  } finally {
+    await app.close()
+  }
+})
+
+test('主 Agent 三次拒绝候选保留 hash 事件且不生成报告版本', {
+  skip: !databaseUrl,
+  concurrency: false,
+}, async () => {
+  const pool = createPool(databaseUrl!)
+  const events = createAgentEventRepository(pool)
+  const badReport = integratedReport({
+    title: '无法追溯的候选', marketState: '未知', trend: '未知', drivers: [],
+    supportingEvidence: [], contraryEvidence: [], scenarios: [], invalidationConditions: [],
+    valuation: null, personalImpact: null, conditionalSuggestion: null, limitations: [],
+    keyJudgments: [{
+      type: 'market', statement: '无法追溯的结论', direction: 'neutral', confidence: 'low',
+      supportingEvidence: ['fact:not-in-research'], contraryEvidence: [],
+      contraryEvidenceStatus: 'not_searched', invalidationConditions: [],
+    }],
+  })
+  const model = createPiModel({ fauxResponses: Array.from({ length: 3 }, (_, index) => (
+    fauxAssistantMessage(
+      fauxToolCall('submit_analysis_report', badReport, { id: `rejected-report-${index + 1}` }),
+      { stopReason: 'toolUse' },
+    )
+  )) })
+  const app = buildApp({
+    productDatabase: { checkSchema: () => checkSchema(pool), close: () => pool.end() },
+    portfolioRepository: createPortfolioRepository(pool),
+    analysisRepository: createAnalysisRepository(pool), agentEventRepository: events,
+    runtimeSettingsRepository: createRuntimeSettingsRepository(pool),
+    toolProjectionRepository: createToolProjectionRepository(pool),
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, gaps: [], facts: [] }), model,
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: `RJ${crypto.randomUUID().slice(0, 8)}` },
+  })).json() as { analysisId: string; sessionId: string }
+  try {
+    await waitForAnalysisStatus(app, created.analysisId, 'failed')
+    const ledger = await events.list(created.sessionId, 0)
+    const rejections = ledger.filter(({ payload }) => payload.type === 'tool_result'
+      && payload.name === 'submit_analysis_report' && payload.isError === true)
+    assert.equal(rejections.length, 3)
+    const hashes = rejections.map(({ payload }) => String(
+      (payload.result as Record<string, unknown>).candidatePayloadHash,
+    ))
+    assert.ok(hashes.every((hash) => /^[a-f0-9]{64}$/.test(hash)))
+    assert.equal(new Set(hashes).size, 1)
+    assert.match(JSON.stringify(rejections), /reference_integrity/)
+    const replay = await app.inject({
+      method: 'GET', url: `/api/agent-sessions/${created.sessionId}/events`,
+    })
+    assert.match(replay.body, new RegExp(hashes[0]!))
+    const versions = await app.inject({
+      method: 'GET', url: `/api/research/${created.analysisId}/report-versions`,
+    })
+    assert.deepEqual(versions.json(), { items: [] })
   } finally {
     await app.close()
   }
@@ -1182,7 +1259,7 @@ test('主 Agent 跨 Turn 复用与空 call id 在真实 PostgreSQL 各自完整�
       assert.ok((await events.list(createdSessionId, 0)).length >= beforeReplay)
       providerChecks += 1
       return fauxAssistantMessage(
-        fauxToolCall('submit_analysis_report', report, { id: reportCallId }),
+        fauxToolCall('submit_analysis_report', integratedReport(report), { id: reportCallId }),
         { stopReason: 'toolUse' },
       )
     },
@@ -1270,7 +1347,7 @@ test('同一 execution 两次专项 invocation 在真实 PostgreSQL 各自封存
       ).length, 8)
       return fauxAssistantMessage('第二次专项完成')
     },
-    fauxAssistantMessage(fauxToolCall('submit_analysis_report', report), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('submit_analysis_report', integratedReport(report)), { stopReason: 'toolUse' }),
   ] })
   const app = buildApp({
     productDatabase: { checkSchema: () => checkSchema(pool), close: () => pool.end() },

@@ -122,6 +122,9 @@ export function createAnalysisService(options: {
       status?: string; executionStatus?: import('@vibe-invest/contracts').AgentExecutionStatus
       waitTarget?: string; terminal?: boolean
       report?: unknown; snapshot?: unknown; error?: string; facts?: Fact[]
+      reportVersion?: {
+        id: string; kind: 'integrated' | 'specialist'; payloadHash: string; report: unknown
+      }
     },
   ) {
     const createdAt = new Date().toISOString()
@@ -157,7 +160,12 @@ export function createAnalysisService(options: {
     executionId: string,
     operationId: string,
     status: string,
-    extra: { report?: unknown; snapshot?: unknown; error?: string; terminal?: boolean } = {},
+    extra: {
+      report?: unknown; snapshot?: unknown; error?: string; terminal?: boolean
+      reportVersion?: {
+        id: string; kind: 'integrated' | 'specialist'; payloadHash: string; report: unknown
+      }
+    } = {},
     waitTargetOverride?: string,
   ) {
     const executionStatus = status
@@ -170,6 +178,7 @@ export function createAnalysisService(options: {
       ...(extra.report !== undefined ? { report: extra.report } : {}),
       ...(extra.snapshot !== undefined ? { snapshot: extra.snapshot } : {}),
       ...(extra.error !== undefined ? { error: extra.error } : {}),
+      ...(extra.reportVersion !== undefined ? { reportVersion: extra.reportVersion } : {}),
       ...(isExecutionStatus(executionStatus) ? {
         executionStatus,
         ...(waitTargetOverride ? { waitTarget: waitTargetOverride } : {}),
@@ -426,7 +435,11 @@ export function createAnalysisService(options: {
           }
           const report = enforceDataGaps(personalized, gaps)
           const status = report.limitations.length ? 'partial' : 'completed'
-          await setStatus(sessionId, executionId, operationId(`status-${status}`), status, { report })
+          const reportVersion = event.reportVersion
+            ? finalReportVersion(executionId, event.reportVersion, report, status, gaps) : undefined
+          await setStatus(sessionId, executionId, operationId(`status-${status}`), status, {
+            report, ...(reportVersion ? { reportVersion } : {}),
+          })
           return
         }
         assertPolicy()
@@ -470,7 +483,14 @@ export function createAnalysisService(options: {
             }
             if (event.type === 'completed') {
               const report = enforceDataGaps(event.report, limitedContext.gaps ?? [])
-              await setStatus(sessionId, executionId, operationId('status-partial'), 'partial', { report })
+              const reportVersion = event.reportVersion
+                ? finalReportVersion(
+                    executionId, event.reportVersion, report, 'partial', limitedContext.gaps ?? [],
+                  )
+                : undefined
+              await setStatus(sessionId, executionId, operationId('status-partial'), 'partial', {
+                report, ...(reportVersion ? { reportVersion } : {}),
+              })
               return
             }
           }
@@ -689,6 +709,29 @@ function enforceDataGaps(report: AnalysisReport, gaps: unknown[]) {
   if (capabilities.has('news')) add('近期新闻不可用，无法判断新闻驱动')
   if (capabilities.has('portfolio_prices')) add('组合内部分持仓缺少当前价格，无法计算准确仓位占比和集中度')
   return result
+}
+
+function finalReportVersion(
+  executionId: string,
+  candidate: NonNullable<Extract<ModelEvent, { type: 'completed' }>['reportVersion']>,
+  report: AnalysisReport,
+  status: 'completed' | 'partial',
+  gaps: unknown[],
+) {
+  const candidateGaps = Array.isArray(candidate.report.gaps) ? candidate.report.gaps : []
+  const payload = {
+    ...candidate.report,
+    status,
+    availability: status === 'partial' ? 'partial' : candidate.report.availability,
+    gaps: [...candidateGaps, ...gaps], limitations: report.limitations,
+  }
+  const payloadHash = createHash('sha256').update(JSON.stringify(payload)).digest('hex')
+  return {
+    id: `${executionId}:report:${payloadHash}`,
+    kind: candidate.kind,
+    payloadHash,
+    report: payload,
+  }
 }
 
 function createModelContext(snapshot: FinancialContext & Record<string, unknown>) {

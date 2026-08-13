@@ -281,6 +281,14 @@ export function buildApp(dependencies: AppDependencies) {
     const result = await analysis?.research(request.params.id)
     return result ?? reply.status(404).send({ error: 'research_not_found' })
   })
+  app.get<{ Params: { id: string } }>('/api/research/:id/report-versions', async (request, reply) => {
+    if (!await dependencies.analysisRepository.get(request.params.id)) {
+      return reply.status(404).send({ error: 'analysis_not_found' })
+    }
+    return {
+      items: await dependencies.agentEventRepository.listReportVersions(request.params.id),
+    }
+  })
   app.get<{ Querystring: { symbol?: string } }>('/api/research', async (request) => ({
     records: await analysis?.listResearch(request.query.symbol) ?? [],
   }))

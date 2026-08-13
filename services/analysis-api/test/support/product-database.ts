@@ -16,6 +16,10 @@ export function createTestProductDatabase() {
   const traces = new Map<string, unknown[]>()
   const agentSessions = new Map<string, AgentSession>()
   const agentEvents = new Map<string, AgentEvent[]>()
+  const reportVersions = new Map<string, Array<{
+    id: string; analysisId: string; sessionId: string; executionId: string; version: number
+    kind: 'integrated' | 'specialist'; payloadHash: string; report: unknown; createdAt: string
+  }>>()
   const lifecycles = new Map<string, {
     execution: { id: string; generation: number; status: string; createdAt: string; updatedAt: string }
     waitReason: { kind: 'database'; target: string; startedAt: string }
@@ -298,6 +302,14 @@ export function createTestProductDatabase() {
       }
       if (input.projection) {
         const analysisId = session.analysisId
+        if (input.projection.reportVersion) {
+          const versions = reportVersions.get(analysisId) ?? []
+          reportVersions.set(analysisId, [...versions, {
+            ...input.projection.reportVersion,
+            analysisId, sessionId: input.sessionId, executionId: input.executionId,
+            version: versions.length + 1, createdAt: input.createdAt,
+          }])
+        }
         for (const fact of input.projection.facts ?? []) {
           facts.set(fact.id, fact)
           const ids = analysisFacts.get(analysisId) ?? new Set()
@@ -315,6 +327,9 @@ export function createTestProductDatabase() {
         })
       }
       return { sequence: event.sequence, created: true, event }
+    },
+    async listReportVersions(analysisId) {
+      return structuredClone(reportVersions.get(analysisId) ?? [])
     },
     async list(sessionId, afterSequence) {
       return (agentEvents.get(sessionId) ?? []).filter(({ sequence }) => sequence > afterSequence)
@@ -526,7 +541,7 @@ export function createTestProductDatabase() {
 
   return {
     productDatabase: {
-      checkSchema: async () => ({ status: 'ok' as const, version: 16 }),
+      checkSchema: async () => ({ status: 'ok' as const, version: 17 }),
       close: async () => {},
     },
     portfolioRepository,

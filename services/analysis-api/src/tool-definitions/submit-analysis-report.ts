@@ -6,6 +6,15 @@ export const submitAnalysisReportDefinition: RegisteredToolDefinition = {
     name: 'submit_analysis_report',
     description: '提交最终结构化综合分析报告',
     parameters: Type.Object({
+      kind: Type.Literal('integrated'),
+      availability: Type.Union([
+        Type.Literal('available'), Type.Literal('partial'), Type.Literal('unavailable'),
+      ]),
+      status: Type.Union([Type.Literal('completed'), Type.Literal('partial')]),
+      gaps: Type.Array(Type.Object({
+        capability: Type.String(), reason: Type.String(), impact: Type.String(),
+      })),
+      limitations: Type.Array(Type.String()),
       title: Type.Optional(Type.String()), marketState: Type.Optional(Type.String()),
       trend: Type.Optional(Type.String()), drivers: Type.Optional(Type.Array(Type.String())),
       supportingEvidence: Type.Optional(Type.Array(Type.String())),
@@ -18,10 +27,22 @@ export const submitAnalysisReportDefinition: RegisteredToolDefinition = {
       valuation: Type.Optional(Type.Union([Type.String(), Type.Null()])),
       personalImpact: Type.Optional(Type.Union([Type.String(), Type.Null()])),
       conditionalSuggestion: Type.Optional(Type.Union([Type.String(), Type.Null()])),
-      limitations: Type.Optional(Type.Array(Type.String())),
       keyJudgments: Type.Optional(Type.Array(Type.Object({
-        judgment: Type.Optional(Type.String()),
-        evidence: Type.Optional(Type.Array(Type.String())),
+        type: Type.Union([
+          Type.Literal('market'), Type.Literal('news'), Type.Literal('fundamental'),
+          Type.Literal('technical'), Type.Literal('operational'),
+        ]),
+        statement: Type.String(),
+        direction: Type.Union([
+          Type.Literal('bullish'), Type.Literal('bearish'), Type.Literal('neutral'),
+        ]),
+        confidence: Type.Union([Type.Literal('low'), Type.Literal('medium'), Type.Literal('high')]),
+        supportingEvidence: Type.Array(Type.String()),
+        contraryEvidence: Type.Array(Type.String()),
+        contraryEvidenceStatus: Type.Union([
+          Type.Literal('none_found'), Type.Literal('not_searched'), Type.Literal('not_applicable'),
+        ]),
+        invalidationConditions: Type.Array(Type.String()),
       }))),
     }),
   },

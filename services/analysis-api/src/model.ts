@@ -67,6 +67,10 @@ export type ModelEvent =
   | {
     type: 'completed'
     report: AnalysisReport
+    reportVersion?: {
+      kind: 'integrated' | 'specialist'
+      report: Record<string, unknown>
+    }
     usage?: unknown
     stopReason?: string
     operationId?: string

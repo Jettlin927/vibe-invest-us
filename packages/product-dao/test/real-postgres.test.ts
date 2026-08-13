@@ -795,7 +795,7 @@ test('真实 PostgreSQL migration 幂等且 application role 没有 DDL 权限',
   await migrate(migrationUrl!)
 
   const pool = createPool(applicationUrl!)
-  assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 16 })
+  assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 17 })
   const privileges = await pool.query<{ can_create: boolean; can_temp: boolean }>(
     `SELECT has_schema_privilege(current_user, 'public', 'CREATE') AS can_create,
             has_database_privilege(current_user, current_database(), 'TEMP') AS can_temp`,
@@ -852,7 +852,7 @@ test('真实 PostgreSQL migration receipt 为空时按 max=0 升级', {
     )
     await pool.query('DELETE FROM product_schema_migrations')
     await migrate(migrationUrl!)
-    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 16 })
+    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 17 })
     assert.deepEqual((await pool.query<{ sequence: number; provenance: string }>(
       `SELECT sequence, provenance FROM tool_event_migration_provenance WHERE session_id = $1`,
       [sessionId],
@@ -882,7 +882,7 @@ test('真实 PostgreSQL 拒绝未发布的 schema 13、14、15 候选状态', {
       )).rows, [{ version }])
       await pool.query(
         `INSERT INTO product_schema_migrations (version)
-         SELECT generate_series($1, 16) ON CONFLICT (version) DO NOTHING`,
+         SELECT generate_series($1, 17) ON CONFLICT (version) DO NOTHING`,
         [version + 1],
       )
     }
@@ -919,23 +919,23 @@ test('真实 PostgreSQL 拒绝未来 schema 且不修改数据库', {
   })
   try {
     await pool.query('DROP TABLE tool_event_migration_provenance')
-    await pool.query('INSERT INTO product_schema_migrations (version) VALUES (17)')
+    await pool.query('INSERT INTO product_schema_migrations (version) VALUES (18)')
     const before = await fingerprint()
 
     await assert.rejects(
       migrate(migrationUrl!),
-      /product_schema_future_version_unsupported:17/,
+      /product_schema_future_version_unsupported:18/,
     )
 
     assert.deepEqual(await fingerprint(), before)
   } finally {
-    await pool.query('DELETE FROM product_schema_migrations WHERE version = 17')
+    await pool.query('DELETE FROM product_schema_migrations WHERE version = 18')
     await migrate(migrationUrl!)
     await pool.end()
   }
 })
 
-test('真实 PostgreSQL v12 无 Tool Batch 的历史工具事件原样升级到 v16', {
+test('真实 PostgreSQL v12 无 Tool Batch 的历史工具事件原样升级到 v17', {
   skip: !migrationUrl,
   concurrency: false,
 }, async () => {
@@ -979,7 +979,7 @@ test('真实 PostgreSQL v12 无 Tool Batch 的历史工具事件原样升级到 
 
     await migrate(migrationUrl!)
 
-    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 16 })
+    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 17 })
     assert.deepEqual((await pool.query<{ sequence: number; provenance: string }>(
       `SELECT sequence, provenance FROM tool_event_migration_provenance
        WHERE session_id = $1 ORDER BY sequence`, [sessionId],
@@ -1333,6 +1333,58 @@ test('真实 PostgreSQL Agent Session 事件 sequence 严格递增且 operationI
     )
   } finally {
     await analyses.removeResearch(sessionId)
+    await pool.end()
+  }
+})
+
+test('真实 PostgreSQL 仅为通过校验的报告原子生成不可变版本', {
+  skip: !applicationUrl,
+  concurrency: false,
+}, async () => {
+  const pool = createPool(applicationUrl!)
+  const analyses = createAnalysisRepository(pool)
+  const events = createAgentEventRepository(pool)
+  const analysisId = `report-version-${crypto.randomUUID()}`
+  const sessionId = `report-version-session-${crypto.randomUUID()}`
+  const executionId = `report-version-execution-${crypto.randomUUID()}`
+  const now = '2026-08-13T08:00:00.000Z'
+  const payloadHash = 'a'.repeat(64)
+  const report = { kind: 'integrated', title: '可追溯的综合报告' }
+  try {
+    await events.createResearch({
+      analysisId, sessionId, executionId, symbol: `R${crypto.randomUUID().slice(0, 8)}`,
+      status: 'planning', operationId: 'create-report-session',
+      event: { type: 'runtime_context' }, createdAt: now,
+    })
+    await events.append({
+      sessionId, executionId, operationId: 'reject-candidate',
+      event: {
+        type: 'tool_result', name: 'submit_analysis_report', isError: true,
+        result: { error: 'report_validation_failed', candidatePayloadHash: 'b'.repeat(64) },
+      },
+      createdAt: now,
+    })
+    assert.deepEqual(await events.listReportVersions(analysisId), [])
+
+    const completed = {
+      sessionId, executionId, operationId: 'complete-with-report',
+      event: { type: 'status', status: 'completed', terminal: true },
+      projection: {
+        status: 'completed', executionStatus: 'completed' as const, terminal: true,
+        report,
+        reportVersion: { id: `${executionId}:report`, kind: 'integrated' as const, payloadHash, report },
+      },
+      createdAt: now,
+    }
+    await events.append(completed)
+    await events.append(completed)
+
+    assert.deepEqual(await events.listReportVersions(analysisId), [{
+      id: `${executionId}:report`, analysisId, sessionId, executionId, version: 1,
+      kind: 'integrated', payloadHash, report, createdAt: now,
+    }])
+  } finally {
+    await analyses.removeResearch(analysisId)
     await pool.end()
   }
 })
