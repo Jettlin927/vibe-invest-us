@@ -175,7 +175,9 @@ export function validateReportCandidate(
   const qualificationErrors = [...missingSupportErrors, ...judgmentReferences.flatMap(({ id, judgment, path }) => {
     const fact = facts.get(id)!
     const allowed = allowedEvidenceFor(String(judgment.type))
-    if (allowed.includes(evidenceLevel(fact))) return []
+    if (allowed.includes(evidenceLevel(fact))
+      && (evidenceLevel(fact) !== 'deterministic_valuation'
+        || qualifiedValuationEvidence(fact, facts))) return []
     return [{ path, rule: 'evidence_qualification',
       message: `${evidenceLevel(fact)} 事实不能支撑 ${String(judgment.type)} 判断`,
       allowedEvidenceTypes: allowed }]
@@ -226,6 +228,21 @@ export function validateReportCandidate(
   return { ok: true, report: candidate as ValidatedReport }
 }
 
+function qualifiedValuationEvidence(fact: ReportFact, facts: Map<string, ReportFact>) {
+  const evidence = asRecord(fact.value)
+  const range = asRecord(evidence.range)
+  return evidence.status === 'available'
+    && typeof evidence.method === 'string' && evidence.method.trim() !== ''
+    && typeof evidence.formula === 'string' && evidence.formula.trim() !== ''
+    && typeof evidence.unit === 'string' && evidence.unit.trim() !== ''
+    && typeof evidence.unitConversion === 'string' && evidence.unitConversion.trim() !== ''
+    && typeof evidence.asOf === 'string' && evidence.asOf.trim() !== ''
+    && Array.isArray(evidence.inputs) && evidence.inputs.length > 0
+    && evidence.inputs.every((id) => typeof id === 'string' && facts.has(id))
+    && typeof range.low === 'number' && Number.isFinite(range.low)
+    && typeof range.high === 'number' && Number.isFinite(range.high) && range.low <= range.high
+}
+
 function allowedEvidenceFor(judgmentType: string) {
   if (judgmentType === 'market') return ['market_observation', 'verified_market']
   if (judgmentType === 'news') return ['verified_news', 'official_company_event']
@@ -263,7 +280,8 @@ function qualifiedTargetPrice(value: unknown, facts: Map<string, ReportFact>) {
     if (fact?.type !== 'deterministic_valuation') return false
     const evidence = asRecord(fact.value)
     const evidenceRange = asRecord(evidence.range)
-    return evidence.unit === 'USD/share'
+    return qualifiedValuationEvidence(fact, facts)
+      && evidence.unit === 'USD/share'
       && evidence.method === target.method
       && evidence.asOf === target.asOf
       && arraysEqual(evidence.inputs, target.inputs)

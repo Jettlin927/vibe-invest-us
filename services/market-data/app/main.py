@@ -60,7 +60,10 @@ def financial_metric_series_endpoint(symbol: str, metric: str, cursor: Optional[
     )
 
 
-@app.post("/v1/valuation-evidence", operation_id="getValuationEvidence", response_model=ValuationEvidenceResult)
+@app.post(
+    "/v1/valuation-evidence", operation_id="getValuationEvidence",
+    response_model=ValuationEvidenceResult, response_model_exclude_none=True,
+)
 def valuation_evidence_endpoint(symbol: str) -> ValuationEvidenceResult:
     return valuation_evidence_result(
         symbol, datetime.now(timezone.utc), build_sources(source_config, "quote"),

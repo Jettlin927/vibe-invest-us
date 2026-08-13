@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any, List, Literal, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class Quote(BaseModel):
@@ -103,15 +103,33 @@ class FilingDocumentResult(PaginatedFactResult):
     items: List[Any]
 
 
+class ValuationComparable(BaseModel):
+    symbol: str
+    pe: Optional[float] = None
+    evToEbitda: Optional[float] = None
+    evToRevenue: Optional[float] = None
+
+
+class ValuationMethodView(BaseModel):
+    status: Literal["available", "unavailable"]
+    reason: Optional[str] = None
+    multiple: Optional[float] = None
+    targetPrice: Optional[float] = None
+    range: Optional[dict[str, float]] = None
+    multiplePercentile: Optional[float] = None
+
+
 class ValuationEvidenceResult(BaseModel):
     symbol: str
     authorizedComparables: List[str]
-    comparables: List[Any]
-    currentMultiples: Any
-    historicalRanges: Any
-    methods: Any
+    comparables: List[ValuationComparable]
+    currentMultiples: dict[str, float]
+    historicalRanges: dict[str, List[float]]
+    methods: dict[str, ValuationMethodView]
     facts: List[AtomicFact]
     sources: List[SourceStatus] = []
+
+    model_config = {"exclude_none": True}
 
 
 class NewsDocumentResult(FactQueryResult):

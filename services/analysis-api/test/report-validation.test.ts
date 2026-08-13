@@ -330,6 +330,28 @@ test('财务判断不能由新闻报道替代正式财务证据', () => {
   })
 })
 
+test('缺少完整可用方法的估值事实不能支撑估值方向判断', () => {
+  const candidate = {
+    kind: 'specialist', domain: 'fundamental_valuation', availability: 'available',
+    status: 'completed', gaps: [], limitations: [], keyJudgments: [{
+      type: 'fundamental', statement: '当前估值偏贵', direction: 'bearish', confidence: 'medium',
+      supportingEvidence: ['fact:valuation'], contraryEvidence: [],
+      contraryEvidenceStatus: 'none_found', invalidationConditions: ['估值区间改变'],
+    }],
+  }
+  const result = validateReportCandidate(candidate, {
+    role: 'fundamental_valuation', knownFacts: [{
+      id: 'fact:valuation', type: 'deterministic_valuation',
+      evidenceLevel: 'deterministic_valuation',
+      value: { method: 'pe', status: 'unavailable', reason: 'missing_inputs_or_comparables' },
+    }, { id: 'fact:inputs', type: 'valuation_inputs' }],
+  })
+
+  assert.equal(result.ok, false)
+  if (result.ok) return
+  assert.equal(result.errors[0]?.rule, 'evidence_qualification')
+})
+
 test('技术判断接受宿主确定性技术证据且宿主目标价事实可原样出现', () => {
   const result = validateReportCandidate({
     kind: 'integrated', availability: 'available', status: 'completed', gaps: [], limitations: [],
@@ -344,7 +366,8 @@ test('技术判断接受宿主确定性技术证据且宿主目标价事实可�
   }, { role: 'main', knownFacts: [
     { id: 'fact:technical', type: 'technical_evidence', evidenceLevel: 'deterministic_technical' },
     { id: 'fact:valuation', type: 'deterministic_valuation', evidenceLevel: 'deterministic_valuation',
-      value: { method: 'DCF', inputs: ['fact:valuation'], unit: 'USD/share',
+      value: { method: 'DCF', status: 'available', inputs: ['fact:valuation'],
+        formula: 'discounted_cash_flow', unit: 'USD/share', unitConversion: 'none',
         range: { low: 210, high: 250 }, asOf: '2026-08-13' } },
   ] })
 

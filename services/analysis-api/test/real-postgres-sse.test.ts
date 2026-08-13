@@ -1069,7 +1069,7 @@ test('主 Agent 经真实 PostgreSQL、HTTP 与 SSE 启动并展示独立基本�
     source: 'deterministic-calculation', sourceReference: 'source://yahoo-timeseries/valuation',
     value: {
       method: 'pe', status: 'available', inputs: [valuationInputs.id],
-      formula: 'diluted_eps * adopted_comparable_pe', unit: 'USD/share',
+      formula: 'diluted_eps * adopted_comparable_pe', unit: 'USD/share', unitConversion: 'none',
       multiple: 28, targetPrice: 112, range: { low: 80, high: 128 },
       asOf: '2026-08-12T14:30:00Z',
     },

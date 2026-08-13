@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 
 from app.main import app
 from app.adapters import (
-    _PinnedHTTPConnection, _diagnose, configure_diagnostics, read_document_page,
+    _PinnedHTTPConnection, YahooValuationSource, _diagnose, configure_diagnostics, read_document_page,
     validate_document_url,
 )
 from app.models import Quote
@@ -29,6 +29,43 @@ def test_openapi_contract_matches_application():
     contract = json.loads(contract_path.read_text())
 
     assert app.openapi() == contract
+
+
+def test_yahoo_valuation_preserves_each_metric_fact_date(monkeypatch):
+    payload = {"timeseries": {"result": [{
+        "meta": {"type": ["trailingDilutedEPS"]},
+        "trailingDilutedEPS": [{
+            "asOfDate": "2026-07-31", "reportedValue": {"raw": 4.2},
+        }],
+    }, {
+        "meta": {"type": ["trailingEnterpriseValue"]},
+        "trailingEnterpriseValue": [{
+            "asOfDate": "2026-08-12", "reportedValue": {"raw": 500},
+        }],
+    }]}}
+    monkeypatch.setattr("app.adapters._read", lambda *args, **kwargs: json.dumps(payload))
+
+    metrics = YahooValuationSource()._metrics("NVDA")
+
+    assert metrics["observedAt"] == {
+        "dilutedEps": "2026-07-31", "enterpriseValue": "2026-08-12",
+    }
+
+
+def test_yahoo_valuation_without_quote_uses_latest_input_fact_date(monkeypatch):
+    source = YahooValuationSource()
+    monkeypatch.setattr(source, "_metrics", lambda symbol: {
+        "dilutedEps": 4, "pe": 28, "enterpriseValue": 500,
+        "ebitda": 25, "revenue": 100,
+        "observedAt": {"dilutedEps": "2026-07-31", "pe": "2026-08-12"},
+    })
+
+    result = source.fetch_with_market_price("NVDA", None, None)
+
+    assert result.as_of == "2026-08-12"
+    assert "marketPrice" not in result.input_observed_at
+    assert result.input_observed_at["company.dilutedEps"] == "2026-07-31"
+    assert result.input_observed_at["comparables.AMD.pe"] == "2026-08-12"
 
 
 def test_financial_overview_hides_xbrl_mapping_and_returns_official_facts(monkeypatch):

@@ -1,6 +1,14 @@
 import { Type } from '@earendil-works/pi-ai'
 import type { RegisteredToolDefinition } from './types.js'
 
+const optionalNumber = Type.Optional(Type.Number())
+const methodView = Type.Object({
+  status: Type.Union([Type.Literal('available'), Type.Literal('unavailable')]),
+  reason: Type.Optional(Type.String()), multiple: optionalNumber, targetPrice: optionalNumber,
+  range: Type.Optional(Type.Object({ low: Type.Number(), high: Type.Number() })),
+  multiplePercentile: optionalNumber,
+})
+
 export const getValuationEvidenceDefinition: RegisteredToolDefinition = {
   model: {
     name: 'get_valuation_evidence',
@@ -9,8 +17,13 @@ export const getValuationEvidenceDefinition: RegisteredToolDefinition = {
   },
   resultSchema: Type.Object({
     symbol: Type.String(), authorizedComparables: Type.Array(Type.String()),
-    comparables: Type.Array(Type.Unknown()),
-    currentMultiples: Type.Unknown(), historicalRanges: Type.Unknown(), methods: Type.Unknown(),
+    comparables: Type.Array(Type.Object({
+      symbol: Type.String(), pe: optionalNumber, evToEbitda: optionalNumber,
+      evToRevenue: optionalNumber,
+    })),
+    currentMultiples: Type.Record(Type.String(), Type.Number()),
+    historicalRanges: Type.Record(Type.String(), Type.Array(Type.Number())),
+    methods: Type.Record(Type.String(), methodView),
     facts: Type.Array(Type.Unknown()),
   }),
   allowedRoles: ['fundamental'], allowedStages: ['research'], sideEffect: 'read_only',

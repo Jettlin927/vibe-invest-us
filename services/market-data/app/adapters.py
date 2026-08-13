@@ -592,18 +592,28 @@ class YahooValuationSource(TimedSource):
         industry_and_peers = COMPARABLES.get(symbol)
         if not industry_and_peers:
             company = self._metrics(symbol)
+            input_observed_at = {
+                **({"marketPrice": market_price_observed_at} if market_price_observed_at else {}),
+                **{f"company.{key}": value for key, value in company.get("observedAt", {}).items()},
+            }
             return calculate_valuation(ValuationInput(
                 symbol=symbol, industry="unsupported", current_price=market_price or 0,
                 diluted_eps=company.get("dilutedEps"), enterprise_value=company.get("enterpriseValue"),
                 ebitda=company.get("ebitda"), revenue=company.get("revenue"), comparables=[],
                 historical_multiples={"pe": company.get("historicalPe", [])},
+                input_observed_at=input_observed_at,
                 source=self.name, as_of=market_price_observed_at,
             ))
         industry, peers = industry_and_peers
         company = self._metrics(symbol)
         comparables = []
+        peer_observed_at = {}
         for peer in peers:
             values = self._metrics(peer)
+            peer_observed_at.update({
+                f"comparables.{peer}.{key}": value
+                for key, value in values.get("observedAt", {}).items()
+            })
             comparables.append({
                 "symbol": peer, "pe": values.get("pe"),
                 "evToEbitda": _ratio(values.get("enterpriseValue"), values.get("ebitda")),
@@ -616,8 +626,15 @@ class YahooValuationSource(TimedSource):
             ebitda=company.get("ebitda"), revenue=company.get("revenue"),
             comparables=comparables,
             historical_multiples={"pe": company.get("historicalPe", [])},
+            input_observed_at={
+                **({"marketPrice": market_price_observed_at} if market_price_observed_at else {}),
+                **{f"company.{key}": value for key, value in company.get("observedAt", {}).items()},
+                **peer_observed_at,
+            },
             source=self.name,
-            as_of=market_price_observed_at,
+            as_of=market_price_observed_at or max(
+                [*company.get("observedAt", {}).values(), *peer_observed_at.values()], default=None,
+            ),
         ))
 
     def _metrics(self, symbol: str):
@@ -644,6 +661,9 @@ class YahooValuationSource(TimedSource):
                 mapped["historicalPe"] = [item["reportedValue"]["raw"] for item in values if item.get("reportedValue")]
             if values and source_key in keys:
                 mapped[keys[source_key]] = values[-1]["reportedValue"]["raw"]
+                observed_at = values[-1].get("asOfDate")
+                if observed_at:
+                    mapped.setdefault("observedAt", {})[keys[source_key]] = observed_at
         return mapped
 
 

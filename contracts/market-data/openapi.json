@@ -1298,6 +1298,52 @@
         ],
         "title": "ValidationError"
       },
+      "ValuationComparable": {
+        "properties": {
+          "symbol": {
+            "type": "string",
+            "title": "Symbol"
+          },
+          "pe": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pe"
+          },
+          "evToEbitda": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Evtoebitda"
+          },
+          "evToRevenue": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Evtorevenue"
+          }
+        },
+        "type": "object",
+        "required": [
+          "symbol"
+        ],
+        "title": "ValuationComparable"
+      },
       "ValuationEvidenceResult": {
         "properties": {
           "symbol": {
@@ -1312,17 +1358,34 @@
             "title": "Authorizedcomparables"
           },
           "comparables": {
-            "items": {},
+            "items": {
+              "$ref": "#/components/schemas/ValuationComparable"
+            },
             "type": "array",
             "title": "Comparables"
           },
           "currentMultiples": {
+            "additionalProperties": {
+              "type": "number"
+            },
+            "type": "object",
             "title": "Currentmultiples"
           },
           "historicalRanges": {
+            "additionalProperties": {
+              "items": {
+                "type": "number"
+              },
+              "type": "array"
+            },
+            "type": "object",
             "title": "Historicalranges"
           },
           "methods": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ValuationMethodView"
+            },
+            "type": "object",
             "title": "Methods"
           },
           "facts": {
@@ -1352,6 +1415,81 @@
           "facts"
         ],
         "title": "ValuationEvidenceResult"
+      },
+      "ValuationMethodView": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "available",
+              "unavailable"
+            ],
+            "title": "Status"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "multiple": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Multiple"
+          },
+          "targetPrice": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Targetprice"
+          },
+          "range": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "number"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Range"
+          },
+          "multiplePercentile": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Multiplepercentile"
+          }
+        },
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "title": "ValuationMethodView"
       }
     }
   }

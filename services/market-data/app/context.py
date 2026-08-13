@@ -171,6 +171,7 @@ def valuation_evidence_result(symbol: str, now: datetime, quote_sources: Iterabl
         "authorizedComparables": result.comparable_symbols,
         "comparables": result.comparables,
         "inputs": result.inputs,
+        "inputObservedAt": result.input_observed_at,
         "currentMultiples": result.current_multiples,
         "historicalRanges": result.historical_ranges,
         "methods": {name: value.model_dump(exclude_none=True) for name, value in result.methods.items()},
@@ -182,7 +183,7 @@ def valuation_evidence_result(symbol: str, now: datetime, quote_sources: Iterabl
     snapshot = AtomicFact(
         id=f"fact:{normalized_symbol}:valuation-inputs:{fingerprint}",
         type="valuation_inputs", value=snapshot_value,
-        observedAt=result.as_of or now.isoformat(), fetchedAt=now.isoformat(),
+        observedAt=max(result.input_observed_at.values(), default=result.as_of or now.isoformat()),
         source=result.source, sourceReference="https://finance.yahoo.com/",
         evidenceLevel="verified_valuation_input",
     )

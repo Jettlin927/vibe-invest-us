@@ -18,6 +18,7 @@ class ValuationInput(BaseModel):
     revenue: Optional[float]
     comparables: List[dict]
     historical_multiples: Dict[str, List[float]] = Field(default_factory=dict)
+    input_observed_at: Dict[str, str] = Field(default_factory=dict)
     source: str = "unspecified"
     as_of: Optional[str] = None
 
@@ -40,6 +41,7 @@ class ValuationResult(BaseModel):
     historical_ranges: Dict[str, List[float]]
     current_multiples: Dict[str, float] = Field(default_factory=dict)
     inputs: Dict[str, Optional[float]]
+    input_observed_at: Dict[str, str]
     source: str
     as_of: Optional[str]
 
@@ -81,6 +83,7 @@ def calculate_valuation(inputs: ValuationInput) -> ValuationResult:
             "ebitda": inputs.ebitda,
             "revenue": inputs.revenue,
         },
+        input_observed_at=inputs.input_observed_at,
         source=inputs.source,
         as_of=inputs.as_of,
     )

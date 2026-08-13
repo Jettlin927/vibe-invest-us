@@ -397,7 +397,7 @@ test('基本面 Agent 只能读取主标的估值证据并由确定性事实支�
     source: 'deterministic-calculation', sourceReference: 'source://yahoo-timeseries/valuation',
     value: {
       method: 'pe', status: 'available', inputs: ['fact:valuation-inputs'],
-      formula: 'diluted_eps * adopted_comparable_pe', unit: 'USD/share',
+      formula: 'diluted_eps * adopted_comparable_pe', unit: 'USD/share', unitConversion: 'none',
       multiple: 28, targetPrice: 112, range: { low: 80, high: 128 },
       asOf: '2026-08-12T14:30:00Z',
     },

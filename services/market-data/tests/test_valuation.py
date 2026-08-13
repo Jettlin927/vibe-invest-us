@@ -28,6 +28,7 @@ def test_semiconductor_uses_pe_and_ev_to_ebitda_comparables():
         "currentPrice": 120, "dilutedEps": 4,
         "enterpriseValue": 500, "ebitda": 25, "revenue": 100,
     }
+    assert result.input_observed_at == {}
     assert result.source == "test-source"
     assert result.as_of == "2026-08-12T00:00:00Z"
 
