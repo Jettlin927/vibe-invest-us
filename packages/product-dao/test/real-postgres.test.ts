@@ -991,6 +991,79 @@ test('真实 PostgreSQL 树级 fence 与主 Session append 使用同一锁序', 
   }
 })
 
+test('真实 PostgreSQL 树级 fence 与带事实的 Tool Batch 完成使用同一锁序', {
+  skip: !migrationUrl || !applicationUrl,
+  concurrency: false,
+}, async () => {
+  await migrate(migrationUrl!)
+  const pool = createPool(applicationUrl!)
+  const events = createAgentEventRepository(pool)
+  const projections = createToolProjectionRepository(pool)
+  const analyses = createAnalysisRepository(pool)
+  const blocker = await pool.connect()
+  const suffix = crypto.randomUUID()
+  const analysisId = `tree-fence-batch-${suffix}`
+  const sessionId = `${analysisId}:main`
+  const executionId = `${sessionId}:execution`
+  const batchId = `${executionId}:batch`
+  const factId = `${analysisId}:fact`
+  try {
+    await events.createResearch({
+      analysisId, sessionId, executionId, symbol: `B${suffix.slice(0, 8)}`,
+      status: 'running', operationId: 'main-created',
+      event: { type: 'status', status: 'running' }, createdAt: '2026-08-14T04:00:00.000Z',
+    })
+    const projection = await projections.ensureVersion({
+      executionId, role: 'main', stage: 'research', schemaHash: 'batch-lock-order',
+      projectedTools: [{ name: 'fetch_financial_context' }],
+      visibleToolNames: ['fetch_financial_context'], reasons: { stage: 'research' },
+      createdAt: '2026-08-14T04:00:00.000Z',
+    })
+    await projections.beginToolBatch({
+      id: batchId, executionId, projectionId: projection.id, turnIndex: 1,
+      calls: [{ toolCallId: 'fact-call', toolName: 'fetch_financial_context', position: 1 }],
+      createdAt: '2026-08-14T04:00:01.000Z',
+    })
+    await projections.startToolCall({
+      batchId, executionId, toolCallId: 'fact-call', operationId: 'fact-call-start',
+      eventPayload: { type: 'tool_call', name: 'fetch_financial_context' },
+      startedAt: '2026-08-14T04:00:01.000Z',
+    })
+    await blocker.query('BEGIN')
+    await blocker.query('SELECT id FROM analyses WHERE id = $1 FOR UPDATE', [analysisId])
+    const fencing = events.fenceForStopping({
+      sessionId, executionId, fenceExecutionId: `${executionId}:stopping`,
+      operationId: 'batch-race-stopping', event: { type: 'status', status: 'stopping' },
+      createdAt: '2026-08-14T04:00:02.000Z',
+    })
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    const completing = projections.completeToolBatch({
+      id: batchId, executionId, completedAt: '2026-08-14T04:00:02.000Z', results: [{
+        toolCallId: 'fact-call', status: 'completed',
+        startedAt: '2026-08-14T04:00:01.000Z', completedAt: '2026-08-14T04:00:02.000Z',
+        completionOrder: 1, operationId: 'fact-call-result',
+        resultPayload: { facts: [{ id: factId, type: 'quote' }] },
+        eventPayload: {
+          type: 'tool_result', name: 'fetch_financial_context',
+          result: { facts: [{ id: factId, type: 'quote' }] },
+        },
+      }],
+    })
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    await blocker.query('COMMIT')
+    await fencing
+    await assert.rejects(completing, /tool_batch_completion_conflict/)
+    assert.equal((await projections.replay(executionId)).toolBatches[0]?.status, 'cancelled')
+    const stored = await pool.query('SELECT fact_id FROM analysis_facts WHERE fact_id = $1', [factId])
+    assert.equal(stored.rowCount, 0)
+  } finally {
+    await blocker.query('ROLLBACK').catch(() => undefined)
+    blocker.release()
+    await analyses.removeResearch(analysisId)
+    await pool.end()
+  }
+})
+
 test('真实 PostgreSQL 并发保存 Runtime settings 不丢失不同字段更新', {
   skip: !migrationUrl || !applicationUrl,
   concurrency: false,

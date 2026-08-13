@@ -2161,6 +2161,16 @@ export function createToolProjectionRepository(pool: Pool) {
       const client = await pool.connect()
       try {
         await client.query('BEGIN')
+        const sessionIdentity = await client.query<{ analysis_id: string }>(
+          `SELECT session.analysis_id FROM agent_executions execution
+           JOIN agent_sessions session ON session.id = execution.session_id
+           WHERE execution.id = $1`, [input.executionId],
+        )
+        if (!sessionIdentity.rows[0]) throw new Error('agent_session_not_found')
+        await client.query(
+          'SELECT id FROM analyses WHERE id = $1 FOR UPDATE',
+          [sessionIdentity.rows[0].analysis_id],
+        )
         const session = await client.query<{
           id: string; latest_sequence: number; current_execution_id: string; terminal: boolean
         }>(
@@ -2238,6 +2248,16 @@ export function createToolProjectionRepository(pool: Pool) {
       const client = await pool.connect()
       try {
         await client.query('BEGIN')
+        const sessionIdentity = await client.query<{ analysis_id: string }>(
+          `SELECT session.analysis_id FROM agent_executions execution
+           JOIN agent_sessions session ON session.id = execution.session_id
+           WHERE execution.id = $1`, [input.executionId],
+        )
+        if (!sessionIdentity.rows[0]) throw new Error('agent_session_not_found')
+        await client.query(
+          'SELECT id FROM analyses WHERE id = $1 FOR UPDATE',
+          [sessionIdentity.rows[0].analysis_id],
+        )
         const session = await client.query<{
           session_id: string; analysis_id: string; latest_sequence: number
           current_execution_id: string; execution_terminal: boolean
