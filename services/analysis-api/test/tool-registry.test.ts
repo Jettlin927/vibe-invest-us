@@ -28,6 +28,7 @@ function definition(
     externalNetwork: 'none',
     resultRetention: 'research_record',
     modelProjection: 'full_result',
+    executionMode: 'sequential',
     countsAsToolRound: true,
     ...overrides,
   }
@@ -49,6 +50,7 @@ test('唯一 Registry 中每个工具独立声明完整权限、保留、网络�
     assert.ok(tool.externalNetwork)
     assert.ok(tool.resultRetention)
     assert.ok(tool.modelProjection)
+    assert.ok(tool.executionMode)
     assert.equal(typeof tool.countsAsToolRound, 'boolean')
     assert.equal(typeof registry.handler(tool.model.name), 'function')
   }
@@ -76,6 +78,12 @@ test('Registry 启动校验 fail closed 拒绝重复名称、缺失 schema、han
   assert.throws(() => createToolRegistry([definition('bad-stages', {
     allowedStages: [],
   })], { 'bad-stages': handler }), /tool_registry_invalid:allowed_stages/)
+  assert.throws(() => createToolRegistry([definition('illegal-role', {
+    allowedRoles: ['arbitrary'] as never,
+  })], { 'illegal-role': handler }), /tool_registry_invalid:allowed_roles/)
+  assert.throws(() => createToolRegistry([definition('illegal-stage', {
+    allowedStages: ['secret_phase'] as never,
+  })], { 'illegal-stage': handler }), /tool_registry_invalid:allowed_stages/)
   assert.throws(() => createToolRegistry([definition('bad-network', {
     externalNetwork: undefined as never,
   })], { 'bad-network': handler }), /tool_registry_invalid:external_network/)

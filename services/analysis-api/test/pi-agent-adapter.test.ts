@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import test from 'node:test'
 
 import {
-  createPiAgentAdapter,
+  createPersistedPiToolProjectionCommit, createPiAgentAdapter,
   type PiAgentAdapterMessage,
   type PiAgentAdapterModel,
   type PiAgentAdapterStream,
@@ -281,6 +281,7 @@ test('工具投影和上下文替换只在完整 turn boundary 后影响下一�
       messages,
       tools: [visibleNext],
     }),
+    commitToolProjection: async ({ tools }) => ({ tools }),
   })
   await adapter.submit(userMessage('开始'))
   assert.deepEqual(seenTools, [['visible_now'], ['visible_next'], ['visible_next']])
@@ -313,6 +314,64 @@ test('持久化 Projection 提交失败时 Pi 不会在下一 Turn 暴露新工�
   assert.deepEqual(snapshot.tools.map(({ name }) => name), ['old_tool'])
   assert.match(snapshot.errorMessage ?? '', /projection_commit_failed/)
   adapter.dispose()
+})
+
+test('下一 Turn 改变工具但缺少持久化 Projection hook 时 fail closed', async () => {
+  const fixture = createFixture([
+    assistantMessage([toolCall('old_tool', 'old-call')], 'toolUse'),
+  ])
+  let providerRequests = 0
+  const adapter = createPiAgentAdapter({
+    initialState: {
+      systemPrompt: 'system', model: fixture.model,
+      tools: [textTool('old_tool', async () => ({
+        content: [{ type: 'text', text: 'old' }], details: {},
+      }))],
+    },
+    streamFn: async (model, context, options) => {
+      providerRequests += 1
+      return fixture.streamFn(model, context, options)
+    },
+    prepareNextTurn: async () => ({ tools: [textTool('new_tool', async () => ({
+      content: [{ type: 'text', text: 'new' }], details: {},
+    }))] }),
+  })
+  await adapter.submit(userMessage('开始'))
+  await adapter.waitForIdle()
+  assert.equal(providerRequests, 1)
+  assert.match(adapter.snapshot().errorMessage ?? '', /tool_projection_commit_required/)
+  assert.deepEqual(adapter.snapshot().tools.map(({ name }) => name), ['old_tool'])
+})
+
+test('生产 Projection bridge 在 Pi turn boundary 持久化下一轮模型工具', async () => {
+  const recorded: Array<{ turnIndex: number; tools: Array<{ name: string }> }> = []
+  const next = textTool('next_tool', async () => ({
+    content: [{ type: 'text', text: 'next' }], details: {},
+  }))
+  const commit = createPersistedPiToolProjectionCommit({
+    executionId: 'persisted-boundary', role: 'main', stage: 'research',
+    beginModelRequest: async (input) => { recorded.push({ turnIndex: input.turnIndex, tools: input.tools }) },
+  })
+  const fixture = createFixture([
+    assistantMessage([toolCall('old_tool', 'old-call')], 'toolUse'),
+    textMessage('完成'),
+  ])
+  const adapter = createPiAgentAdapter({
+    initialState: {
+      systemPrompt: 'system', model: fixture.model,
+      tools: [textTool('old_tool', async () => ({ content: [], details: {} }))],
+    },
+    streamFn: fixture.streamFn,
+    prepareNextTurn: async () => ({ tools: [next] }),
+    commitToolProjection: commit,
+  })
+  await adapter.submit(userMessage('开始'))
+  assert.deepEqual(recorded.map(({ turnIndex, tools }) => ({
+    turnIndex, toolNames: tools.map(({ name }) => name),
+  })), [
+    { turnIndex: 1, toolNames: ['next_tool'] },
+    { turnIndex: 2, toolNames: ['next_tool'] },
+  ])
 })
 
 test('Pi compaction 阈值只在 turn boundary 切换并保留到后续提交', async () => {

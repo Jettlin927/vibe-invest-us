@@ -28,5 +28,5 @@ export const submitAnalysisReportDefinition: RegisteredToolDefinition = {
   resultSchema: Type.Object({ submitted: Type.Boolean() }),
   allowedRoles: ['main'], allowedStages: ['research', 'finalization'],
   sideEffect: 'creates_report', externalNetwork: 'none', resultRetention: 'report_version',
-  modelProjection: 'acknowledgement', countsAsToolRound: true,
+  modelProjection: 'acknowledgement', executionMode: 'sequential', countsAsToolRound: true,
 }

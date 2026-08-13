@@ -12,5 +12,6 @@ export type RegisteredToolDefinition = {
   externalNetwork: 'none' | 'financial_data'
   resultRetention: 'research_record' | 'report_version'
   modelProjection: 'full_result' | 'bounded_summary' | 'acknowledgement'
+  executionMode: 'sequential' | 'parallel'
   countsAsToolRound: boolean
 }

@@ -130,6 +130,32 @@ export type PiAgentAdapterState = {
 
 type TurnBoundaryState = Pick<PiAgentAdapterState, 'systemPrompt' | 'model' | 'messages' | 'tools'>
 
+export type PiToolProjectionCommit = (
+  state: TurnBoundaryState, signal?: AbortSignal,
+) => Promise<{ tools: PiAgentAdapterTool[] } | undefined>
+
+export function createPersistedPiToolProjectionCommit(options: {
+  executionId: string; role: 'main' | 'fundamental'; stage: 'research' | 'finalization'
+  beginModelRequest: (input: {
+    requestId: string; executionId: string; role: 'main' | 'fundamental'
+    stage: 'research' | 'finalization'; turnIndex: number
+    tools: Array<{ name: string; description: string; parameters: Record<string, unknown> }>
+    createdAt: string
+  }) => Promise<unknown>
+}) {
+  let turnIndex = 0
+  return async (state: TurnBoundaryState) => {
+    const tools = state.tools.map(modelToolDefinition)
+    const nextTurn = ++turnIndex
+    await options.beginModelRequest({
+      requestId: `execution:${options.executionId}:pi-boundary:${nextTurn}`,
+      executionId: options.executionId, role: options.role, stage: options.stage,
+      turnIndex: nextTurn, tools, createdAt: new Date().toISOString(),
+    })
+    return { tools: state.tools }
+  }
+}
+
 export type PiAgentAdapterEvent =
   | { type: 'agent_start' }
   | { type: 'agent_end'; messages: PiAgentAdapterMessage[] }
@@ -153,8 +179,7 @@ type CreatePiAgentAdapterOptions = {
   signal?: AbortSignal
   prepareNextTurn?: (state: TurnBoundaryState, signal?: AbortSignal) =>
     Promise<Partial<TurnBoundaryState> | undefined> | Partial<TurnBoundaryState> | undefined
-  commitToolProjection?: (state: TurnBoundaryState, signal?: AbortSignal) =>
-    Promise<{ tools: PiAgentAdapterTool[] } | undefined>
+  commitToolProjection?: PiToolProjectionCommit
   compaction?: {
     settings: { enabled: boolean; reserveTokens: number; keepRecentTokens: number }
     compact: (input: {
@@ -192,6 +217,9 @@ export function createPiAgentAdapter(options: CreatePiAgentAdapterOptions) {
       }
       const replacement = await options.prepareNextTurn?.(copyBoundaryState(boundaryState), signal)
       const nextState = mergeBoundaryState(boundaryState, replacement)
+      if (toolDefinitionsChanged(boundaryState.tools, nextState.tools) && !options.commitToolProjection) {
+        throw new Error('tool_projection_commit_required')
+      }
       const persistedProjection = await options.commitToolProjection?.(copyBoundaryState(nextState), signal)
       if (persistedProjection) nextState.tools = [...persistedProjection.tools]
       if (options.compaction && shouldCompact(
@@ -265,6 +293,14 @@ export function createPiAgentAdapter(options: CreatePiAgentAdapterOptions) {
       agent.reset()
     },
   }
+}
+
+function toolDefinitionsChanged(current: PiAgentAdapterTool[], next: PiAgentAdapterTool[]) {
+  return JSON.stringify(current.map(modelToolDefinition)) !== JSON.stringify(next.map(modelToolDefinition))
+}
+
+function modelToolDefinition(tool: PiAgentAdapterTool) {
+  return { name: tool.name, description: tool.description, parameters: tool.parameters }
 }
 
 function toCompactionEntries(messages: PiAgentAdapterMessage[]): Parameters<typeof prepareCompaction>[0] {

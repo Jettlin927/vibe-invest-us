@@ -33,14 +33,21 @@ export function createToolRegistry(
     if (!validSchema(definition.model.parameters)) invalid(name, 'parameters_schema')
     if (!validSchema(definition.resultSchema)) invalid(name, 'result_schema')
     if (typeof handlers[name] !== 'function') invalid(name, 'handler')
-    if (!definition.allowedRoles?.length) invalid(name, 'allowed_roles')
-    if (!definition.allowedStages?.length) invalid(name, 'allowed_stages')
+    if (!definition.allowedRoles?.length
+      || !definition.allowedRoles.every((role) => oneOf(role, ['main', 'fundamental']))) {
+      invalid(name, 'allowed_roles')
+    }
+    if (!definition.allowedStages?.length
+      || !definition.allowedStages.every((stage) => oneOf(stage, ['research', 'finalization']))) {
+      invalid(name, 'allowed_stages')
+    }
     if (!oneOf(definition.sideEffect, ['read_only', 'creates_report'])) invalid(name, 'side_effect')
     if (!oneOf(definition.externalNetwork, ['none', 'financial_data'])) invalid(name, 'external_network')
     if (!oneOf(definition.resultRetention, ['research_record', 'report_version'])) invalid(name, 'result_retention')
     if (!oneOf(definition.modelProjection, ['full_result', 'bounded_summary', 'acknowledgement'])) {
       invalid(name, 'model_projection')
     }
+    if (!oneOf(definition.executionMode, ['sequential', 'parallel'])) invalid(name, 'execution_mode')
     if (typeof definition.countsAsToolRound !== 'boolean') invalid(name, 'round_behavior')
     return Object.freeze({ ...definition })
   })

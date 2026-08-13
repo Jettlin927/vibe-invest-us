@@ -46,6 +46,18 @@ test('真实 PostgreSQL 持久化 Tool Projection 版本、模型请求与批次
     })
     assert.equal(first.version, 1)
     assert.deepEqual(same, first)
+    await assert.rejects(projections.ensureVersion({
+      executionId, role: 'main', stage: 'research', schemaHash: 'hash-research',
+      projectedTools: [{ name: 'different_tool', parameters: { type: 'object' } }],
+      visibleToolNames: ['fetch_financial_context'], reasons: { stage: 'research' },
+      createdAt: '2026-08-13T04:00:02.000Z',
+    }), /tool_projection_conflict/)
+    await assert.rejects(projections.ensureVersion({
+      executionId, role: 'main', stage: 'research', schemaHash: 'hash-research',
+      projectedTools: [{ name: 'fetch_financial_context', parameters: { type: 'object' } }],
+      visibleToolNames: ['fetch_financial_context'], reasons: { stage: 'different' },
+      createdAt: '2026-08-13T04:00:02.000Z',
+    }), /tool_projection_conflict/)
 
     await projections.recordModelRequest({
       id: 'request-1', executionId, projectionId: first.id, turnIndex: 1,

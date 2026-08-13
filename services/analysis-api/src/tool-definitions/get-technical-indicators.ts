@@ -14,5 +14,5 @@ export const getTechnicalIndicatorsDefinition: RegisteredToolDefinition = {
   resultSchema: Type.Object({ facts: Type.Array(Type.Unknown()) }),
   allowedRoles: ['fundamental'], allowedStages: ['research'], sideEffect: 'read_only',
   externalNetwork: 'financial_data', resultRetention: 'research_record',
-  modelProjection: 'bounded_summary', countsAsToolRound: true,
+  modelProjection: 'bounded_summary', executionMode: 'parallel', countsAsToolRound: true,
 }

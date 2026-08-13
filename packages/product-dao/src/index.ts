@@ -1552,6 +1552,10 @@ export function createToolProjectionRepository(pool: Pool) {
             JSON.stringify(input.visibleToolNames)],
         )
         if (existing.rows[0]) {
+          if (!jsonValuesEqual(existing.rows[0].projected_tools_json, input.projectedTools)
+            || !jsonValuesEqual(existing.rows[0].reasons_json, input.reasons)) {
+            throw new Error('tool_projection_conflict')
+          }
           await client.query('COMMIT')
           return mapToolProjection(existing.rows[0])
         }
@@ -1763,6 +1767,19 @@ function mapToolProjection(row: ToolProjectionRow) {
     visibleToolNames: row.visible_tool_names_json,
     reasons: row.reasons_json, createdAt: new Date(row.created_at).toISOString(),
   }
+}
+
+function jsonValuesEqual(left: unknown, right: unknown) {
+  return canonicalizeJson(left) === canonicalizeJson(right)
+}
+
+function canonicalizeJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalizeJson).join(',')}]`
+  if (value !== null && typeof value === 'object') {
+    return `{${Object.entries(value).sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, entry]) => `${JSON.stringify(key)}:${canonicalizeJson(entry)}`).join(',')}}`
+  }
+  return JSON.stringify(value)
 }
 
 function mapAgentEventRow(row: AgentEventRow): AgentEvent {
