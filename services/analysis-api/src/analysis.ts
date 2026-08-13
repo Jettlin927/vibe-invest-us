@@ -44,6 +44,9 @@ export function createAnalysisService(options: {
   getFinancialMetricSeries?: (
     symbol: string, metric: string, cursor: string | undefined, signal: AbortSignal,
   ) => Promise<PaginatedFactQueryResult>
+  getValuationEvidence?: (
+    symbol: string, signal: AbortSignal,
+  ) => Promise<{ facts: FinancialFact[]; [key: string]: unknown }>
   readFilingDocument?: (
     symbol: string, filingId: string, cursor: string | undefined, signal: AbortSignal,
   ) => Promise<PaginatedFactQueryResult>
@@ -410,7 +413,8 @@ export function createAnalysisService(options: {
         && options.readNewsDocument && options.listCompanyEvents)
       const fundamentalRuntimeAvailable = Boolean(options.model.analyzeFundamental
         && options.getFinancialOverview && options.getFinancialMetricSeries
-        && options.readFilingDocument && options.listOfficialCompanyEvents)
+        && options.getValuationEvidence && options.readFilingDocument
+        && options.listOfficialCompanyEvents)
       type SpecialistRequest = {
         launch: boolean; researchQuestion: string; reason: string
       }
@@ -543,7 +547,8 @@ export function createAnalysisService(options: {
       }
       const runFundamentalSpecialist = async (request: SpecialistRequest) => {
         if (!options.model.analyzeFundamental || !options.getFinancialOverview
-          || !options.getFinancialMetricSeries || !options.readFilingDocument
+          || !options.getFinancialMetricSeries || !options.getValuationEvidence
+          || !options.readFilingDocument
           || !options.listOfficialCompanyEvents) {
           throw new Error('fundamental_specialist_runtime_unavailable')
         }
@@ -555,6 +560,7 @@ export function createAnalysisService(options: {
             researchQuestion: request.researchQuestion, knownFacts: modelContext.facts,
             getFinancialOverview: options.getFinancialOverview!,
             getFinancialMetricSeries: options.getFinancialMetricSeries!,
+            getValuationEvidence: options.getValuationEvidence!,
             readFilingDocument: options.readFilingDocument!,
             listCompanyEvents: options.listOfficialCompanyEvents!,
             signal: controller.signal, executionDeadlineSignal: wallDeadline, activeBudget,
@@ -986,6 +992,7 @@ function specialistResultProjection(report: Record<string, unknown>, fallbackSum
     summary: typeof firstStatement === 'string' ? firstStatement : fallbackSummary,
     keyFactIds: [...new Set(keyFactIds)], contraryFactIds: [...new Set(contraryFactIds)],
     gaps: Array.isArray(report.gaps) ? report.gaps : [],
+    ...('targetPrice' in report ? { targetPrice: report.targetPrice } : {}),
   }
 }
 

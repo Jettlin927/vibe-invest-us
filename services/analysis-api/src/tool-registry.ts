@@ -4,6 +4,7 @@ import addFormatsModule from 'ajv-formats'
 import { fetchFinancialContextDefinition } from './tool-definitions/fetch-financial-context.js'
 import { getFinancialMetricSeriesDefinition } from './tool-definitions/get-financial-metric-series.js'
 import { getFinancialOverviewDefinition } from './tool-definitions/get-financial-overview.js'
+import { getValuationEvidenceDefinition } from './tool-definitions/get-valuation-evidence.js'
 import { listCompanyEventsDefinition } from './tool-definitions/list-company-events.js'
 import { readNewsDocumentDefinition } from './tool-definitions/read-news-document.js'
 import { readFilingDocumentDefinition } from './tool-definitions/read-filing-document.js'
@@ -28,6 +29,7 @@ export const registeredToolDefinitions = [
   submitAnalysisReportDefinition,
   getFinancialOverviewDefinition,
   getFinancialMetricSeriesDefinition,
+  getValuationEvidenceDefinition,
   readFilingDocumentDefinition,
   searchNewsCandidatesDefinition,
   searchWebEvidenceDefinition,

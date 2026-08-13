@@ -43,6 +43,9 @@ type AppDependencies = {
   getFinancialMetricSeries?: (
     symbol: string, metric: string, cursor: string | undefined, signal: AbortSignal,
   ) => Promise<PaginatedFactQueryResult>
+  getValuationEvidence?: (
+    symbol: string, signal: AbortSignal,
+  ) => Promise<{ facts: import('./financial-data-client.js').FinancialFact[]; [key: string]: unknown }>
   readFilingDocument?: (
     symbol: string, filingId: string, cursor: string | undefined, signal: AbortSignal,
   ) => Promise<PaginatedFactQueryResult>
@@ -83,6 +86,7 @@ export function buildApp(dependencies: AppDependencies) {
         listOfficialCompanyEvents: dependencies.listOfficialCompanyEvents,
         getFinancialOverview: dependencies.getFinancialOverview,
         getFinancialMetricSeries: dependencies.getFinancialMetricSeries,
+        getValuationEvidence: dependencies.getValuationEvidence,
         readFilingDocument: dependencies.readFilingDocument,
         fetchTechnicalIndicators: dependencies.fetchTechnicalIndicators,
         fetchMarketPrices: dependencies.fetchMarketPrices,

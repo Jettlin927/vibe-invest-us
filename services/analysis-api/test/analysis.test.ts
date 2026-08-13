@@ -216,6 +216,10 @@ test('主 Agent 启动的基本面 Agent 拥有独立 Session、受限工具和�
       supportingEvidence: [fundamentalFact.id], contraryEvidence: [],
       contraryEvidenceStatus: 'none_found', invalidationConditions: ['正式财报下修收入'],
     }],
+    targetPrice: {
+      method: 'pe', inputs: ['fact:valuation-inputs'], range: { low: 80, high: 128 },
+      asOf: '2026-08-12T14:30:00Z', evidence: ['fact:valuation:pe'],
+    },
   }
   const model = {
     async *analyze(input: Parameters<ReturnType<typeof createPiModel>['analyze']>[0]) {
@@ -223,6 +227,7 @@ test('主 Agent 启动的基本面 Agent 拥有独立 Session、受限工具和�
         launch: true, researchQuestion: '最新财务质量是否改变方向？', reason: '需要核实正式财务证据。',
       })
       assert.equal(result.status, 'completed')
+      assert.deepEqual(result.targetPrice, specialistReport.targetPrice)
       yield { type: 'completed' as const, report, reportVersion: {
         kind: 'integrated' as const, report: reportCandidate,
       } }
@@ -248,6 +253,7 @@ test('主 Agent 启动的基本面 Agent 拥有独立 Session、受限工具和�
     getFinancialMetricSeries: async () => ({
       facts: [], returnedCount: 0, totalCount: 0, nextCursor: null, truncated: false,
     }),
+    getValuationEvidence: async () => ({ facts: [] }),
     readFilingDocument: async () => ({
       facts: [], items: [], returnedCount: 0, totalCount: 0, nextCursor: null, truncated: false,
     }),

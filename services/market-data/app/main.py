@@ -10,8 +10,9 @@ from app.context import (
     build_financial_context, company_event_facts, read_news_document_fact,
     filing_document_page, financial_metric_series_result, financial_overview_facts, search_news_facts,
     official_company_event_facts, technical_indicator_facts, web_search_lead_facts,
+    valuation_evidence_result,
 )
-from app.models import AtomicFact, FactQueryResult, FilingDocumentResult, FinancialContext, FinancialOverviewResult, NewsDocumentResult, PaginatedFactResult, QuoteBatch, QuoteSnapshot, SourceStatus
+from app.models import AtomicFact, FactQueryResult, FilingDocumentResult, FinancialContext, FinancialOverviewResult, NewsDocumentResult, PaginatedFactResult, QuoteBatch, QuoteSnapshot, SourceStatus, ValuationEvidenceResult
 from app.source_config import build_sources, load_source_config
 
 
@@ -56,6 +57,14 @@ def financial_metric_series_endpoint(symbol: str, metric: str, cursor: Optional[
     return financial_metric_series_result(
         symbol.strip().upper(), metric, cursor,
         next(iter(build_sources(source_config, "fundamentals")), None), datetime.now(timezone.utc),
+    )
+
+
+@app.post("/v1/valuation-evidence", operation_id="getValuationEvidence", response_model=ValuationEvidenceResult)
+def valuation_evidence_endpoint(symbol: str) -> ValuationEvidenceResult:
+    return valuation_evidence_result(
+        symbol, datetime.now(timezone.utc), build_sources(source_config, "quote"),
+        next(iter(build_sources(source_config, "valuation")), None),
     )
 
 

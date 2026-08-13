@@ -71,6 +71,36 @@ def test_financial_metric_series_http_returns_complete_pagination_metadata(monke
     }
 
 
+def test_valuation_evidence_http_returns_host_calculated_facts_and_method_states(monkeypatch):
+    from app.models import AtomicFact, ValuationEvidenceResult
+    expected = ValuationEvidenceResult(
+        symbol="NVDA", authorizedComparables=["AMD", "AVGO", "QCOM"],
+        comparables=[{"symbol": "AMD", "pe": 28}],
+        currentMultiples={"pe": 30}, historicalRanges={"pe": [18, 34]},
+        methods={"dcf": {"status": "unavailable", "reason": "not_implemented"}},
+        facts=[AtomicFact(
+            id="fact:NVDA:deterministic-valuation:pe:abc", type="deterministic_valuation",
+            value={"method": "pe", "inputs": ["fact:eps", "fact:price"],
+                   "formula": "diluted_eps * adopted_comparable_pe", "unit": "USD/share",
+                   "targetPrice": 112, "range": {"low": 80, "high": 128},
+                   "asOf": "2026-08-12T14:30:00Z"},
+            observedAt="2026-08-12T14:30:00Z", fetchedAt="2026-08-13T00:00:00Z",
+            source="deterministic-calculation", sourceReference="source://valuation",
+            evidenceLevel="deterministic_valuation",
+        )],
+    )
+    monkeypatch.setattr("app.main.valuation_evidence_result", lambda symbol, now, quote, source: expected)
+
+    response = TestClient(app).post("/v1/valuation-evidence", params={"symbol": "nvda"})
+
+    assert response.status_code == 200
+    assert response.json()["symbol"] == "NVDA"
+    assert response.json()["authorizedComparables"] == ["AMD", "AVGO", "QCOM"]
+    assert response.json()["comparables"] == [{"symbol": "AMD", "pe": 28}]
+    assert response.json()["facts"][0]["evidenceLevel"] == "deterministic_valuation"
+    assert "targetPrice" not in response.json()["methods"]["dcf"]
+
+
 def test_filing_document_http_uses_sec_adapter_and_returns_bounded_page(monkeypatch):
     monkeypatch.setattr("app.main.SecFilingSource.fetch", lambda self, symbol, filing_id: {
         "filingId": filing_id, "form": "10-Q", "filedAt": "2026-07-31",

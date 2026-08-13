@@ -230,7 +230,10 @@ function allowedEvidenceFor(judgmentType: string) {
   if (judgmentType === 'market') return ['market_observation', 'verified_market']
   if (judgmentType === 'news') return ['verified_news', 'official_company_event']
   if (judgmentType === 'fundamental') {
-    return ['official_filing', 'reported_financial', 'deterministic_financial_metric']
+    return [
+      'official_filing', 'reported_financial',
+      'deterministic_financial_metric', 'deterministic_valuation',
+    ]
   }
   if (judgmentType === 'technical') return ['deterministic_technical']
   if (judgmentType === 'operational') return ['runtime_observation']
@@ -254,8 +257,24 @@ function qualifiedTargetPrice(value: unknown, facts: Map<string, ReportFact>) {
     || typeof range.high !== 'number' || !Number.isFinite(range.high) || range.low > range.high
     || typeof target.asOf !== 'string' || target.asOf.trim() === ''
     || !Array.isArray(target.evidence) || target.evidence.length === 0) return false
-  return target.evidence.every((id) => typeof id === 'string'
-    && facts.get(id)?.type === 'deterministic_valuation')
+  return target.evidence.every((id) => {
+    if (typeof id !== 'string') return false
+    const fact = facts.get(id)
+    if (fact?.type !== 'deterministic_valuation') return false
+    const evidence = asRecord(fact.value)
+    const evidenceRange = asRecord(evidence.range)
+    return evidence.unit === 'USD/share'
+      && evidence.method === target.method
+      && evidence.asOf === target.asOf
+      && arraysEqual(evidence.inputs, target.inputs)
+      && evidenceRange.low === range.low
+      && evidenceRange.high === range.high
+  })
+}
+
+function arraysEqual(left: unknown, right: unknown) {
+  return Array.isArray(left) && Array.isArray(right)
+    && left.length === right.length && left.every((value, index) => value === right[index])
 }
 
 function asRecord(value: unknown): Record<string, unknown> {

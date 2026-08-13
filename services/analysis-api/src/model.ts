@@ -157,6 +157,9 @@ export type AnalyzeFundamentalInput = {
   getFinancialMetricSeries: (
     symbol: string, metric: string, cursor: string | undefined, signal: AbortSignal,
   ) => Promise<{ facts: Fact[]; [key: string]: unknown }>
+  getValuationEvidence: (
+    symbol: string, signal: AbortSignal,
+  ) => Promise<{ facts: Fact[]; [key: string]: unknown }>
   readFilingDocument: (
     symbol: string, filingId: string, cursor: string | undefined, signal: AbortSignal,
   ) => Promise<{ facts: Fact[]; [key: string]: unknown }>

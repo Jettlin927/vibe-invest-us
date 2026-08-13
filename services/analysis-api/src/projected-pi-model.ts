@@ -493,6 +493,9 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
               symbol, stringParam(params, 'metric'), stringParam(params, 'cursor') || undefined, toolSignal,
             ),
           )
+          if (name === 'get_valuation_evidence') return runTool(
+            name, onStart, signal, (toolSignal) => input.getValuationEvidence(symbol, toolSignal),
+          )
           if (name === 'read_filing_document') return runTool(
             name, onStart, signal, (toolSignal) => input.readFilingDocument(
               symbol, stringParam(params, 'filingId'), stringParam(params, 'cursor') || undefined, toolSignal,
@@ -1165,6 +1168,8 @@ function modelToolResult(name: string, result: Record<string, unknown>) {
     'facts', 'gaps', 'summary', 'analysis', 'error', 'source', 'sources',
     'cursor', 'nextCursor', 'pagination', 'truncated', 'resultCount',
     'returnedCount', 'totalCount', 'items', 'overview',
+    'symbol', 'authorizedComparables', 'comparables',
+    'currentMultiples', 'historicalRanges', 'methods',
   ]
   return Object.fromEntries(allowed.flatMap((key) => key in result ? [[key, result[key]]] : []))
 }

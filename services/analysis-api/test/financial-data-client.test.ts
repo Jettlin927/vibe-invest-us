@@ -134,7 +134,13 @@ test('TS 客户端读取基本面高层工具并完整保留分页元数据', as
   const server = createServer((request, response) => {
     requests.push(request.url ?? '')
     response.writeHead(200, { 'content-type': 'application/json' })
-    response.end(JSON.stringify(request.url?.includes('financial-overview')
+    response.end(JSON.stringify(request.url?.includes('valuation-evidence')
+      ? { symbol: 'NVDA', authorizedComparables: ['AMD', 'AVGO', 'QCOM'],
+          comparables: [{ symbol: 'AMD', pe: 28 }],
+          currentMultiples: { pe: 30 }, historicalRanges: { pe: [18, 34] },
+          methods: { dcf: { status: 'unavailable', reason: 'not_implemented' } },
+          facts: [fact], sources: [] }
+      : request.url?.includes('financial-overview')
       ? { overview: { symbol: 'NVDA', latestPeriod: '2026-Q2' }, facts: [fact], sources: [] }
       : request.url?.includes('filing-document')
         ? { items: [{ name: 'guidance', summary: 'Raised.' }], facts: [fact], sources: [],
@@ -155,7 +161,15 @@ test('TS 客户端读取基本面高层工具并完整保留分页元数据', as
   })
   assert.equal((await client.filingDocument('NVDA', '0001', '1')).items[0]?.name, 'guidance')
   assert.deepEqual(await client.officialCompanyEvents('NVDA'), { facts: [fact], sources: [] })
+  assert.deepEqual(await client.valuationEvidence('NVDA'), {
+    symbol: 'NVDA', authorizedComparables: ['AMD', 'AVGO', 'QCOM'],
+    comparables: [{ symbol: 'AMD', pe: 28 }],
+    currentMultiples: { pe: 30 }, historicalRanges: { pe: [18, 34] },
+    methods: { dcf: { status: 'unavailable', reason: 'not_implemented' } },
+    facts: [fact], sources: [],
+  })
   assert.match(requests.join('\n'), /financial-metric-series.*metric=revenue_yoy.*cursor=2/)
   assert.match(requests.join('\n'), /filing-document.*filing_id=0001.*cursor=1/)
   assert.match(requests.join('\n'), /official-company-events.*symbol=NVDA/)
+  assert.match(requests.join('\n'), /valuation-evidence.*symbol=NVDA/)
 })

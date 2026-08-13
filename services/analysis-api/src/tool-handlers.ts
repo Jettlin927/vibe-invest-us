@@ -7,6 +7,7 @@ export const registeredToolHandlers: Record<string, RegisteredToolHandler> = {
   fetch_financial_context: async (_params, context) => required(context, 'loadFinancialContext')(),
   get_financial_overview: async (params, context) => required(context, 'getFinancialOverview')(params),
   get_financial_metric_series: async (params, context) => required(context, 'getFinancialMetricSeries')(params),
+  get_valuation_evidence: async (params, context) => required(context, 'getValuationEvidence')(params),
   read_filing_document: async (params, context) => required(context, 'readFilingDocument')(params),
   run_fundamental_analysis: async (params, context) => required(context, 'runFundamentalSpecialist')(params),
   run_news_analysis: async (params, context) => required(context, 'runNewsSpecialist')(params),

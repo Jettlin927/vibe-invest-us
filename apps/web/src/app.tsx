@@ -55,6 +55,7 @@ type ResearchRecord = ResearchSummary & {
     reportVersion?: { version: number; report: {
       gaps?: Array<{ capability?: string; reason?: string; impact?: string }>
       keyJudgments?: Array<{ statement?: string; direction?: string; confidence?: string }>
+      targetPrice?: { method?: string; range?: { low?: number; high?: number }; asOf?: string }
     } }
   }>
 }
@@ -341,6 +342,12 @@ function SpecialistAgents({ agents = [] }: { agents?: ResearchRecord['specialist
         {agent.reportVersion.report.keyJudgments?.map((judgment, index) => (
           <p key={index}>{judgment.statement} · {directionLabel(judgment.direction)} · {confidenceLabel(judgment.confidence)}</p>
         ))}
+        {agent.reportVersion.report.targetPrice && <p>
+          估值区间：{agent.reportVersion.report.targetPrice.range?.low}
+          {' – '}{agent.reportVersion.report.targetPrice.range?.high}
+          {' · '}{agent.reportVersion.report.targetPrice.method}
+          {' · '}{agent.reportVersion.report.targetPrice.asOf}
+        </p>}
         {agent.reportVersion.report.gaps?.map((gap, index) => (
           <p key={index}>证据缺口：{gap.reason}{gap.impact ? ` · ${gap.impact}` : ''}</p>
         ))}

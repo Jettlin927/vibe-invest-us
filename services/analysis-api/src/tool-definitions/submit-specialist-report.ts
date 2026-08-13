@@ -29,6 +29,11 @@ export const submitSpecialistReportDefinition: RegisteredToolDefinition = {
         ]),
         invalidationConditions: Type.Array(Type.String()),
       })),
+      targetPrice: Type.Optional(Type.Object({
+        method: Type.String(), inputs: Type.Array(Type.String()),
+        range: Type.Object({ low: Type.Number(), high: Type.Number() }),
+        asOf: Type.String(), evidence: Type.Array(Type.String()),
+      })),
     }),
   },
   resultSchema: Type.Object({ submitted: Type.Boolean() }),

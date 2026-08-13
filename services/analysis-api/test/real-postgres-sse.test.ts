@@ -1058,15 +1058,35 @@ test('主 Agent 经真实 PostgreSQL、HTTP 与 SSE 启动并展示独立基本�
     type: 'company_event', evidenceLevel: 'official_company_event',
     value: { filingId: '0001045810-26-000123', form: '10-Q', eventType: 'earnings' },
   }
+  const valuationInputs = {
+    ...reported, id: `fact:fundamental:e2e:valuation-inputs:${crypto.randomUUID()}`,
+    type: 'valuation_inputs', evidenceLevel: 'verified_valuation_input',
+    value: { symbol: 'NVDA', authorizedComparables: ['AMD', 'AVGO', 'QCOM'] },
+  }
+  const valuationFact = {
+    ...reported, id: `fact:fundamental:e2e:valuation:pe:${crypto.randomUUID()}`,
+    type: 'deterministic_valuation', evidenceLevel: 'deterministic_valuation',
+    source: 'deterministic-calculation', sourceReference: 'source://yahoo-timeseries/valuation',
+    value: {
+      method: 'pe', status: 'available', inputs: [valuationInputs.id],
+      formula: 'diluted_eps * adopted_comparable_pe', unit: 'USD/share',
+      multiple: 28, targetPrice: 112, range: { low: 80, high: 128 },
+      asOf: '2026-08-12T14:30:00Z',
+    },
+  }
   const specialistReport = {
     kind: 'specialist' as const, domain: 'fundamental_valuation',
     availability: 'available' as const, status: 'completed' as const, gaps: [], limitations: [],
     keyJudgments: [{
       type: 'fundamental', statement: '正式财报支持基本面质量偏强',
       direction: 'bullish', confidence: 'medium',
-      supportingEvidence: [reported.id, filing.id], contraryEvidence: [],
+      supportingEvidence: [reported.id, filing.id, valuationFact.id], contraryEvidence: [],
       contraryEvidenceStatus: 'none_found', invalidationConditions: ['下期收入同比转负'],
     }],
+    targetPrice: {
+      method: 'pe', inputs: [valuationInputs.id], range: { low: 80, high: 128 },
+      asOf: '2026-08-12T14:30:00Z', evidence: [valuationFact.id],
+    },
   }
   const mainModel = createPiModel({ fauxResponses: [
     fauxAssistantMessage(fauxToolCall('run_fundamental_analysis', {
@@ -1086,6 +1106,7 @@ test('主 Agent 经真实 PostgreSQL、HTTP 与 SSE 启动并展示独立基本�
       fauxToolCall('get_financial_metric_series', {
         symbol: 'NVDA', metric: 'revenue_yoy',
       }, { id: 'fundamental-series' }),
+      fauxToolCall('get_valuation_evidence', { symbol: 'NVDA' }, { id: 'fundamental-valuation' }),
       fauxToolCall('read_filing_document', {
         symbol: 'NVDA', filingId: '0001045810-26-000123',
       }, { id: 'fundamental-filing' }),
@@ -1110,6 +1131,14 @@ test('主 Agent 经真实 PostgreSQL、HTTP 与 SSE 启动并展示独立基本�
     }),
     getFinancialMetricSeries: async () => ({
       facts: [], returnedCount: 0, totalCount: 23, nextCursor: '20', truncated: true,
+    }),
+    getValuationEvidence: async () => ({
+      symbol: 'NVDA', authorizedComparables: ['AMD', 'AVGO', 'QCOM'],
+      comparables: [{ symbol: 'AMD', pe: 28 }, { symbol: 'AVGO', pe: 32 }, { symbol: 'QCOM', pe: 20 }],
+      currentMultiples: { pe: 30 }, historicalRanges: { pe: [18, 34] },
+      methods: { pe: { status: 'available', targetPrice: 112, range: [80, 128] },
+        dcf: { status: 'unavailable', reason: 'not_implemented' } },
+      facts: [valuationInputs, valuationFact], sources: [],
     }),
     readFilingDocument: async () => ({
       facts: [filing], items: [{
@@ -1138,10 +1167,16 @@ test('主 Agent 经真实 PostgreSQL、HTTP 与 SSE 启动并展示独立基本�
     const serialized = JSON.stringify(fundamental.events)
     for (const tool of [
       'get_financial_overview', 'get_financial_metric_series',
-      'read_filing_document', 'list_company_events', 'submit_specialist_report',
+      'get_valuation_evidence', 'read_filing_document',
+      'list_company_events', 'submit_specialist_report',
     ]) assert.match(serialized, new RegExp(tool))
     assert.match(serialized, new RegExp(reported.id))
     assert.match(serialized, new RegExp(filing.id))
+    assert.match(serialized, new RegExp(valuationFact.id))
+    const specialistResult = research.mainAgent.events.find((event: any) => (
+      event.type === 'tool_result' && event.name === 'run_fundamental_analysis'
+    ))
+    assert.deepEqual(specialistResult.result.targetPrice, specialistReport.targetPrice)
     assert.match(serialized, /"totalCount":23/)
     assert.match(serialized, /"nextCursor":"20"/)
     assert.equal(fundamental.researchQuestion, '最新正式财务事实是否改变基本面方向？')
@@ -1160,7 +1195,13 @@ test('主 Agent 经真实 PostgreSQL、HTTP 与 SSE 启动并展示独立基本�
     assert.equal(specialistVersion.sessionId, fundamental.id)
     assert.equal(specialistVersion.version, 1)
     assert.equal(specialistVersion.report.domain, 'fundamental_valuation')
-    assert.deepEqual(specialistVersion.report.keyJudgments[0].supportingEvidence, [reported.id, filing.id])
+    assert.deepEqual(specialistVersion.report.keyJudgments[0].supportingEvidence, [
+      reported.id, filing.id, valuationFact.id,
+    ])
+    assert.deepEqual(specialistVersion.report.targetPrice, {
+      method: 'pe', inputs: [valuationInputs.id], range: { low: 80, high: 128 },
+      asOf: '2026-08-12T14:30:00Z', evidence: [valuationFact.id],
+    })
     assert.match(specialistVersion.payloadHash, /^[a-f0-9]{64}$/)
   } finally { await app.close() }
 })

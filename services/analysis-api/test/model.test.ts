@@ -110,7 +110,7 @@ test('主分析模型和财报专家使用不同的显式工具集', () => {
     'fetch_financial_context', 'run_fundamental_analysis', 'run_news_analysis', 'submit_analysis_report',
   ])
   assert.deepEqual(financialSpecialistTools.map((tool) => tool.name), [
-    'get_financial_overview', 'get_financial_metric_series', 'read_filing_document',
+    'get_financial_overview', 'get_financial_metric_series', 'get_valuation_evidence', 'read_filing_document',
     'list_company_events', 'submit_specialist_report',
   ])
 })
@@ -370,7 +370,8 @@ test('基本面 Agent 使用正式财务工具、保留分页语义并提交专�
   })) events.push(event)
 
   assert.deepEqual(visible[0], [
-    'get_financial_overview', 'get_financial_metric_series', 'read_filing_document',
+    'get_financial_overview', 'get_financial_metric_series', 'get_valuation_evidence',
+    'read_filing_document',
     'list_company_events', 'submit_specialist_report',
   ])
   assert.deepEqual(providerToolResults[1], {
@@ -379,6 +380,85 @@ test('基本面 Agent 使用正式财务工具、保留分页语义并提交专�
   assert.deepEqual(providerToolResults[2]?.items, [
     { name: 'Management Discussion', summary: '收入保持增长。' },
   ])
+  const completed = events.find((event) => event.type === 'completed')
+  assert.equal(completed?.type, 'completed')
+  if (completed?.type === 'completed') assert.deepEqual(completed.reportVersion?.report, report)
+})
+
+test('基本面 Agent 只能读取主标的估值证据并由确定性事实支持目标区间', async () => {
+  const valuationInputs = {
+    ...facts[0]!, id: 'fact:valuation-inputs', type: 'valuation_inputs',
+    evidenceLevel: 'verified_valuation_input',
+    value: { symbol: 'NVDA', authorizedComparables: ['AMD', 'AVGO', 'QCOM'] },
+  }
+  const valuationFact = {
+    ...facts[0]!, id: 'fact:NVDA:deterministic-valuation:pe:abc',
+    type: 'deterministic_valuation', evidenceLevel: 'deterministic_valuation',
+    source: 'deterministic-calculation', sourceReference: 'source://yahoo-timeseries/valuation',
+    value: {
+      method: 'pe', status: 'available', inputs: ['fact:valuation-inputs'],
+      formula: 'diluted_eps * adopted_comparable_pe', unit: 'USD/share',
+      multiple: 28, targetPrice: 112, range: { low: 80, high: 128 },
+      asOf: '2026-08-12T14:30:00Z',
+    },
+  }
+  const report = {
+    kind: 'specialist' as const, domain: 'fundamental_valuation',
+    availability: 'available' as const, status: 'completed' as const, gaps: [], limitations: [],
+    keyJudgments: [{
+      type: 'fundamental', statement: '确定性估值区间显示当前估值中性', direction: 'neutral',
+      confidence: 'medium', supportingEvidence: [valuationFact.id], contraryEvidence: [],
+      contraryEvidenceStatus: 'none_found', invalidationConditions: ['盈利输入发生重大变化'],
+    }],
+    targetPrice: {
+      method: 'pe', inputs: ['fact:valuation-inputs'], range: { low: 80, high: 128 },
+      asOf: '2026-08-12T14:30:00Z', evidence: [valuationFact.id],
+    },
+  }
+  let calls = 0
+  const providerResults: Array<Record<string, unknown>> = []
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall('get_valuation_evidence', { symbol: 'AMD' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('get_valuation_evidence', { symbol: 'NVDA' }), { stopReason: 'toolUse' }),
+    (context) => {
+      const message = context.messages.filter(({ role }) => role === 'toolResult').at(-1)
+      const text = message?.role === 'toolResult'
+        ? message.content.find((item) => item.type === 'text')?.text : undefined
+      providerResults.push(JSON.parse(text ?? '{}') as Record<string, unknown>)
+      return fauxAssistantMessage(fauxToolCall('submit_specialist_report', report), { stopReason: 'toolUse' })
+    },
+  ] })
+  const events = []
+  for await (const event of model.analyzeFundamental!({
+    executionId: 'valuation-authorization', runtimeSettings: runtimeSettings(),
+    symbol: 'NVDA', systemPrompt: 'fundamental', researchQuestion: '估值方向？', knownFacts: [],
+    getFinancialOverview: async () => ({ facts: [] }),
+    getFinancialMetricSeries: async () => ({ facts: [] }),
+    getValuationEvidence: async () => {
+      calls += 1
+      return {
+        symbol: 'NVDA', authorizedComparables: ['AMD', 'AVGO', 'QCOM'],
+        comparables: [{ symbol: 'AMD', pe: 28 }, { symbol: 'AVGO', pe: 32 }, { symbol: 'QCOM', pe: 20 }],
+        currentMultiples: { pe: 30 }, historicalRanges: { pe: [18, 34] },
+        methods: { pe: { status: 'available', targetPrice: 112, range: [80, 128] },
+          dcf: { status: 'unavailable', reason: 'not_implemented' } },
+        facts: [valuationInputs, valuationFact],
+      }
+    },
+    readFilingDocument: async () => ({ facts: [] }), listCompanyEvents: async () => ({ facts: [] }),
+    toolRuntime: createTestToolRuntime(),
+  })) events.push(event)
+
+  assert.equal(calls, 1)
+  assert.match(JSON.stringify(events), /tool_symbol_not_allowed/)
+  assert.deepEqual(providerResults[0]?.authorizedComparables, ['AMD', 'AVGO', 'QCOM'])
+  assert.deepEqual(providerResults[0]?.comparables, [
+    { symbol: 'AMD', pe: 28 }, { symbol: 'AVGO', pe: 32 }, { symbol: 'QCOM', pe: 20 },
+  ])
+  assert.deepEqual(providerResults[0]?.methods, {
+    pe: { status: 'available', targetPrice: 112, range: [80, 128] },
+    dcf: { status: 'unavailable', reason: 'not_implemented' },
+  })
   const completed = events.find((event) => event.type === 'completed')
   assert.equal(completed?.type, 'completed')
   if (completed?.type === 'completed') assert.deepEqual(completed.reportVersion?.report, report)

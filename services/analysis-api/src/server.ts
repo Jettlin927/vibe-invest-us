@@ -54,6 +54,7 @@ const app = buildApp({
   getFinancialMetricSeries: (symbol, metric, cursor, signal) => (
     financialData.financialMetricSeries(symbol, metric, cursor, signal)
   ),
+  getValuationEvidence: (symbol, signal) => financialData.valuationEvidence(symbol, signal),
   readFilingDocument: (symbol, filingId, cursor, signal) => (
     financialData.filingDocument(symbol, filingId, cursor, signal)
   ),

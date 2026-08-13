@@ -1,7 +1,11 @@
+import json
 from statistics import median
+from hashlib import sha256
+from datetime import datetime
 from typing import Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
+from app.models import AtomicFact
 
 
 class ValuationInput(BaseModel):
@@ -31,9 +35,11 @@ class ValuationResult(BaseModel):
     symbol: str
     industry: str
     comparable_symbols: List[str]
+    comparables: List[dict]
     methods: Dict[str, MethodResult]
     historical_ranges: Dict[str, List[float]]
     current_multiples: Dict[str, float] = Field(default_factory=dict)
+    inputs: Dict[str, Optional[float]]
     source: str
     as_of: Optional[str]
 
@@ -60,6 +66,7 @@ def calculate_valuation(inputs: ValuationInput) -> ValuationResult:
         symbol=inputs.symbol,
         industry=inputs.industry,
         comparable_symbols=[item["symbol"] for item in inputs.comparables if item.get("symbol")],
+        comparables=inputs.comparables,
         methods=methods,
         historical_ranges=historical_ranges,
         current_multiples={
@@ -67,9 +74,64 @@ def calculate_valuation(inputs: ValuationInput) -> ValuationResult:
             for _ in [0]
             if inputs.current_price > 0 and inputs.diluted_eps is not None and inputs.diluted_eps > 0
         },
+        inputs={
+            "currentPrice": inputs.current_price,
+            "dilutedEps": inputs.diluted_eps,
+            "enterpriseValue": inputs.enterprise_value,
+            "ebitda": inputs.ebitda,
+            "revenue": inputs.revenue,
+        },
         source=inputs.source,
         as_of=inputs.as_of,
     )
+
+
+def valuation_evidence(result: ValuationResult, now: datetime, input_fact_ids: List[str]):
+    methods = {}
+    facts = []
+    formulas = {
+        "pe": ("diluted_eps * adopted_comparable_pe", "USD/share"),
+        "evToEbitda": ("enterprise_value / ebitda", "multiple"),
+        "evToRevenue": ("enterprise_value / revenue", "multiple"),
+    }
+    for method, calculated in result.methods.items():
+        if calculated.status == "unavailable":
+            methods[method] = {"status": "unavailable", "reason": calculated.reason}
+            continue
+        formula, unit = formulas.get(method, ("deterministic_calculation", "multiple"))
+        method_value = {
+            "method": method, "status": "available", "inputs": input_fact_ids,
+            "formula": formula, "unit": unit, "unitConversion": "none",
+            **({"multiple": calculated.multiple} if calculated.multiple is not None else {}),
+            **({"targetPrice": calculated.target_price} if calculated.target_price is not None else {}),
+            **({"range": {"low": calculated.range[0], "high": calculated.range[1]}}
+               if calculated.range is not None else {}),
+            "asOf": result.as_of,
+        }
+        methods[method] = {
+            "status": "available",
+            **({"multiple": calculated.multiple} if calculated.multiple is not None else {}),
+            **({"targetPrice": calculated.target_price} if calculated.target_price is not None else {}),
+            **({"range": {"low": calculated.range[0], "high": calculated.range[1]}}
+               if calculated.range is not None else {}),
+            **({"multiplePercentile": calculated.multiple_percentile}
+               if calculated.multiple_percentile is not None else {}),
+        }
+        fingerprint = sha256(_canonical_json(method_value)).hexdigest()[:16]
+        facts.append(AtomicFact(
+            id=f"fact:{result.symbol}:deterministic-valuation:{method}:{fingerprint}",
+            type="deterministic_valuation", value=method_value,
+            observedAt=result.as_of or now.isoformat(), fetchedAt=now.isoformat(),
+            source="deterministic-calculation", sourceReference=f"source://{result.source}/valuation",
+            evidenceLevel="deterministic_valuation",
+        ))
+    return {
+        "symbol": result.symbol, "authorizedComparables": result.comparable_symbols,
+        "comparables": result.comparables,
+        "currentMultiples": result.current_multiples,
+        "historicalRanges": result.historical_ranges,
+        "methods": methods, "facts": facts,
+    }
 
 
 def _pe(inputs: ValuationInput) -> MethodResult:
@@ -107,3 +169,7 @@ def _percentile(value: float, values: List[float]) -> float:
     below = sum(item < value for item in values)
     equal = sum(item == value for item in values)
     return round((below + equal / 2) / len(values), 4)
+
+
+def _canonical_json(value: dict) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()

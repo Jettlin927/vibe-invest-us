@@ -43,6 +43,7 @@ test('唯一 Registry 中每个工具独立声明完整权限、保留、网络�
     'submit_analysis_report',
     'get_financial_overview',
     'get_financial_metric_series',
+    'get_valuation_evidence',
     'read_filing_document',
     'search_news_candidates',
     'search_web_evidence',
@@ -142,7 +143,7 @@ test('消息面 Agent 只获得新闻候选、文档、公司事件和专项报�
 test('基本面 Agent 只获得高层财务、Filing、官方事件和专项报告工具', () => {
   const registry = createToolRegistry(registeredToolDefinitions, registeredToolHandlers)
   assert.deepEqual(registry.project({ role: 'fundamental', stage: 'research' }).map(({ name }) => name), [
-    'get_financial_overview', 'get_financial_metric_series', 'read_filing_document',
+    'get_financial_overview', 'get_financial_metric_series', 'get_valuation_evidence', 'read_filing_document',
     'list_company_events', 'submit_specialist_report',
   ])
   assert.deepEqual(registry.project({ role: 'fundamental', stage: 'finalization' }).map(({ name }) => name), [

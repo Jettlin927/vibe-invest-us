@@ -165,6 +165,45 @@
         }
       }
     },
+    "/v1/valuation-evidence": {
+      "post": {
+        "summary": "Valuation Evidence Endpoint",
+        "operationId": "getValuationEvidence",
+        "parameters": [
+          {
+            "name": "symbol",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Symbol"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValuationEvidenceResult"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/filing-document": {
       "post": {
         "summary": "Filing Document",
@@ -1258,6 +1297,61 @@
           "type"
         ],
         "title": "ValidationError"
+      },
+      "ValuationEvidenceResult": {
+        "properties": {
+          "symbol": {
+            "type": "string",
+            "title": "Symbol"
+          },
+          "authorizedComparables": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Authorizedcomparables"
+          },
+          "comparables": {
+            "items": {},
+            "type": "array",
+            "title": "Comparables"
+          },
+          "currentMultiples": {
+            "title": "Currentmultiples"
+          },
+          "historicalRanges": {
+            "title": "Historicalranges"
+          },
+          "methods": {
+            "title": "Methods"
+          },
+          "facts": {
+            "items": {
+              "$ref": "#/components/schemas/AtomicFact"
+            },
+            "type": "array",
+            "title": "Facts"
+          },
+          "sources": {
+            "items": {
+              "$ref": "#/components/schemas/SourceStatus"
+            },
+            "type": "array",
+            "title": "Sources",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "symbol",
+          "authorizedComparables",
+          "comparables",
+          "currentMultiples",
+          "historicalRanges",
+          "methods",
+          "facts"
+        ],
+        "title": "ValuationEvidenceResult"
       }
     }
   }

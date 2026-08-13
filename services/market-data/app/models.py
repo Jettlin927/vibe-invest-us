@@ -103,6 +103,17 @@ class FilingDocumentResult(PaginatedFactResult):
     items: List[Any]
 
 
+class ValuationEvidenceResult(BaseModel):
+    symbol: str
+    authorizedComparables: List[str]
+    comparables: List[Any]
+    currentMultiples: Any
+    historicalRanges: Any
+    methods: Any
+    facts: List[AtomicFact]
+    sources: List[SourceStatus] = []
+
+
 class NewsDocumentResult(FactQueryResult):
     excerpt: str
 

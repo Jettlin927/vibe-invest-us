@@ -360,6 +360,9 @@ test('研究页固定展示基本面专项，并独立展示工具轨迹和不�
       reportVersion: { version: 1, report: {
         gaps: [{ capability: 'guidance', reason: '未发现正式指引', impact: '置信度受限' }],
         keyJudgments: [{ statement: '正式财务事实支持基本面偏强', direction: 'bullish', confidence: 'medium' }],
+        targetPrice: {
+          method: 'pe', range: { low: 80, high: 128 }, asOf: '2026-08-12T14:30:00Z',
+        },
       } },
     }],
   }
@@ -384,6 +387,7 @@ test('研究页固定展示基本面专项，并独立展示工具轨迹和不�
   assert.match(specialist.textContent ?? '', /报告版本 1/)
   assert.match(specialist.textContent ?? '', /未发现正式指引.*置信度受限/)
   assert.match(specialist.textContent ?? '', /正式财务事实支持基本面偏强.*中等/)
+  assert.match(specialist.textContent ?? '', /估值区间.*80.*128.*pe.*2026-08-12T14:30:00Z/)
 })
 
 test('模型未配置时首次研究创建后立即打开主 Agent 生命周期', async () => {

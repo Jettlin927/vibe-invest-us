@@ -97,6 +97,26 @@ export function createFinancialDataClient(baseUrl: string) {
       }
       return { overview: result.overview as Record<string, unknown>, facts: result.facts, sources: result.sources }
     },
+    async valuationEvidence(symbol: string, signal?: AbortSignal) {
+      const result = await rawFactQuery(
+        `/v1/valuation-evidence?symbol=${encodeURIComponent(symbol)}`, signal,
+      )
+      if (typeof result.symbol !== 'string' || !Array.isArray(result.authorizedComparables)
+        || !result.authorizedComparables.every((value) => typeof value === 'string')
+        || !Array.isArray(result.comparables)
+        || !result.currentMultiples || typeof result.currentMultiples !== 'object'
+        || !result.historicalRanges || typeof result.historicalRanges !== 'object'
+        || !result.methods || typeof result.methods !== 'object') {
+        throw new Error('financial_data_valuation_contract_invalid')
+      }
+      return {
+        symbol: result.symbol, authorizedComparables: result.authorizedComparables as string[],
+        comparables: result.comparables as unknown[],
+        currentMultiples: result.currentMultiples as Record<string, unknown>,
+        historicalRanges: result.historicalRanges as Record<string, unknown>,
+        methods: result.methods as Record<string, unknown>, facts: result.facts, sources: result.sources,
+      }
+    },
     async financialMetricSeries(
       symbol: string, metric: string, cursor?: string, signal?: AbortSignal,
     ): Promise<PaginatedFactQueryResult> {

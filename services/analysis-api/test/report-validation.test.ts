@@ -323,11 +323,14 @@ test('财务判断不能由新闻报道替代正式财务证据', () => {
   assert.deepEqual(result.errors[0], {
     path: '/keyJudgments/0/supportingEvidence/0', rule: 'evidence_qualification',
     message: 'verified_news 事实不能支撑 fundamental 判断',
-    allowedEvidenceTypes: ['official_filing', 'reported_financial', 'deterministic_financial_metric'],
+    allowedEvidenceTypes: [
+      'official_filing', 'reported_financial',
+      'deterministic_financial_metric', 'deterministic_valuation',
+    ],
   })
 })
 
-test('技术判断接受宿主确定性技术证据且合格目标价可出现', () => {
+test('技术判断接受宿主确定性技术证据且宿主目标价事实可原样出现', () => {
   const result = validateReportCandidate({
     kind: 'integrated', availability: 'available', status: 'completed', gaps: [], limitations: [],
     keyJudgments: [{
@@ -340,8 +343,31 @@ test('技术判断接受宿主确定性技术证据且合格目标价可出现',
     },
   }, { role: 'main', knownFacts: [
     { id: 'fact:technical', type: 'technical_evidence', evidenceLevel: 'deterministic_technical' },
-    { id: 'fact:valuation', type: 'deterministic_valuation', evidenceLevel: 'deterministic_valuation' },
+    { id: 'fact:valuation', type: 'deterministic_valuation', evidenceLevel: 'deterministic_valuation',
+      value: { method: 'DCF', inputs: ['fact:valuation'], unit: 'USD/share',
+        range: { low: 210, high: 250 }, asOf: '2026-08-13' } },
   ] })
 
   assert.equal(result.ok, true)
+})
+
+test('只有倍数区间或与宿主事实不一致时不能生成目标价', () => {
+  const candidate = {
+    kind: 'specialist', domain: 'fundamental_valuation', availability: 'available',
+    status: 'completed', gaps: [], limitations: [], keyJudgments: [], targetPrice: {
+      method: 'PE comparable', inputs: ['fact:multiple'], range: { low: 80, high: 128 },
+      asOf: '2026-08-12', evidence: ['fact:multiple'],
+    },
+  }
+  const result = validateReportCandidate(candidate, {
+    role: 'fundamental_valuation', knownFacts: [{
+      id: 'fact:multiple', type: 'deterministic_valuation', evidenceLevel: 'deterministic_valuation',
+      value: { method: 'evToEbitda', inputs: ['fact:multiple'], unit: 'multiple',
+        range: { low: 14, high: 22 }, asOf: '2026-08-12' },
+    }],
+  })
+
+  assert.equal(result.ok, false)
+  if (result.ok) return
+  assert.equal(result.errors[0]?.rule, 'conditional_field_qualification')
 })

@@ -1,3 +1,4 @@
+import json
 import re
 from datetime import datetime, timedelta
 from hashlib import sha256
@@ -17,7 +18,9 @@ from app.models import (
     SourceStatus,
     PaginatedFactResult,
     FilingDocumentResult,
+    ValuationEvidenceResult,
 )
+from app.valuation import valuation_evidence
 
 
 def build_financial_context(
@@ -149,6 +152,45 @@ def financial_metric_series_result(symbol: str, metric: str, cursor: Optional[st
         raise ValueError("fundamentals_source_unavailable")
     normalized = fundamentals_source.fetch(symbol.strip().upper())
     return financial_metric_series(symbol, metric, cursor, normalized, now)
+
+
+def valuation_evidence_result(symbol: str, now: datetime, quote_sources: Iterable[Any],
+                              valuation_source: Optional[Any]) -> ValuationEvidenceResult:
+    normalized_symbol = symbol.strip().upper()
+    if valuation_source is None:
+        raise ValueError("valuation_source_unavailable")
+    quote = _first_available(quote_sources, normalized_symbol)
+    quote_value = quote.value if isinstance(quote.value, Quote) else None
+    result = valuation_source.fetch_with_market_price(
+        normalized_symbol,
+        quote_value.price if quote_value else None,
+        quote_value.observed_at.isoformat() if quote_value else None,
+    )
+    snapshot_value = {
+        "symbol": result.symbol, "industry": result.industry,
+        "authorizedComparables": result.comparable_symbols,
+        "comparables": result.comparables,
+        "inputs": result.inputs,
+        "currentMultiples": result.current_multiples,
+        "historicalRanges": result.historical_ranges,
+        "methods": {name: value.model_dump(exclude_none=True) for name, value in result.methods.items()},
+        "asOf": result.as_of,
+    }
+    fingerprint = sha256(json.dumps(
+        snapshot_value, sort_keys=True, separators=(",", ":"),
+    ).encode()).hexdigest()[:16]
+    snapshot = AtomicFact(
+        id=f"fact:{normalized_symbol}:valuation-inputs:{fingerprint}",
+        type="valuation_inputs", value=snapshot_value,
+        observedAt=result.as_of or now.isoformat(), fetchedAt=now.isoformat(),
+        source=result.source, sourceReference="https://finance.yahoo.com/",
+        evidenceLevel="verified_valuation_input",
+    )
+    evidence = valuation_evidence(result, now, [snapshot.id])
+    return ValuationEvidenceResult(
+        **evidence, facts=[snapshot, *evidence["facts"]],
+        sources=[SourceStatus(source=result.source, status="ok", item_count=len(evidence["facts"]))],
+    )
 
 
 def filing_document_page(symbol: str, filing_id: str, cursor: Optional[str],

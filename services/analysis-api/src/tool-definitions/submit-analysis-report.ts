@@ -27,6 +27,11 @@ export const submitAnalysisReportDefinition: RegisteredToolDefinition = {
       valuation: Type.Optional(Type.Union([Type.String(), Type.Null()])),
       personalImpact: Type.Optional(Type.Union([Type.String(), Type.Null()])),
       conditionalSuggestion: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+      targetPrice: Type.Optional(Type.Object({
+        method: Type.String(), inputs: Type.Array(Type.String()),
+        range: Type.Object({ low: Type.Number(), high: Type.Number() }),
+        asOf: Type.String(), evidence: Type.Array(Type.String()),
+      })),
       keyJudgments: Type.Optional(Type.Array(Type.Object({
         type: Type.Union([
           Type.Literal('market'), Type.Literal('news'), Type.Literal('fundamental'),
