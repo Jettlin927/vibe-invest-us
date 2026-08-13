@@ -42,14 +42,24 @@ def test_yahoo_valuation_preserves_each_metric_fact_date(monkeypatch):
         "trailingEnterpriseValue": [{
             "asOfDate": "2026-08-12", "reportedValue": {"raw": 500},
         }],
+    }, {
+        "meta": {"type": ["trailingPeRatio"]},
+        "trailingPeRatio": [
+            {"asOfDate": "2025-08-12", "reportedValue": {"raw": 24}},
+            {"asOfDate": "2026-08-12", "reportedValue": {"raw": 28}},
+        ],
     }]}}
     monkeypatch.setattr("app.adapters._read", lambda *args, **kwargs: json.dumps(payload))
 
     metrics = YahooValuationSource()._metrics("NVDA")
 
     assert metrics["observedAt"] == {
-        "dilutedEps": "2026-07-31", "enterpriseValue": "2026-08-12",
+        "dilutedEps": "2026-07-31", "enterpriseValue": "2026-08-12", "pe": "2026-08-12",
     }
+    assert metrics["historicalPe"] == [
+        {"value": 24, "observedAt": "2025-08-12"},
+        {"value": 28, "observedAt": "2026-08-12"},
+    ]
 
 
 def test_yahoo_valuation_without_quote_uses_latest_input_fact_date(monkeypatch):

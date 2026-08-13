@@ -184,6 +184,7 @@ def valuation_evidence_result(symbol: str, now: datetime, quote_sources: Iterabl
         id=f"fact:{normalized_symbol}:valuation-inputs:{fingerprint}",
         type="valuation_inputs", value=snapshot_value,
         observedAt=max(result.input_observed_at.values(), default=result.as_of or now.isoformat()),
+        fetchedAt=now.isoformat(),
         source=result.source, sourceReference="https://finance.yahoo.com/",
         evidenceLevel="verified_valuation_input",
     )

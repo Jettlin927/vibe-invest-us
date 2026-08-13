@@ -595,12 +595,18 @@ class YahooValuationSource(TimedSource):
             input_observed_at = {
                 **({"marketPrice": market_price_observed_at} if market_price_observed_at else {}),
                 **{f"company.{key}": value for key, value in company.get("observedAt", {}).items()},
+                **{
+                    f"company.historicalPe.{index}": item["observedAt"]
+                    for index, item in enumerate(company.get("historicalPe", []))
+                },
             }
             return calculate_valuation(ValuationInput(
                 symbol=symbol, industry="unsupported", current_price=market_price or 0,
                 diluted_eps=company.get("dilutedEps"), enterprise_value=company.get("enterpriseValue"),
                 ebitda=company.get("ebitda"), revenue=company.get("revenue"), comparables=[],
-                historical_multiples={"pe": company.get("historicalPe", [])},
+                historical_multiples={
+                    "pe": [item["value"] for item in company.get("historicalPe", [])],
+                },
                 input_observed_at=input_observed_at,
                 source=self.name, as_of=market_price_observed_at,
             ))
@@ -625,10 +631,16 @@ class YahooValuationSource(TimedSource):
             diluted_eps=company.get("dilutedEps"), enterprise_value=company.get("enterpriseValue"),
             ebitda=company.get("ebitda"), revenue=company.get("revenue"),
             comparables=comparables,
-            historical_multiples={"pe": company.get("historicalPe", [])},
+            historical_multiples={
+                "pe": [item["value"] for item in company.get("historicalPe", [])],
+            },
             input_observed_at={
                 **({"marketPrice": market_price_observed_at} if market_price_observed_at else {}),
                 **{f"company.{key}": value for key, value in company.get("observedAt", {}).items()},
+                **{
+                    f"company.historicalPe.{index}": item["observedAt"]
+                    for index, item in enumerate(company.get("historicalPe", []))
+                },
                 **peer_observed_at,
             },
             source=self.name,
@@ -658,7 +670,9 @@ class YahooValuationSource(TimedSource):
             source_key = (series.get("meta", {}).get("type") or [None])[0]
             values = series.get(source_key, [])
             if source_key == "trailingPeRatio":
-                mapped["historicalPe"] = [item["reportedValue"]["raw"] for item in values if item.get("reportedValue")]
+                mapped["historicalPe"] = [{
+                    "value": item["reportedValue"]["raw"], "observedAt": item["asOfDate"],
+                } for item in values if item.get("reportedValue") and item.get("asOfDate")]
             if values and source_key in keys:
                 mapped[keys[source_key]] = values[-1]["reportedValue"]["raw"]
                 observed_at = values[-1].get("asOfDate")
