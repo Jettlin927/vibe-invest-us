@@ -1193,53 +1193,91 @@ export function createAgentEventRepository(pool: Pool) {
             || !jsonValuesEqual(row.payload_json, input.event)
             || !sameInstant(row.created_at, input.createdAt)) throw new Error('agent_execution_fenced')
           const cancelled = await client.query<AgentEventRow>(
-            `SELECT session_id, sequence, operation_id, payload_json, created_at::text
-             FROM agent_events WHERE session_id = $1 AND created_at = $2
-               AND operation_id LIKE '%:cancelled-%' ORDER BY sequence`,
-            [input.sessionId, input.createdAt],
+            `SELECT e.session_id, e.sequence, e.operation_id, e.payload_json, e.created_at::text
+             FROM agent_events e JOIN agent_sessions s ON s.id = e.session_id
+             WHERE s.analysis_id = $1 AND e.created_at = $2
+               AND e.operation_id LIKE '%:cancelled-%' ORDER BY e.session_id, e.sequence`,
+            [session.rows[0].analysis_id, input.createdAt],
+          )
+          const fenced = await client.query<AgentEventRow & { execution_id: string }>(
+            `SELECT e.session_id, e.sequence, e.operation_id, e.payload_json, e.created_at::text,
+                    s.execution_id
+             FROM agent_events e JOIN agent_sessions s ON s.id = e.session_id
+             WHERE s.analysis_id = $1 AND e.created_at = $2
+               AND e.payload_json->>'status' = 'stopping' ORDER BY e.session_id`,
+            [session.rows[0].analysis_id, input.createdAt],
           )
           await client.query('COMMIT')
-          return { ...mapAgentEventRow(row), cancelledToolEvents: cancelled.rows.map(mapAgentEventRow) }
+          return {
+            ...mapAgentEventRow(row), executionId: input.fenceExecutionId,
+            cancelledToolEvents: cancelled.rows.map(mapAgentEventRow),
+            fencedSessions: fenced.rows.map((event) => ({
+              ...mapAgentEventRow(event), executionId: event.execution_id,
+            })),
+          }
         }
-        const execution = await client.query<{ generation: number; terminal: boolean }>(
-          'SELECT generation, terminal FROM agent_executions WHERE id = $1 FOR UPDATE',
-          [input.executionId],
+        const sessions = await client.query<{
+          id: string; execution_id: string; latest_sequence: number; is_primary: boolean
+        }>(
+          `SELECT id, execution_id, latest_sequence, is_primary FROM agent_sessions
+           WHERE analysis_id = $1 ORDER BY id FOR UPDATE`, [session.rows[0].analysis_id],
         )
-        if (!execution.rows[0]) throw new Error('agent_execution_not_found')
-        if (execution.rows[0].terminal) throw new Error('agent_execution_terminal')
-        const cancelled = await cancelRunningToolBatches(
-          client, input.sessionId, input.executionId, session.rows[0].latest_sequence, input.createdAt,
-        )
-        const sequence = cancelled.latestSequence + 1
-        const waitReason = input.event.waitReason ?? null
-        await client.query(
-          'UPDATE agent_executions SET terminal = true, updated_at = $1 WHERE id = $2',
-          [input.createdAt, input.executionId],
-        )
-        await client.query(
-          `INSERT INTO agent_executions (
-             id, session_id, generation, status, wait_reason_json, terminal, created_at, updated_at
-           ) VALUES ($1, $2, $3, 'stopping', $4, false, $5, $5)`,
-          [input.fenceExecutionId, input.sessionId, execution.rows[0].generation + 1,
-            waitReason ? JSON.stringify(waitReason) : null, input.createdAt],
-        )
-        await client.query(
-          `INSERT INTO agent_events (session_id, sequence, operation_id, payload_json, created_at)
-           VALUES ($1, $2, $3, $4, $5)`,
-          [input.sessionId, sequence, input.operationId, JSON.stringify(input.event), input.createdAt],
-        )
-        await client.query(
-          `UPDATE agent_sessions SET execution_id = $1, status = 'stopping', latest_sequence = $2,
-             updated_at = $3 WHERE id = $4`,
-          [input.fenceExecutionId, sequence, input.createdAt, input.sessionId],
-        )
+        const fencedSessions: Array<AgentEvent & { executionId: string }> = []
+        const cancelledToolEvents: AgentEvent[] = []
+        for (const currentSession of sessions.rows) {
+          const execution = await client.query<{ generation: number; terminal: boolean }>(
+            'SELECT generation, terminal FROM agent_executions WHERE id = $1 FOR UPDATE',
+            [currentSession.execution_id],
+          )
+          if (!execution.rows[0]) throw new Error('agent_execution_not_found')
+          if (execution.rows[0].terminal) {
+            if (currentSession.id === input.sessionId) throw new Error('agent_execution_terminal')
+            continue
+          }
+          const cancelled = await cancelRunningToolBatches(
+            client, currentSession.id, currentSession.execution_id,
+            currentSession.latest_sequence, input.createdAt,
+          )
+          cancelledToolEvents.push(...cancelled.events)
+          const sequence = cancelled.latestSequence + 1
+          const waitReason = input.event.waitReason ?? null
+          const fenceExecutionId = currentSession.id === input.sessionId
+            ? input.fenceExecutionId : `${input.fenceExecutionId}:session:${currentSession.id}`
+          const operationId = currentSession.id === input.sessionId
+            ? input.operationId : `${input.operationId}:session:${currentSession.id}`
+          await client.query(
+            'UPDATE agent_executions SET terminal = true, updated_at = $1 WHERE id = $2',
+            [input.createdAt, currentSession.execution_id],
+          )
+          await client.query(
+            `INSERT INTO agent_executions (
+               id, session_id, generation, status, wait_reason_json, terminal, created_at, updated_at
+             ) VALUES ($1, $2, $3, 'stopping', $4, false, $5, $5)`,
+            [fenceExecutionId, currentSession.id, execution.rows[0].generation + 1,
+              waitReason ? JSON.stringify(waitReason) : null, input.createdAt],
+          )
+          await client.query(
+            `INSERT INTO agent_events (session_id, sequence, operation_id, payload_json, created_at)
+             VALUES ($1, $2, $3, $4, $5)`,
+            [currentSession.id, sequence, operationId, JSON.stringify(input.event), input.createdAt],
+          )
+          await client.query(
+            `UPDATE agent_sessions SET execution_id = $1, status = 'stopping', latest_sequence = $2,
+               updated_at = $3 WHERE id = $4`,
+            [fenceExecutionId, sequence, input.createdAt, currentSession.id],
+          )
+          fencedSessions.push({
+            sessionId: currentSession.id, sequence, operationId, payload: input.event,
+            createdAt: input.createdAt, executionId: fenceExecutionId,
+          })
+        }
         if (session.rows[0].is_primary) await client.query(
           `UPDATE analyses SET status = 'stopping', active = true, updated_at = $1 WHERE id = $2`,
           [input.createdAt, session.rows[0].analysis_id],
         )
         await client.query('COMMIT')
-        return { sessionId: input.sessionId, sequence, operationId: input.operationId,
-          payload: input.event, createdAt: input.createdAt, cancelledToolEvents: cancelled.events }
+        const primary = fencedSessions.find(({ sessionId }) => sessionId === input.sessionId)!
+        return { ...primary, cancelledToolEvents, fencedSessions }
       } catch (error) {
         await client.query('ROLLBACK')
         throw error

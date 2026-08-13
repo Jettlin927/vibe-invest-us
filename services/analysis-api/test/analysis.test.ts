@@ -442,6 +442,47 @@ test('专项批次单项失败不取消其余专项且主 Agent 在全部终态�
   await app.close()
 })
 
+test('专项取消落为 stopped 且主 Agent 收到 cancelled 紧凑结果', async () => {
+  const database = createTestProductDatabase()
+  let compactStatus = ''
+  const model = {
+    async *analyze(input: any) {
+      const [prepared] = await input.prepareSpecialistBatch([{
+        domain: 'news', researchQuestion: '消息面取消测试', reason: '验证取消收口',
+      }], `execution:${input.executionId}:cancelled-specialist`)
+      const result = await input.runNewsSpecialist({
+        launch: true, researchQuestion: '消息面取消测试', reason: '验证取消收口', prepared,
+      })
+      compactStatus = result.status
+      assert.equal(result.status, 'cancelled')
+      assert.equal(result.sessionId, prepared.sessionId)
+      yield { type: 'completed' as const, report, reportVersion: {
+        kind: 'integrated' as const, report: reportCandidate,
+      } }
+    },
+    async *analyzeNews() { yield { type: 'cancelled' as const } },
+  }
+  const emptyFacts = async () => ({ facts: [] })
+  const app = buildProductionApp({
+    ...database, model,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [] }),
+    searchNewsCandidates: emptyFacts, readNewsDocument: emptyFacts, listCompanyEvents: emptyFacts,
+  } as any)
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'CANCELSP' },
+  })).json()
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  const research = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  assert.equal(compactStatus, 'cancelled')
+  assert.equal(research.specialistAgents[0].execution.status, 'stopped')
+  assert.equal(research.specialistAgents[0].events.some((event: any) => event.status === 'failed'), false)
+  await app.close()
+})
+
 test('主 Agent 跨 Turn 追问同一领域时复用长期专项 Session 并创建报告 V2', async () => {
   const database = createTestProductDatabase()
   let specialistRun = 0
@@ -1183,6 +1224,53 @@ test('取消运行任务会以 stopping → stopped 统一收敛模型与生命�
     .map((entry: { status: string }) => entry.status), ['stopping', 'stopped'])
   assert.equal(research.json().status, 'stopped')
   assert.equal(research.json().mainAgent.status, 'stopped')
+  await app.close()
+})
+
+test('取消并行专项时先 fence 整棵 Agent 树再统一 stopped', async () => {
+  const database = createTestProductDatabase()
+  let specialistStarted!: () => void
+  const started = new Promise<void>((resolve) => { specialistStarted = resolve })
+  const model = {
+    async *analyze(input: any) {
+      const [prepared] = await input.prepareSpecialistBatch([{
+        domain: 'news', researchQuestion: '停止测试', reason: '验证树级 fence',
+      }], `execution:${input.executionId}:cancel-tree`)
+      await input.runNewsSpecialist({
+        launch: true, researchQuestion: '停止测试', reason: '验证树级 fence', prepared,
+      })
+    },
+    async *analyzeNews(input: any) {
+      specialistStarted()
+      await new Promise<void>((resolve) => input.signal.addEventListener('abort', () => resolve(), {
+        once: true,
+      }))
+      yield { type: 'cancelled' as const }
+    },
+  }
+  const emptyFacts = async () => ({ facts: [] })
+  const app = buildProductionApp({
+    ...database, model,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [] }),
+    searchNewsCandidates: emptyFacts, readNewsDocument: emptyFacts, listCompanyEvents: emptyFacts,
+  } as any)
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'CANCELTREE' },
+  })).json()
+  await started
+  const response = await app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/cancel`,
+  })
+  assert.equal(response.statusCode, 202)
+  const research = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  assert.equal(research.mainAgent.execution.status, 'stopped')
+  const news = research.specialistAgents.find((agent: any) => agent.domain === 'news')
+  assert.equal(news.execution.status, 'stopped')
+  assert.equal(news.execution.generation, 2)
   await app.close()
 })
 

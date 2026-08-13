@@ -176,28 +176,40 @@ export function createTestProductDatabase() {
       const lifecycle = lifecycles.get(input.sessionId)
       if (!session || !lifecycle) throw new Error('agent_session_not_found')
       if (session.executionId !== input.executionId) throw new Error('agent_execution_fenced')
-      const event = {
-        sessionId: input.sessionId, sequence: session.latestSequence + 1,
-        operationId: input.operationId, payload: input.event, createdAt: input.createdAt,
-      }
-      agentEvents.set(input.sessionId, [...(agentEvents.get(input.sessionId) ?? []), event])
-      agentSessions.set(input.sessionId, {
-        ...session, executionId: input.fenceExecutionId, status: 'stopping',
-        latestSequence: event.sequence, updatedAt: input.createdAt,
-      })
-      lifecycles.set(input.sessionId, {
-        ...lifecycle,
-        execution: {
-          id: input.fenceExecutionId, generation: lifecycle.execution.generation + 1,
-          status: 'stopping', createdAt: input.createdAt, updatedAt: input.createdAt,
-        },
-        waitReason: input.event.waitReason as never,
+      const fencedSessions = [...agentSessions.values()].filter((candidate) => (
+        candidate.analysisId === session.analysisId
+        && !['completed', 'partial', 'failed', 'stopped', 'interrupted'].includes(candidate.status)
+      )).map((candidate) => {
+        const candidateLifecycle = lifecycles.get(candidate.id)!
+        const fenceExecutionId = candidate.id === input.sessionId
+          ? input.fenceExecutionId : `${input.fenceExecutionId}:session:${candidate.id}`
+        const operationId = candidate.id === input.sessionId
+          ? input.operationId : `${input.operationId}:session:${candidate.id}`
+        const event = {
+          sessionId: candidate.id, sequence: candidate.latestSequence + 1,
+          operationId, payload: input.event, createdAt: input.createdAt,
+        }
+        agentEvents.set(candidate.id, [...(agentEvents.get(candidate.id) ?? []), event])
+        agentSessions.set(candidate.id, {
+          ...candidate, executionId: fenceExecutionId, status: 'stopping',
+          latestSequence: event.sequence, updatedAt: input.createdAt,
+        })
+        lifecycles.set(candidate.id, {
+          ...candidateLifecycle,
+          execution: {
+            id: fenceExecutionId, generation: candidateLifecycle.execution.generation + 1,
+            status: 'stopping', createdAt: input.createdAt, updatedAt: input.createdAt,
+          },
+          waitReason: input.event.waitReason as never,
+        })
+        return { ...event, executionId: fenceExecutionId }
       })
       const record = analyses.get(session.analysisId)
       if (record && session.isPrimary) analyses.set(session.analysisId, {
         ...record, status: 'stopping', terminal: false, updatedAt: input.createdAt,
       })
-      return event
+      const event = fencedSessions.find(({ sessionId }) => sessionId === input.sessionId)!
+      return { ...event, cancelledToolEvents: [], fencedSessions }
     },
     async createResearch(input) {
       const existing = [...analyses.values()]

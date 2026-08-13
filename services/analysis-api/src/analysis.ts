@@ -558,7 +558,7 @@ export function createAnalysisService(options: {
               specialistStatus = 'cancelled'
               await setStatus(
                 specialistSessionId, specialistExecutionId,
-                `execution:${specialistExecutionId}:status-cancelled`, 'cancelled',
+                `execution:${specialistExecutionId}:status-stopped`, 'stopped',
               )
               return {
                 launched: true, status: 'cancelled', sessionId: specialistSessionId,
@@ -816,7 +816,8 @@ export function createAnalysisService(options: {
   }
   async function cancel(analysisId: string) {
     const job = await get(analysisId)
-    if (!job || !['queued', 'running'].includes(job.status)) return false
+    if (!job || ['completed', 'partial', 'failed', 'stopping', 'stopped', 'interrupted', 'budget_exhausted']
+      .includes(job.status)) return false
     const session = await options.eventRepository.findPrimarySession(analysisId)
     if (!session) return false
     const fenceExecutionId = randomUUID()
@@ -829,13 +830,19 @@ export function createAnalysisService(options: {
       createdAt,
     })
     for (const cancelled of event.cancelledToolEvents ?? []) {
-      for (const listener of listeners.get(session.id) ?? []) listener(cancelled)
+      for (const listener of listeners.get(cancelled.sessionId) ?? []) listener(cancelled)
     }
-    for (const listener of listeners.get(session.id) ?? []) listener(event)
+    for (const fenced of event.fencedSessions ?? [event]) {
+      for (const listener of listeners.get(fenced.sessionId) ?? []) listener(fenced)
+    }
     const controller = controllers.get(analysisId)
     controller?.abort()
     await analysisTasks.get(analysisId)
-    await setStatus(session.id, fenceExecutionId, `session:${session.id}:stopped`, 'stopped')
+    for (const fenced of event.fencedSessions ?? [{ sessionId: session.id, executionId: fenceExecutionId }]) {
+      await setStatus(
+        fenced.sessionId, fenced.executionId, `session:${fenced.sessionId}:stopped`, 'stopped',
+      )
+    }
     return true
   }
   async function research(analysisId: string) {

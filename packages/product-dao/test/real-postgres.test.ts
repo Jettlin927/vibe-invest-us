@@ -817,6 +817,69 @@ test('真实 PostgreSQL settings snapshot 失败时不残留 Session、execution
   }
 })
 
+test('真实 PostgreSQL 停止主 Session 时原子 fence 整棵专项树', {
+  skip: !migrationUrl || !applicationUrl,
+  concurrency: false,
+}, async () => {
+  await migrate(migrationUrl!)
+  const pool = createPool(applicationUrl!)
+  const events = createAgentEventRepository(pool)
+  const projections = createToolProjectionRepository(pool)
+  const analyses = createAnalysisRepository(pool)
+  const suffix = crypto.randomUUID()
+  const analysisId = `tree-fence-${suffix}`
+  const mainSessionId = `${analysisId}:main`
+  const mainExecutionId = `${mainSessionId}:execution`
+  const specialistSessionId = `${analysisId}:news`
+  const specialistExecutionId = `${specialistSessionId}:execution`
+  try {
+    await events.createResearch({
+      analysisId, sessionId: mainSessionId, executionId: mainExecutionId,
+      symbol: `T${suffix.slice(0, 8)}`, status: 'running', operationId: 'main-created',
+      event: { type: 'status', status: 'running' }, createdAt: '2026-08-14T01:00:00.000Z',
+    })
+    await events.createSpecialistSession({
+      id: specialistSessionId, analysisId, domain: 'news', executionId: specialistExecutionId,
+      status: 'running_tools', operationId: 'news-created',
+      event: { type: 'specialist_context', domain: 'news' },
+      createdAt: '2026-08-14T01:00:00.000Z',
+    })
+    const projection = await projections.ensureVersion({
+      executionId: specialistExecutionId, role: 'news', stage: 'research',
+      schemaHash: 'tree-fence-news', projectedTools: [{ name: 'search_news_candidates' }],
+      visibleToolNames: ['search_news_candidates'], reasons: { stage: 'research' },
+      createdAt: '2026-08-14T01:00:01.000Z',
+    })
+    await projections.beginToolBatch({
+      id: `${specialistExecutionId}:batch`, executionId: specialistExecutionId,
+      projectionId: projection.id, turnIndex: 1, calls: [{
+        toolCallId: 'news-call', toolName: 'search_news_candidates', position: 1,
+      }], createdAt: '2026-08-14T01:00:01.000Z',
+    })
+
+    const stopped = await events.fenceForStopping({
+      sessionId: mainSessionId, executionId: mainExecutionId,
+      fenceExecutionId: `${mainExecutionId}:stopping`, operationId: 'tree-stopping',
+      event: { type: 'status', status: 'stopping' },
+      createdAt: '2026-08-14T01:00:02.000Z',
+    })
+
+    assert.equal(stopped.fencedSessions.length, 2)
+    assert.deepEqual(new Set(stopped.fencedSessions.map(({ sessionId }) => sessionId)),
+      new Set([mainSessionId, specialistSessionId]))
+    assert.equal((await events.sessionLifecycle(specialistSessionId))?.execution.status, 'stopping')
+    assert.equal((await projections.replay(specialistExecutionId)).toolBatches[0]?.status, 'cancelled')
+    await assert.rejects(events.append({
+      sessionId: specialistSessionId, executionId: specialistExecutionId,
+      operationId: 'late-specialist-result', event: { type: 'status', status: 'partial' },
+      createdAt: '2026-08-14T01:00:03.000Z',
+    }), /agent_execution_fenced/)
+  } finally {
+    await analyses.removeResearch(analysisId)
+    await pool.end()
+  }
+})
+
 test('真实 PostgreSQL 并发保存 Runtime settings 不丢失不同字段更新', {
   skip: !migrationUrl || !applicationUrl,
   concurrency: false,
