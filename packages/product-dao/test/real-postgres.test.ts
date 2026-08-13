@@ -46,12 +46,36 @@ test('真实 PostgreSQL 持久化 Tool Projection 版本、模型请求与批次
     })
     assert.equal(first.version, 1)
     assert.deepEqual(same, first)
+    const concurrent = await Promise.all([
+      projections.ensureVersion({
+        executionId, role: 'fundamental', stage: 'research', schemaHash: 'hash-concurrent-a',
+        projectedTools: [{ name: 'search_news_by_keyword', parameters: { type: 'object' } }],
+        visibleToolNames: ['search_news_by_keyword'], reasons: { stage: 'research' },
+        createdAt: '2026-08-13T04:00:02.010Z',
+      }),
+      projections.ensureVersion({
+        executionId, role: 'fundamental', stage: 'finalization', schemaHash: 'hash-concurrent-b',
+        projectedTools: [], visibleToolNames: [], reasons: { stage: 'finalization' },
+        createdAt: '2026-08-13T04:00:02.020Z',
+      }),
+    ])
+    assert.deepEqual(concurrent.map(({ version }) => version).sort((left, right) => left - right), [2, 3])
     await assert.rejects(projections.ensureVersion({
       executionId, role: 'main', stage: 'research', schemaHash: 'hash-research',
       projectedTools: [{ name: 'different_tool', parameters: { type: 'object' } }],
       visibleToolNames: ['fetch_financial_context'], reasons: { stage: 'research' },
       createdAt: '2026-08-13T04:00:02.000Z',
     }), /tool_projection_conflict/)
+    await assert.rejects(projections.ensureVersion({
+      executionId, role: 'unknown' as never, stage: 'research', schemaHash: 'hash-invalid-role',
+      projectedTools: [], visibleToolNames: [], reasons: {},
+      createdAt: '2026-08-13T04:00:02.100Z',
+    }), /tool_projection_versions_role_check/)
+    await assert.rejects(projections.ensureVersion({
+      executionId, role: 'main', stage: 'unknown' as never, schemaHash: 'hash-invalid-stage',
+      projectedTools: [], visibleToolNames: [], reasons: {},
+      createdAt: '2026-08-13T04:00:02.200Z',
+    }), /tool_projection_versions_stage_check/)
     await assert.rejects(projections.ensureVersion({
       executionId, role: 'main', stage: 'research', schemaHash: 'hash-research',
       projectedTools: [{ name: 'fetch_financial_context', parameters: { type: 'object' } }],
@@ -83,12 +107,43 @@ test('真实 PostgreSQL 持久化 Tool Projection 版本、模型请求与批次
       visibleToolNames: ['submit_analysis_report'], reasons: { stage: 'finalization' },
       createdAt: '2026-08-13T04:00:05.000Z',
     }), /tool_batch_not_terminal/)
-    await projections.completeToolBatch({
-      id: 'batch-1', executionId, status: 'completed',
-      results: [{ toolCallId: 'call-2', status: 'failed', completedAt: '2026-08-13T04:00:05.500Z' },
-        { toolCallId: 'call-1', status: 'completed', completedAt: '2026-08-13T04:00:05.000Z' }],
+    await assert.rejects(projections.completeToolBatch({
+      id: 'batch-1', executionId,
+      results: [{
+        toolCallId: 'call-1', status: 'completed', startedAt: '2026-08-13T04:00:04.100Z',
+        completedAt: '2026-08-13T04:00:05.000Z', completionOrder: 1,
+        resultPayload: { content: 'first', isError: false }, operationId: 'batch-1:result:call-1',
+        eventPayload: { type: 'trace', kind: 'tool_result', toolCallId: 'call-1', content: 'first' },
+      }],
       completedAt: '2026-08-13T04:00:06.000Z',
-    })
+    }), /tool_batch_results_incomplete/)
+    assert.equal((await projections.replay(executionId)).toolBatches[0]?.status, 'running')
+    assert.deepEqual(await events.list(sessionId, 1), [])
+    const completedBatch = {
+      id: 'batch-1', executionId,
+      results: [{
+        toolCallId: 'call-2', status: 'failed', startedAt: '2026-08-13T04:00:04.200Z',
+        completedAt: '2026-08-13T04:00:05.500Z', completionOrder: 2,
+        resultPayload: { content: 'second', isError: true }, operationId: 'batch-1:result:call-2',
+        eventPayload: { type: 'trace', kind: 'tool_result', toolCallId: 'call-2', content: 'second' },
+      }, {
+        toolCallId: 'call-1', status: 'completed', startedAt: '2026-08-13T04:00:04.100Z',
+        completedAt: '2026-08-13T04:00:05.000Z', completionOrder: 1,
+        resultPayload: { content: 'first', isError: false }, operationId: 'batch-1:result:call-1',
+        eventPayload: { type: 'trace', kind: 'tool_result', toolCallId: 'call-1', content: 'first' },
+      }],
+      completedAt: '2026-08-13T04:00:06.000Z',
+    } as const
+    const firstCompletionEvents = await projections.completeToolBatch(completedBatch)
+    const retriedCompletionEvents = await projections.completeToolBatch(completedBatch)
+    assert.deepEqual(retriedCompletionEvents, firstCompletionEvents)
+    assert.equal((await events.list(sessionId, 1)).length, 2)
+    await assert.rejects(projections.completeToolBatch({
+      ...completedBatch,
+      results: completedBatch.results.map((result) => result.toolCallId === 'call-1'
+        ? { ...result, resultPayload: { content: 'tampered', isError: false } }
+        : result),
+    }), /tool_batch_completion_conflict/)
     const second = await projections.ensureVersion({
       executionId, role: 'main', stage: 'finalization', schemaHash: 'hash-final',
       projectedTools: [{ name: 'submit_analysis_report', parameters: { type: 'object' } }],
@@ -107,22 +162,39 @@ test('真实 PostgreSQL 持久化 Tool Projection 版本、模型请求与批次
       id: 'request-a', executionId, projectionId: second.id, turnIndex: 3,
       createdAt: '2026-08-13T04:00:09.000Z',
     })
-    assert.equal(second.version, 2)
+    assert.equal(second.version, 4)
     const replay = await projections.replay(executionId)
     assert.deepEqual(replay.projections.map(({ version, visibleToolNames }) => ({ version, visibleToolNames })), [
       { version: 1, visibleToolNames: ['fetch_financial_context'] },
-      { version: 2, visibleToolNames: ['submit_analysis_report'] },
+      { version: 2, visibleToolNames: ['search_news_by_keyword'] },
+      { version: 3, visibleToolNames: [] },
+      { version: 4, visibleToolNames: ['submit_analysis_report'] },
     ])
     assert.deepEqual(replay.modelRequests.map(({ id, projectionVersion }) => ({ id, projectionVersion })), [
-      { id: 'request-1', projectionVersion: 1 }, { id: 'request-2', projectionVersion: 2 },
-      { id: 'request-a', projectionVersion: 2 }, { id: 'request-z', projectionVersion: 2 },
+      { id: 'request-1', projectionVersion: 1 }, { id: 'request-2', projectionVersion: 4 },
+      { id: 'request-a', projectionVersion: 4 }, { id: 'request-z', projectionVersion: 4 },
     ])
     assert.equal(replay.toolBatches[0]?.projectionVersion, 1)
     assert.equal(replay.toolBatches[0]?.status, 'failed')
     assert.deepEqual(replay.toolBatches[0]?.calls.map(({ toolCallId }) => toolCallId), ['call-1', 'call-2'])
-    assert.deepEqual(replay.toolBatches[0]?.results.map(({ toolCallId, status }) => ({ toolCallId, status })), [
-      { toolCallId: 'call-1', status: 'completed' }, { toolCallId: 'call-2', status: 'failed' },
+    assert.deepEqual(replay.toolBatches[0]?.results.map(({ toolCallId, status, completionOrder }) => ({
+      toolCallId, status, completionOrder,
+    })), [
+      { toolCallId: 'call-1', status: 'completed', completionOrder: 1 },
+      { toolCallId: 'call-2', status: 'failed', completionOrder: 2 },
     ])
+    assert.deepEqual(replay.toolBatches[0]?.results.map(({ resultPayload }) => resultPayload), [
+      { content: 'first', isError: false }, { content: 'second', isError: true },
+    ])
+    const resultEvents = (await events.list(sessionId, 1)).map(({ operationId, payload }) => ({
+      operationId, toolCallId: payload.toolCallId,
+    }))
+    assert.deepEqual(resultEvents, [
+      { operationId: 'batch-1:result:call-1', toolCallId: 'call-1' },
+      { operationId: 'batch-1:result:call-2', toolCallId: 'call-2' },
+    ])
+    assert.equal((await projections.replayForSession(sessionId, executionId))?.executionId, executionId)
+    assert.equal(await projections.replayForSession(`not-${sessionId}`, executionId), null)
     await assert.rejects(pool.query(
       `UPDATE tool_call_batches SET projection_id = $1 WHERE id = 'batch-1'`, [second.id],
     ), /permission denied/)
@@ -183,15 +255,30 @@ test('真实 PostgreSQL execution 终态事务会取消未完成 Tool Batch', {
     const replay = await projections.replay(executionId)
     assert.equal(replay.toolBatches[0]?.status, 'cancelled')
     assert.deepEqual(replay.toolBatches[0]?.results.map(({ status }) => status), ['cancelled'])
+    assert.deepEqual(replay.toolBatches[0]?.results.map((result) => ({
+      startedAt: result.startedAt, completedAt: result.completedAt,
+      completionOrder: result.completionOrder, resultPayload: result.resultPayload,
+    })), [{
+      startedAt: '2026-08-13T04:10:03.000Z', completedAt: '2026-08-13T04:10:03.000Z',
+      completionOrder: 1, resultPayload: {
+        toolName: 'fetch_financial_context',
+        result: { error: 'tool_execution_interrupted', facts: [] }, isError: true,
+      },
+    }])
     await assert.rejects(projections.recordModelRequest({
       id: 'late-request', executionId, projectionId: projection.id, turnIndex: 2,
       createdAt: '2026-08-13T04:10:04.000Z',
     }), /agent_execution_fenced/)
     await assert.rejects(projections.completeToolBatch({
-      id: 'terminal-batch', executionId, status: 'completed',
-      results: [{ toolCallId: 'terminal-call', status: 'completed', completedAt: '2026-08-13T04:10:04.000Z' }],
+      id: 'terminal-batch', executionId,
+      results: [{
+        toolCallId: 'terminal-call', status: 'completed', startedAt: '2026-08-13T04:10:02.000Z',
+        completedAt: '2026-08-13T04:10:04.000Z', completionOrder: 1,
+        resultPayload: { content: 'late', isError: false }, operationId: 'terminal-result',
+        eventPayload: { type: 'trace', kind: 'tool_result', toolCallId: 'terminal-call' },
+      }],
       completedAt: '2026-08-13T04:10:04.000Z',
-    }), /agent_execution_fenced/)
+    }), /tool_batch_completion_conflict/)
   } finally {
     await createAnalysisRepository(pool).removeResearch(analysisId)
     await pool.end()
@@ -626,7 +713,7 @@ test('真实 PostgreSQL migration 幂等且 application role 没有 DDL 权限',
   await migrate(migrationUrl!)
 
   const pool = createPool(applicationUrl!)
-  assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 13 })
+  assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 14 })
   const privileges = await pool.query<{ can_create: boolean; can_temp: boolean }>(
     `SELECT has_schema_privilege(current_user, 'public', 'CREATE') AS can_create,
             has_database_privilege(current_user, current_database(), 'TEMP') AS can_temp`,
@@ -1117,7 +1204,7 @@ test('真实 PostgreSQL 启动恢复在一个事务内中断全部活跃 Session
     })
     for (const executionId of ['interrupt-all-main-execution', 'interrupt-all-specialist-execution']) {
       const projection = await projections.ensureVersion({
-        executionId, role: executionId.includes('main') ? 'main' : 'fundamental_specialist',
+        executionId, role: executionId.includes('main') ? 'main' : 'fundamental',
         stage: 'research', schemaHash: `${executionId}:hash`, projectedTools: [],
         visibleToolNames: [], reasons: { stage: 'research' }, createdAt: now,
       })

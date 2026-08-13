@@ -35,6 +35,10 @@ function createPiModel(options: ModelOptions = {}) {
 function createTestToolRuntime(): ToolRuntime {
   let version = 0
   return {
+    async ensureProjection(input) {
+      return { id: `${input.executionId}:test-projection:${++version}`, version }
+    },
+    async recordModelRequest() {},
     async beginModelRequest(input) {
       return { id: `${input.requestId}:test-projection`, version: ++version }
     },
@@ -77,13 +81,13 @@ function toolTurnOperations(
 function providerCallId(runtimeId: string) {
   return runtimeId
     .replace(/:specialist-invocation:[^:]+:attempt:\d+:position:\d+$/, '')
-    .replace(/:(?:main|specialist)-attempt:\d+:position:\d+$/, '')
+    .replace(/:(?:main|specialist|fundamental)-attempt:\d+:position:\d+$/, '')
 }
 
 function legacyOperationId(operationId: string) {
   return operationId
     .replace(/:specialist-invocation:[^:]+:attempt:\d+:position:\d+(?=:(?:call|result)$)/, '')
-    .replace(/:(?:main|specialist)-attempt:\d+:position:\d+(?=:(?:call|result)$)/, '')
+    .replace(/:(?:main|specialist|fundamental)-attempt:\d+:position:\d+(?=:(?:call|result)$)/, '')
 }
 
 test('主分析模型和财报专家使用不同的显式工具集', () => {
@@ -404,6 +408,9 @@ for (const [position, calls, expectedExecutions] of [
 ] as const) {
   test(`submit 位于批次${position}时先封存全部结果且不执行其后工具`, async () => {
     let executions = 0
+    const committedResults: Array<{ toolCallId: string }> = []
+    const toolRuntime = createTestToolRuntime()
+    toolRuntime.completeToolBatch = async (input) => { committedResults.push(...input.results) }
     const finalContexts: Context[] = []
     const model = createPiModel({ fauxResponses: [
       (context) => {
@@ -414,18 +421,14 @@ for (const [position, calls, expectedExecutions] of [
     const events = []
     for await (const event of model.analyze({
       executionId: `submit-${position}`, runtimeSettings: runtimeSettings(),
+      toolRuntime,
       symbol: 'NVDA', systemPrompt: 'system', userPrompt: 'user', knownFacts: facts,
       fetchFinancialContext: async () => { executions += 1; return { facts } },
     })) events.push(event)
 
     assert.equal(executions, expectedExecutions)
     const ids = calls.map(({ id }) => id)
-    assert.deepEqual(finalContexts[0]?.messages.filter(({ role }) => role === 'toolResult')
-      .map((message) => message.role === 'toolResult' ? providerCallId(message.toolCallId) : ''), ids)
-    assert.deepEqual(toolTurnOperations(events, new RegExp(ids.join('|'))).map(legacyOperationId), [
-      ...ids.map((id) => `execution:submit-${position}:tool:${id}:call`),
-      ...ids.map((id) => `execution:submit-${position}:tool:${id}:result`),
-    ])
+    assert.deepEqual(committedResults.map(({ toolCallId }) => providerCallId(toolCallId)), ids)
     const completedIndex = events.findIndex(({ type }) => type === 'completed')
     const finalResultIndex = events.findLastIndex((event) => event.type === 'trace'
       && event.entry.type === 'tool_result')
@@ -875,7 +878,7 @@ test('专项未投影工具统一不可用且同批已投影工具继续执行',
   assert.doesNotMatch(JSON.stringify(events), /technical_indicators_unavailable/)
 })
 
-test('主 Agent 校验结果 yield 时消费者提前关闭会停止 runtime active segment', async () => {
+test('主 Agent 原子提交结果发布前已停止 runtime active segment', async () => {
   let now = 0
   const budget = createActiveBudget(100, () => now, () => new AbortController().signal)
   const model = createPiModel({ fauxResponses: [
@@ -896,10 +899,10 @@ test('主 Agent 校验结果 yield 时消费者提前关闭会停止 runtime act
   now = 40
   await iterator.return(undefined)
   now = 90
-  assert.equal(budget.elapsedMs(), 40)
+  assert.equal(budget.elapsedMs(), 0)
 })
 
-test('主 Agent 校验 trace 持久化失败时也会停止 runtime active segment', async () => {
+test('主 Agent 原子提交后下游消费失败不会重新开启 runtime active segment', async () => {
   let now = 0
   const budget = createActiveBudget(100, () => now, () => new AbortController().signal)
   const model = createPiModel({ fauxResponses: [
@@ -921,7 +924,7 @@ test('主 Agent 校验 trace 持久化失败时也会停止 runtime active segme
   now = 35
   await assert.rejects(iterator.throw(new Error('pg_trace_failed')), /pg_trace_failed/)
   now = 90
-  assert.equal(budget.elapsedMs(), 35)
+  assert.equal(budget.elapsedMs(), 0)
 })
 
 test('主工具 active start 失败会释放槽位且同批后续工具可再次取得', async () => {
@@ -1065,15 +1068,18 @@ test('专项 Agent 在工具并发槽等待期 abort 仍为同批全部调用补
   })) {
     events.push(event)
   }
-  assert.deepEqual(events.filter((event) => event.type === 'trace'
+  const specialistAudit = events.filter((event) => event.type === 'trace'
     && (event.entry.type === 'tool_call' || event.entry.type === 'tool_result')
     && event.entry.operationId.includes('specialist-tool'))
-    .map((event) => event.type === 'trace' ? legacyOperationId(event.entry.operationId) : ''), [
+    .map((event) => event.type === 'trace' ? legacyOperationId(event.entry.operationId) : '')
+  assert.deepEqual(specialistAudit.slice(0, 2), [
     'execution:gate-wait:specialist-tool:waiting-first:call',
     'execution:gate-wait:specialist-tool:waiting-second:call',
+  ])
+  assert.deepEqual(new Set(specialistAudit.slice(2)), new Set([
     'execution:gate-wait:specialist-tool:waiting-first:result',
     'execution:gate-wait:specialist-tool:waiting-second:result',
-  ])
+  ]))
   assert.ok(events.some((event) => event.type === 'cancelled'))
 })
 

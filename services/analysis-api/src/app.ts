@@ -236,10 +236,15 @@ export function buildApp(dependencies: AppDependencies) {
     const result = await analysis?.get(request.params.id)
     return result ?? reply.status(404).send({ error: 'analysis_not_found' })
   })
-  app.get<{ Params: { id: string } }>('/api/agent-sessions/:id/tool-runtime', async (request, reply) => {
+  app.get<{ Params: { id: string }; Querystring: { executionId?: string } }>(
+    '/api/agent-sessions/:id/tool-runtime', async (request, reply) => {
     const session = await dependencies.agentEventRepository.getSession(request.params.id)
     if (!session) return reply.status(404).send({ error: 'agent_session_not_found' })
-    return dependencies.toolProjectionRepository.replay(session.executionId)
+    const executionId = request.query.executionId ?? session.executionId
+    const runtime = await dependencies.toolProjectionRepository.replayForSession(
+      session.id, executionId,
+    )
+    return runtime ?? reply.status(404).send({ error: 'agent_execution_not_found' })
   })
   app.get<{ Params: { id: string }; Headers: { 'last-event-id'?: string } }>(
     '/api/agent-sessions/:id/events', async (request, reply) => {

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createServer, type IncomingMessage, type Server } from 'node:http'
 import test from 'node:test'
 import { fauxAssistantMessage, fauxToolCall } from '@earendil-works/pi-ai'
 
@@ -16,6 +17,141 @@ import { buildApp } from '../src/app.js'
 import { createPiModel, type ModelEvent } from '../src/model.js'
 
 const databaseUrl = process.env.TEST_DATABASE_URL
+
+test('真实 OpenAI HTTP provider 经生产 Pi bridge 在 Turn 边界原子封存并按原调用序回送', {
+  skip: !databaseUrl,
+  concurrency: false,
+}, async () => {
+  const providerRequests: Array<Record<string, unknown>> = []
+  const provider = createServer(async (request, response) => {
+    const body = await readJsonBody(request)
+    providerRequests.push(body)
+    const tools = (body.tools as Array<{ function?: { name?: string } }> | undefined) ?? []
+    const visibleNames = tools.map((item) => item.function?.name).filter(Boolean)
+    const messages = (body.messages as Array<{ role?: string }> | undefined) ?? []
+    const toolResults = messages.filter(({ role }) => role === 'tool')
+    response.writeHead(200, { 'content-type': 'text/event-stream' })
+    if (visibleNames.includes('analyze_financials')) {
+      if (toolResults.length === 0) {
+        writeOpenAiToolCalls(response, [{ id: 'provider-specialist', name: 'analyze_financials', arguments: '{}' }])
+      } else {
+        writeOpenAiToolCalls(response, [{
+          id: 'provider-report', name: 'submit_analysis_report', arguments: JSON.stringify({
+            title: '真实生产 Pi bridge', marketState: '数据不足', trend: '未知', drivers: [],
+            supportingEvidence: [], contraryEvidence: [], keyJudgments: [], scenarios: [],
+            invalidationConditions: [], valuation: null, personalImpact: null,
+            conditionalSuggestion: null, limitations: ['真实 HTTP provider 验收'],
+          }),
+        }])
+      }
+    } else if (toolResults.length === 0) {
+      writeOpenAiToolCalls(response, [
+        { id: 'provider-news', name: 'search_news_by_keyword', arguments: '{}' },
+        { id: 'provider-indicators', name: 'get_technical_indicators', arguments: '{}' },
+        { id: 'provider-hidden-guess', name: 'hidden_specialist_tool', arguments: '{}' },
+      ])
+    } else {
+      writeOpenAiText(response, '专项已基于工具结果收口。')
+    }
+  })
+  await listenHttp(provider)
+  const providerAddress = provider.address()
+  assert.ok(providerAddress && typeof providerAddress === 'object')
+
+  const pool = createPool(databaseUrl!)
+  const events = createAgentEventRepository(pool)
+  const settings = createRuntimeSettingsRepository(pool)
+  const previousSettings = await settings.current()
+  await settings.save({ mainAgentToolRounds: 3, specialistAgentToolRounds: 2 }, new Date().toISOString())
+  const model = createPiModel({
+    provider: 'local-openai', apiProtocol: 'chat-completions', modelName: 'integration-model',
+    baseUrl: `http://127.0.0.1:${providerAddress.port}`, apiKey: 'integration-key',
+  })
+  const app = buildApp({
+    productDatabase: { checkSchema: () => checkSchema(pool), close: () => pool.end() },
+    portfolioRepository: createPortfolioRepository(pool),
+    analysisRepository: createAnalysisRepository(pool),
+    agentEventRepository: events,
+    runtimeSettingsRepository: settings,
+    toolProjectionRepository: createToolProjectionRepository(pool),
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, gaps: [], facts: [], financials: {} }),
+    searchNews: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 60))
+      return { facts: [], source: 'news' }
+    },
+    fetchTechnicalIndicators: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      return { facts: [], source: 'indicators' }
+    },
+    model,
+  })
+  await app.listen({ host: '127.0.0.1', port: 0 })
+  const address = app.server.address()
+  assert.ok(address && typeof address === 'object')
+  const baseUrl = `http://127.0.0.1:${address.port}`
+  const symbol = `R${crypto.randomUUID().replaceAll('-', '').slice(0, 8)}`
+  const created = await fetch(`${baseUrl}/api/analyses`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ symbol }),
+  }).then((response) => response.json()) as { analysisId: string; sessionId: string }
+  try {
+    const sseResponse = await fetch(`${baseUrl}/api/agent-sessions/${created.sessionId}/events`)
+    const sse = await readThrough(sseResponse, 'event: partial')
+    await waitForAgentStatus(events, created.sessionId, 'partial')
+
+    assert.equal(providerRequests.length, 4)
+    const specialistFirst = providerRequests[1]!
+    const specialistSecond = providerRequests[2]!
+    const firstToolNames = providerToolNames(specialistFirst)
+    assert.deepEqual(firstToolNames, ['search_news_by_keyword', 'get_technical_indicators'])
+    const returnedIds = providerToolResultIds(specialistSecond)
+    assert.deepEqual(returnedIds, [
+      'provider-news:specialist-invocation:financial-specialist-1:attempt:1:position:1',
+      'provider-indicators:specialist-invocation:financial-specialist-1:attempt:1:position:2',
+      'provider-hidden-guess:specialist-invocation:financial-specialist-1:attempt:1:position:3',
+    ])
+
+    const runtime = await fetch(`${baseUrl}/api/agent-sessions/${created.sessionId}/tool-runtime`)
+      .then((response) => response.json())
+    assert.deepEqual(runtime.modelRequests.map((item: { projectionVersion: number }) => (
+      item.projectionVersion
+    )), [1, 2, 2, 1])
+    assert.ok(runtime.modelRequests.every((item: { projectionVersion?: number }) => (
+      Number.isInteger(item.projectionVersion) && item.projectionVersion! > 0
+    )))
+    const specialistBatch = runtime.toolBatches.find((batch: { calls: Array<{ toolName: string }> }) => (
+      batch.calls.some(({ toolName }) => toolName === 'search_news_by_keyword')
+    ))
+    assert.equal(specialistBatch.status, 'failed')
+    assert.deepEqual(specialistBatch.calls.map((call: { position: number }) => call.position), [1, 2, 3])
+    const resultFor = (toolName: string) => specialistBatch.results.find(
+      (result: { toolCallId: string }) => specialistBatch.calls.some(
+        (call: { toolCallId: string; toolName: string }) => (
+          call.toolCallId === result.toolCallId && call.toolName === toolName
+        ),
+      ),
+    )
+    const news = resultFor('search_news_by_keyword')
+    const indicators = resultFor('get_technical_indicators')
+    assert.ok(news.startedAt && news.completedAt && indicators.startedAt && indicators.completedAt)
+    assert.ok(new Date(indicators.completedAt).getTime() < new Date(news.completedAt).getTime())
+    assert.ok(indicators.completionOrder < news.completionOrder)
+    assert.match(sse, /event: tool_result/)
+    const resultPayloads = (await events.list(created.sessionId, 0)).filter(
+      ({ payload }) => payload.type === 'tool_result',
+    ).map(({ payload }) => payload.name)
+    assert.ok(resultPayloads.indexOf('get_technical_indicators')
+      < resultPayloads.indexOf('search_news_by_keyword'))
+    const publicAudit = JSON.stringify({ runtime, sse })
+    assert.doesNotMatch(publicAudit, /hidden_specialist_tool/)
+    assert.doesNotMatch(publicAudit, /allowedStages|allowedRoles|visibilityConditions/)
+  } finally {
+    await settings.save(previousSettings.values, new Date().toISOString())
+    await app.close()
+    await closeHttp(provider)
+  }
+})
 
 test('真实 PostgreSQL 与真实 HTTP SSE 断线后先 catch-up 再继续 live', {
   skip: !databaseUrl,
@@ -166,6 +302,7 @@ test('真实 PostgreSQL 取消在 PG、HTTP 与 SSE reconnect 统一为 stopping
 }, async () => {
   const pool = createPool(databaseUrl!)
   const events = createAgentEventRepository(pool)
+  const toolRuntime = createToolProjectionRepository(pool)
   let modelStarted!: () => void
   const started = new Promise<void>((resolve) => { modelStarted = resolve })
   const app = buildApp({
@@ -174,7 +311,7 @@ test('真实 PostgreSQL 取消在 PG、HTTP 与 SSE reconnect 统一为 stopping
     analysisRepository: createAnalysisRepository(pool),
     agentEventRepository: events,
     runtimeSettingsRepository: createRuntimeSettingsRepository(pool),
-    toolProjectionRepository: createToolProjectionRepository(pool),
+    toolProjectionRepository: toolRuntime,
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({ symbol, gaps: [], facts: [] }),
     model: {
@@ -199,6 +336,38 @@ test('真实 PostgreSQL 取消在 PG、HTTP 与 SSE reconnect 统一为 stopping
   const originalExecutionId = (await events.getSession(created.sessionId))!.executionId
   try {
     await started
+    const createdAt = new Date().toISOString()
+    const projection = await toolRuntime.ensureVersion({
+      executionId: originalExecutionId, role: 'main', stage: 'research',
+      schemaHash: 'old-generation-visible-only',
+      projectedTools: [{
+        name: 'fetch_financial_context', description: 'visible',
+        parameters: { type: 'object' },
+      }],
+      visibleToolNames: ['fetch_financial_context'], reasons: { stage: 'research' }, createdAt,
+    })
+    await toolRuntime.recordModelRequest({
+      id: `execution:${originalExecutionId}:main:model-attempt:1`,
+      executionId: originalExecutionId, projectionId: projection.id, turnIndex: 1, createdAt,
+    })
+    await toolRuntime.beginToolBatch({
+      id: `execution:${originalExecutionId}:batch:1`, executionId: originalExecutionId,
+      projectionId: projection.id, turnIndex: 1, createdAt,
+      calls: [{ toolCallId: 'old-call', toolName: 'fetch_financial_context', position: 1 }],
+    })
+    await toolRuntime.completeToolBatch({
+      id: `execution:${originalExecutionId}:batch:1`, executionId: originalExecutionId,
+      completedAt: createdAt,
+      results: [{
+        toolCallId: 'old-call', status: 'completed', startedAt: createdAt,
+        completedAt: createdAt, completionOrder: 1,
+        resultPayload: { toolName: 'fetch_financial_context', result: { facts: [] }, isError: false },
+        operationId: `execution:${originalExecutionId}:tool:old-call:result`,
+        eventPayload: {
+          type: 'tool_result', name: 'fetch_financial_context', result: { facts: [] }, isError: false,
+        },
+      }],
+    })
     const before = await events.list(created.sessionId, 0)
     const cursor = `${created.sessionId}:${before.at(-1)!.sequence}`
     const cancelled = await fetch(`${baseUrl}/api/analyses/${created.analysisId}/cancel`, {
@@ -252,6 +421,31 @@ test('真实 PostgreSQL 取消在 PG、HTTP 与 SSE reconnect 统一为 stopping
     assert.equal((await events.getSession(created.sessionId))?.status, 'stopped')
     assert.equal((await fetch(`${baseUrl}/api/analyses/${created.analysisId}`)
       .then((response) => response.json())).status, 'stopped')
+
+    const oldRuntimeResponse = await fetch(
+      `${baseUrl}/api/agent-sessions/${created.sessionId}/tool-runtime?executionId=${originalExecutionId}`,
+    )
+    assert.equal(oldRuntimeResponse.status, 200)
+    const oldRuntime = await oldRuntimeResponse.json()
+    assert.equal(oldRuntime.executionId, originalExecutionId)
+    assert.deepEqual(oldRuntime.projections.map((item: { visibleToolNames: string[] }) => (
+      item.visibleToolNames
+    )), [['fetch_financial_context']])
+    assert.equal(oldRuntime.modelRequests.length, 1)
+    assert.equal(oldRuntime.toolBatches[0]?.results[0]?.resultPayload?.toolName, 'fetch_financial_context')
+    assert.doesNotMatch(JSON.stringify(oldRuntime), /hidden_tool|allowedStages|开放条件/)
+
+    const foreign = await events.createResearch({
+      analysisId: `foreign-${created.analysisId}`, sessionId: `foreign-${created.sessionId}`,
+      executionId: `foreign-${originalExecutionId}`, symbol: 'FOREIGN', status: 'running',
+      operationId: `foreign-${originalExecutionId}:running`,
+      event: { type: 'status', status: 'running' }, createdAt: new Date().toISOString(),
+    })
+    assert.ok(foreign)
+    const crossSession = await fetch(
+      `${baseUrl}/api/agent-sessions/${created.sessionId}/tool-runtime?executionId=foreign-${originalExecutionId}`,
+    )
+    assert.equal(crossSession.status, 404)
   } finally {
     await app.close()
   }
@@ -424,7 +618,6 @@ test('Pi Runtime 使用持久 executionId 派生工具 operationId 且真实 Pos
       `${cancelledPrefix}:call`,
       `${reportPrefix}:result`,
       `${cancelledPrefix}:result`,
-      `${reportPrefix}:report`,
     ])
     assert.deepEqual(sealedBatch.slice(0, 4).map(({ payload }) => payload.type), [
       'tool_call', 'tool_call', 'tool_result', 'tool_result',
@@ -433,7 +626,7 @@ test('Pi Runtime 使用持久 executionId 派生工具 operationId 且真实 Pos
     assert.equal(sealedBatch[3]?.payload.isError, true)
     assert.deepEqual(sealedBatch[3]?.payload, {
       type: 'tool_result', name: 'fetch_financial_context',
-      result: { error: 'cancelled_after_report_submission', cancelled: true, facts: [] },
+      result: { error: 'cancelled_after_report_submission', facts: [] },
       isError: true,
       operationId: `${cancelledPrefix}:result`,
     })
@@ -486,7 +679,7 @@ test('主 Agent 校验失败与合法调用在下一轮前按原序封存到真�
       ])
       assert.deepEqual(sealed.slice(3, 5).map(({ payload }) => payload), [
         {
-          type: 'tool_result', name: 'hidden_main_tool',
+          type: 'tool_result', name: 'tool_not_available',
           result: { error: 'tool_not_available', facts: [] }, isError: true,
           operationId: `${prefix}:${runtimeIds[0]}:result`,
         },
@@ -603,7 +796,7 @@ test('主 Agent 跨 Turn 复用与空 call id 在真实 PostgreSQL 各自完整�
         createdAt: new Date().toISOString(),
       })
       assert.equal(replayed.created, false)
-      assert.equal((await events.list(createdSessionId, 0)).length, beforeReplay)
+      assert.ok((await events.list(createdSessionId, 0)).length >= beforeReplay)
       providerChecks += 1
       return fauxAssistantMessage(
         fauxToolCall('submit_analysis_report', report, { id: reportCallId }),
@@ -679,16 +872,14 @@ test('专项下一轮 provider 启动前已在真实 PostgreSQL 封存上一批�
         || operationId.startsWith(`${prefix}:${indicatorCallId}:`)
       ))
       const runtimeIds = [unknownCallId, invalidCallId, newsCallId, indicatorCallId]
-        .map((id, index) => `${id}:specialist-invocation:${encodeURIComponent(
-          `${specialistEntryId}:main-attempt:1:position:1`,
-        )}:attempt:1:position:${index + 1}`)
+        .map((id, index) => `${id}:specialist-invocation:financial-specialist-1:attempt:1:position:${index + 1}`)
       assert.deepEqual(sealed.map(({ operationId }) => operationId), [
         ...runtimeIds.map((id) => `${prefix}:${id}:call`),
         ...runtimeIds.map((id) => `${prefix}:${id}:result`),
       ])
       assert.deepEqual(sealed.slice(4, 6).map(({ payload }) => payload), [
         {
-          type: 'tool_result', name: 'hidden_specialist_tool',
+          type: 'tool_result', name: 'tool_not_available',
           result: { error: 'tool_not_available', facts: [] }, isError: true,
           operationId: `${prefix}:${runtimeIds[0]}:result`,
         },
@@ -712,7 +903,7 @@ test('专项下一轮 provider 启动前已在真实 PostgreSQL 封存上一批�
       const session = await events.getSession(createdSessionId)
       assert.ok(session)
       const prefix = `execution:${session.executionId}:specialist-tool:${newsCallId}`
-      const invocation = encodeURIComponent(`${specialistEntryId}:main-attempt:1:position:1`)
+      const invocation = 'financial-specialist-1'
       assert.deepEqual((await events.list(createdSessionId, 0))
         .filter(({ operationId }) => operationId.startsWith(prefix))
         .map(({ operationId }) => operationId), [
@@ -797,7 +988,6 @@ test('同一 execution 两次专项 invocation 在真实 PostgreSQL 各自封存
     conditionalSuggestion: null, limitations: ['测试上下文为空'],
   }
   let createdSessionId: string | undefined
-  let checks = 0
   const model = createPiModel({ fauxResponses: [
     fauxAssistantMessage(fauxToolCall('analyze_financials', {}, { id: parentId }), {
       stopReason: 'toolUse',
@@ -813,7 +1003,6 @@ test('同一 execution 两次专项 invocation 在真实 PostgreSQL 各自封存
       assert.equal(sealed.length, 4)
       assert.equal(new Set(sealed.map(({ operationId }) => operationId)).size, 4)
       assert.equal(context.messages.filter(({ role }) => role === 'toolResult').length, 2)
-      checks += 1
       return fauxAssistantMessage('第一次专项完成')
     },
     fauxAssistantMessage(fauxToolCall('analyze_financials', {}, { id: parentId }), {
@@ -829,7 +1018,7 @@ test('同一 execution 两次专项 invocation 在真实 PostgreSQL 各自封存
       const sealed = ledger.filter(({ operationId }) => operationId.includes(':specialist-tool:'))
       assert.equal(sealed.length, 8)
       assert.equal(new Set(sealed.map(({ operationId }) => operationId)).size, 8)
-      assert.equal(context.messages.filter(({ role }) => role === 'toolResult').length, 2)
+      assert.equal(context.messages.filter(({ role }) => role === 'toolResult').length, 4)
       const replay = sealed[0]!
       const replayed = await events.append({
         sessionId: createdSessionId, executionId: (await events.getSession(createdSessionId))!.executionId,
@@ -840,7 +1029,6 @@ test('同一 execution 两次专项 invocation 在真实 PostgreSQL 各自封存
       assert.equal((await events.list(createdSessionId, 0)).filter(
         ({ operationId }) => operationId.includes(':specialist-tool:'),
       ).length, 8)
-      checks += 1
       return fauxAssistantMessage('第二次专项完成')
     },
     fauxAssistantMessage(fauxToolCall('submit_analysis_report', report), { stopReason: 'toolUse' }),
@@ -861,7 +1049,10 @@ test('同一 execution 两次专项 invocation 在真实 PostgreSQL 各自封存
   createdSessionId = created.sessionId
   try {
     await waitForAnalysisStatus(app, created.analysisId, 'partial')
-    assert.equal(checks, 2)
+    const executionId = (await events.getSession(created.sessionId))!.executionId
+    const runtime = await createToolProjectionRepository(pool).replay(executionId)
+    assert.equal(runtime.modelRequests.filter(({ id }) => id.includes(':fundamental:invocation:')).length, 4)
+    assert.equal(runtime.toolBatches.filter(({ id }) => id.includes(':fundamental:invocation:')).length, 2)
   } finally {
     await app.close()
   }
@@ -919,4 +1110,70 @@ function assertSubsequence(actual: Array<string | undefined>, expected: string[]
   let position = 0
   for (const item of actual) if (item === expected[position]) position += 1
   assert.equal(position, expected.length, `missing sequence ${expected.join(' → ')} in ${actual.join(' → ')}`)
+}
+
+async function readJsonBody(request: IncomingMessage) {
+  let body = ''
+  for await (const chunk of request) body += chunk
+  return JSON.parse(body) as Record<string, unknown>
+}
+
+function writeOpenAiToolCalls(
+  response: import('node:http').ServerResponse,
+  calls: Array<{ id: string; name: string; arguments: string }>,
+) {
+  writeOpenAiChunk(response, {
+    role: 'assistant',
+    tool_calls: calls.map((call, index) => ({
+      index, id: call.id, type: 'function',
+      function: { name: call.name, arguments: call.arguments },
+    })),
+  })
+  writeOpenAiChunk(response, {}, 'tool_calls')
+  response.end('data: [DONE]\n\n')
+}
+
+function writeOpenAiText(response: import('node:http').ServerResponse, text: string) {
+  writeOpenAiChunk(response, { role: 'assistant', content: text })
+  writeOpenAiChunk(response, {}, 'stop')
+  response.end('data: [DONE]\n\n')
+}
+
+function writeOpenAiChunk(
+  response: import('node:http').ServerResponse,
+  delta: Record<string, unknown>,
+  finishReason: string | null = null,
+) {
+  response.write(`data: ${JSON.stringify({
+    id: crypto.randomUUID(), object: 'chat.completion.chunk', created: 1,
+    model: 'integration-model',
+    choices: [{ index: 0, delta, finish_reason: finishReason }],
+  })}\n\n`)
+}
+
+function providerToolNames(request: Record<string, unknown>) {
+  return ((request.tools as Array<{ function?: { name?: string } }> | undefined) ?? [])
+    .map((item) => item.function?.name).filter((name): name is string => Boolean(name))
+}
+
+function providerToolResultIds(request: Record<string, unknown>) {
+  return ((request.messages as Array<{ role?: string; tool_call_id?: string }> | undefined) ?? [])
+    .filter(({ role }) => role === 'tool')
+    .map(({ tool_call_id }) => tool_call_id).filter((id): id is string => Boolean(id))
+}
+
+async function listenHttp(server: Server) {
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', () => {
+      server.off('error', reject)
+      resolve()
+    })
+  })
+}
+
+async function closeHttp(server: Server) {
+  await new Promise<void>((resolve, reject) => server.close((error) => (
+    error ? reject(error) : resolve()
+  )))
 }

@@ -35,7 +35,10 @@ export function createTestProductDatabase() {
   const toolBatches = new Map<string, {
     id: string; executionId: string; projectionId: string; turnIndex: number; status: string
     calls: Array<{ toolCallId: string; toolName: string; position: number }>
-    results: Array<{ toolCallId: string; status: string; completedAt: string }>
+    results: Array<{
+      toolCallId: string; status: string; startedAt: string; completedAt: string
+      completionOrder: number; resultPayload: Record<string, unknown>
+    }>
   }>()
 
   const portfolioRepository: PortfolioRepository = {
@@ -316,6 +319,14 @@ export function createTestProductDatabase() {
     async list(sessionId, afterSequence) {
       return (agentEvents.get(sessionId) ?? []).filter(({ sequence }) => sequence > afterSequence)
     },
+    async listByExecution(executionId, afterSequence) {
+      const session = [...agentSessions.values()].find((candidate) => (
+        candidate.executionId === executionId
+      ))
+      return session
+        ? (agentEvents.get(session.id) ?? []).filter(({ sequence }) => sequence > afterSequence)
+        : []
+    },
     async getSession(id) { return agentSessions.get(id) ?? null },
     async findPrimarySession(analysisId) {
       return [...agentSessions.values()].find((session) => (
@@ -440,7 +451,36 @@ export function createTestProductDatabase() {
       const batch = toolBatches.get(input.id)
       if (!batch) throw new Error('tool_batch_not_found')
       if (input.results.length !== batch.calls.length) throw new Error('tool_batch_not_terminal')
-      toolBatches.set(input.id, { ...batch, status: input.status, results: structuredClone(input.results) })
+      const results = input.results.map((result) => ({
+        toolCallId: result.toolCallId, status: result.status, startedAt: result.startedAt,
+        completedAt: result.completedAt, completionOrder: result.completionOrder,
+        resultPayload: structuredClone(result.resultPayload),
+      }))
+      const status = results.some((result) => result.status === 'failed') ? 'failed'
+        : results.some((result) => result.status === 'cancelled') ? 'cancelled' : 'completed'
+      toolBatches.set(input.id, { ...batch, status, results })
+      const session = [...agentSessions.values()].find(({ executionId }) => executionId === input.executionId)
+      if (!session) return []
+      const existing = agentEvents.get(session.id) ?? []
+      const created = [...input.results]
+        .sort((left, right) => left.completionOrder - right.completionOrder)
+        .map((result, index) => ({
+          sessionId: session.id, sequence: existing.length + index + 1,
+          operationId: result.operationId, payload: structuredClone(result.eventPayload),
+          createdAt: result.completedAt,
+        }))
+      agentEvents.set(session.id, [...existing, ...created])
+      for (const result of input.results) {
+        const resultValue = result.eventPayload.result as { facts?: Array<Record<string, unknown>> } | undefined
+        for (const fact of resultValue?.facts ?? []) {
+          if (typeof fact.id !== 'string') continue
+          facts.set(fact.id, structuredClone(fact))
+          const ids = analysisFacts.get(session.analysisId) ?? new Set<string>()
+          ids.add(fact.id)
+          analysisFacts.set(session.analysisId, ids)
+        }
+      }
+      return created
     },
     async replay(executionId) {
       const projections = toolProjections.get(executionId) ?? []
@@ -455,11 +495,16 @@ export function createTestProductDatabase() {
           .map((batch) => structuredClone(batch)),
       }
     },
+    async replayForSession(sessionId, executionId) {
+      const belongs = lifecycles.get(sessionId)?.execution.id === executionId
+        || agentSessions.get(sessionId)?.executionId === executionId
+      return belongs ? { executionId, ...await this.replay(executionId) } : null
+    },
   }
 
   return {
     productDatabase: {
-      checkSchema: async () => ({ status: 'ok' as const, version: 13 }),
+      checkSchema: async () => ({ status: 'ok' as const, version: 14 }),
       close: async () => {},
     },
     portfolioRepository,

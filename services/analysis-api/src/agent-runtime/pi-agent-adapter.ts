@@ -134,28 +134,6 @@ export type PiToolProjectionCommit = (
   state: TurnBoundaryState, signal?: AbortSignal,
 ) => Promise<{ tools: PiAgentAdapterTool[] } | undefined>
 
-export function createPersistedPiToolProjectionCommit(options: {
-  executionId: string; role: 'main' | 'fundamental'; stage: 'research' | 'finalization'
-  beginModelRequest: (input: {
-    requestId: string; executionId: string; role: 'main' | 'fundamental'
-    stage: 'research' | 'finalization'; turnIndex: number
-    tools: Array<{ name: string; description: string; parameters: Record<string, unknown> }>
-    createdAt: string
-  }) => Promise<unknown>
-}) {
-  let turnIndex = 0
-  return async (state: TurnBoundaryState) => {
-    const tools = state.tools.map(modelToolDefinition)
-    const nextTurn = ++turnIndex
-    await options.beginModelRequest({
-      requestId: `execution:${options.executionId}:pi-boundary:${nextTurn}`,
-      executionId: options.executionId, role: options.role, stage: options.stage,
-      turnIndex: nextTurn, tools, createdAt: new Date().toISOString(),
-    })
-    return { tools: state.tools }
-  }
-}
-
 export type PiAgentAdapterEvent =
   | { type: 'agent_start' }
   | { type: 'agent_end'; messages: PiAgentAdapterMessage[] }
@@ -176,6 +154,13 @@ type CreatePiAgentAdapterOptions = {
     tools?: PiAgentAdapterTool[]
   }
   streamFn: PiAgentAdapterStreamFn
+  beforeModelRequest?: PiToolProjectionCommit
+  beforeToolCall?: (context: PiBeforeToolCallContext, signal?: AbortSignal) =>
+    Promise<PiBeforeToolCallResult | undefined>
+  afterToolCall?: (context: PiAfterToolCallContext, signal?: AbortSignal) =>
+    Promise<PiAfterToolCallResult | undefined>
+  shouldStopAfterTurn?: (context: PiShouldStopAfterTurnContext, signal?: AbortSignal) =>
+    boolean | Promise<boolean>
   signal?: AbortSignal
   prepareNextTurn?: (state: TurnBoundaryState, signal?: AbortSignal) =>
     Promise<Partial<TurnBoundaryState> | undefined> | Partial<TurnBoundaryState> | undefined
@@ -191,6 +176,32 @@ type CreatePiAgentAdapterOptions = {
   }
 }
 
+type PiBeforeToolCallContext = {
+  assistantMessage: PiAgentAdapterMessage
+  toolCall: Extract<PiAgentAdapterContent, { type: 'toolCall' }>
+  args: unknown
+  context: { systemPrompt: string; messages: PiAgentAdapterMessage[]; tools?: PiAgentAdapterTool[] }
+}
+
+type PiBeforeToolCallResult = { block?: boolean; reason?: string; terminate?: boolean }
+
+type PiAfterToolCallContext = PiBeforeToolCallContext & {
+  result: { content: PiAgentAdapterContent[]; details?: unknown; usage?: unknown; terminate?: boolean }
+  isError: boolean
+}
+
+type PiAfterToolCallResult = {
+  content?: PiAgentAdapterContent[]; details?: unknown; isError?: boolean
+  usage?: unknown; terminate?: boolean
+}
+
+type PiShouldStopAfterTurnContext = {
+  message: PiAgentAdapterMessage
+  toolResults: PiAgentAdapterMessage[]
+  context: { systemPrompt: string; messages: PiAgentAdapterMessage[]; tools?: PiAgentAdapterTool[] }
+  newMessages: PiAgentAdapterMessage[]
+}
+
 export function createPiAgentAdapter(options: CreatePiAgentAdapterOptions) {
   let activeModel = options.initialState.model
   let externallyAborted = options.signal?.aborted ?? false
@@ -202,12 +213,33 @@ export function createPiAgentAdapter(options: CreatePiAgentAdapterOptions) {
       tools: options.initialState.tools as AgentTool[],
     },
     convertToLlm: (messages) => messages as Message[],
-    streamFn: (model, context, streamOptions) => options.streamFn(
-      fromPiModel(model),
-      fromPiContext(context),
-      { signal: streamOptions?.signal, apiKey: streamOptions?.apiKey },
-    ) as unknown as AssistantMessageEventStream,
+    streamFn: async (model, context, streamOptions) => {
+      const boundaryState: TurnBoundaryState = {
+        systemPrompt: context.systemPrompt ?? '',
+        model: fromPiModel(model),
+        messages: fromPiMessages(context.messages as Message[]),
+        tools: (context.tools ?? []) as PiAgentAdapterTool[],
+      }
+      const persisted = await options.beforeModelRequest?.(
+        copyBoundaryState(boundaryState), streamOptions?.signal,
+      )
+      const providerContext = persisted
+        ? { ...boundaryState, tools: [...persisted.tools] }
+        : boundaryState
+      return options.streamFn(
+        providerContext.model,
+        {
+          systemPrompt: providerContext.systemPrompt,
+          messages: providerContext.messages,
+          tools: providerContext.tools,
+        },
+        { signal: streamOptions?.signal, apiKey: streamOptions?.apiKey },
+      ) as unknown as AssistantMessageEventStream
+    },
     toolExecution: 'parallel',
+    beforeToolCall: options.beforeToolCall as Agent['beforeToolCall'],
+    afterToolCall: options.afterToolCall as Agent['afterToolCall'],
+    shouldStopAfterTurn: options.shouldStopAfterTurn as Agent['shouldStopAfterTurn'],
     prepareNextTurnWithContext: async (context, signal) => {
       const boundaryState: TurnBoundaryState = {
         systemPrompt: context.context.systemPrompt,

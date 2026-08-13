@@ -53,7 +53,7 @@ export function createAnalysisService(options: {
     }),
   ])
   const toolRuntime: ToolRuntime = {
-    async beginModelRequest(input) {
+    async ensureProjection(input) {
       const visibleToolNames = input.tools.map(({ name }) => name)
       const schemaHash = createHash('sha256').update(JSON.stringify(input.tools)).digest('hex')
       const projection = await options.toolProjectionRepository.ensureVersion({
@@ -62,14 +62,52 @@ export function createAnalysisService(options: {
         reasons: { role: input.role, stage: input.stage },
         createdAt: input.createdAt,
       })
-      await options.toolProjectionRepository.recordModelRequest({
-        id: input.requestId, executionId: input.executionId, projectionId: projection.id,
-        turnIndex: input.turnIndex, createdAt: input.createdAt,
-      })
       return { id: projection.id, version: projection.version }
     },
-    beginToolBatch: (input) => options.toolProjectionRepository.beginToolBatch(input),
-    completeToolBatch: (input) => options.toolProjectionRepository.completeToolBatch(input),
+    async recordModelRequest(input) {
+      await options.toolProjectionRepository.recordModelRequest({
+        id: input.requestId, executionId: input.executionId, projectionId: input.projectionId,
+        turnIndex: input.turnIndex, createdAt: input.createdAt,
+      })
+    },
+    async beginModelRequest(input) {
+      const projection = await toolRuntime.ensureProjection(input)
+      await toolRuntime.recordModelRequest({
+        requestId: input.requestId, executionId: input.executionId,
+        projectionId: projection.id, turnIndex: input.turnIndex, createdAt: input.createdAt,
+      })
+      return projection
+    },
+    async beginToolBatch(input) {
+      await options.toolProjectionRepository.beginToolBatch(input)
+      const operations = new Set(input.calls.map((call) => call.operationId).filter(Boolean))
+      if (!operations.size) return
+      const created = await options.eventRepository.listByExecution(input.executionId, 0)
+      for (const event of created) if (operations.has(event.operationId)) {
+        for (const listener of listeners.get(event.sessionId) ?? []) listener(event)
+      }
+    },
+    async completeToolBatch(input) {
+      const events = await options.toolProjectionRepository.completeToolBatch({
+        id: input.id, executionId: input.executionId, completedAt: input.completedAt,
+        results: input.results.map((result) => ({
+          toolCallId: result.toolCallId, status: result.status,
+          startedAt: result.startedAt, completedAt: result.completedAt,
+          completionOrder: result.completionOrder,
+          resultPayload: {
+            toolName: result.toolName, result: result.result, isError: result.isError,
+          },
+          operationId: result.operationId,
+          eventPayload: {
+            type: 'tool_result', name: result.toolName, result: result.result,
+            isError: result.isError, operationId: result.operationId,
+          },
+        })),
+      })
+      for (const event of events) {
+        for (const listener of listeners.get(event.sessionId) ?? []) listener(event)
+      }
+    },
   }
 
   async function appendEvent(
@@ -344,6 +382,7 @@ export function createAnalysisService(options: {
           lifecycleStatus = event.status
         }
         else if (event.type === 'trace') {
+          if (event.entry.type === 'tool_result' && typeof event.entry.operationId === 'string') continue
           await appendTrace(sessionId, executionId, event.entry.operationId ? event.entry : {
             ...event.entry, operationId: nextModelOperationId(event.entry.type),
           })
@@ -412,9 +451,12 @@ export function createAnalysisService(options: {
             if (event.type === 'lifecycle') await setStatus(sessionId, executionId, event.operationId, event.status, {
               terminal: event.status === 'budget_exhausted' ? false : undefined,
             }, event.waitTarget)
-            if (event.type === 'trace') await appendTrace(sessionId, executionId, event.entry.operationId ? event.entry : {
-              ...event.entry, operationId: nextModelOperationId(event.entry.type),
-            })
+            if (event.type === 'trace' && (event.entry.type !== 'tool_result'
+              || typeof event.entry.operationId !== 'string')) {
+              await appendTrace(sessionId, executionId, event.entry.operationId ? event.entry : {
+                ...event.entry, operationId: nextModelOperationId(event.entry.type),
+              })
+            }
             if (event.type === 'completed') {
               const report = enforceDataGaps(event.report, limitedContext.gaps ?? [])
               await setStatus(sessionId, executionId, operationId('status-partial'), 'partial', { report })
