@@ -19,7 +19,8 @@ import type { RuntimeSettings } from '@vibe-invest/contracts'
 import {
   acquireActiveSlot, createActiveBudget, createConcurrencyGate, deadlineSignal, type ActiveBudget,
 } from './runtime-policy.js'
-import { analysisModelTools, financialSpecialistTools } from './tools.js'
+import { analysisModelTools, finalizationModelTools, financialSpecialistTools } from './tools.js'
+import { toolRegistry } from './tool-registry.js'
 
 type Fact = {
   id: string
@@ -59,6 +60,7 @@ type TraceEntry =
   | { type: 'tool_call'; name: string; input: unknown; operationId: string }
   | { type: 'tool_result'; name: string; result: unknown; isError: boolean; operationId: string }
   | { type: 'cancelled'; operationId?: string }
+  | { type: 'tool_projection'; projectionId: string; version: number; visibleToolNames: string[]; operationId: string }
 
 export type ModelEvent =
   | {
@@ -90,6 +92,23 @@ export type AnalyzeInput = {
   activeBudget?: ActiveBudget
   acquireModelSlot?: (signal: AbortSignal) => Promise<() => void>
   acquireToolSlot?: (signal: AbortSignal) => Promise<() => void>
+  toolRuntime?: ToolRuntime
+}
+
+export type ToolRuntime = {
+  beginModelRequest(input: {
+    requestId: string; executionId: string; role: 'main' | 'fundamental'
+    stage: 'research' | 'finalization'; turnIndex: number; tools: Tool[]; createdAt: string
+  }): Promise<{ id: string; version: number }>
+  beginToolBatch(input: {
+    id: string; executionId: string; projectionId: string; turnIndex: number
+    calls: Array<{ toolCallId: string; toolName: string; position: number }>; createdAt: string
+  }): Promise<void>
+  completeToolBatch(input: {
+    id: string; executionId: string; status: 'completed' | 'failed' | 'cancelled'
+    results: Array<{ toolCallId: string; status: 'completed' | 'failed' | 'cancelled'; completedAt: string }>
+    completedAt: string
+  }): Promise<void>
 }
 
 type ModelOptions = {
@@ -231,9 +250,16 @@ export function createPiModel(options: ModelOptions = {}) {
             operationId: `execution:${input.executionId}:finalizing:${closingAttempts + 1}`,
           }
           closingAttempts += 1
-          context.tools = analysisModelTools.filter(({ name }) => name === 'submit_analysis_report')
+          context.tools = [...finalizationModelTools]
         }
         const attemptId = `execution:${input.executionId}:model-attempt:${++modelAttempts}`
+        const projection = await beginProjectedModelRequest(input, attemptId, 'main', closing
+          ? 'finalization' : 'research', modelAttempts, context.tools ?? [])
+        yield { type: 'trace', entry: {
+          type: 'tool_projection', projectionId: projection.id, version: projection.version,
+          visibleToolNames: (context.tools ?? []).map(({ name }) => name),
+          operationId: `${attemptId}:tool-projection`,
+        } }
         if (!closing) yield {
           type: 'lifecycle', status: 'running_model', operationId: `${attemptId}:running-model`,
         }
@@ -338,9 +364,17 @@ export function createPiModel(options: ModelOptions = {}) {
           }
 
           const preparedCalls = prepareToolCalls(
-            [...analysisModelTools], calls, `execution:${input.executionId}:tool`,
+            [...(context.tools ?? [])], calls, `execution:${input.executionId}:tool`,
             `main-attempt:${modelAttempts}`,
           )
+          const batchId = `${attemptId}:tool-batch`
+          await input.toolRuntime?.beginToolBatch({
+            id: batchId, executionId: input.executionId, projectionId: projection.id,
+            turnIndex: modelAttempts, createdAt: new Date().toISOString(),
+            calls: preparedCalls.map(({ call }, index) => ({
+              toolCallId: call.id, toolName: call.name, position: index + 1,
+            })),
+          })
           yield {
             type: 'lifecycle', status: 'running_tools',
             operationId: `${attemptId}:running-tools`,
@@ -353,6 +387,9 @@ export function createPiModel(options: ModelOptions = {}) {
           }
           let completedReport: AnalysisReport | undefined
           let completedOperationId: string | undefined
+          const batchResults: Array<{
+            toolCallId: string; status: 'completed' | 'failed' | 'cancelled'; completedAt: string
+          }> = []
           for (const { call, toolInput, validationError, toolOperationId } of preparedCalls) {
             if (completedReport) {
               const result = { error: 'cancelled_after_report_submission', cancelled: true, facts: [] as Fact[] }
@@ -361,15 +398,12 @@ export function createPiModel(options: ModelOptions = {}) {
                 type: 'tool_result', name: call.name, result, isError: true,
                 operationId: `${toolOperationId}:result`,
               } }
+              batchResults.push({ toolCallId: call.id, status: 'cancelled', completedAt: new Date().toISOString() })
               continue
             }
-            const terminalError = validationError === 'tool_not_available'
+            const terminalError = validationError
               ? { error: validationError, facts: [] as Fact[] }
-              : closing && call.name !== 'submit_analysis_report'
-                ? { error: 'tool_rejected_during_closure', rejected: true, facts: [] as Fact[] }
-                : validationError
-                  ? { error: validationError, facts: [] as Fact[] }
-                  : undefined
+              : undefined
             if (terminalError) {
               const result = terminalError
               context.messages.push(toolResultMessage(call, result, true))
@@ -377,12 +411,18 @@ export function createPiModel(options: ModelOptions = {}) {
                 type: 'tool_result', name: call.name, result, isError: true,
                 operationId: `${toolOperationId}:result`,
               } }
+              batchResults.push({ toolCallId: call.id, status: 'failed', completedAt: new Date().toISOString() })
               continue
             }
             if (call.name === 'submit_analysis_report') {
-              const report = normalizeReport(toolInput)
               try {
-                validateEvidence(report, knownFactIds)
+                const report = await toolRegistry.handler(call.name)?.(toolInput, {
+                  submitAnalysisReport: async (params) => {
+                    const candidate = normalizeReport(params)
+                    validateEvidence(candidate, knownFactIds)
+                    return candidate
+                  },
+                }) as AnalysisReport
                 const result = { submitted: true }
                 context.messages.push(toolResultMessage(call, result, false))
                 yield { type: 'trace', entry: {
@@ -391,6 +431,7 @@ export function createPiModel(options: ModelOptions = {}) {
                 } }
                 completedReport = report
                 completedOperationId = `${toolOperationId}:report`
+                batchResults.push({ toolCallId: call.id, status: 'completed', completedAt: new Date().toISOString() })
               } catch (error) {
                 const result = {
                   error: error instanceof Error ? error.message : String(error),
@@ -404,6 +445,7 @@ export function createPiModel(options: ModelOptions = {}) {
                   type: 'tool_result', name: call.name, result, isError: true,
                   operationId: `${toolOperationId}:result`,
                 } }
+                batchResults.push({ toolCallId: call.id, status: 'failed', completedAt: new Date().toISOString() })
               }
               continue
             }
@@ -420,7 +462,9 @@ export function createPiModel(options: ModelOptions = {}) {
             }
             try {
               const toolSymbol = (toolInput as { symbol?: string }).symbol ?? input.symbol
-              const financialContext = await loadFrozenContext(toolSymbol)
+              const financialContext = await toolRegistry.handler('fetch_financial_context')?.(
+                toolInput, { loadFinancialContext: async () => loadFrozenContext(toolSymbol) },
+              ) as Awaited<ReturnType<AnalyzeInput['fetchFinancialContext']>>
               if (call.name === 'analyze_financials') {
                 yield {
                   type: 'lifecycle', status: 'waiting_for_specialists',
@@ -474,7 +518,11 @@ export function createPiModel(options: ModelOptions = {}) {
                   operationId: `${toolOperationId}:specialist-completed`,
                 }
                 for (const fact of specialist.facts) knownFactIds.add(fact.id)
-                result = { facts: specialist.facts, analysis: specialist.analysis }
+                result = await toolRegistry.handler(call.name)?.(toolInput, {
+                  runFinancialSpecialist: async () => ({
+                    facts: specialist.facts, analysis: specialist.analysis,
+                  }),
+                }) as { facts: Fact[]; analysis: string }
               } else {
                 result = financialContext
               }
@@ -486,6 +534,7 @@ export function createPiModel(options: ModelOptions = {}) {
                 for (const pending of pendingCalls) {
                   const cancelledResult = policyToolResult(input, executionSignal, activeBudget)
                   context.messages.push(toolResultMessage(pending, cancelledResult, true))
+                  batchResults.push({ toolCallId: pending.id, status: 'cancelled', completedAt: new Date().toISOString() })
                   yield { type: 'trace', entry: {
                     type: 'tool_result', name: pending.name, result: cancelledResult, isError: true,
                     operationId: `execution:${input.executionId}:tool:${pending.id}:result`,
@@ -518,9 +567,19 @@ export function createPiModel(options: ModelOptions = {}) {
               type: 'tool_result', name: call.name, result, isError,
               operationId: `${toolOperationId}:result`,
             } }
+            batchResults.push({
+              toolCallId: call.id, status: isError ? 'failed' : 'completed',
+              completedAt: new Date().toISOString(),
+            })
             options.log?.({ type: 'tool_result', toolName: call.name, isError })
           }
           runtimeWork.stop()
+          await input.toolRuntime?.completeToolBatch({
+            id: batchId, executionId: input.executionId,
+            status: batchResults.some(({ status }) => status === 'cancelled') ? 'cancelled'
+              : batchResults.some(({ status }) => status === 'failed') ? 'failed' : 'completed',
+            results: uniqueBatchResults(batchResults), completedAt: new Date().toISOString(),
+          })
           if (completedReport) {
             yield {
               type: 'lifecycle', status: 'finalizing',
@@ -578,6 +637,16 @@ async function* runFinancialSpecialist(
       input, options, runtimeSettings, executionSignal, activeBudget, modelGate, specialist: true,
       countActive: !closing,
     })
+    const requestId = `execution:${input.executionId}:specialist:${encodeURIComponent(invocationId)}:model-attempt:${modelAttempts}`
+    const projection = await beginProjectedModelRequest(
+      input, requestId, 'fundamental', closing ? 'finalization' : 'research',
+      modelAttempts, context.tools ?? [],
+    )
+    yield {
+      type: 'tool_projection', projectionId: projection.id, version: projection.version,
+      visibleToolNames: (context.tools ?? []).map(({ name }) => name),
+      operationId: `${requestId}:tool-projection`,
+    }
     let message: AssistantMessage
     try {
       message = await models.complete(selectedModel, context, {
@@ -628,9 +697,20 @@ async function* runFinancialSpecialist(
         }
       }
       const preparedCalls = prepareToolCalls(
-        [...availableTools], calls, `execution:${input.executionId}:specialist-tool`,
+        [...(context.tools ?? [])], calls, `execution:${input.executionId}:specialist-tool`,
         `specialist-invocation:${encodeURIComponent(invocationId)}:attempt:${modelAttempts}`,
       )
+      const batchId = `${requestId}:tool-batch`
+      await input.toolRuntime?.beginToolBatch({
+        id: batchId, executionId: input.executionId, projectionId: projection.id,
+        turnIndex: modelAttempts, createdAt: new Date().toISOString(),
+        calls: preparedCalls.map(({ call }, index) => ({
+          toolCallId: call.id, toolName: call.name, position: index + 1,
+        })),
+      })
+      const batchResults: Array<{
+        toolCallId: string; status: 'completed' | 'failed' | 'cancelled'; completedAt: string
+      }> = []
       for (const { call, toolOperationId } of preparedCalls) {
         yield {
           type: 'tool_call', name: call.name, input: call.arguments,
@@ -638,13 +718,9 @@ async function* runFinancialSpecialist(
         }
       }
       for (const { call, toolInput, validationError, toolOperationId } of preparedCalls) {
-        const terminalError = validationError === 'tool_not_available'
+        const terminalError = validationError
           ? { error: validationError, facts: [] as Fact[] }
-          : closing
-            ? { error: 'tool_rejected_during_closure', rejected: true, facts: [] as Fact[] }
-            : validationError
-              ? { error: validationError, facts: [] as Fact[] }
-              : undefined
+          : undefined
         if (terminalError) {
           const result = terminalError
           context.messages.push(toolResultMessage(call, result, true))
@@ -652,6 +728,7 @@ async function* runFinancialSpecialist(
             type: 'tool_result', name: call.name, result, isError: true,
             operationId: `${toolOperationId}:result`,
           }
+          batchResults.push({ toolCallId: call.id, status: 'failed', completedAt: new Date().toISOString() })
           continue
         }
         let result: { facts: Fact[]; [key: string]: unknown }
@@ -672,18 +749,22 @@ async function* runFinancialSpecialist(
           if (call.name === 'search_news_by_keyword') {
             if (!input.searchNews) throw new Error('news_search_unavailable')
             const keyword = (toolInput as { keyword?: string }).keyword ?? input.symbol
-            result = await input.searchNews(keyword, toolSignal(
-              input, options, runtimeSettings, toolOwner.signal,
-            ))
+            result = await toolRegistry.handler(call.name)?.(toolInput, {
+              searchNews: async () => input.searchNews!(keyword, toolSignal(
+                input, options, runtimeSettings, toolOwner!.signal,
+              )),
+            }) as { facts: Fact[]; [key: string]: unknown }
           } else if (call.name === 'get_technical_indicators') {
             if (!input.fetchTechnicalIndicators) throw new Error('technical_indicators_unavailable')
             const values = toolInput as { symbol?: string; startDate?: string; endDate?: string }
             const endDate = values.endDate ?? new Date().toISOString().slice(0, 10)
             const startDate = values.startDate ?? oneYearBefore(endDate)
-            result = await input.fetchTechnicalIndicators(
-              values.symbol ?? input.symbol, startDate, endDate,
-              toolSignal(input, options, runtimeSettings, toolOwner.signal),
-            )
+            result = await toolRegistry.handler(call.name)?.(toolInput, {
+              fetchTechnicalIndicators: async () => input.fetchTechnicalIndicators!(
+                values.symbol ?? input.symbol, startDate, endDate,
+                toolSignal(input, options, runtimeSettings, toolOwner!.signal),
+              ),
+            }) as { facts: Fact[]; [key: string]: unknown }
           } else {
             throw new Error(`tool_not_allowed:${call.name}`)
           }
@@ -694,6 +775,7 @@ async function* runFinancialSpecialist(
             for (const pending of calls.slice(calls.indexOf(call))) {
               const cancelledResult = policyToolResult(input, executionSignal, activeBudget)
               context.messages.push(toolResultMessage(pending, cancelledResult, true))
+              batchResults.push({ toolCallId: pending.id, status: 'cancelled', completedAt: new Date().toISOString() })
               yield {
                 type: 'tool_result', name: pending.name, result: cancelledResult, isError: true,
                 operationId: `execution:${input.executionId}:specialist-tool:${pending.id}:result`,
@@ -725,8 +807,17 @@ async function* runFinancialSpecialist(
           type: 'tool_result', name: call.name, result, isError,
           operationId: `${toolOperationId}:result`,
         }
+        batchResults.push({
+          toolCallId: call.id, status: isError ? 'failed' : 'completed', completedAt: new Date().toISOString(),
+        })
       }
       runtimeWork.stop()
+      await input.toolRuntime?.completeToolBatch({
+        id: batchId, executionId: input.executionId,
+        status: batchResults.some(({ status }) => status === 'cancelled') ? 'cancelled'
+          : batchResults.some(({ status }) => status === 'failed') ? 'failed' : 'completed',
+        results: uniqueBatchResults(batchResults), completedAt: new Date().toISOString(),
+      })
       if (toolRounds >= runtimeSettings.specialistAgentToolRounds) closing = true
     } finally {
       runtimeWork.stop()
@@ -758,6 +849,20 @@ function prepareToolCalls(
     }
     return prepared
   })
+}
+
+async function beginProjectedModelRequest(
+  input: AnalyzeInput, requestId: string, role: 'main' | 'fundamental',
+  stage: 'research' | 'finalization', turnIndex: number, tools: Tool[],
+) {
+  return input.toolRuntime?.beginModelRequest({
+    requestId, executionId: input.executionId, role, stage, turnIndex, tools,
+    createdAt: new Date().toISOString(),
+  }) ?? { id: `${requestId}:ephemeral-projection`, version: turnIndex }
+}
+
+function uniqueBatchResults<T extends { toolCallId: string }>(results: T[]) {
+  return [...new Map(results.map((result) => [result.toolCallId, result])).values()]
 }
 
 function projectedSpecialistTools(input: AnalyzeInput) {

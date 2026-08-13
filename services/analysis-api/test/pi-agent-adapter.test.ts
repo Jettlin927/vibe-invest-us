@@ -287,6 +287,34 @@ test('工具投影和上下文替换只在完整 turn boundary 后影响下一�
   assert.deepEqual(adapter.snapshot().tools.map((tool) => tool.name), ['visible_next'])
 })
 
+test('持久化 Projection 提交失败时 Pi 不会在下一 Turn 暴露新工具', async () => {
+  const fixture = createFixture([
+    assistantMessage([toolCall('old_tool', 'old-call')], 'toolUse'),
+  ])
+  const contexts: string[][] = []
+  const adapter = createPiAgentAdapter({
+    initialState: {
+      systemPrompt: 'system', model: fixture.model,
+      tools: [textTool('old_tool', async () => ({
+        content: [{ type: 'text', text: 'old' }], details: {},
+      }))],
+    },
+    streamFn: async (model, context, options) => {
+      contexts.push((context.tools ?? []).map(({ name }) => name))
+      return fixture.streamFn(model, context, options)
+    },
+    prepareNextTurn: async () => { throw new Error('projection_commit_failed') },
+  })
+
+  await adapter.submit(userMessage('开始'))
+  await adapter.waitForIdle()
+  assert.deepEqual(contexts, [['old_tool']])
+  const snapshot = adapter.snapshot()
+  assert.deepEqual(snapshot.tools.map(({ name }) => name), ['old_tool'])
+  assert.match(snapshot.errorMessage ?? '', /projection_commit_failed/)
+  adapter.dispose()
+})
+
 test('Pi compaction 阈值只在 turn boundary 切换并保留到后续提交', async () => {
   const seenContents: string[][] = []
   const cuts: Array<{ summarized: string[]; turnPrefix: string[]; retained: string[] }> = []

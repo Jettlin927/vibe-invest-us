@@ -8,6 +8,7 @@ import {
   createPool,
   createPortfolioRepository,
   createRuntimeSettingsRepository,
+  createToolProjectionRepository,
 } from '@vibe-invest/product-dao'
 
 import { buildApp } from '../src/app.js'
@@ -26,6 +27,7 @@ function createPostgresApp(now?: () => Date) {
     analysisRepository: createAnalysisRepository(pool),
     agentEventRepository: createAgentEventRepository(pool),
     runtimeSettingsRepository: createRuntimeSettingsRepository(pool),
+    toolProjectionRepository: createToolProjectionRepository(pool),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchMarketPrices: async (symbols) => Object.fromEntries(
       symbols.map((symbol) => [symbol, symbol === 'NVDA' ? 120 : 240]),
@@ -109,6 +111,7 @@ test('真实 PostgreSQL HTTP 持仓与研究闭环在重启后持久化', {
     analysisRepository: createAnalysisRepository(analysisPool),
     agentEventRepository: createAgentEventRepository(analysisPool),
     runtimeSettingsRepository: createRuntimeSettingsRepository(analysisPool),
+    toolProjectionRepository: createToolProjectionRepository(analysisPool),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({
       symbol, gaps: [], facts: [{

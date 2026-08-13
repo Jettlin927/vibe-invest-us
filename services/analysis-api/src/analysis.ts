@@ -1,6 +1,7 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import type {
   AgentEvent, AgentEventRepository, AnalysisRepository, RuntimeSettingsRepository,
+  ToolProjectionRepository,
 } from '@vibe-invest/product-dao'
 import {
   agentExecutionStatuses, defaultRuntimeSettings, isTerminalAgentExecutionStatus,
@@ -8,7 +9,7 @@ import {
   type AgentExecutionStatus, type RuntimeSettings,
 } from '@vibe-invest/contracts'
 
-import type { AnalyzeInput, AnalysisReport, ModelEvent } from './model.js'
+import type { AnalyzeInput, AnalysisReport, ModelEvent, ToolRuntime } from './model.js'
 import type { FactQueryResult, FinancialContext, FinancialFact } from './financial-data-client.js'
 import { acquireActiveSlot, createActiveBudget, createConcurrencyGate } from './runtime-policy.js'
 
@@ -19,6 +20,7 @@ export function createAnalysisService(options: {
   repository: AnalysisRepository
   eventRepository: AgentEventRepository
   settingsRepository: RuntimeSettingsRepository
+  toolProjectionRepository: ToolProjectionRepository
   model: Model
   fetchFinancialContext: (symbol: string, signal: AbortSignal) => Promise<FinancialContext>
   searchNews?: (keyword: string, signal: AbortSignal) => Promise<FactQueryResult>
@@ -50,6 +52,25 @@ export function createAnalysisService(options: {
       toolGate.setLimit(revision.values.toolConcurrency)
     }),
   ])
+  const toolRuntime: ToolRuntime = {
+    async beginModelRequest(input) {
+      const visibleToolNames = input.tools.map(({ name }) => name)
+      const schemaHash = createHash('sha256').update(JSON.stringify(input.tools)).digest('hex')
+      const projection = await options.toolProjectionRepository.ensureVersion({
+        executionId: input.executionId, role: input.role, stage: input.stage,
+        schemaHash, projectedTools: input.tools, visibleToolNames,
+        reasons: { role: input.role, stage: input.stage },
+        createdAt: input.createdAt,
+      })
+      await options.toolProjectionRepository.recordModelRequest({
+        id: input.requestId, executionId: input.executionId, projectionId: projection.id,
+        turnIndex: input.turnIndex, createdAt: input.createdAt,
+      })
+      return { id: projection.id, version: projection.version }
+    },
+    beginToolBatch: (input) => options.toolProjectionRepository.beginToolBatch(input),
+    completeToolBatch: (input) => options.toolProjectionRepository.completeToolBatch(input),
+  }
 
   async function appendEvent(
     sessionId: string,
@@ -312,6 +333,7 @@ export function createAnalysisService(options: {
         acquireToolSlot: (signal) => toolGate.acquire(signal),
         searchNews: options.searchNews,
         fetchTechnicalIndicators: options.fetchTechnicalIndicators,
+        toolRuntime,
       })) {
         resumeProcessing()
         assertPolicy()
@@ -385,6 +407,7 @@ export function createAnalysisService(options: {
             signal: controller.signal, executionDeadlineSignal: wallDeadline, activeBudget,
             acquireModelSlot: (signal) => modelGate.acquire(signal),
             acquireToolSlot: (signal) => toolGate.acquire(signal),
+            toolRuntime,
           })) {
             if (event.type === 'lifecycle') await setStatus(sessionId, executionId, event.operationId, event.status, {
               terminal: event.status === 'budget_exhausted' ? false : undefined,

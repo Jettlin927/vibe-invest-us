@@ -6,11 +6,148 @@ import { defaultRuntimeSettings } from '@vibe-invest/contracts'
 
 import {
   checkSchema, createAgentEventRepository, createAnalysisRepository, createPool,
-  createPortfolioRepository, createRuntimeSettingsRepository, migrate,
+  createPortfolioRepository, createRuntimeSettingsRepository, createToolProjectionRepository, migrate,
 } from '../src/index.js'
 
 const migrationUrl = process.env.TEST_MIGRATION_DATABASE_URL
 const applicationUrl = process.env.TEST_DATABASE_URL
+
+test('真实 PostgreSQL 持久化 Tool Projection 版本、模型请求与批次边界并可重放', {
+  skip: !migrationUrl || !applicationUrl,
+  concurrency: false,
+}, async () => {
+  await migrate(migrationUrl!)
+  const pool = createPool(applicationUrl!)
+  const events = createAgentEventRepository(pool)
+  const projections = createToolProjectionRepository(pool)
+  const analysisId = `projection-${crypto.randomUUID()}`
+  const sessionId = `projection-session-${crypto.randomUUID()}`
+  const executionId = `projection-execution-${crypto.randomUUID()}`
+  try {
+    await events.createResearch({
+      analysisId, sessionId, executionId, symbol: `P${crypto.randomUUID().slice(0, 8)}`,
+      status: 'planning', analysisStatus: 'queued', operationId: 'runtime-context',
+      event: { type: 'runtime_context', status: 'planning' },
+      createdAt: '2026-08-13T04:00:00.000Z',
+    })
+    const first = await projections.ensureVersion({
+      executionId, role: 'main', stage: 'research', schemaHash: 'hash-research',
+      projectedTools: [{ name: 'fetch_financial_context', parameters: { type: 'object' } }],
+      visibleToolNames: ['fetch_financial_context'], reasons: { stage: 'research' },
+      createdAt: '2026-08-13T04:00:01.000Z',
+    })
+    const same = await projections.ensureVersion({
+      executionId, role: 'main', stage: 'research', schemaHash: 'hash-research',
+      projectedTools: [{ name: 'fetch_financial_context', parameters: { type: 'object' } }],
+      visibleToolNames: ['fetch_financial_context'], reasons: { stage: 'research' },
+      createdAt: '2026-08-13T04:00:02.000Z',
+    })
+    assert.equal(first.version, 1)
+    assert.deepEqual(same, first)
+
+    await projections.recordModelRequest({
+      id: 'request-1', executionId, projectionId: first.id, turnIndex: 1,
+      createdAt: '2026-08-13T04:00:03.000Z',
+    })
+    await projections.beginToolBatch({
+      id: 'batch-1', executionId, projectionId: first.id, turnIndex: 1,
+      calls: [{ toolCallId: 'call-2', toolName: 'hidden_guess', position: 2 },
+        { toolCallId: 'call-1', toolName: 'fetch_financial_context', position: 1 }],
+      createdAt: '2026-08-13T04:00:04.000Z',
+    })
+    await assert.rejects(projections.ensureVersion({
+      executionId, role: 'main', stage: 'finalization', schemaHash: 'hash-final',
+      projectedTools: [{ name: 'submit_analysis_report', parameters: { type: 'object' } }],
+      visibleToolNames: ['submit_analysis_report'], reasons: { stage: 'finalization' },
+      createdAt: '2026-08-13T04:00:05.000Z',
+    }), /tool_batch_not_terminal/)
+    await projections.completeToolBatch({
+      id: 'batch-1', executionId, status: 'completed',
+      results: [{ toolCallId: 'call-2', status: 'failed', completedAt: '2026-08-13T04:00:05.500Z' },
+        { toolCallId: 'call-1', status: 'completed', completedAt: '2026-08-13T04:00:05.000Z' }],
+      completedAt: '2026-08-13T04:00:06.000Z',
+    })
+    const second = await projections.ensureVersion({
+      executionId, role: 'main', stage: 'finalization', schemaHash: 'hash-final',
+      projectedTools: [{ name: 'submit_analysis_report', parameters: { type: 'object' } }],
+      visibleToolNames: ['submit_analysis_report'], reasons: { stage: 'finalization' },
+      createdAt: '2026-08-13T04:00:07.000Z',
+    })
+    await projections.recordModelRequest({
+      id: 'request-2', executionId, projectionId: second.id, turnIndex: 2,
+      createdAt: '2026-08-13T04:00:08.000Z',
+    })
+    assert.equal(second.version, 2)
+    const replay = await projections.replay(executionId)
+    assert.deepEqual(replay.projections.map(({ version, visibleToolNames }) => ({ version, visibleToolNames })), [
+      { version: 1, visibleToolNames: ['fetch_financial_context'] },
+      { version: 2, visibleToolNames: ['submit_analysis_report'] },
+    ])
+    assert.deepEqual(replay.modelRequests.map(({ id, projectionVersion }) => ({ id, projectionVersion })), [
+      { id: 'request-1', projectionVersion: 1 }, { id: 'request-2', projectionVersion: 2 },
+    ])
+    assert.deepEqual(replay.toolBatches[0]?.calls.map(({ toolCallId }) => toolCallId), ['call-1', 'call-2'])
+    assert.deepEqual(replay.toolBatches[0]?.results.map(({ toolCallId, status }) => ({ toolCallId, status })), [
+      { toolCallId: 'call-1', status: 'completed' }, { toolCallId: 'call-2', status: 'failed' },
+    ])
+  } finally {
+    await createAnalysisRepository(pool).removeResearch(analysisId)
+    await pool.end()
+  }
+})
+
+test('真实 PostgreSQL execution 终态事务会取消未完成 Tool Batch', {
+  skip: !migrationUrl || !applicationUrl,
+  concurrency: false,
+}, async () => {
+  await migrate(migrationUrl!)
+  const pool = createPool(applicationUrl!)
+  const events = createAgentEventRepository(pool)
+  const projections = createToolProjectionRepository(pool)
+  const analysisId = `projection-terminal-${crypto.randomUUID()}`
+  const sessionId = `projection-terminal-session-${crypto.randomUUID()}`
+  const executionId = `projection-terminal-execution-${crypto.randomUUID()}`
+  try {
+    await events.createResearch({
+      analysisId, sessionId, executionId, symbol: `T${crypto.randomUUID().slice(0, 8)}`,
+      status: 'planning', analysisStatus: 'queued', operationId: 'runtime-context',
+      event: { type: 'runtime_context', status: 'planning' },
+      createdAt: '2026-08-13T04:10:00.000Z',
+    })
+    const projection = await projections.ensureVersion({
+      executionId, role: 'main', stage: 'research', schemaHash: 'terminal-hash',
+      projectedTools: [{ name: 'fetch_financial_context', parameters: { type: 'object' } }],
+      visibleToolNames: ['fetch_financial_context'], reasons: { stage: 'research' },
+      createdAt: '2026-08-13T04:10:01.000Z',
+    })
+    await projections.beginToolBatch({
+      id: 'terminal-batch', executionId, projectionId: projection.id, turnIndex: 1,
+      calls: [{ toolCallId: 'terminal-call', toolName: 'fetch_financial_context', position: 1 }],
+      createdAt: '2026-08-13T04:10:02.000Z',
+    })
+    await events.append({
+      sessionId, executionId, operationId: 'execution-failed',
+      event: { type: 'status', status: 'failed', terminal: true },
+      projection: { status: 'failed', executionStatus: 'failed', terminal: true },
+      createdAt: '2026-08-13T04:10:03.000Z',
+    })
+    const replay = await projections.replay(executionId)
+    assert.equal(replay.toolBatches[0]?.status, 'cancelled')
+    assert.deepEqual(replay.toolBatches[0]?.results.map(({ status }) => status), ['cancelled'])
+    await assert.rejects(projections.recordModelRequest({
+      id: 'late-request', executionId, projectionId: projection.id, turnIndex: 2,
+      createdAt: '2026-08-13T04:10:04.000Z',
+    }), /agent_execution_fenced/)
+    await assert.rejects(projections.completeToolBatch({
+      id: 'terminal-batch', executionId, status: 'completed',
+      results: [{ toolCallId: 'terminal-call', status: 'completed', completedAt: '2026-08-13T04:10:04.000Z' }],
+      completedAt: '2026-08-13T04:10:04.000Z',
+    }), /agent_execution_fenced/)
+  } finally {
+    await createAnalysisRepository(pool).removeResearch(analysisId)
+    await pool.end()
+  }
+})
 
 test('真实 PostgreSQL 保存不可变 Runtime settings revision 并可恢复默认值', {
   skip: !migrationUrl || !applicationUrl,
@@ -428,7 +565,7 @@ test('真实 PostgreSQL migration 幂等且 application role 没有 DDL 权限',
   await migrate(migrationUrl!)
 
   const pool = createPool(applicationUrl!)
-  assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 12 })
+  assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 13 })
   const privileges = await pool.query<{ can_create: boolean; can_temp: boolean }>(
     `SELECT has_schema_privilege(current_user, 'public', 'CREATE') AS can_create,
             has_database_privilege(current_user, current_database(), 'TEMP') AS can_temp`,

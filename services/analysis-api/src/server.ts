@@ -3,6 +3,7 @@ import { resolve } from 'node:path'
 import {
   checkSchema, createAgentEventRepository, createAnalysisRepository, createPool,
   createPortfolioRepository, createRuntimeSettingsRepository,
+  createToolProjectionRepository,
 } from '@vibe-invest/product-dao'
 
 import { buildApp } from './app.js'
@@ -39,6 +40,7 @@ const app = buildApp({
   analysisRepository: createAnalysisRepository(productPool),
   agentEventRepository: createAgentEventRepository(productPool),
   runtimeSettingsRepository: createRuntimeSettingsRepository(productPool),
+  toolProjectionRepository: createToolProjectionRepository(productPool),
   staticDir,
   financialDataHealth: () => financialData.health(),
   fetchFinancialContext: (symbol, signal) => financialData.context(symbol, signal),

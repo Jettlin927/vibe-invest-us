@@ -9,6 +9,7 @@ import {
   createPool,
   createPortfolioRepository,
   createRuntimeSettingsRepository,
+  createToolProjectionRepository,
 } from '@vibe-invest/product-dao'
 
 import { buildApp } from '../src/app.js'
@@ -33,6 +34,7 @@ test('真实 PostgreSQL 与真实 HTTP SSE 断线后先 catch-up 再继续 live'
     analysisRepository: createAnalysisRepository(pool),
     agentEventRepository: eventRepository,
     runtimeSettingsRepository: createRuntimeSettingsRepository(pool),
+    toolProjectionRepository: createToolProjectionRepository(pool),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({ symbol, gaps: [], facts: [] }),
     model: {
@@ -130,6 +132,7 @@ test('真实 PostgreSQL 重启恢复在 API、Session ledger 与 SSE 中一致�
     analysisRepository: analyses,
     agentEventRepository: events,
     runtimeSettingsRepository: createRuntimeSettingsRepository(pool),
+    toolProjectionRepository: createToolProjectionRepository(pool),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({ symbol, gaps: [], facts: [] }),
     model: { async *analyze(): AsyncGenerator<ModelEvent> { return } },
@@ -171,6 +174,7 @@ test('真实 PostgreSQL 取消在 PG、HTTP 与 SSE reconnect 统一为 stopping
     analysisRepository: createAnalysisRepository(pool),
     agentEventRepository: events,
     runtimeSettingsRepository: createRuntimeSettingsRepository(pool),
+    toolProjectionRepository: createToolProjectionRepository(pool),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({ symbol, gaps: [], facts: [] }),
     model: {
@@ -285,6 +289,7 @@ test('生产 Pi 经 HTTP、SSE 与真实 PostgreSQL 留存工具及预算收口�
     analysisRepository: createAnalysisRepository(pool),
     agentEventRepository: events,
     runtimeSettingsRepository: settings,
+    toolProjectionRepository: createToolProjectionRepository(pool),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (requested) => ({ symbol: requested, gaps: [], facts: [] }),
     model,
@@ -328,6 +333,19 @@ test('生产 Pi 经 HTTP、SSE 与真实 PostgreSQL 留存工具及预算收口�
     for (const status of ['running_model', 'running_tools', 'budget_exhausted', 'finalizing', 'partial']) {
       assert.match(replay, new RegExp(`event: ${status}`))
     }
+    const toolRuntime = await fetch(
+      `${baseUrl}/api/agent-sessions/${created.sessionId}/tool-runtime`,
+    ).then((response) => response.json())
+    assert.deepEqual(toolRuntime.modelRequests.map((request: { projectionVersion: number }) => (
+      request.projectionVersion
+    )), [1, 2])
+    assert.deepEqual(toolRuntime.projections.map((projection: { visibleToolNames: string[] }) => (
+      projection.visibleToolNames
+    )), [[
+      'fetch_financial_context', 'analyze_financials', 'submit_analysis_report',
+    ], ['submit_analysis_report']])
+    assert.equal(JSON.stringify(toolRuntime).includes('hidden_tool'), false)
+    assert.equal(JSON.stringify(toolRuntime).includes('allowedStages'), false)
   } finally {
     await settings.save(previousSettings.values, new Date().toISOString())
     await app.close()
@@ -366,6 +384,7 @@ test('Pi Runtime 使用持久 executionId 派生工具 operationId 且真实 Pos
     analysisRepository: analyses,
     agentEventRepository: events,
     runtimeSettingsRepository: createRuntimeSettingsRepository(pool),
+    toolProjectionRepository: createToolProjectionRepository(pool),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({ symbol, gaps: [], facts: [] }),
     model,
@@ -494,6 +513,7 @@ test('主 Agent 校验失败与合法调用在下一轮前按原序封存到真�
     analysisRepository: analyses,
     agentEventRepository: events,
     runtimeSettingsRepository: createRuntimeSettingsRepository(pool),
+    toolProjectionRepository: createToolProjectionRepository(pool),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => {
       validCalls += 1
@@ -597,6 +617,7 @@ test('主 Agent 跨 Turn 复用与空 call id 在真实 PostgreSQL 各自完整�
     analysisRepository: analyses,
     agentEventRepository: events,
     runtimeSettingsRepository: createRuntimeSettingsRepository(pool),
+    toolProjectionRepository: createToolProjectionRepository(pool),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({ symbol, gaps: [], facts: [] }),
     model,
@@ -717,6 +738,7 @@ test('专项下一轮 provider 启动前已在真实 PostgreSQL 封存上一批�
     analysisRepository: analyses,
     agentEventRepository: events,
     runtimeSettingsRepository: createRuntimeSettingsRepository(pool),
+    toolProjectionRepository: createToolProjectionRepository(pool),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({ symbol, gaps: [], facts: [], financials: {} }),
     searchNews: async () => ({ facts: [] }),
@@ -827,6 +849,7 @@ test('同一 execution 两次专项 invocation 在真实 PostgreSQL 各自封存
     productDatabase: { checkSchema: () => checkSchema(pool), close: () => pool.end() },
     portfolioRepository: createPortfolioRepository(pool), analysisRepository: analyses,
     agentEventRepository: events, runtimeSettingsRepository: createRuntimeSettingsRepository(pool),
+    toolProjectionRepository: createToolProjectionRepository(pool),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({ symbol, gaps: [], facts: [], financials: {} }),
     searchNews: async () => ({ facts: [] }), model,

@@ -6,6 +6,7 @@ import {
 } from '@vibe-invest/contracts'
 import type {
   AgentEventRepository, AnalysisRepository, PortfolioRepository, RuntimeSettingsRepository,
+  ToolProjectionRepository,
 } from '@vibe-invest/product-dao'
 
 import { createAnalysisService } from './analysis.js'
@@ -22,6 +23,7 @@ type AppDependencies = {
   analysisRepository: AnalysisRepository
   agentEventRepository: AgentEventRepository
   runtimeSettingsRepository: RuntimeSettingsRepository
+  toolProjectionRepository: ToolProjectionRepository
   financialDataHealth: () => Promise<FinancialDataHealth>
   staticDir?: string
   fetchFinancialContext?: (symbol: string, signal: AbortSignal) => Promise<FinancialContext>
@@ -48,6 +50,7 @@ export function buildApp(dependencies: AppDependencies) {
         repository: dependencies.analysisRepository,
         eventRepository: dependencies.agentEventRepository,
         settingsRepository: dependencies.runtimeSettingsRepository,
+        toolProjectionRepository: dependencies.toolProjectionRepository,
         fetchFinancialContext: dependencies.fetchFinancialContext
           ?? (async () => { throw new Error('model_not_configured') }),
         searchNews: dependencies.searchNews,
@@ -232,6 +235,11 @@ export function buildApp(dependencies: AppDependencies) {
   app.get<{ Params: { id: string } }>('/api/analyses/:id', async (request, reply) => {
     const result = await analysis?.get(request.params.id)
     return result ?? reply.status(404).send({ error: 'analysis_not_found' })
+  })
+  app.get<{ Params: { id: string } }>('/api/agent-sessions/:id/tool-runtime', async (request, reply) => {
+    const session = await dependencies.agentEventRepository.getSession(request.params.id)
+    if (!session) return reply.status(404).send({ error: 'agent_session_not_found' })
+    return dependencies.toolProjectionRepository.replay(session.executionId)
   })
   app.get<{ Params: { id: string }; Headers: { 'last-event-id'?: string } }>(
     '/api/agent-sessions/:id/events', async (request, reply) => {

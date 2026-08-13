@@ -359,7 +359,8 @@ test('主 Agent 收口阶段拒绝整批非 submit 工具并向下一轮提供�
   ])
   assert.ok(events.filter((event) => event.type === 'trace' && event.entry.type === 'tool_result'
     && /closing-(first|second)/.test(event.entry.operationId))
-    .every((event) => event.type === 'trace' && event.entry.isError))
+    .every((event) => event.type === 'trace' && event.entry.isError
+      && event.entry.result.error === 'tool_not_available'))
   assert.ok(events.some((event) => event.type === 'completed'))
 })
 
@@ -753,6 +754,10 @@ test('专项 Agent 轮次到限后拒绝整批工具并向收口轮提供完整 
     'execution:specialist-closing:specialist-tool:specialist-closing-first:result',
     'execution:specialist-closing:specialist-tool:specialist-closing-second:result',
   ])
+  assert.ok(events.filter((event) => event.type === 'trace' && event.entry.type === 'tool_result'
+    && /specialist-closing-(first|second)/.test(event.entry.operationId))
+    .every((event) => event.type === 'trace' && event.entry.isError
+      && event.entry.result.error === 'tool_not_available'))
   assert.ok(events.some((event) => event.type === 'completed'))
 })
 

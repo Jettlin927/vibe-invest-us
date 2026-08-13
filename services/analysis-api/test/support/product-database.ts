@@ -1,6 +1,7 @@
 import type {
   AgentEvent, AgentEventRepository, AgentSession, AnalysisRecord, AnalysisRepository, PortfolioRepository,
   ProductEquitySnapshot, RuntimeSettingsRepository,
+  ToolProjectionRepository,
   ProductPosition,
 } from '@vibe-invest/product-dao'
 import { defaultRuntimeSettings, parseRuntimeSettingsUpdate } from '@vibe-invest/contracts'
@@ -25,6 +26,17 @@ export function createTestProductDatabase() {
     id: nextSettingsRevisionId, values: { ...defaultRuntimeSettings }, createdAt: '2026-08-13T00:00:00.000Z',
   }]
   const executionSettingsSnapshots = new Map<string, Awaited<ReturnType<RuntimeSettingsRepository['freezeExecution']>>>()
+  const toolProjections = new Map<string, Array<{
+    id: string; executionId: string; version: number; role: string; stage: string; schemaHash: string
+    projectedTools: unknown[]; visibleToolNames: string[]
+    reasons: Record<string, unknown>; createdAt: string
+  }>>()
+  const modelRequests: Array<{ id: string; executionId: string; projectionId: string; turnIndex: number; createdAt: string }> = []
+  const toolBatches = new Map<string, {
+    id: string; executionId: string; projectionId: string; turnIndex: number; status: string
+    calls: Array<{ toolCallId: string; toolName: string; position: number }>
+    results: Array<{ toolCallId: string; status: string; completedAt: string }>
+  }>()
 
   const portfolioRepository: PortfolioRepository = {
     async list() { return [...positions.values()].sort((left, right) => left.symbol.localeCompare(right.symbol)) },
@@ -402,15 +414,58 @@ export function createTestProductDatabase() {
         .map((snapshot) => structuredClone(snapshot))
     },
   }
+  const toolProjectionRepository: ToolProjectionRepository = {
+    async ensureVersion(input) {
+      const versions = toolProjections.get(input.executionId) ?? []
+      const existing = versions.find((projection) => projection.role === input.role
+        && projection.stage === input.stage && projection.schemaHash === input.schemaHash
+        && JSON.stringify(projection.visibleToolNames) === JSON.stringify(input.visibleToolNames))
+      if (existing) return structuredClone(existing)
+      if ([...toolBatches.values()].some((batch) => batch.executionId === input.executionId
+        && batch.status === 'running')) throw new Error('tool_batch_not_terminal')
+      const projection = {
+        ...input, id: `${input.executionId}:tool-projection:${versions.length + 1}`,
+        version: versions.length + 1,
+      }
+      toolProjections.set(input.executionId, [...versions, projection])
+      return structuredClone(projection)
+    },
+    async recordModelRequest(input) {
+      if (!modelRequests.some(({ id }) => id === input.id)) modelRequests.push(structuredClone(input))
+    },
+    async beginToolBatch(input) {
+      toolBatches.set(input.id, { ...structuredClone(input), status: 'running', results: [] })
+    },
+    async completeToolBatch(input) {
+      const batch = toolBatches.get(input.id)
+      if (!batch) throw new Error('tool_batch_not_found')
+      if (input.results.length !== batch.calls.length) throw new Error('tool_batch_not_terminal')
+      toolBatches.set(input.id, { ...batch, status: input.status, results: structuredClone(input.results) })
+    },
+    async replay(executionId) {
+      const projections = toolProjections.get(executionId) ?? []
+      return {
+        projections: structuredClone(projections),
+        modelRequests: modelRequests.filter((request) => request.executionId === executionId).map((request) => ({
+          id: request.id, turnIndex: request.turnIndex,
+          projectionVersion: projections.find(({ id }) => id === request.projectionId)?.version ?? 0,
+          createdAt: request.createdAt,
+        })),
+        toolBatches: [...toolBatches.values()].filter((batch) => batch.executionId === executionId)
+          .map((batch) => structuredClone(batch)),
+      }
+    },
+  }
 
   return {
     productDatabase: {
-      checkSchema: async () => ({ status: 'ok' as const, version: 12 }),
+      checkSchema: async () => ({ status: 'ok' as const, version: 13 }),
       close: async () => {},
     },
     portfolioRepository,
     analysisRepository,
     agentEventRepository,
     runtimeSettingsRepository,
+    toolProjectionRepository,
   }
 }

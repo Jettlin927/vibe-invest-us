@@ -1,0 +1,98 @@
+import assert from 'node:assert/strict'
+import test from 'node:test'
+
+import { Type } from '@earendil-works/pi-ai'
+
+import {
+  createToolRegistry, registeredToolHandlers,
+  registeredToolDefinitions,
+  type RegisteredToolDefinition,
+} from '../src/tool-registry.js'
+
+const handler = async () => ({ facts: [] })
+
+function definition(
+  name: string,
+  overrides: Partial<RegisteredToolDefinition> = {},
+): RegisteredToolDefinition {
+  return {
+    model: {
+      name,
+      description: `${name} description`,
+      parameters: Type.Object({}),
+    },
+    resultSchema: Type.Object({ facts: Type.Array(Type.Unknown()) }),
+    allowedRoles: ['main'],
+    allowedStages: ['research'],
+    sideEffect: 'read_only',
+    externalNetwork: 'none',
+    resultRetention: 'research_record',
+    modelProjection: 'full_result',
+    countsAsToolRound: true,
+    ...overrides,
+  }
+}
+
+test('唯一 Registry 中每个工具独立声明完整权限、保留、网络、投影与轮次 metadata', () => {
+  const registry = createToolRegistry(registeredToolDefinitions, registeredToolHandlers)
+  assert.deepEqual(registry.list().map((tool) => tool.model.name), [
+    'fetch_financial_context',
+    'analyze_financials',
+    'submit_analysis_report',
+    'search_news_by_keyword',
+    'get_technical_indicators',
+  ])
+  for (const tool of registry.list()) {
+    assert.ok(tool.allowedRoles.length > 0)
+    assert.ok(tool.allowedStages.length > 0)
+    assert.ok(tool.sideEffect)
+    assert.ok(tool.externalNetwork)
+    assert.ok(tool.resultRetention)
+    assert.ok(tool.modelProjection)
+    assert.equal(typeof tool.countsAsToolRound, 'boolean')
+    assert.equal(typeof registry.handler(tool.model.name), 'function')
+  }
+})
+
+test('Registry 启动校验 fail closed 拒绝重复名称、缺失 schema、handler 和声明', () => {
+  assert.throws(() => createToolRegistry([definition('duplicate'), definition('duplicate')], { duplicate: handler }),
+    /tool_registry_invalid:duplicate_name/)
+  assert.throws(() => createToolRegistry([definition('bad-parameters', {
+    model: { name: 'bad-parameters', description: 'bad', parameters: undefined as never },
+  })], { 'bad-parameters': handler }), /tool_registry_invalid:parameters_schema/)
+  assert.throws(() => createToolRegistry([definition('bad-result', {
+    resultSchema: undefined as never,
+  })], { 'bad-result': handler }), /tool_registry_invalid:result_schema/)
+  assert.throws(() => createToolRegistry([definition('semantic-bad-result', {
+    resultSchema: { description: 'missing type' },
+  })], { 'semantic-bad-result': handler }), /tool_registry_invalid:result_schema/)
+  assert.throws(() => createToolRegistry([definition('bad-handler')], {}), /tool_registry_invalid:handler/)
+  assert.throws(() => createToolRegistry([definition('bad-roles', {
+    allowedRoles: [],
+  })], { 'bad-roles': handler }), /tool_registry_invalid:allowed_roles/)
+  assert.throws(() => createToolRegistry([definition('bad-stages', {
+    allowedStages: [],
+  })], { 'bad-stages': handler }), /tool_registry_invalid:allowed_stages/)
+  assert.throws(() => createToolRegistry([definition('bad-network', {
+    externalNetwork: undefined as never,
+  })], { 'bad-network': handler }), /tool_registry_invalid:external_network/)
+  assert.throws(() => createToolRegistry([definition('bad-retention', {
+    resultRetention: undefined as never,
+  })], { 'bad-retention': handler }), /tool_registry_invalid:result_retention/)
+})
+
+test('Registry 只按角色和阶段返回模型定义且不提供隐藏工具 discovery', () => {
+  const registry = createToolRegistry([
+    definition('main-research'),
+    definition('fundamental-research', { allowedRoles: ['fundamental'] }),
+    definition('main-finalize', { allowedStages: ['finalization'] }),
+  ], { 'main-research': handler, 'fundamental-research': handler, 'main-finalize': handler })
+  assert.deepEqual(registry.project({ role: 'main', stage: 'research' }).map((tool) => tool.name), [
+    'main-research',
+  ])
+  assert.deepEqual(registry.project({ role: 'main', stage: 'finalization' }).map((tool) => tool.name), [
+    'main-finalize',
+  ])
+  assert.equal('get' in registry, false)
+  assert.equal('has' in registry, false)
+})

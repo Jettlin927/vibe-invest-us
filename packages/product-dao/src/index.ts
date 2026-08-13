@@ -6,7 +6,7 @@ import {
   type ExecutionSettingsSnapshot, type RuntimeSettings, type RuntimeSettingsRevision,
 } from '@vibe-invest/contracts'
 
-export const schemaVersion = 12
+export const schemaVersion = 13
 
 const migrationSql = `
 CREATE TABLE IF NOT EXISTS product_schema_migrations (
@@ -228,6 +228,50 @@ CREATE TABLE IF NOT EXISTS execution_settings_snapshots (
   frozen_at timestamptz NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS tool_projection_versions (
+  id text PRIMARY KEY,
+  execution_id text NOT NULL REFERENCES agent_executions(id) ON DELETE CASCADE,
+  version integer NOT NULL CHECK (version > 0),
+  role text NOT NULL CHECK (role <> ''),
+  stage text NOT NULL CHECK (stage <> ''),
+  schema_hash text NOT NULL CHECK (schema_hash <> ''),
+  projected_tools_json jsonb NOT NULL CHECK (jsonb_typeof(projected_tools_json) = 'array'),
+  visible_tool_names_json jsonb NOT NULL CHECK (jsonb_typeof(visible_tool_names_json) = 'array'),
+  reasons_json jsonb NOT NULL CHECK (jsonb_typeof(reasons_json) = 'object'),
+  created_at timestamptz NOT NULL,
+  UNIQUE (execution_id, version),
+  UNIQUE (execution_id, role, stage, schema_hash, visible_tool_names_json)
+);
+
+CREATE TABLE IF NOT EXISTS model_requests (
+  id text PRIMARY KEY,
+  execution_id text NOT NULL REFERENCES agent_executions(id) ON DELETE CASCADE,
+  projection_id text NOT NULL REFERENCES tool_projection_versions(id),
+  turn_index integer NOT NULL CHECK (turn_index > 0),
+  created_at timestamptz NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS tool_call_batches (
+  id text PRIMARY KEY,
+  execution_id text NOT NULL REFERENCES agent_executions(id) ON DELETE CASCADE,
+  projection_id text NOT NULL REFERENCES tool_projection_versions(id),
+  turn_index integer NOT NULL CHECK (turn_index > 0),
+  status text NOT NULL CHECK (status IN ('running', 'completed', 'failed', 'cancelled')),
+  created_at timestamptz NOT NULL,
+  completed_at timestamptz
+);
+
+CREATE TABLE IF NOT EXISTS tool_batch_calls (
+  batch_id text NOT NULL REFERENCES tool_call_batches(id) ON DELETE CASCADE,
+  tool_call_id text NOT NULL,
+  tool_name text NOT NULL CHECK (tool_name <> ''),
+  position integer NOT NULL CHECK (position > 0),
+  status text NOT NULL DEFAULT 'running' CHECK (status IN ('running', 'completed', 'failed', 'cancelled')),
+  completed_at timestamptz,
+  PRIMARY KEY (batch_id, tool_call_id),
+  UNIQUE (batch_id, position)
+);
+
 UPDATE analyses analysis SET active = EXISTS (
   SELECT 1 FROM agent_sessions session
   JOIN agent_executions execution ON execution.session_id = session.id
@@ -292,6 +336,10 @@ INSERT INTO product_schema_migrations (version)
 VALUES (12)
 ON CONFLICT (version) DO NOTHING;
 
+INSERT INTO product_schema_migrations (version)
+VALUES (13)
+ON CONFLICT (version) DO NOTHING;
+
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM vibe_invest_app;
 REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM vibe_invest_app;
 GRANT SELECT ON product_schema_migrations TO vibe_invest_app;
@@ -303,6 +351,8 @@ GRANT SELECT, INSERT ON agent_events TO vibe_invest_app;
 GRANT SELECT, INSERT, UPDATE ON agent_executions TO vibe_invest_app;
 GRANT SELECT, INSERT ON conversation_segments TO vibe_invest_app;
 GRANT SELECT, INSERT ON runtime_settings_revisions, execution_settings_snapshots TO vibe_invest_app;
+GRANT SELECT, INSERT ON tool_projection_versions, model_requests, tool_call_batches, tool_batch_calls TO vibe_invest_app;
+GRANT UPDATE ON tool_call_batches, tool_batch_calls TO vibe_invest_app;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO vibe_invest_app;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM vibe_invest_app;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON SEQUENCES FROM vibe_invest_app;
@@ -1227,6 +1277,20 @@ export function createAgentEventRepository(pool: Pool) {
             [input.projection.executionStatus, waitReason ? JSON.stringify(waitReason) : null,
               terminal, input.createdAt, current.id],
           )
+          if (terminal) {
+            await client.query(
+              `UPDATE tool_batch_calls call SET status = 'cancelled', completed_at = $1
+               FROM tool_call_batches batch
+               WHERE call.batch_id = batch.id AND batch.execution_id = $2
+                 AND batch.status = 'running' AND call.status = 'running'`,
+              [input.createdAt, current.id],
+            )
+            await client.query(
+              `UPDATE tool_call_batches SET status = 'cancelled', completed_at = $1
+               WHERE execution_id = $2 AND status = 'running'`,
+              [input.createdAt, current.id],
+            )
+          }
         }
         for (const fact of input.projection?.facts ?? []) {
           await client.query(
@@ -1420,6 +1484,204 @@ export function createAgentEventRepository(pool: Pool) {
 }
 
 export type AgentEventRepository = ReturnType<typeof createAgentEventRepository>
+
+type ToolProjectionRow = {
+  id: string; execution_id: string; version: number; role: string; stage: string
+  schema_hash: string; projected_tools_json: unknown[]
+  visible_tool_names_json: string[]; reasons_json: Record<string, unknown>
+  created_at: string
+}
+
+export function createToolProjectionRepository(pool: Pool) {
+  return {
+    async ensureVersion(input: {
+      executionId: string; role: string; stage: string; schemaHash: string
+      projectedTools: unknown[]; visibleToolNames: string[]
+      reasons: Record<string, unknown>; createdAt: string
+    }) {
+      const client = await pool.connect()
+      try {
+        await client.query('BEGIN')
+        await assertCurrentExecution(client, input.executionId)
+        const running = await client.query(
+          `SELECT batch.id FROM tool_call_batches batch
+           JOIN tool_projection_versions projection ON projection.id = batch.projection_id
+           WHERE batch.execution_id = $1 AND projection.role = $2 AND batch.status = 'running' LIMIT 1`,
+          [input.executionId, input.role],
+        )
+        if (running.rowCount) throw new Error('tool_batch_not_terminal')
+        const existing = await client.query<ToolProjectionRow>(
+          `SELECT id, execution_id, version, role, stage, schema_hash, projected_tools_json, visible_tool_names_json,
+             reasons_json, created_at::text FROM tool_projection_versions
+           WHERE execution_id = $1 AND role = $2 AND stage = $3 AND schema_hash = $4
+             AND visible_tool_names_json = $5::jsonb`,
+          [input.executionId, input.role, input.stage, input.schemaHash,
+            JSON.stringify(input.visibleToolNames)],
+        )
+        if (existing.rows[0]) {
+          await client.query('COMMIT')
+          return mapToolProjection(existing.rows[0])
+        }
+        const version = await client.query<{ next: number }>(
+          `SELECT COALESCE(max(version), 0) + 1 AS next
+           FROM tool_projection_versions WHERE execution_id = $1`, [input.executionId],
+        )
+        const next = Number(version.rows[0]!.next)
+        const id = `${input.executionId}:tool-projection:${next}`
+        const inserted = await client.query<ToolProjectionRow>(
+          `INSERT INTO tool_projection_versions (
+             id, execution_id, version, role, stage, schema_hash, projected_tools_json,
+             visible_tool_names_json, reasons_json, created_at
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+           RETURNING id, execution_id, version, role, stage, schema_hash, projected_tools_json, visible_tool_names_json,
+             reasons_json, created_at::text`,
+          [id, input.executionId, next, input.role, input.stage, input.schemaHash,
+            JSON.stringify(input.projectedTools), JSON.stringify(input.visibleToolNames),
+            JSON.stringify(input.reasons), input.createdAt],
+        )
+        await client.query('COMMIT')
+        return mapToolProjection(inserted.rows[0]!)
+      } catch (error) {
+        await client.query('ROLLBACK'); throw error
+      } finally { client.release() }
+    },
+    async recordModelRequest(input: {
+      id: string; executionId: string; projectionId: string; turnIndex: number; createdAt: string
+    }) {
+      const client = await pool.connect()
+      try {
+        await client.query('BEGIN')
+        await assertCurrentExecution(client, input.executionId)
+        const projection = await client.query(
+          `SELECT id FROM tool_projection_versions WHERE id = $1 AND execution_id = $2`,
+          [input.projectionId, input.executionId],
+        )
+        if (!projection.rowCount) throw new Error('tool_projection_not_available')
+        await client.query(
+          `INSERT INTO model_requests (id, execution_id, projection_id, turn_index, created_at)
+           VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id) DO NOTHING`,
+          [input.id, input.executionId, input.projectionId, input.turnIndex, input.createdAt],
+        )
+        await client.query('COMMIT')
+      } catch (error) { await client.query('ROLLBACK'); throw error } finally { client.release() }
+    },
+    async beginToolBatch(input: {
+      id: string; executionId: string; projectionId: string; turnIndex: number
+      calls: Array<{ toolCallId: string; toolName: string; position: number }>; createdAt: string
+    }) {
+      const client = await pool.connect()
+      try {
+        await client.query('BEGIN')
+        await assertCurrentExecution(client, input.executionId)
+        await client.query(
+          `INSERT INTO tool_call_batches (
+             id, execution_id, projection_id, turn_index, status, created_at
+           ) VALUES ($1, $2, $3, $4, 'running', $5)`,
+          [input.id, input.executionId, input.projectionId, input.turnIndex, input.createdAt],
+        )
+        for (const call of input.calls) await client.query(
+          `INSERT INTO tool_batch_calls (batch_id, tool_call_id, tool_name, position)
+           VALUES ($1, $2, $3, $4)`,
+          [input.id, call.toolCallId, call.toolName, call.position],
+        )
+        await client.query('COMMIT')
+      } catch (error) { await client.query('ROLLBACK'); throw error } finally { client.release() }
+    },
+    async completeToolBatch(input: {
+      id: string; executionId: string; status: 'completed' | 'failed' | 'cancelled'
+      results: Array<{ toolCallId: string; status: 'completed' | 'failed' | 'cancelled'; completedAt: string }>
+      completedAt: string
+    }) {
+      const client = await pool.connect()
+      try {
+        await client.query('BEGIN')
+        await assertCurrentExecution(client, input.executionId)
+        for (const result of input.results) {
+          const updated = await client.query(
+          `UPDATE tool_batch_calls SET status = $1, completed_at = $2
+           WHERE batch_id = $3 AND tool_call_id = $4 AND status = 'running'`,
+          [result.status, result.completedAt, input.id, result.toolCallId],
+          )
+          if (!updated.rowCount) throw new Error('tool_call_not_running')
+        }
+        const unsettled = await client.query(
+          `SELECT tool_call_id FROM tool_batch_calls WHERE batch_id = $1 AND status = 'running' LIMIT 1`,
+          [input.id],
+        )
+        if (unsettled.rowCount) throw new Error('tool_batch_not_terminal')
+        const closed = await client.query(
+          `UPDATE tool_call_batches SET status = $1, completed_at = $2
+           WHERE id = $3 AND execution_id = $4 AND status = 'running'`,
+          [input.status, input.completedAt, input.id, input.executionId],
+        )
+        if (!closed.rowCount) throw new Error('tool_batch_not_running')
+        await client.query('COMMIT')
+      } catch (error) { await client.query('ROLLBACK'); throw error } finally { client.release() }
+    },
+    async replay(executionId: string) {
+      const [projections, requests, batches, calls] = await Promise.all([
+        pool.query<ToolProjectionRow>(
+          `SELECT id, execution_id, version, role, stage, schema_hash, projected_tools_json, visible_tool_names_json,
+             reasons_json, created_at::text FROM tool_projection_versions
+           WHERE execution_id = $1 ORDER BY version`, [executionId],
+        ),
+        pool.query<{ id: string; projection_version: number; turn_index: number; created_at: string }>(
+          `SELECT request.id, projection.version AS projection_version, request.turn_index,
+             request.created_at::text FROM model_requests request
+           JOIN tool_projection_versions projection ON projection.id = request.projection_id
+           WHERE request.execution_id = $1 ORDER BY request.turn_index`, [executionId],
+        ),
+        pool.query<{ id: string; turn_index: number; status: string; created_at: string; completed_at: string | null }>(
+          `SELECT id, turn_index, status, created_at::text, completed_at::text
+           FROM tool_call_batches WHERE execution_id = $1 ORDER BY turn_index`, [executionId],
+        ),
+        pool.query<{ batch_id: string; tool_call_id: string; tool_name: string; position: number; status: string; completed_at: string | null }>(
+          `SELECT call.batch_id, call.tool_call_id, call.tool_name, call.position, call.status,
+             call.completed_at::text FROM tool_batch_calls call
+           JOIN tool_call_batches batch ON batch.id = call.batch_id
+           WHERE batch.execution_id = $1 ORDER BY batch.turn_index, call.position`, [executionId],
+        ),
+      ])
+      return {
+        projections: projections.rows.map(mapToolProjection),
+        modelRequests: requests.rows.map((row) => ({
+          id: row.id, projectionVersion: row.projection_version, turnIndex: row.turn_index,
+          createdAt: new Date(row.created_at).toISOString(),
+        })),
+        toolBatches: batches.rows.map((batch) => ({
+          id: batch.id, turnIndex: batch.turn_index, status: batch.status,
+          calls: calls.rows.filter((call) => call.batch_id === batch.id).map((call) => ({
+            toolCallId: call.tool_call_id, toolName: call.tool_name, position: call.position,
+          })),
+          results: calls.rows.filter((call) => call.batch_id === batch.id).map((call) => ({
+            toolCallId: call.tool_call_id, status: call.status, completedAt: call.completed_at,
+          })),
+        })),
+      }
+    },
+  }
+}
+
+export type ToolProjectionRepository = ReturnType<typeof createToolProjectionRepository>
+
+async function assertCurrentExecution(database: PoolClient, executionId: string) {
+  const execution = await database.query(
+    `SELECT execution.id FROM agent_executions execution
+     JOIN agent_sessions session ON session.id = execution.session_id
+     WHERE execution.id = $1 AND session.execution_id = execution.id AND NOT execution.terminal
+     FOR UPDATE OF execution`, [executionId],
+  )
+  if (!execution.rowCount) throw new Error('agent_execution_fenced')
+}
+
+function mapToolProjection(row: ToolProjectionRow) {
+  return {
+    id: row.id, executionId: row.execution_id, version: row.version, role: row.role,
+    stage: row.stage, schemaHash: row.schema_hash, projectedTools: row.projected_tools_json,
+    visibleToolNames: row.visible_tool_names_json,
+    reasons: row.reasons_json, createdAt: new Date(row.created_at).toISOString(),
+  }
+}
 
 function mapAgentEventRow(row: AgentEventRow): AgentEvent {
   return {
