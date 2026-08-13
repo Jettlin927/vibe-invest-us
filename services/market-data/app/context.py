@@ -189,9 +189,10 @@ def valuation_evidence_result(symbol: str, now: datetime, quote_sources: Iterabl
         evidenceLevel="verified_valuation_input",
     )
     evidence = valuation_evidence(result, now, [snapshot.id])
+    method_facts = evidence.pop("facts")
     return ValuationEvidenceResult(
-        **evidence, facts=[snapshot, *evidence["facts"]],
-        sources=[SourceStatus(source=result.source, status="ok", item_count=len(evidence["facts"]))],
+        **evidence, facts=[snapshot, *method_facts],
+        sources=[SourceStatus(source=result.source, status="ok", item_count=len(method_facts))],
     )
 
 

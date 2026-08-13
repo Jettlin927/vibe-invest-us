@@ -148,6 +148,28 @@ def test_valuation_evidence_http_returns_host_calculated_facts_and_method_states
     assert "targetPrice" not in response.json()["methods"]["dcf"]
 
 
+def test_valuation_evidence_result_combines_input_and_method_facts_once():
+    from app.context import valuation_evidence_result
+    from app.valuation import ValuationInput, calculate_valuation
+
+    class ValuationSource:
+        def fetch_with_market_price(self, symbol, price, observed_at):
+            return calculate_valuation(ValuationInput(
+                symbol=symbol, industry="semiconductor", current_price=120,
+                diluted_eps=4, enterprise_value=500, ebitda=25, revenue=100,
+                comparables=[{"symbol": "AMD", "pe": 28, "evToEbitda": 18}],
+                source="test-valuation", as_of="2026-08-12T14:30:00Z",
+            ))
+
+    result = valuation_evidence_result(
+        "NVDA", datetime(2026, 8, 13, tzinfo=timezone.utc), [], ValuationSource(),
+    )
+
+    assert [fact.type for fact in result.facts] == [
+        "valuation_inputs", "deterministic_valuation", "deterministic_valuation",
+    ]
+
+
 def test_filing_document_http_uses_sec_adapter_and_returns_bounded_page(monkeypatch):
     monkeypatch.setattr("app.main.SecFilingSource.fetch", lambda self, symbol, filing_id: {
         "filingId": filing_id, "form": "10-Q", "filedAt": "2026-07-31",
