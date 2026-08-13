@@ -15,6 +15,23 @@ export const submitAnalysisReportDefinition: RegisteredToolDefinition = {
         capability: Type.String(), reason: Type.String(), impact: Type.String(),
       })),
       limitations: Type.Array(Type.String()),
+      specialistStatuses: Type.Array(Type.Object({
+        domain: Type.Union([
+          Type.Literal('news'), Type.Literal('fundamental_valuation'), Type.Literal('technical'),
+        ]),
+        status: Type.Union([
+          Type.Literal('not_started'), Type.Literal('completed'), Type.Literal('partial'),
+          Type.Literal('failed'), Type.Literal('cancelled'), Type.Literal('budget_exhausted'),
+        ]), impact: Type.String(),
+      })),
+      specialistReferences: Type.Array(Type.Object({
+        domain: Type.Union([
+          Type.Literal('news'), Type.Literal('fundamental_valuation'), Type.Literal('technical'),
+        ]),
+        sessionId: Type.String(), reportId: Type.String(), version: Type.Number(), status: Type.Union([
+          Type.Literal('completed'), Type.Literal('partial'),
+        ]),
+      })),
       title: Type.Optional(Type.String()), marketState: Type.Optional(Type.String()),
       trend: Type.Optional(Type.String()), drivers: Type.Optional(Type.Array(Type.String())),
       supportingEvidence: Type.Optional(Type.Array(Type.String())),
@@ -48,6 +65,9 @@ export const submitAnalysisReportDefinition: RegisteredToolDefinition = {
           Type.Literal('none_found'), Type.Literal('not_searched'), Type.Literal('not_applicable'),
         ]),
         invalidationConditions: Type.Array(Type.String()),
+        affectedByMissingDomains: Type.Array(Type.Union([
+          Type.Literal('news'), Type.Literal('fundamental_valuation'), Type.Literal('technical'),
+        ])),
       }))),
     }),
   },

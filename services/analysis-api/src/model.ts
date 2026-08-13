@@ -94,6 +94,15 @@ export type AnalyzeInput = {
   userPrompt?: string
   runtimeContext?: RuntimeContext
   knownFacts: Fact[]
+  refreshKnownFacts?: () => Promise<Fact[]>
+  finalizationOnly?: boolean
+  priorSpecialistOutcomes?: Array<{
+    domain: 'news' | 'fundamental_valuation' | 'technical'
+    outcome: Record<string, unknown>
+  }>
+  onSpecialistOutcome?: (
+    domain: 'news' | 'fundamental_valuation' | 'technical', outcome: Record<string, unknown>,
+  ) => void
   fetchFinancialContext: (
     symbol: string,
     signal: AbortSignal,

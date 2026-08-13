@@ -15,6 +15,17 @@ export type ReportFact = {
 export type ReportValidationContext = {
   role: 'main' | 'news' | 'fundamental_valuation' | 'technical'
   knownFacts: ReportFact[]
+  specialistReports?: Array<{
+    domain: 'news' | 'fundamental_valuation' | 'technical'
+    sessionId: string
+    reportId: string
+    version: number
+    status: 'completed' | 'partial'
+  }>
+  specialistStatuses?: Array<{
+    domain: 'news' | 'fundamental_valuation' | 'technical'
+    status: string
+  }>
 }
 
 export type ValidatedReport = Record<string, unknown> & {
@@ -91,6 +102,67 @@ export function validateReportCandidate(
   if ('keyJudgments' in candidate && !Array.isArray(candidate.keyJudgments)) {
     envelopeErrors.push(typeError('/keyJudgments', '关键判断必须是数组'))
   }
+  if (context.role === 'main' && !('specialistStatuses' in candidate)) envelopeErrors.push({
+    path: '/specialistStatuses', rule: 'required',
+    message: '缺少专项状态列表', allowedEvidenceTypes: [],
+  })
+  if (context.role === 'main' && !('specialistReferences' in candidate)) envelopeErrors.push({
+    path: '/specialistReferences', rule: 'required',
+    message: '缺少专项报告引用列表', allowedEvidenceTypes: [],
+  })
+  if ('specialistReferences' in candidate && !Array.isArray(candidate.specialistReferences)) {
+    envelopeErrors.push(typeError('/specialistReferences', '专项报告引用必须是数组'))
+  } else if (Array.isArray(candidate.specialistReferences)) {
+    candidate.specialistReferences.forEach((value, index) => {
+      if (!isRecord(value)) {
+        envelopeErrors.push(typeError(`/specialistReferences/${index}`, '专项报告引用必须是对象'))
+        return
+      }
+      const reference = asRecord(value)
+      for (const field of ['domain', 'sessionId', 'reportId', 'status']) {
+        if (typeof reference[field] !== 'string') envelopeErrors.push(typeError(
+          `/specialistReferences/${index}/${field}`, '专项报告引用字段必须是字符串',
+        ))
+      }
+      if (!['news', 'fundamental_valuation', 'technical'].includes(String(reference.domain))) {
+        envelopeErrors.push({
+          path: `/specialistReferences/${index}/domain`, rule: 'enum',
+          message: '专项报告引用领域无效', allowedEvidenceTypes: [],
+        })
+      }
+      if (!['completed', 'partial'].includes(String(reference.status))) envelopeErrors.push({
+        path: `/specialistReferences/${index}/status`, rule: 'enum',
+        message: '专项报告引用状态无效', allowedEvidenceTypes: [],
+      })
+      if (!Number.isInteger(reference.version) || Number(reference.version) <= 0) {
+        envelopeErrors.push(typeError(`/specialistReferences/${index}/version`, '专项报告版本必须是正整数'))
+      }
+    })
+  }
+  if ('specialistStatuses' in candidate && !Array.isArray(candidate.specialistStatuses)) {
+    envelopeErrors.push(typeError('/specialistStatuses', '专项状态必须是数组'))
+  } else if (Array.isArray(candidate.specialistStatuses)) {
+    candidate.specialistStatuses.forEach((value, index) => {
+      if (!isRecord(value)) {
+        envelopeErrors.push(typeError(`/specialistStatuses/${index}`, '专项状态必须是对象'))
+        return
+      }
+      const status = asRecord(value)
+      if (!['news', 'fundamental_valuation', 'technical'].includes(String(status.domain))) {
+        envelopeErrors.push(typeError(`/specialistStatuses/${index}/domain`, '专项领域无效'))
+      }
+      if (!['not_started', 'completed', 'partial', 'failed', 'cancelled', 'budget_exhausted']
+        .includes(String(status.status))) {
+        envelopeErrors.push({
+          path: `/specialistStatuses/${index}/status`, rule: 'enum',
+          message: '专项状态无效', allowedEvidenceTypes: [],
+        })
+      }
+      if (typeof status.impact !== 'string' || status.impact.trim() === '') {
+        envelopeErrors.push(typeError(`/specialistStatuses/${index}/impact`, '专项影响不能为空'))
+      }
+    })
+  }
   for (const field of ['supportingEvidence', 'contraryEvidence']) {
     if (field in candidate && !Array.isArray(candidate[field])) {
       envelopeErrors.push(typeError(`/${field}`, '证据引用必须是数组'))
@@ -128,6 +200,25 @@ export function validateReportCandidate(
   if (Array.isArray(candidate.keyJudgments)) candidate.keyJudgments.forEach((value, index) => {
     const judgment = asRecord(value)
     validateJudgmentSchema(judgment, index, envelopeErrors)
+    if (context.role === 'main') {
+      if (!('affectedByMissingDomains' in judgment)) envelopeErrors.push({
+        path: `/keyJudgments/${index}/affectedByMissingDomains`, rule: 'required',
+        message: '综合判断必须声明受缺失专项影响的领域', allowedEvidenceTypes: [],
+      })
+      else validateOptionalStringArray(
+        judgment, 'affectedByMissingDomains', envelopeErrors, `/keyJudgments/${index}`,
+      )
+      if (Array.isArray(judgment.affectedByMissingDomains)) {
+        judgment.affectedByMissingDomains.forEach((domain, domainIndex) => {
+          if (!['news', 'fundamental_valuation', 'technical'].includes(String(domain))) {
+            envelopeErrors.push({
+              path: `/keyJudgments/${index}/affectedByMissingDomains/${domainIndex}`,
+              rule: 'enum', message: '受影响专项领域无效', allowedEvidenceTypes: [],
+            })
+          }
+        })
+      }
+    }
     if (context.role === 'news' && judgment.type !== 'news') envelopeErrors.push({
       path: `/keyJudgments/${index}/type`, rule: 'role_policy',
       message: '消息面 Agent 只能提交 news 判断', allowedEvidenceTypes: [],
@@ -143,6 +234,61 @@ export function validateReportCandidate(
   })
   if (envelopeErrors.length) return { ok: false, errors: envelopeErrors }
   const facts = new Map(context.knownFacts.map((fact) => [fact.id, fact]))
+  const specialistReports = context.specialistReports ?? []
+  const authoritativeStatuses = context.specialistStatuses
+  if (context.role === 'main' && authoritativeStatuses) {
+    const submittedStatuses = Array.isArray(candidate.specialistStatuses)
+      ? candidate.specialistStatuses.map(asRecord) : []
+    const statusErrors = authoritativeStatuses.flatMap((expected) => {
+      const matches = submittedStatuses.filter(({ domain }) => domain === expected.domain)
+      return matches.length === 1 && matches[0]!.status === expected.status ? [] : [{
+        path: '/specialistStatuses', rule: 'integrated_report_policy',
+        message: `综合报告必须准确记录专项状态：${expected.domain}/${expected.status}`,
+        allowedEvidenceTypes: [],
+      }]
+    })
+    if (submittedStatuses.length !== authoritativeStatuses.length) statusErrors.push({
+      path: '/specialistStatuses', rule: 'integrated_report_policy',
+      message: '综合报告专项状态必须与当前研究领域一一对应', allowedEvidenceTypes: [],
+    })
+    if (statusErrors.length) return { ok: false, errors: statusErrors }
+  }
+  const specialistReferenceErrors = Array.isArray(candidate.specialistReferences)
+    ? candidate.specialistReferences.flatMap((value, index) => {
+        const reference = asRecord(value)
+        const matched = specialistReports.some((report) => (
+          report.domain === reference.domain && report.sessionId === reference.sessionId
+          && report.reportId === reference.reportId && report.version === reference.version
+          && report.status === reference.status
+        ))
+        return matched ? [] : [{
+          path: `/specialistReferences/${index}`, rule: 'reference_integrity',
+          message: `专项报告版本不属于当前研究：${String(reference.domain)}/${String(reference.reportId)}/v${String(reference.version)}`,
+          allowedEvidenceTypes: [],
+        }]
+      }) : []
+  if (specialistReferenceErrors.length) return { ok: false, errors: specialistReferenceErrors }
+  if (context.role === 'main' && authoritativeStatuses) {
+    const references = Array.isArray(candidate.specialistReferences)
+      ? candidate.specialistReferences.map(asRecord) : []
+    const expectedDomains = new Set(specialistReports.map(({ domain }) => domain))
+    const referencePolicyErrors = [
+      ...specialistReports.flatMap(({ domain }) => (
+        references.filter((reference) => reference.domain === domain).length === 1 ? [] : [{
+          path: '/specialistReferences', rule: 'integrated_report_policy',
+          message: `可用专项必须恰好引用一个报告版本：${domain}`, allowedEvidenceTypes: [],
+        }]
+      )),
+      ...references.flatMap((reference, index) => expectedDomains.has(
+        reference.domain as 'news' | 'fundamental_valuation' | 'technical',
+      ) ? [] : [{
+        path: `/specialistReferences/${index}`, rule: 'integrated_report_policy',
+        message: `无可用报告的专项不能创建引用：${String(reference.domain)}`,
+        allowedEvidenceTypes: [],
+      }]),
+    ]
+    if (referencePolicyErrors.length) return { ok: false, errors: referencePolicyErrors }
+  }
   const judgments = Array.isArray(candidate.keyJudgments) ? candidate.keyJudgments : []
   const reportReferences = ['supportingEvidence', 'contraryEvidence'].flatMap((field) => (
     Array.isArray(candidate[field]) ? candidate[field].flatMap((id, evidenceIndex) => (
@@ -228,6 +374,23 @@ export function validateReportCandidate(
       })
     }
   })
+  if (context.role === 'main') {
+    const missingDomains = (context.specialistStatuses ?? []).filter(({ status }) => (
+      ['not_started', 'failed', 'cancelled', 'budget_exhausted'].includes(status)
+    )).map(({ domain }) => domain)
+    judgments.forEach((value, index) => {
+      const judgment = asRecord(value)
+      const requiredDomain = ({
+        news: 'news', fundamental: 'fundamental_valuation', technical: 'technical',
+      } as const)[String(judgment.type) as 'news']
+      if (requiredDomain && missingDomains.includes(requiredDomain)) policyErrors.push({
+        path: `/keyJudgments/${index}/type`,
+        rule: 'integrated_report_policy',
+        message: `依赖缺失或失败专项的判断必须关闭：${requiredDomain}`,
+        allowedEvidenceTypes: [],
+      })
+    })
+  }
   if ('targetPrice' in candidate && !qualifiedTargetPrice(candidate.targetPrice, facts)) {
     policyErrors.push({
       path: '/targetPrice', rule: 'conditional_field_qualification',
@@ -383,14 +546,16 @@ function typeError(path: string, message: string): ReportValidationError {
 }
 
 function validateOptionalStringArray(
-  candidate: Record<string, unknown>, field: string, errors: ReportValidationError[],
+  candidate: Record<string, unknown>, field: string, errors: ReportValidationError[], prefix = '',
 ) {
   if (!(field in candidate)) return
   if (!Array.isArray(candidate[field])) {
-    errors.push(typeError(`/${field}`, '报告数组字段无效'))
+    errors.push(typeError(`${prefix}/${field}`, '报告数组字段无效'))
     return
   }
   candidate[field].forEach((value, index) => {
-    if (typeof value !== 'string') errors.push(typeError(`/${field}/${index}`, '报告数组元素必须是字符串'))
+    if (typeof value !== 'string') errors.push(typeError(
+      `${prefix}/${field}/${index}`, '报告数组元素必须是字符串',
+    ))
   })
 }

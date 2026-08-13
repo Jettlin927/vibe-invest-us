@@ -36,12 +36,16 @@ const report = {
 
 const reportCandidate = {
   kind: 'integrated' as const, availability: 'available' as const,
-  status: 'completed' as const, gaps: [], ...report,
+  status: 'completed' as const, gaps: [], specialistStatuses: [
+    { domain: 'news', status: 'not_started', impact: '消息面专项不可用' },
+    { domain: 'fundamental_valuation', status: 'not_started', impact: '基本面专项不可用' },
+    { domain: 'technical', status: 'not_started', impact: '技术面专项不可用' },
+  ], specialistReferences: [], ...report,
   keyJudgments: report.keyJudgments.map(({ judgment, evidence }) => ({
     type: 'market' as const, statement: judgment, direction: 'bullish' as const,
     confidence: 'medium' as const, supportingEvidence: evidence,
     contraryEvidence: [], contraryEvidenceStatus: 'none_found' as const,
-    invalidationConditions: report.invalidationConditions,
+    invalidationConditions: report.invalidationConditions, affectedByMissingDomains: [],
   })),
 }
 
@@ -931,6 +935,90 @@ test('8 分钟 Runtime 加 8 分钟 provider 共用 10 分钟 active budget 并�
     (event: { status?: string }) => event.status === 'finalizing',
   )
   assert.equal(finalizing.waitReason.target, '报告收口')
+  await app.close()
+})
+
+test('专项已有 V1 后主预算耗尽的二次收口保留真实状态与精确引用', async () => {
+  const database = createTestProductDatabase()
+  await database.runtimeSettingsRepository.save({
+    researchActiveMinutes: 1, executionWallClockMinutes: 240, modelRequestTimeoutMinutes: 60,
+  }, new Date().toISOString())
+  let activeNow = 0
+  let attempts = 0
+  let researchBudget: Parameters<typeof closure.analyze>[0]['activeBudget']
+  const outcome = {
+    launched: true, status: 'completed', sessionId: 'news-session', executionId: 'news-execution',
+    reportId: 'news-report-v1', reportVersion: 1, summary: '消息专项已完成',
+    keyFactIds: [fact.id], contraryFactIds: [], gaps: [],
+  }
+  const closingReport = {
+    ...reportCandidate, availability: 'partial' as const, status: 'partial' as const,
+    limitations: ['研究 active time 已耗尽'],
+    specialistStatuses: [
+      { domain: 'news', status: 'completed', impact: '消息面专项可用' },
+      { domain: 'fundamental_valuation', status: 'not_started', impact: '基本面专项未启动' },
+      { domain: 'technical', status: 'not_started', impact: '技术面专项未启动' },
+    ],
+    specialistReferences: [{
+      domain: 'news', sessionId: outcome.sessionId, reportId: outcome.reportId,
+      version: outcome.reportVersion, status: 'completed',
+    }],
+  }
+  const closure = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall('submit_analysis_report', closingReport), {
+      stopReason: 'toolUse',
+    }),
+  ] })
+  const research = createPiModel({ fauxResponses: [
+    () => {
+      activeNow = 1_600
+      return fauxAssistantMessage('专项已完成，主研究预算耗尽。')
+    },
+  ] })
+  const model = {
+    async *analyze(input: Parameters<typeof closure.analyze>[0]) {
+      attempts += 1
+      if (attempts === 1) {
+        researchBudget = input.activeBudget
+        input.onSpecialistOutcome?.('news', outcome)
+        yield* research.analyze(input)
+        return
+      }
+      assert.equal(input.priorSpecialistOutcomes?.length, 3)
+      assert.deepEqual(input.priorSpecialistOutcomes?.find(({ domain }) => domain === 'news'), {
+        domain: 'news', outcome,
+      })
+      assert.notEqual(input.activeBudget, researchBudget)
+      assert.equal(input.activeBudget?.exhausted(), false)
+      yield* closure.analyze(input)
+    },
+    async *analyzeNews() { throw new Error('news_specialist_must_not_restart') },
+  }
+  const app = buildProductionApp({
+    ...database, model, runtimeMinuteMs: 1_000, activeNow: () => activeNow,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    searchNewsCandidates: async () => ({ facts: [] }),
+    readNewsDocument: async () => ({ facts: [] }), listCompanyEvents: async () => ({ facts: [] }),
+    fetchFinancialContext: async (symbol) => {
+      activeNow = 800
+      return { symbol, facts: [fact], gaps: [], indicators: {} }
+    },
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'BUDGETV1' },
+  })).json()
+  const completed = await waitForStatus(app as any, created.analysisId, 'partial').catch(async (error) => {
+    const research = (await app.inject({
+      method: 'GET', url: `/api/research/${created.analysisId}`,
+    })).json()
+    throw new Error(`${String(error)}:${JSON.stringify(research)}`)
+  })
+  assert.equal(attempts, 2)
+  const versions = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}/report-versions`,
+  })).json().items
+  assert.deepEqual(versions.at(-1).report.specialistReferences, closingReport.specialistReferences)
   await app.close()
 })
 

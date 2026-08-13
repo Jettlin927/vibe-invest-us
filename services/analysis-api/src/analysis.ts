@@ -20,6 +20,7 @@ import { acquireActiveSlot, createActiveBudget, createConcurrencyGate } from './
 import { analysisModelTools } from './tools.js'
 
 type Fact = FinancialFact
+type SpecialistDomain = 'news' | 'fundamental_valuation' | 'technical'
 type Model = {
   analyze(input: AnalyzeInput): AsyncIterable<ModelEvent>
   analyzeNews?: (input: AnalyzeNewsInput) => AsyncIterable<ModelEvent>
@@ -359,6 +360,18 @@ export function createAnalysisService(options: {
     let modelEventSequence = 0
     let lifecycleStatus: AgentExecutionStatus = 'planning'
     let context: FinancialContext | undefined
+    let adoptedFacts: Fact[] = []
+    let terminalSnapshotBase: Record<string, unknown> = {}
+    const specialistOutcomes = new Map<SpecialistDomain, Record<string, unknown>>()
+    const refreshKnownFacts = async () => {
+      const research = await repository.research(analysisId)
+      adoptedFacts = (research?.facts ?? []) as Fact[]
+      return adoptedFacts
+    }
+    const rememberSpecialistOutcome = (
+      domain: SpecialistDomain, outcome: Record<string, unknown>,
+    ) => { specialistOutcomes.set(domain, outcome) }
+    const terminalSnapshot = () => ({ ...terminalSnapshotBase, facts: adoptedFacts })
     const nextModelOperationId = (kind: string) => (
       `execution:${executionId}:model:${++modelEventSequence}:${kind}`
     )
@@ -409,6 +422,8 @@ export function createAnalysisService(options: {
         ...(portfolioPriceGap ? [{ capability: 'portfolio_prices', reason: 'source_unavailable' }] : []),
       ]
       const snapshot = { ...context, gaps, portfolioContext, createdAt: new Date().toISOString() }
+      terminalSnapshotBase = snapshot
+      adoptedFacts = snapshot.facts
       await appendEvent(sessionId, executionId, operationId('financial-context'), {
         type: 'financial_context',
         gaps,
@@ -430,7 +445,6 @@ export function createAnalysisService(options: {
         launch: boolean; researchQuestion: string; reason: string
         prepared?: { sessionId: string; executionId: string; created: boolean }
       }
-      type SpecialistDomain = 'news' | 'fundamental_valuation' | 'technical'
       const prepareSpecialist = async (request: {
         domain: SpecialistDomain; researchQuestion: string; reason: string
       }) => {
@@ -490,8 +504,11 @@ export function createAnalysisService(options: {
           const existing = versions.filter(
             ({ sessionId }) => sessionId === specialistSession.sessionId,
           ).at(-1)
+          const existingStatus = existing
+            && (existing.report as Record<string, unknown>).status === 'partial'
+            ? 'partial' : 'completed'
           return {
-            launched: true, status: existing ? 'completed' : 'not_started',
+            launched: true, status: existing ? existingStatus : 'not_started',
             sessionId: specialistSession.sessionId, executionId: specialistSession.executionId,
             ...(existing ? { reportId: existing.id, reportVersion: existing.version } : {}),
             summary: config.request.researchQuestion,
@@ -684,6 +701,8 @@ export function createAnalysisService(options: {
         systemPrompt: ANALYSIS_SYSTEM_PROMPT,
         runtimeContext,
         knownFacts: modelContext.facts,
+        refreshKnownFacts,
+        onSpecialistOutcome: rememberSpecialistOutcome,
         fetchFinancialContext: async () => modelContext,
         financialContextToolViews: { model: modelContext, retained: snapshot },
         prepareSpecialistBatch,
@@ -742,7 +761,7 @@ export function createAnalysisService(options: {
           const reportVersion = event.reportVersion
             ? finalReportVersion(executionId, event.reportVersion, report, status, gaps) : undefined
           await setStatus(sessionId, executionId, operationId(`status-${status}`), status, {
-            report, ...(reportVersion ? { reportVersion } : {}),
+            report, snapshot: terminalSnapshot(), ...(reportVersion ? { reportVersion } : {}),
           })
           return
         }
@@ -765,13 +784,24 @@ export function createAnalysisService(options: {
         }
         try {
           pauseProcessing()
+          const finalizationBudget = createActiveBudget(
+            runtimeSettings.modelRequestTimeoutMinutes * (options.runtimeMinuteMs ?? 60_000) * 2,
+            options.activeNow,
+            options.activeTimeoutSignal,
+          )
           for await (const event of options.model.analyze({
             executionId, runtimeSettings, symbol: job.symbol,
             systemPrompt: ANALYSIS_SYSTEM_PROMPT,
             userPrompt: `研究 active time 已耗尽，请仅生成确定性受限报告。`,
             knownFacts: limitedContext.facts,
+            refreshKnownFacts,
+            finalizationOnly: true,
+            priorSpecialistOutcomes: [...specialistOutcomes].map(([domain, outcome]) => ({
+              domain, outcome,
+            })),
             fetchFinancialContext: async () => limitedContext,
-            signal: controller.signal, executionDeadlineSignal: wallDeadline, activeBudget,
+            signal: controller.signal, executionDeadlineSignal: wallDeadline,
+            activeBudget: finalizationBudget,
             acquireModelSlot: (signal) => modelGate.acquire(signal),
             acquireToolSlot: (signal) => toolGate.acquire(signal),
             toolRuntime,
@@ -793,7 +823,7 @@ export function createAnalysisService(options: {
                   )
                 : undefined
               await setStatus(sessionId, executionId, operationId('status-partial'), 'partial', {
-                report, ...(reportVersion ? { reportVersion } : {}),
+                report, snapshot: terminalSnapshot(), ...(reportVersion ? { reportVersion } : {}),
               })
               return
             }

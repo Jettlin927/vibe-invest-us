@@ -1078,7 +1078,11 @@ export function createAnalysisRepository(pool: Pool) {
       return result.rows[0]?.id ?? null
     },
     async saveSnapshot(id: string, snapshot: unknown) {
-      await pool.query('UPDATE analyses SET snapshot_json = $1 WHERE id = $2', [JSON.stringify(snapshot), id])
+      await pool.query(
+        `UPDATE analyses SET snapshot_json = $1
+         WHERE id = $2 AND NOT (status = ANY($3::text[]))`,
+        [JSON.stringify(snapshot), id, terminal],
+      )
     },
     async research(id: string) {
       const analysis = await this.get(id)

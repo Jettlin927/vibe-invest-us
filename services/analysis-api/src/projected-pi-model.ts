@@ -81,6 +81,26 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
       const preparedSpecialists = new Map<string, {
         sessionId: string; executionId: string; created: boolean
       }>()
+      const specialistOutcomes = new Map<string, Record<string, unknown>>(
+        input.priorSpecialistOutcomes?.map(({ domain, outcome }) => [domain, outcome]) ?? [],
+      )
+      const rememberSpecialistOutcome = (
+        domain: 'news' | 'fundamental_valuation' | 'technical', outcome: Record<string, unknown>,
+      ) => {
+        specialistOutcomes.set(domain, outcome)
+        input.onSpecialistOutcome?.(domain, outcome)
+      }
+      if (!input.runNewsSpecialist && !specialistOutcomes.has('news')) rememberSpecialistOutcome('news', {
+        launched: false, status: 'not_started', reason: 'news_specialist_runtime_unavailable',
+      })
+      if (!input.runFundamentalSpecialist && !specialistOutcomes.has('fundamental_valuation')) {
+        rememberSpecialistOutcome('fundamental_valuation', {
+        launched: false, status: 'not_started', reason: 'fundamental_specialist_runtime_unavailable',
+        })
+      }
+      if (!input.runTechnicalSpecialist && !specialistOutcomes.has('technical')) rememberSpecialistOutcome('technical', {
+        launched: false, status: 'not_started', reason: 'technical_specialist_runtime_unavailable',
+      })
       const reportValidationState = { failures: 0, exhausted: false }
 
       const loadFrozenContext = async (symbol: string) => {
@@ -140,7 +160,9 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
       const main = runProjectedAgent({
         role: 'main', input, options, settings, executionSignal: agentSignal, activeBudget,
         onPolicyFailure: (error) => { policyFailure ??= error },
-        modelGate, toolGate, provider, queue, initialTools: analysisModelTools,
+        modelGate, toolGate, provider, queue,
+        initialTools: input.finalizationOnly ? finalizationModelTools : analysisModelTools,
+        initialStage: input.finalizationOnly ? 'finalization' : 'research',
         systemPrompt: input.systemPrompt,
         userPrompt: input.runtimeContext ? runtimeContextMessage(input.runtimeContext) : input.userPrompt ?? '',
         shouldRejectNextTurn: () => reportValidationState.exhausted,
@@ -204,13 +226,17 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
             const reason = asString(request.reason)
             const researchQuestion = asString(request.researchQuestion)
             if (request.launch !== true) {
-              return succeeded({ launched: false, status: 'not_started', reason, researchQuestion })
+              const result = { launched: false, status: 'not_started', reason, researchQuestion }
+              rememberSpecialistOutcome('fundamental_valuation', result)
+              return succeeded(result)
             }
             if (!input.runFundamentalSpecialist) return failed('fundamental_specialist_runtime_unavailable')
             const prepared = preparedSpecialists.get('fundamental_valuation')
-            return succeeded(await input.runFundamentalSpecialist({
+            const result = await input.runFundamentalSpecialist({
               launch: true, researchQuestion, reason, ...(prepared ? { prepared } : {}),
-            }))
+            })
+            rememberSpecialistOutcome('fundamental_valuation', result)
+            return succeeded(result)
           }
           if (name === 'run_news_analysis') {
             await onStart()
@@ -221,13 +247,17 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
             const reason = asString(request.reason)
             const researchQuestion = asString(request.researchQuestion)
             if (request.launch !== true) {
-              return succeeded({ launched: false, status: 'not_started', reason, researchQuestion })
+              const result = { launched: false, status: 'not_started', reason, researchQuestion }
+              rememberSpecialistOutcome('news', result)
+              return succeeded(result)
             }
             if (!input.runNewsSpecialist) return failed('news_specialist_runtime_unavailable')
             const prepared = preparedSpecialists.get('news')
-            return succeeded(await input.runNewsSpecialist({
+            const result = await input.runNewsSpecialist({
               launch: true, researchQuestion, reason, ...(prepared ? { prepared } : {}),
-            }))
+            })
+            rememberSpecialistOutcome('news', result)
+            return succeeded(result)
           }
           if (name === 'run_technical_analysis') {
             await onStart()
@@ -238,13 +268,17 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
             const reason = asString(request.reason)
             const researchQuestion = asString(request.researchQuestion)
             if (request.launch !== true) {
-              return succeeded({ launched: false, status: 'not_started', reason, researchQuestion })
+              const result = { launched: false, status: 'not_started', reason, researchQuestion }
+              rememberSpecialistOutcome('technical', result)
+              return succeeded(result)
             }
             if (!input.runTechnicalSpecialist) return failed('technical_specialist_runtime_unavailable')
             const prepared = preparedSpecialists.get('technical')
-            return succeeded(await input.runTechnicalSpecialist({
+            const result = await input.runTechnicalSpecialist({
               launch: true, researchQuestion, reason, ...(prepared ? { prepared } : {}),
-            }))
+            })
+            rememberSpecialistOutcome('technical', result)
+            return succeeded(result)
           }
           if (name === 'submit_analysis_report') {
             try {
@@ -260,8 +294,23 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
               }
               return await toolRegistry.handler(name)!(params, {
                 submitAnalysisReport: async (submitted) => {
+                  if (input.refreshKnownFacts) rememberFacts(await input.refreshKnownFacts())
                   const validation = validateReportCandidate(submitted, {
                     role: 'main', knownFacts: [...knownFacts.values()],
+                    specialistStatuses: [...specialistOutcomes].map(([domain, outcome]) => ({
+                      domain: domain as 'news' | 'fundamental_valuation' | 'technical',
+                      status: asString(outcome.status),
+                    })),
+                    specialistReports: [...specialistOutcomes].flatMap(([domain, outcome]) => (
+                      typeof outcome.sessionId === 'string' && typeof outcome.reportId === 'string'
+                      && typeof outcome.reportVersion === 'number'
+                      && ['completed', 'partial'].includes(asString(outcome.status)) ? [{
+                          domain: domain as 'news' | 'fundamental_valuation' | 'technical',
+                          sessionId: outcome.sessionId, reportId: outcome.reportId,
+                          version: outcome.reportVersion,
+                          status: asString(outcome.status) as 'completed' | 'partial',
+                        }] : []
+                    )),
                   })
                   if (!validation.ok) {
                     reportValidationState.failures += 1
@@ -645,6 +694,7 @@ async function runProjectedAgent(config: {
   modelGate: ReturnType<typeof createConcurrencyGate>; toolGate: ReturnType<typeof createConcurrencyGate>
   provider: ReturnType<typeof createProviderRuntime>; queue: ReturnType<typeof createAsyncQueue<ModelEvent>>
   initialTools: Tool[]; systemPrompt: string; userPrompt: string
+  initialStage?: Stage
   invocationId?: string
   shouldRejectNextTurn?: () => boolean
   nextResearchTools?: () => Tool[]
@@ -656,7 +706,7 @@ async function runProjectedAgent(config: {
   onPolicyFailure: (error: Error) => void
 }) {
   const { input } = config
-  let stage: Stage = 'research'
+  let stage: Stage = config.initialStage ?? 'research'
   let turnIndex = 0
   let toolRounds = 0
   let finalizationAttempts = 0

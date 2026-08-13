@@ -3,6 +3,8 @@ import test from 'node:test'
 
 import { validateReportCandidate } from '../src/report-validation.js'
 
+const integratedSpecialistFields = { specialistStatuses: [], specialistReferences: [] }
+
 test('报告稳定外壳缺失时返回机器可读 Schema 错误而不补空占位', () => {
   const result = validateReportCandidate({ title: '旧式报告', keyJudgments: [] }, {
     role: 'main', knownFacts: [],
@@ -21,6 +23,7 @@ test('报告稳定外壳缺失时返回机器可读 Schema 错误而不补空占
 
 test('部分报告以 availability status 和 gaps 表达缺失且普通可选字段可省略', () => {
   const candidate = {
+    ...integratedSpecialistFields,
     kind: 'integrated', availability: 'partial', status: 'partial',
     gaps: [{ capability: 'news', reason: 'source_unavailable', impact: '无法判断消息驱动' }],
     limitations: ['近期新闻不可用'], keyJudgments: [], specialistStatuses: [],
@@ -31,6 +34,152 @@ test('部分报告以 availability status 和 gaps 表达缺失且普通可选�
   if (!result.ok) return
   assert.deepEqual(result.report, candidate)
   assert.equal('targetPrice' in result.report, false)
+})
+
+test('综合报告拒绝不属于当前研究的专项报告版本引用', () => {
+  const result = validateReportCandidate({
+    kind: 'integrated', availability: 'partial', status: 'partial',
+    gaps: [{ capability: 'technical', reason: 'specialist_failed', impact: '关闭技术判断' }],
+    limitations: ['技术面专项失败'],
+    specialistStatuses: [
+      { domain: 'news', status: 'partial', impact: '消息判断置信度受限' },
+      { domain: 'fundamental_valuation', status: 'completed', impact: '基本面判断可用' },
+      { domain: 'technical', status: 'failed', impact: '关闭技术判断' },
+    ],
+    specialistReferences: [{
+      domain: 'news', sessionId: 'news-session', reportId: 'wrong-report',
+      version: 2, status: 'partial',
+    }],
+    keyJudgments: [],
+  }, {
+    role: 'main', knownFacts: [], specialistReports: [{
+      domain: 'news', sessionId: 'news-session', reportId: 'news-report-v1',
+      version: 1, status: 'partial',
+    }],
+  })
+
+  assert.equal(result.ok, false)
+  if (result.ok) return
+  assert.deepEqual(result.errors, [{
+    path: '/specialistReferences/0', rule: 'reference_integrity',
+    message: '专项报告版本不属于当前研究：news/wrong-report/v2', allowedEvidenceTypes: [],
+  }])
+})
+
+test('综合报告必须关闭依赖失败专项的关键判断', () => {
+  const result = validateReportCandidate({
+    kind: 'integrated', availability: 'partial', status: 'partial',
+    gaps: [{ capability: 'technical', reason: 'specialist_failed', impact: '关闭技术判断' }],
+    limitations: ['技术面专项失败'],
+    specialistStatuses: [
+      { domain: 'news', status: 'not_started', impact: '不作消息驱动判断' },
+      { domain: 'fundamental_valuation', status: 'partial', impact: '降低基本面置信度' },
+      { domain: 'technical', status: 'failed', impact: '关闭技术判断' },
+    ],
+    specialistReferences: [],
+    keyJudgments: [{
+      type: 'technical', statement: '技术结构偏强', direction: 'bullish', confidence: 'medium',
+      supportingEvidence: ['fact:technical'], contraryEvidence: [],
+      contraryEvidenceStatus: 'none_found', invalidationConditions: ['跌破支撑'],
+      affectedByMissingDomains: ['technical'],
+    }],
+  }, {
+    role: 'main', knownFacts: [{
+      id: 'fact:technical', type: 'technical_evidence', evidenceLevel: 'deterministic_technical',
+      value: {
+        actualStart: '2025-01-01', actualEnd: '2026-01-20', totalBarCount: 260,
+        structures: Object.fromEntries([20, 60, 120, 252].map((size) => [
+          `${size}d`, { status: 'available', barCount: size, returnPct: 0.1, high: 130, low: 90 },
+        ])),
+        indicators: { ma_5: 120, ma_20: 115, macd: { line: 1, signal: 0.5, histogram: 0.5 },
+          rsi_14: 58, annualized_volatility: 0.3, max_drawdown: -0.2,
+          volume_ratio_5_to_20: 1.1 },
+        volatility: { annualized: 0.3 }, drawdown: { maximum: -0.2 },
+        volumePrice: { volumeRatio5To20: 1.1 }, keyLevels: { support: 90, resistance: 130 },
+        conflicts: [],
+      },
+    }],
+    specialistStatuses: [
+      { domain: 'news', status: 'not_started' },
+      { domain: 'fundamental_valuation', status: 'partial' },
+      { domain: 'technical', status: 'failed' },
+    ],
+  })
+
+  assert.equal(result.ok, false)
+  if (result.ok) return
+  assert.deepEqual(result.errors, [{
+    path: '/keyJudgments/0/type', rule: 'integrated_report_policy',
+    message: '依赖缺失或失败专项的判断必须关闭：technical', allowedEvidenceTypes: [],
+  }])
+})
+
+test('综合报告判断必须显式声明受缺失专项影响且专项状态必须是已知终态', () => {
+  const candidate = {
+    kind: 'integrated', availability: 'partial', status: 'partial', gaps: [], limitations: [],
+    specialistReferences: [], specialistStatuses: [{
+      domain: 'news', status: 'invented', impact: '错误状态',
+    }],
+    keyJudgments: [{
+      type: 'market', statement: '市场判断', direction: 'neutral', confidence: 'low',
+      supportingEvidence: ['fact:market'], contraryEvidence: [],
+      contraryEvidenceStatus: 'none_found', invalidationConditions: ['新数据出现'],
+    }],
+  }
+  const result = validateReportCandidate(candidate, {
+    role: 'main', knownFacts: [{
+      id: 'fact:market', type: 'market', evidenceLevel: 'verified_market',
+    }], specialistStatuses: [{ domain: 'news', status: 'invented' }],
+  })
+
+  assert.equal(result.ok, false)
+  if (result.ok) return
+  assert.deepEqual(result.errors, [
+    { path: '/specialistStatuses/0/status', rule: 'enum',
+      message: '专项状态无效', allowedEvidenceTypes: [] },
+    { path: '/keyJudgments/0/affectedByMissingDomains', rule: 'required',
+      message: '综合判断必须声明受缺失专项影响的领域', allowedEvidenceTypes: [] },
+  ])
+})
+
+test('综合报告稳定 Schema 要求专项状态引用并拒绝未知领域枚举', () => {
+  const result = validateReportCandidate({
+    kind: 'integrated', availability: 'partial', status: 'partial', gaps: [], limitations: [],
+    specialistStatuses: [], specialistReferences: [{
+      domain: 'macro', sessionId: 'session', reportId: 'report', version: 1, status: 'stale',
+    }], keyJudgments: [{
+      type: 'market', statement: '市场判断', direction: 'neutral', confidence: 'low',
+      supportingEvidence: ['fact:market'], contraryEvidence: [],
+      contraryEvidenceStatus: 'none_found', invalidationConditions: ['新数据出现'],
+      affectedByMissingDomains: ['macro'],
+    }],
+  }, { role: 'main', knownFacts: [{
+    id: 'fact:market', type: 'market', evidenceLevel: 'verified_market',
+  }] })
+
+  assert.equal(result.ok, false)
+  if (result.ok) return
+  assert.deepEqual(result.errors.map(({ path, rule }) => ({ path, rule })), [
+    { path: '/specialistReferences/0/domain', rule: 'enum' },
+    { path: '/specialistReferences/0/status', rule: 'enum' },
+    { path: '/keyJudgments/0/affectedByMissingDomains/0', rule: 'enum' },
+  ])
+})
+
+test('综合报告缺少固定专项状态与引用字段时在 Schema 层拒绝', () => {
+  const result = validateReportCandidate({
+    kind: 'integrated', availability: 'partial', status: 'partial', gaps: [], limitations: [],
+    keyJudgments: [],
+  }, { role: 'main', knownFacts: [] })
+
+  assert.equal(result.ok, false)
+  if (result.ok) return
+  assert.deepEqual(result.errors, [
+    { path: '/specialistStatuses', rule: 'required',
+      message: '缺少专项状态列表', allowedEvidenceTypes: [] },
+    { path: '/specialistReferences', rule: 'required',
+      message: '缺少专项报告引用列表', allowedEvidenceTypes: [] },
+  ])
 })
 
 test('引用不属于当前研究的事实时在引用完整性层返回字段路径', () => {
@@ -108,11 +257,13 @@ test('专项报告拒绝个人行动建议和跨领域裁决', () => {
 
 test('结构化方向与自然语言高风险冲突时拒绝报告', () => {
   const result = validateReportCandidate({
+    ...integratedSpecialistFields,
     kind: 'integrated', availability: 'available', status: 'completed', gaps: [], limitations: [],
     keyJudgments: [{
       type: 'market', statement: '未来一至四周明显看跌并存在下行风险',
       direction: 'bullish', confidence: 'high', supportingEvidence: ['fact:qualified'],
       contraryEvidence: [], contraryEvidenceStatus: 'none_found', invalidationConditions: ['重新站稳高点'],
+      affectedByMissingDomains: [],
     }], specialistStatuses: [],
   }, { role: 'main', knownFacts: [{ id: 'fact:qualified', type: 'market', evidenceLevel: 'verified_market' }] })
 
@@ -126,6 +277,7 @@ test('结构化方向与自然语言高风险冲突时拒绝报告', () => {
 
 test('专项 Runtime 拒绝候选伪装为综合报告', () => {
   const result = validateReportCandidate({
+    ...integratedSpecialistFields,
     kind: 'integrated', availability: 'available', status: 'completed', gaps: [], limitations: [],
     keyJudgments: [],
   }, { role: 'news', knownFacts: [] })
@@ -180,11 +332,12 @@ test('技术面 Runtime 只接受 technical 领域和判断类型', () => {
 
 test('每项关键判断必须至少有一个合格支持证据', () => {
   const result = validateReportCandidate({
+    ...integratedSpecialistFields,
     kind: 'integrated', availability: 'available', status: 'completed', gaps: [], limitations: [],
     keyJudgments: [{
       type: 'market', statement: '短期偏强', direction: 'bullish', confidence: 'medium',
       supportingEvidence: [], contraryEvidence: [], contraryEvidenceStatus: 'not_searched',
-      invalidationConditions: ['跌破支撑'],
+      invalidationConditions: ['跌破支撑'], affectedByMissingDomains: [],
     }],
   }, { role: 'main', knownFacts: [] })
 
@@ -199,11 +352,13 @@ test('每项关键判断必须至少有一个合格支持证据', () => {
 
 test('判断级反方证据也必须属于当前研究且符合证据资格', () => {
   const result = validateReportCandidate({
+    ...integratedSpecialistFields,
     kind: 'integrated', availability: 'available', status: 'completed', gaps: [], limitations: [],
     keyJudgments: [{
       type: 'market', statement: '短期偏强', direction: 'bullish', confidence: 'medium',
       supportingEvidence: ['fact:market'], contraryEvidence: ['fact:not-in-research'],
       contraryEvidenceStatus: 'none_found', invalidationConditions: ['跌破支撑'],
+      affectedByMissingDomains: [],
     }],
   }, { role: 'main', knownFacts: [{
     id: 'fact:market', type: 'quote', evidenceLevel: 'market_observation',
@@ -219,6 +374,7 @@ test('判断级反方证据也必须属于当前研究且符合证据资格', ()
 
 test('目标价拒绝空方法空输入空区间空时点和研究外引用', () => {
   const candidate = {
+    ...integratedSpecialistFields,
     kind: 'integrated', availability: 'available', status: 'completed', gaps: [], limitations: [],
     keyJudgments: [], targetPrice: {
       method: '', inputs: [], range: {}, asOf: '', evidence: ['fact:not-in-research'],
@@ -237,6 +393,7 @@ test('目标价拒绝空方法空输入空区间空时点和研究外引用', ()
 
 test('稳定 Schema 拒绝畸形数组元素和主 Agent 伪装专项报告', () => {
   const result = validateReportCandidate({
+    ...integratedSpecialistFields,
     kind: 'specialist', availability: 'available', status: 'completed',
     gaps: [{ capability: 'news', reason: 0, impact: 'unknown' }],
     limitations: [0], keyJudgments: 'invalid', supportingEvidence: [0],
@@ -256,11 +413,12 @@ test('稳定 Schema 拒绝畸形数组元素和主 Agent 伪装专项报告', ()
 
 test('稳定 Schema 逐字段校验关键判断内部结构', () => {
   const result = validateReportCandidate({
+    ...integratedSpecialistFields,
     kind: 'integrated', availability: 'available', status: 'completed', gaps: [], limitations: [],
     keyJudgments: [{
       type: 'unknown', statement: 0, direction: 'up', confidence: 'sure',
       supportingEvidence: [0], contraryEvidence: 'invalid', contraryEvidenceStatus: 'unknown',
-      invalidationConditions: [0],
+      invalidationConditions: [0], affectedByMissingDomains: [],
     }],
   }, { role: 'main', knownFacts: [] })
 
@@ -281,6 +439,7 @@ test('稳定 Schema 逐字段校验关键判断内部结构', () => {
 
 test('稳定 Schema 拒绝非对象情景元素', () => {
   const result = validateReportCandidate({
+    ...integratedSpecialistFields,
     kind: 'integrated', availability: 'available', status: 'completed', gaps: [], limitations: [],
     keyJudgments: [], scenarios: [0, null, [], 'bad'],
   }, { role: 'main', knownFacts: [] })
@@ -297,6 +456,7 @@ test('稳定 Schema 拒绝非对象情景元素', () => {
 
 test('目标价缺少确定性估值方法输入区间或时点时拒绝条件字段', () => {
   const result = validateReportCandidate({
+    ...integratedSpecialistFields,
     kind: 'integrated', availability: 'available', status: 'completed', gaps: [], limitations: [],
     keyJudgments: [], specialistStatuses: [], targetPrice: { value: 250, evidence: ['fact:pe'] },
   }, { role: 'main', knownFacts: [{ id: 'fact:pe', type: 'valuation_multiple', evidenceLevel: 'verified_valuation' }] })
@@ -312,6 +472,7 @@ test('目标价缺少确定性估值方法输入区间或时点时拒绝条件�
 
 test('稳定外壳拒绝空字符串零值和非法枚举占位', () => {
   const result = validateReportCandidate({
+    ...integratedSpecialistFields,
     kind: '', availability: 'unknown', status: '', gaps: 0, limitations: '',
   }, { role: 'main', knownFacts: [] })
 
@@ -374,11 +535,13 @@ test('缺少完整可用方法的估值事实不能支撑估值方向判断', ()
 
 test('技术判断接受宿主确定性技术证据且宿主目标价事实可原样出现', () => {
   const result = validateReportCandidate({
+    ...integratedSpecialistFields,
     kind: 'integrated', availability: 'available', status: 'completed', gaps: [], limitations: [],
     keyJudgments: [{
       type: 'technical', statement: '多周期结构偏强', direction: 'bullish', confidence: 'medium',
       supportingEvidence: ['fact:technical'], contraryEvidence: [],
       contraryEvidenceStatus: 'none_found', invalidationConditions: ['跌破关键价位'],
+      affectedByMissingDomains: [],
     }], specialistStatuses: [], targetPrice: {
       method: 'DCF', inputs: ['fact:valuation'], range: { low: 210, high: 250 },
       asOf: '2026-08-13', evidence: ['fact:valuation'],

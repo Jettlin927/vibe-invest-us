@@ -71,11 +71,33 @@ const validReport = {
   personalImpact: null,
   conditionalSuggestion: null,
   limitations: [],
+  specialistStatuses: [
+    { domain: 'news', status: 'not_started', impact: '消息面专项不可用' },
+    { domain: 'fundamental_valuation', status: 'not_started', impact: '基本面专项不可用' },
+    { domain: 'technical', status: 'not_started', impact: '技术面专项不可用' },
+  ],
+  specialistReferences: [],
   keyJudgments: [{
     type: 'market', statement: '短期趋势偏强', direction: 'bullish', confidence: 'medium',
     supportingEvidence: ['fact:nvda:price:2026-08-12'], contraryEvidence: [],
     contraryEvidenceStatus: 'none_found', invalidationConditions: ['跌破关键均线'],
+    affectedByMissingDomains: [],
   }],
+}
+
+function integratedReportFor(
+  specialistStatuses: Array<{ domain: string; status: string; impact: string }>,
+  specialistReferences: Array<{
+    domain: string; sessionId: string; reportId: string; version: number; status: string
+  }> = [],
+) {
+  const missing = [
+    ['news', '消息面专项不可用'],
+    ['fundamental_valuation', '基本面专项不可用'],
+    ['technical', '技术面专项不可用'],
+  ].flatMap(([domain, impact]) => specialistStatuses.some((item) => item.domain === domain)
+    ? [] : [{ domain, status: 'not_started', impact }])
+  return { ...validReport, specialistStatuses: [...specialistStatuses, ...missing], specialistReferences }
 }
 
 function runtimeSettings(overrides: Partial<typeof defaultRuntimeSettings> = {}) {
@@ -122,7 +144,9 @@ test('主 Agent 可以明确不启动消息面 Agent 并保留理由', async () 
     fauxAssistantMessage(fauxToolCall('run_news_analysis', {
       launch: false, researchQuestion: '近期是否有重大公司事件？', reason: '已有资料足够，无需追加。',
     }), { stopReason: 'toolUse' }),
-    fauxAssistantMessage(fauxToolCall('submit_analysis_report', validReport), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('submit_analysis_report', integratedReportFor([{
+      domain: 'news', status: 'not_started', impact: '不作消息驱动判断',
+    }])), { stopReason: 'toolUse' }),
   ] })
   const events = []
   for await (const event of model.analyze({
@@ -146,7 +170,12 @@ test('主 Agent 启动消息面 Agent 时把研究问题和理由原样交给 Ru
       launch: true, researchQuestion: '检查近 30 天是否有改变预期的公司事件。',
       reason: '当前资料缺少消息面反方证据。',
     }), { stopReason: 'toolUse' }),
-    fauxAssistantMessage(fauxToolCall('submit_analysis_report', validReport), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('submit_analysis_report', integratedReportFor([{
+      domain: 'news', status: 'completed', impact: '消息面判断可用',
+    }], [{
+      domain: 'news', sessionId: 'news-session', reportId: 'news-report', version: 1,
+      status: 'completed',
+    }])), { stopReason: 'toolUse' }),
   ] })
   for await (const _event of model.analyze({
     executionId: 'news-launched', runtimeSettings: runtimeSettings(),
@@ -170,11 +199,15 @@ test('主 Agent 启动消息面 Agent 时把研究问题和理由原样交给 Ru
 
 test('消息面能力可用时主 Agent 未作启动决定不能直接提交综合报告', async () => {
   const model = createPiModel({ fauxResponses: [
-    fauxAssistantMessage(fauxToolCall('submit_analysis_report', validReport), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('submit_analysis_report', integratedReportFor([{
+      domain: 'news', status: 'not_started', impact: '不作消息驱动判断',
+    }])), { stopReason: 'toolUse' }),
     fauxAssistantMessage(fauxToolCall('run_news_analysis', {
       launch: false, researchQuestion: '近期是否有重大事件？', reason: '现有事实已足够。',
     }), { stopReason: 'toolUse' }),
-    fauxAssistantMessage(fauxToolCall('submit_analysis_report', validReport), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('submit_analysis_report', integratedReportFor([{
+      domain: 'news', status: 'not_started', impact: '不作消息驱动判断',
+    }])), { stopReason: 'toolUse' }),
   ] })
   const events = []
   for await (const event of model.analyze({
@@ -188,11 +221,15 @@ test('消息面能力可用时主 Agent 未作启动决定不能直接提交综�
 
 test('基本面能力可用时主 Agent 未作启动决定不能直接提交综合报告', async () => {
   const model = createPiModel({ fauxResponses: [
-    fauxAssistantMessage(fauxToolCall('submit_analysis_report', validReport), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('submit_analysis_report', integratedReportFor([{
+      domain: 'fundamental_valuation', status: 'not_started', impact: '不作基本面专项判断',
+    }])), { stopReason: 'toolUse' }),
     fauxAssistantMessage(fauxToolCall('run_fundamental_analysis', {
       launch: false, researchQuestion: '最新财务质量是否改变方向？', reason: '现有正式财务事实已足够。',
     }), { stopReason: 'toolUse' }),
-    fauxAssistantMessage(fauxToolCall('submit_analysis_report', validReport), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('submit_analysis_report', integratedReportFor([{
+      domain: 'fundamental_valuation', status: 'not_started', impact: '不作基本面专项判断',
+    }])), { stopReason: 'toolUse' }),
   ] })
   const events = []
   for await (const event of model.analyze({
@@ -206,11 +243,15 @@ test('基本面能力可用时主 Agent 未作启动决定不能直接提交综�
 
 test('技术面能力可用时主 Agent 未作启动决定不能直接提交综合报告', async () => {
   const model = createPiModel({ fauxResponses: [
-    fauxAssistantMessage(fauxToolCall('submit_analysis_report', validReport), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('submit_analysis_report', integratedReportFor([{
+      domain: 'technical', status: 'not_started', impact: '不作技术面专项判断',
+    }])), { stopReason: 'toolUse' }),
     fauxAssistantMessage(fauxToolCall('run_technical_analysis', {
       launch: false, researchQuestion: '多周期结构是否一致？', reason: '现有技术证据已足够。',
     }), { stopReason: 'toolUse' }),
-    fauxAssistantMessage(fauxToolCall('submit_analysis_report', validReport), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('submit_analysis_report', integratedReportFor([{
+      domain: 'technical', status: 'not_started', impact: '不作技术面专项判断',
+    }])), { stopReason: 'toolUse' }),
   ] })
   const events = []
   for await (const event of model.analyze({
@@ -260,7 +301,15 @@ test('主 Agent 同一 Turn 启动三个专项时真实重叠且全部终态后�
         const value = message.content.find(({ type }) => type === 'text')
         if (value?.type === 'text') compactResults.push(JSON.parse(value.text))
       }
-      return fauxAssistantMessage(fauxToolCall('submit_analysis_report', validReport), {
+      return fauxAssistantMessage(fauxToolCall('submit_analysis_report', integratedReportFor([
+        { domain: 'news', status: 'completed', impact: '消息面判断可用' },
+        { domain: 'fundamental_valuation', status: 'completed', impact: '基本面判断可用' },
+        { domain: 'technical', status: 'completed', impact: '技术面判断可用' },
+      ], [
+        { domain: 'news', sessionId: 'news-session', reportId: 'news-report', version: 1, status: 'completed' },
+        { domain: 'fundamental_valuation', sessionId: 'fundamental-session', reportId: 'fundamental-report', version: 1, status: 'completed' },
+        { domain: 'technical', sessionId: 'technical-session', reportId: 'technical-report', version: 1, status: 'completed' },
+      ])), {
         stopReason: 'toolUse',
       })
     },
@@ -318,7 +367,9 @@ test('主 Agent 不会为参数校验失败的专项调用预创建 Session', as
     fauxAssistantMessage(fauxToolCall('run_news_analysis', {
       launch: false, researchQuestion: '是否需要消息面？', reason: '非法调用后明确不启动',
     }), { stopReason: 'toolUse' }),
-    fauxAssistantMessage(fauxToolCall('submit_analysis_report', validReport), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('submit_analysis_report', integratedReportFor([{
+      domain: 'news', status: 'not_started', impact: '不作消息驱动判断',
+    }])), { stopReason: 'toolUse' }),
   ] })
   const events = []
   for await (const event of model.analyze({
@@ -331,6 +382,101 @@ test('主 Agent 不会为参数校验失败的专项调用预创建 Session', as
   assert.equal(prepared, 0)
   assert.equal(launched, 0)
   assert.match(JSON.stringify(events), /invalid_tool_arguments/)
+})
+
+test('主 Agent 只能引用本次专项工具返回的精确报告版本', async () => {
+  const specialistStatus = {
+    domain: 'news', status: 'partial', impact: '消息判断置信度受限',
+  }
+  const reportWithReference = (version: number) => ({
+    ...validReport, availability: 'partial' as const, status: 'partial' as const,
+    gaps: [{ capability: 'news', reason: 'bounded', impact: '消息判断置信度受限' }],
+    limitations: ['消息面专项部分可用'],
+    specialistStatuses: [specialistStatus,
+      { domain: 'fundamental_valuation', status: 'not_started', impact: '基本面专项不可用' },
+      { domain: 'technical', status: 'not_started', impact: '技术面专项不可用' }],
+    specialistReferences: [{
+      domain: 'news', sessionId: 'news-session', reportId: 'news-report',
+      version, status: 'partial',
+    }],
+    keyJudgments: validReport.keyJudgments.map((judgment) => ({
+      ...judgment, affectedByMissingDomains: [],
+    })),
+  })
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall('run_news_analysis', {
+      launch: true, researchQuestion: '消息面？', reason: '需要消息证据',
+    }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('submit_analysis_report', reportWithReference(2)), {
+      stopReason: 'toolUse',
+    }),
+    fauxAssistantMessage(fauxToolCall('submit_analysis_report', reportWithReference(1)), {
+      stopReason: 'toolUse',
+    }),
+  ] })
+  const events = []
+  for await (const event of model.analyze({
+    executionId: 'exact-specialist-version', runtimeSettings: runtimeSettings(), symbol: 'NVDA',
+    systemPrompt: 'system', knownFacts: facts, fetchFinancialContext: async () => ({ facts }),
+    prepareSpecialistBatch: async () => [{
+      domain: 'news', sessionId: 'news-session', executionId: 'news-execution', created: true,
+    }],
+    runNewsSpecialist: async () => ({
+      launched: true, status: 'partial', sessionId: 'news-session',
+      executionId: 'news-execution', reportId: 'news-report', reportVersion: 1,
+      summary: '消息面部分可用', keyFactIds: [], contraryFactIds: [], gaps: [],
+    }),
+  })) events.push(event)
+
+  const serialized = JSON.stringify(events)
+  assert.match(serialized, /专项报告版本不属于当前研究/)
+  assert.match(serialized, /candidatePayloadHash/)
+  const completed = events.find((event) => event.type === 'completed')
+  assert.ok(completed?.type === 'completed')
+  assert.equal((completed.reportVersion?.report.specialistReferences as any[])[0]?.version, 1)
+})
+
+test('主 Agent 提交综合报告前刷新当前研究事实以校验专项证据', async () => {
+  const specialistFact = {
+    ...facts[0]!, id: 'fact:nvda:news:specialist', type: 'news', evidenceLevel: 'verified_news',
+  }
+  const report = {
+    ...integratedReportFor([{
+      domain: 'news', status: 'completed', impact: '消息面专项已形成报告',
+    }], [{
+      domain: 'news', sessionId: 'news-session', reportId: 'news-report',
+      version: 1, status: 'completed',
+    }]),
+    supportingEvidence: [specialistFact.id], contraryEvidence: [],
+    keyJudgments: [{
+      type: 'news', statement: '核实消息形成短期催化', direction: 'bullish', confidence: 'medium',
+      supportingEvidence: [specialistFact.id], contraryEvidence: [],
+      contraryEvidenceStatus: 'none_found', invalidationConditions: ['后续消息被撤回'],
+      affectedByMissingDomains: [],
+    }],
+  }
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall('run_news_analysis', {
+      launch: true, researchQuestion: '消息催化？', reason: '需要核实消息',
+    }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('submit_analysis_report', report), { stopReason: 'toolUse' }),
+  ] })
+  const events = []
+  for await (const event of model.analyze({
+    executionId: 'refresh-specialist-facts', runtimeSettings: runtimeSettings(), symbol: 'NVDA',
+    systemPrompt: 'system', knownFacts: facts, fetchFinancialContext: async () => ({ facts }),
+    refreshKnownFacts: async () => [...facts, specialistFact],
+    prepareSpecialistBatch: async () => [{
+      domain: 'news', sessionId: 'news-session', executionId: 'news-execution', created: true,
+    }],
+    runNewsSpecialist: async () => ({
+      launched: true, status: 'completed', sessionId: 'news-session',
+      executionId: 'news-execution', reportId: 'news-report', reportVersion: 1,
+      summary: '消息面已核实', keyFactIds: [specialistFact.id], contraryFactIds: [], gaps: [],
+    }),
+  })) events.push(event)
+
+  assert.ok(events.some((event) => event.type === 'completed'))
 })
 
 test('消息面正文只能读取当前专项候选工具返回的 Fact', async () => {

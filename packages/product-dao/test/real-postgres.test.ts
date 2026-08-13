@@ -1501,6 +1501,7 @@ test('真实 PostgreSQL 研究 DAO 保存任务、事实、轨迹并安全删除
     await repository.appendTrace(id, { type: 'status', status: 'queued' })
     await repository.saveSnapshot(id, { symbol: 'NVDA' })
     await repository.setStatus(id, 'completed', now, { report: { title: 'DAO 测试' } })
+    await repository.saveSnapshot(id, { symbol: 'NVDA', refreshed: true })
     const research = await repository.research(id)
     assert.equal(research?.status, 'completed')
     assert.deepEqual(research?.snapshot, { symbol: 'NVDA' })

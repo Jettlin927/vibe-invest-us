@@ -136,7 +136,8 @@ export function createTestProductDatabase() {
     },
     async saveSnapshot(id, snapshot) {
       const record = analyses.get(id)
-      if (record) analyses.set(id, { ...record, snapshot })
+      if (record && !['completed', 'partial', 'failed', 'stopped', 'interrupted', 'budget_exhausted']
+        .includes(record.status)) analyses.set(id, { ...record, snapshot })
     },
     async research(id) {
       const record = analyses.get(id)

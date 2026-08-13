@@ -21,13 +21,60 @@ const databaseUrl = process.env.TEST_DATABASE_URL
 const migrationDatabaseUrl = process.env.TEST_MIGRATION_DATABASE_URL
 
 function integratedReport<T extends Record<string, unknown>>(report: T) {
+  const judgments = Array.isArray(report.keyJudgments)
+    ? report.keyJudgments.map((value) => ({
+        ...(value as Record<string, unknown>),
+        affectedByMissingDomains: (value as Record<string, unknown>).affectedByMissingDomains ?? [],
+      })) : report.keyJudgments
   return {
     kind: 'integrated' as const, availability: report.limitations instanceof Array
       && report.limitations.length ? 'partial' as const : 'available' as const,
     status: report.limitations instanceof Array && report.limitations.length
       ? 'partial' as const : 'completed' as const,
-    gaps: [], ...report,
+    gaps: [], specialistStatuses: report.specialistStatuses ?? [
+      { domain: 'news', status: 'not_started', impact: '消息面专项未启动' },
+      { domain: 'fundamental_valuation', status: 'not_started', impact: '基本面专项未启动' },
+      { domain: 'technical', status: 'not_started', impact: '技术面专项未启动' },
+    ], specialistReferences: report.specialistReferences ?? [], ...report,
+    ...(judgments ? { keyJudgments: judgments } : {}),
   }
+}
+
+function specialistReportFields(
+  results: Array<Record<string, unknown>>,
+) {
+  const domains = ['news', 'fundamental_valuation', 'technical'] as const
+  const byDomain = new Map(results.map((result) => [String(result.domain), result]))
+  return {
+    specialistStatuses: domains.map((domain) => {
+      const result = byDomain.get(domain)
+      const status = result ? String(result.status) : 'not_started'
+      return { domain, status, impact: result ? `${domain} 专项状态：${status}` : `${domain} 专项未启动` }
+    }),
+    specialistReferences: results.flatMap((result) => {
+      const domain = String(result.domain)
+      const status = String(result.status)
+      return ['completed', 'partial'].includes(status) ? [{
+        domain, sessionId: result.sessionId, reportId: result.reportId,
+        version: result.reportVersion, status,
+      }] : []
+    }),
+  }
+}
+
+function specialistResults(context: { messages: Array<{
+  role: string; toolName?: string; content: Array<{ type: string; text?: string }>
+}> }) {
+  return context.messages.filter(({ role }) => role === 'toolResult').flatMap((message) => {
+    const text = message.content.find(({ type }) => type === 'text')?.text
+    if (!text) return []
+    const result = JSON.parse(text) as Record<string, unknown>
+    const domain = ({
+      run_news_analysis: 'news', run_fundamental_analysis: 'fundamental_valuation',
+      run_technical_analysis: 'technical',
+    } as const)[message.toolName as 'run_news_analysis']
+    return domain ? [{ ...result, domain }] : []
+  })
 }
 
 test('真实 v12 历史 Tool 事件升级到 v19 后经 DAO、HTTP 与 SSE 原样读取', {
@@ -188,27 +235,50 @@ test('真实 OpenAI HTTP provider 经生产 Pi bridge 在 Turn 边界原子封�
     const messages = (body.messages as Array<{ role?: string }> | undefined) ?? []
     const toolResults = messages.filter(({ role }) => role === 'tool')
     response.writeHead(200, { 'content-type': 'text/event-stream' })
-    if (visibleNames.includes('analyze_financials')) {
+    if (visibleNames.includes('run_technical_analysis')) {
       if (toolResults.length === 0) {
-        writeOpenAiToolCalls(response, [{ id: 'provider-specialist', name: 'analyze_financials', arguments: '{}' }])
+        writeOpenAiToolCalls(response, [{
+          id: 'provider-specialist', name: 'run_technical_analysis', arguments: JSON.stringify({
+            launch: true, researchQuestion: '验证技术专项工具批次', reason: '需要真实 provider 验收',
+          }),
+        }])
       } else {
+        const specialist = JSON.parse(String((toolResults.at(-1) as { content?: string }).content))
         writeOpenAiToolCalls(response, [{
           id: 'provider-report', name: 'submit_analysis_report', arguments: JSON.stringify(integratedReport({
             title: '真实生产 Pi bridge', marketState: '数据不足', trend: '未知', drivers: [],
             supportingEvidence: [], contraryEvidence: [], keyJudgments: [], scenarios: [],
             invalidationConditions: [], valuation: null, personalImpact: null,
             conditionalSuggestion: null, limitations: ['真实 HTTP provider 验收'],
+            ...specialistReportFields([{ ...specialist, domain: 'technical' }]),
           })),
         }])
       }
-    } else if (toolResults.length === 0) {
+    } else if (visibleNames.includes('get_technical_evidence') && toolResults.length === 0) {
       writeOpenAiToolCalls(response, [
-        { id: 'provider-news', name: 'search_news_by_keyword', arguments: '{}' },
-        { id: 'provider-indicators', name: 'get_technical_indicators', arguments: '{}' },
+        { id: 'provider-evidence', name: 'get_technical_evidence', arguments: '{}' },
+        { id: 'provider-window', name: 'get_price_window', arguments: JSON.stringify({
+          startDate: '2025-01-01', endDate: '2026-01-20',
+        }) },
         { id: 'provider-hidden-guess', name: 'hidden_specialist_tool', arguments: '{}' },
       ])
+    } else if (visibleNames.includes('get_technical_evidence')) {
+      writeOpenAiToolCalls(response, [{
+        id: 'provider-specialist-report', name: 'submit_specialist_report', arguments: JSON.stringify({
+          kind: 'specialist', domain: 'technical', availability: 'partial', status: 'partial',
+          gaps: [{ capability: 'technical', reason: 'provider_fixture', impact: '仅验收工具批次' }],
+          limitations: ['真实 HTTP provider 验收'], keyJudgments: [],
+        }),
+      }])
     } else {
-      writeOpenAiText(response, '专项已基于工具结果收口。')
+      writeOpenAiToolCalls(response, [{
+        id: 'provider-report', name: 'submit_analysis_report', arguments: JSON.stringify(integratedReport({
+          title: '真实生产 Pi bridge', marketState: '数据不足', trend: '未知', drivers: [],
+          supportingEvidence: [], contraryEvidence: [], keyJudgments: [], scenarios: [],
+          invalidationConditions: [], valuation: null, personalImpact: null,
+          conditionalSuggestion: null, limitations: ['真实 HTTP provider 验收'],
+        })),
+      }])
     }
   })
   await listenHttp(provider)
@@ -235,13 +305,19 @@ test('真实 OpenAI HTTP provider 经生产 Pi bridge 在 Turn 边界原子封�
     toolProjectionRepository: createToolProjectionRepository(pool),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({ symbol, gaps: [], facts: [], financials: {} }),
-    searchNews: async () => {
+    getTechnicalEvidence: async (symbol) => {
       await new Promise((resolve) => setTimeout(resolve, 60))
-      return { facts: [], source: 'news' }
+      return {
+        symbol, actualStart: '2025-01-01', actualEnd: '2026-01-20', totalBarCount: 260,
+        structures: {}, indicators: {}, volatility: {}, drawdown: {}, volumePrice: {},
+        keyLevels: {}, conflicts: [], facts: [],
+      }
     },
-    fetchTechnicalIndicators: async () => {
+    getPriceWindow: async (symbol) => {
       await new Promise((resolve) => setTimeout(resolve, 10))
-      return { facts: [], source: 'indicators' }
+      return { symbol, actualStart: '2025-01-01', actualEnd: '2026-01-20', totalBarCount: 260,
+        sampling: 'weekly', returnedCount: 0, totalCount: 0, nextCursor: null,
+        truncated: false, facts: [] }
     },
     model,
   })
@@ -259,28 +335,41 @@ test('真实 OpenAI HTTP provider 经生产 Pi bridge 在 Turn 边界原子封�
     const sse = await readThrough(sseResponse, 'event: partial')
     await waitForAgentStatus(events, created.sessionId, 'partial')
 
-    assert.equal(providerRequests.length, 4)
+    assert.equal(providerRequests.length, 4, JSON.stringify(providerRequests.map((request) => ({
+      tools: providerToolNames(request),
+      roles: ((request.messages as Array<{ role?: string }> | undefined) ?? []).map(({ role }) => role),
+    }))))
     const specialistFirst = providerRequests[1]!
     const specialistSecond = providerRequests[2]!
     const firstToolNames = providerToolNames(specialistFirst)
-    assert.deepEqual(firstToolNames, ['search_news_by_keyword', 'get_technical_indicators'])
+    assert.deepEqual(firstToolNames, [
+      'get_technical_evidence', 'get_price_window', 'submit_specialist_report',
+    ])
     const returnedIds = providerToolResultIds(specialistSecond)
     assert.deepEqual(returnedIds, [
-      'provider-news:specialist-invocation:financial-specialist-1:attempt:1:position:1',
-      'provider-indicators:specialist-invocation:financial-specialist-1:attempt:1:position:2',
-      'provider-hidden-guess:specialist-invocation:financial-specialist-1:attempt:1:position:3',
+      'provider-evidence:main-attempt:1:position:1',
+      'provider-window:main-attempt:1:position:2',
+      'provider-hidden-guess:main-attempt:1:position:3',
     ])
 
     const runtime = await fetch(`${baseUrl}/api/agent-sessions/${created.sessionId}/tool-runtime`)
       .then((response) => response.json())
     assert.deepEqual(runtime.modelRequests.map((item: { projectionVersion: number }) => (
       item.projectionVersion
-    )), [1, 2, 2, 1])
+    )), [1, 1])
     assert.ok(runtime.modelRequests.every((item: { projectionVersion?: number }) => (
       Number.isInteger(item.projectionVersion) && item.projectionVersion! > 0
     )))
-    const specialistBatch = runtime.toolBatches.find((batch: { calls: Array<{ toolName: string }> }) => (
-      batch.calls.some(({ toolName }) => toolName === 'search_news_by_keyword')
+    const research = await fetch(`${baseUrl}/api/research/${created.analysisId}`)
+      .then((response) => response.json()) as {
+        specialistAgents: Array<{ id: string; domain: string; events: Array<Record<string, unknown>> }>
+      }
+    const technicalAgent = research.specialistAgents.find(({ domain }) => domain === 'technical')!
+    const specialistRuntime = await fetch(
+      `${baseUrl}/api/agent-sessions/${technicalAgent.id}/tool-runtime`,
+    ).then((response) => response.json())
+    const specialistBatch = specialistRuntime.toolBatches.find((batch: { calls: Array<{ toolName: string }> }) => (
+      batch.calls.some(({ toolName }) => toolName === 'get_technical_evidence')
     ))
     assert.equal(specialistBatch.status, 'failed')
     assert.deepEqual(specialistBatch.calls.map((call: { position: number }) => call.position), [1, 2, 3])
@@ -291,47 +380,45 @@ test('真实 OpenAI HTTP provider 经生产 Pi bridge 在 Turn 边界原子封�
         ),
       ),
     )
-    const news = resultFor('search_news_by_keyword')
-    const indicators = resultFor('get_technical_indicators')
-    assert.ok(news.startedAt && news.completedAt && indicators.startedAt && indicators.completedAt)
-    assert.ok(new Date(news.startedAt).getTime() <= new Date(indicators.startedAt).getTime())
-    assert.ok(new Date(indicators.startedAt).getTime() < new Date(news.completedAt).getTime())
-    assert.ok(indicators.completionOrder < news.completionOrder)
+    const evidence = resultFor('get_technical_evidence')
+    const window = resultFor('get_price_window')
+    assert.ok(evidence.startedAt && evidence.completedAt && window.startedAt && window.completedAt)
+    assert.ok(new Date(evidence.startedAt).getTime() <= new Date(window.startedAt).getTime())
+    assert.ok(new Date(window.startedAt).getTime() < new Date(evidence.completedAt).getTime())
+    assert.ok(window.completionOrder < evidence.completionOrder)
     assert.match(sse, /event: tool_result/)
-    const ledger = await events.list(created.sessionId, 0)
+    const ledger = await events.list(technicalAgent.id, 0)
     const callEvents = ledger.filter(({ payload }) => payload.type === 'tool_call'
-      && ['search_news_by_keyword', 'get_technical_indicators'].includes(String(payload.name)))
+      && ['get_technical_evidence', 'get_price_window'].includes(String(payload.name)))
     assert.deepEqual(callEvents.map(({ payload }) => ({
       name: payload.name, startedAt: typeof payload.startedAt,
     })).sort((left, right) => String(left.name).localeCompare(String(right.name))), [
-      { name: 'get_technical_indicators', startedAt: 'string' },
-      { name: 'search_news_by_keyword', startedAt: 'string' },
+      { name: 'get_price_window', startedAt: 'string' },
+      { name: 'get_technical_evidence', startedAt: 'string' },
     ])
     const resultEvents = ledger.filter(({ payload }) => payload.type === 'tool_result'
-      && ['search_news_by_keyword', 'get_technical_indicators'].includes(String(payload.name)))
+      && ['get_technical_evidence', 'get_price_window'].includes(String(payload.name)))
     assert.deepEqual(resultEvents.map(({ payload }) => ({
       name: payload.name, startedAt: typeof payload.startedAt,
       completedAt: typeof payload.completedAt, completionOrder: payload.completionOrder,
     })), [
-      { name: 'get_technical_indicators', startedAt: 'string', completedAt: 'string', completionOrder: 2 },
-      { name: 'search_news_by_keyword', startedAt: 'string', completedAt: 'string', completionOrder: 3 },
+      { name: 'get_price_window', startedAt: 'string', completedAt: 'string', completionOrder: 2 },
+      { name: 'get_technical_evidence', startedAt: 'string', completedAt: 'string', completionOrder: 3 },
     ])
     const resultPayloads = ledger.filter(
       ({ payload }) => payload.type === 'tool_result',
     ).map(({ payload }) => payload.name)
-    assert.ok(resultPayloads.indexOf('get_technical_indicators')
-      < resultPayloads.indexOf('search_news_by_keyword'))
-    const research = await fetch(`${baseUrl}/api/research/${created.analysisId}`)
-      .then((response) => response.json()) as { trace: Array<Record<string, unknown>> }
-    const webToolEvents = research.trace.filter((payload) => (
+    assert.ok(resultPayloads.indexOf('get_price_window')
+      < resultPayloads.indexOf('get_technical_evidence'))
+    const webToolEvents = technicalAgent.events.filter((payload) => (
       ['tool_call', 'tool_result'].includes(String(payload.type))
-      && ['search_news_by_keyword', 'get_technical_indicators'].includes(String(payload.name))
+      && ['get_technical_evidence', 'get_price_window'].includes(String(payload.name))
     ))
     assert.ok(webToolEvents.every((payload) => typeof payload.startedAt === 'string'))
     assert.ok(webToolEvents.filter(({ type }) => type === 'tool_result').every((payload) => (
       typeof payload.completedAt === 'string' && Number.isInteger(payload.completionOrder)
     )))
-    const publicAudit = JSON.stringify({ runtime, sse })
+    const publicAudit = JSON.stringify({ runtime, specialistRuntime, sse })
     assert.doesNotMatch(publicAudit, /hidden_specialist_tool/)
     assert.doesNotMatch(publicAudit, /allowedStages|allowedRoles|visibilityConditions/)
 
@@ -345,12 +432,17 @@ test('真实 OpenAI HTTP provider 经生产 Pi bridge 在 Turn 边界原子封�
       body: JSON.stringify({ symbol: `S${crypto.randomUUID().replaceAll('-', '').slice(0, 8)}` }),
     }).then((response) => response.json()) as { analysisId: string; sessionId: string }
     await waitForAgentStatus(events, serialCreated.sessionId, 'partial')
+    const serialResearch = await fetch(`${baseUrl}/api/research/${serialCreated.analysisId}`)
+      .then((response) => response.json()) as {
+        specialistAgents: Array<{ id: string; domain: string }>
+      }
+    const serialTechnical = serialResearch.specialistAgents.find(({ domain }) => domain === 'technical')!
     const serialRuntime = await fetch(
-      `${baseUrl}/api/agent-sessions/${serialCreated.sessionId}/tool-runtime`,
+      `${baseUrl}/api/agent-sessions/${serialTechnical.id}/tool-runtime`,
     ).then((response) => response.json())
     const serialBatch = serialRuntime.toolBatches.find(
       (batch: { calls: Array<{ toolName: string }> }) => batch.calls.some(
-        ({ toolName }) => toolName === 'search_news_by_keyword',
+        ({ toolName }) => toolName === 'get_technical_evidence',
       ),
     )
     const serialResultFor = (toolName: string) => serialBatch.results.find(
@@ -360,15 +452,15 @@ test('真实 OpenAI HTTP provider 经生产 Pi bridge 在 Turn 边界原子封�
         ),
       ),
     )
-    const serialNews = serialResultFor('search_news_by_keyword')
-    const serialIndicators = serialResultFor('get_technical_indicators')
-    assert.notEqual(serialNews.startedAt, serialIndicators.startedAt)
-    assert.ok(new Date(serialNews.completedAt).getTime()
-      <= new Date(serialIndicators.startedAt).getTime())
-    const serialLedger = await events.list(serialCreated.sessionId, 0)
+    const serialEvidence = serialResultFor('get_technical_evidence')
+    const serialWindow = serialResultFor('get_price_window')
+    assert.notEqual(serialEvidence.startedAt, serialWindow.startedAt)
+    assert.ok(new Date(serialEvidence.completedAt).getTime()
+      <= new Date(serialWindow.startedAt).getTime())
+    const serialLedger = await events.list(serialTechnical.id, 0)
     assert.deepEqual(serialLedger.filter(({ payload }) => payload.type === 'tool_call'
-      && ['search_news_by_keyword', 'get_technical_indicators'].includes(String(payload.name)))
-      .map(({ payload }) => payload.startedAt), [serialNews.startedAt, serialIndicators.startedAt])
+      && ['get_technical_evidence', 'get_price_window'].includes(String(payload.name)))
+      .map(({ payload }) => payload.startedAt), [serialEvidence.startedAt, serialWindow.startedAt])
   } finally {
     await settings.save(previousSettings.values, new Date().toISOString())
     await app.close()
@@ -783,10 +875,11 @@ test('首次研究经真实 PostgreSQL 与 HTTP SSE 展示 Runtime Context、工
 
     assert.equal(providerRequests.length, 2)
     const firstRequest = JSON.stringify(providerRequests[0])
+    const firstMessages = JSON.stringify((providerRequests[0].messages as unknown[]) ?? [])
     const secondRequest = JSON.stringify(providerRequests[1])
     assert.match(firstRequest, /系统生成的 Runtime Context，不是用户输入/)
     assert.match(firstRequest, new RegExp(symbol.toUpperCase()))
-    assert.doesNotMatch(firstRequest, /mainAgentToolRounds|researchActiveMinutes|elapsed|budget/i)
+    assert.doesNotMatch(firstMessages, /mainAgentToolRounds|researchActiveMinutes|activeElapsedMs/i)
     assert.match(secondRequest, /fact:first-research:bar:23/)
     assert.doesNotMatch(secondRequest, /privateDiagnostic|只允许保留在 PostgreSQL 审计视图/)
 
@@ -851,18 +944,18 @@ test('主 Agent 经真实 PostgreSQL、HTTP 与 SSE 启动并展示独立消息�
       contraryEvidenceStatus: 'none_found', invalidationConditions: ['公司取消活动'],
     }],
   }
-  const mainReport = integratedReport({
-    title: '消息面专项闭环', marketState: '数据有限', trend: '震荡', drivers: [],
-    supportingEvidence: [], contraryEvidence: [], keyJudgments: [], scenarios: [],
-    invalidationConditions: [], valuation: null, personalImpact: null,
-    conditionalSuggestion: null, limitations: [],
-  })
   const mainModel = createPiModel({ fauxResponses: [
     fauxAssistantMessage(fauxToolCall('run_news_analysis', {
       launch: true, researchQuestion: '近 30 天是否有改变预期的事件？',
       reason: '缺少消息面反方证据。',
     }), { stopReason: 'toolUse' }),
-    fauxAssistantMessage(fauxToolCall('submit_analysis_report', mainReport), { stopReason: 'toolUse' }),
+    (context) => fauxAssistantMessage(fauxToolCall('submit_analysis_report', integratedReport({
+      title: '消息面专项闭环', marketState: '数据有限', trend: '震荡', drivers: [],
+      supportingEvidence: [], contraryEvidence: [], keyJudgments: [], scenarios: [],
+      invalidationConditions: [], valuation: null, personalImpact: null,
+      conditionalSuggestion: null, limitations: [],
+      ...specialistReportFields(specialistResults(context)),
+    })), { stopReason: 'toolUse' }),
   ] })
   const newsModel = createPiModel({ fauxResponses: [
     fauxAssistantMessage(fauxToolCall('search_news_candidates', {
@@ -876,10 +969,11 @@ test('主 Agent 经真实 PostgreSQL、HTTP 与 SSE 启动并展示独立消息�
     }),
   ] })
   const model = { ...mainModel, analyzeNews: newsModel.analyzeNews }
+  const analyses = createAnalysisRepository(pool)
   const app = buildApp({
     productDatabase: { checkSchema: () => checkSchema(pool), close: () => pool.end() },
     portfolioRepository: createPortfolioRepository(pool),
-    analysisRepository: createAnalysisRepository(pool), agentEventRepository: events,
+    analysisRepository: analyses, agentEventRepository: events,
     runtimeSettingsRepository: createRuntimeSettingsRepository(pool),
     toolProjectionRepository: createToolProjectionRepository(pool),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
@@ -900,8 +994,9 @@ test('主 Agent 经真实 PostgreSQL、HTTP 与 SSE 启动并展示独立消息�
     const research = (await app.inject({
       method: 'GET', url: `/api/research/${created.analysisId}`,
     })).json()
-    assert.equal(research.specialistAgents.length, 1)
-    const news = research.specialistAgents[0]
+    assert.equal(research.specialistAgents.length, 3)
+    const news = research.specialistAgents.find((agent: any) => agent.domain === 'news')
+    assert.ok(news)
     assert.equal(news.domain, 'news')
     assert.equal(news.execution.status, 'completed')
     assert.match(JSON.stringify(news.events), /search_news_candidates/)
@@ -936,6 +1031,33 @@ test('主 Agent 经真实 PostgreSQL、HTTP 与 SSE 启动并展示独立消息�
       { kind: 'specialist', sessionId: news.id, domain: 'news', evidence: [verified.id] },
       { kind: 'integrated', sessionId: created.sessionId, domain: null, evidence: [] },
     ])
+    const specialistVersion = versions[0]
+    const integratedVersion = versions[1]
+    assert.deepEqual(integratedVersion.report.specialistStatuses, [
+      { domain: 'news', status: 'completed', impact: 'news 专项状态：completed' },
+      { domain: 'fundamental_valuation', status: 'not_started', impact: 'fundamental_valuation 专项未启动' },
+      { domain: 'technical', status: 'not_started', impact: 'technical 专项未启动' },
+    ])
+    assert.deepEqual(integratedVersion.report.specialistReferences, [{
+      domain: 'news', sessionId: specialistVersion.sessionId, reportId: specialistVersion.id,
+      version: specialistVersion.version, status: 'completed',
+    }])
+    const beforeRefresh = (await app.inject({
+      method: 'GET', url: `/api/research/${created.analysisId}`,
+    })).json()
+    assert.ok(beforeRefresh.snapshot.facts.some(({ id }: { id: string }) => id === verified.id))
+    await analyses.saveFact(created.analysisId, {
+      id: `fact:post-terminal:${crypto.randomUUID()}`, type: 'quote', value: 999,
+    })
+    await analyses.saveSnapshot(created.analysisId, { overwritten: true })
+    const afterRefresh = (await app.inject({
+      method: 'GET', url: `/api/research/${created.analysisId}`,
+    })).json()
+    const versionsAfterRefresh = (await app.inject({
+      method: 'GET', url: `/api/research/${created.analysisId}/report-versions`,
+    })).json().items
+    assert.deepEqual(afterRefresh.snapshot, beforeRefresh.snapshot)
+    assert.deepEqual(versionsAfterRefresh, versions)
   } finally {
     await app.close()
   }
@@ -947,6 +1069,9 @@ test('Web Search 只在三源资格事件后投影并经正文核实生成专项
 }, async () => {
   const pool = createPool(databaseUrl!)
   const events = createAgentEventRepository(pool)
+  const settings = createRuntimeSettingsRepository(pool)
+  const previousSettings = await settings.current()
+  await settings.save({ specialistAgentToolRounds: 4 }, new Date().toISOString())
   const lead = {
     id: 'fact:web:e2e:lead', type: 'web_search_lead', evidenceLevel: 'lead',
     value: { title: 'NVDA event detail', summary: 'search snippet', url: 'https://example.com/web-event' },
@@ -970,11 +1095,12 @@ test('Web Search 只在三源资格事件后投影并经正文核实生成专项
     fauxAssistantMessage(fauxToolCall('run_news_analysis', {
       launch: true, researchQuestion: '核实近期产品事件', reason: '常规新闻材料不足',
     }), { stopReason: 'toolUse' }),
-    fauxAssistantMessage(fauxToolCall('submit_analysis_report', integratedReport({
+    (context) => fauxAssistantMessage(fauxToolCall('submit_analysis_report', integratedReport({
       title: 'Web Search 降级闭环', marketState: '材料有限', trend: '震荡', drivers: [],
       supportingEvidence: [], contraryEvidence: [], keyJudgments: [], scenarios: [],
       invalidationConditions: [], valuation: null, personalImpact: null,
       conditionalSuggestion: null, limitations: [],
+      ...specialistReportFields(specialistResults(context)),
     })), { stopReason: 'toolUse' }),
   ] })
   const newsModel = createPiModel({ fauxResponses: [
@@ -989,7 +1115,7 @@ test('Web Search 只在三源资格事件后投影并经正文核实生成专项
   const app = buildApp({
     productDatabase: { checkSchema: () => checkSchema(pool), close: () => pool.end() },
     portfolioRepository: createPortfolioRepository(pool), analysisRepository: createAnalysisRepository(pool),
-    agentEventRepository: events, runtimeSettingsRepository: createRuntimeSettingsRepository(pool),
+    agentEventRepository: events, runtimeSettingsRepository: settings,
     toolProjectionRepository: createToolProjectionRepository(pool),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({ symbol, gaps: [], facts: [] }),
@@ -1010,7 +1136,8 @@ test('Web Search 只在三源资格事件后投影并经正文核实生成专项
   try {
     await waitForAnalysisStatus(app, created.analysisId, 'completed')
     const research = (await app.inject({ method: 'GET', url: `/api/research/${created.analysisId}` })).json()
-    const news = research.specialistAgents[0]
+    const news = research.specialistAgents.find((agent: any) => agent.domain === 'news')
+    assert.ok(news)
     const serialized = JSON.stringify(news.events)
     assert.equal(webSearchCalls, 1)
     assert.match(serialized, /web_search_eligibility/)
@@ -1029,7 +1156,10 @@ test('Web Search 只在三源资格事件后投影并经正文核实生成专项
       method: 'GET', url: `/api/research/${created.analysisId}/report-versions`,
     })).json().items
     assert.equal(versions[0].report.keyJudgments[0].supportingEvidence[0], verified.id)
-  } finally { await app.close() }
+  } finally {
+    await settings.save(previousSettings.values, new Date().toISOString())
+    await app.close()
+  }
 })
 
 test('主 Agent 经真实 PostgreSQL、HTTP 与 SSE 启动并展示独立基本面 Agent', {
@@ -1093,11 +1223,12 @@ test('主 Agent 经真实 PostgreSQL、HTTP 与 SSE 启动并展示独立基本�
       launch: true, researchQuestion: '最新正式财务事实是否改变基本面方向？',
       reason: '需要核验财报、指标序列与官方事件。',
     }), { stopReason: 'toolUse' }),
-    fauxAssistantMessage(fauxToolCall('submit_analysis_report', integratedReport({
+    (context) => fauxAssistantMessage(fauxToolCall('submit_analysis_report', integratedReport({
       title: '基本面专项闭环', marketState: '数据有限', trend: '震荡', drivers: [],
       supportingEvidence: [], contraryEvidence: [], keyJudgments: [], scenarios: [],
       invalidationConditions: [], valuation: null, personalImpact: null,
       conditionalSuggestion: null, limitations: [],
+      ...specialistReportFields(specialistResults(context)),
     })), { stopReason: 'toolUse' }),
   ] })
   const specialistModel = createPiModel({ fauxResponses: [
@@ -1243,11 +1374,12 @@ test('主 Agent 经真实 PostgreSQL、HTTP 与 SSE 启动并展示独立技术�
     fauxAssistantMessage(fauxToolCall('run_technical_analysis', {
       launch: true, researchQuestion: '多周期结构是否一致？', reason: '需要核验完整历史与冲突。',
     }), { stopReason: 'toolUse' }),
-    fauxAssistantMessage(fauxToolCall('submit_analysis_report', integratedReport({
+    (context) => fauxAssistantMessage(fauxToolCall('submit_analysis_report', integratedReport({
       title: '技术专项闭环', marketState: '数据有限', trend: '震荡', drivers: [],
       supportingEvidence: [], contraryEvidence: [], keyJudgments: [], scenarios: [],
       invalidationConditions: [], valuation: null, personalImpact: null,
       conditionalSuggestion: null, limitations: [],
+      ...specialistReportFields(specialistResults(context)),
     })), { stopReason: 'toolUse' }),
   ] })
   const specialistModel = createPiModel({ fauxResponses: [
@@ -1405,7 +1537,8 @@ test('生产 Pi 经 HTTP、SSE 与真实 PostgreSQL 留存工具及预算收口�
     assert.deepEqual(toolRuntime.projections.map((projection: { visibleToolNames: string[] }) => (
       projection.visibleToolNames
     )), [[
-      'fetch_financial_context', 'analyze_financials', 'run_news_analysis', 'submit_analysis_report',
+      'fetch_financial_context', 'run_fundamental_analysis', 'run_news_analysis',
+      'run_technical_analysis', 'submit_analysis_report',
     ], ['submit_analysis_report']])
     assert.equal(JSON.stringify(toolRuntime).includes('hidden_tool'), false)
     assert.equal(JSON.stringify(toolRuntime).includes('allowedStages'), false)
@@ -1789,67 +1922,47 @@ test('主 Agent 跨 Turn 复用与空 call id 在真实 PostgreSQL 各自完整�
   }
 })
 
-test('同一 execution 两次专项 invocation 在真实 PostgreSQL 各自封存且重放幂等', {
+test('同一主 execution 跨 Turn 复用长期专项 Session 并生成精确 V2 且事件重放幂等', {
   skip: !databaseUrl,
   concurrency: false,
 }, async () => {
   const pool = createPool(databaseUrl!)
   const events = createAgentEventRepository(pool)
   const analyses = createAnalysisRepository(pool)
-  const parentId = 'pg-specialist-parent-reused'
-  const repeatedId = 'pg-specialist-child-reused'
   const report = {
     title: '多次专项命名空间测试', marketState: '未知', trend: '未知', drivers: [],
     supportingEvidence: [], contraryEvidence: [], keyJudgments: [], scenarios: [],
     invalidationConditions: [], valuation: null, personalImpact: null,
     conditionalSuggestion: null, limitations: ['测试上下文为空'],
   }
-  let createdSessionId: string | undefined
-  const model = createPiModel({ fauxResponses: [
-    fauxAssistantMessage(fauxToolCall('analyze_financials', {}, { id: parentId }), {
+  const compactResults: Array<Record<string, unknown>> = []
+  const mainModel = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall('run_news_analysis', {
+      launch: true, researchQuestion: '第一次消息面核验', reason: '验证专项版本复用',
+    }, { id: 'first-news-run' }), {
       stopReason: 'toolUse',
     }),
-    fauxAssistantMessage([
-      fauxToolCall('search_news_by_keyword', {}, { id: repeatedId }),
-      fauxToolCall('search_news_by_keyword', {}, { id: '' }),
-    ], { stopReason: 'toolUse' }),
-    async (context) => {
-      assert.ok(createdSessionId)
-      const ledger = await events.list(createdSessionId, 0)
-      const sealed = ledger.filter(({ operationId }) => operationId.includes(':specialist-tool:'))
-      assert.equal(sealed.length, 4)
-      assert.equal(new Set(sealed.map(({ operationId }) => operationId)).size, 4)
-      assert.equal(context.messages.filter(({ role }) => role === 'toolResult').length, 2)
-      return fauxAssistantMessage('第一次专项完成')
-    },
-    fauxAssistantMessage(fauxToolCall('analyze_financials', {}, { id: parentId }), {
+    fauxAssistantMessage(fauxToolCall('run_news_analysis', {
+      launch: true, researchQuestion: '第二次消息面核验', reason: '复用已有专项报告',
+    }, { id: 'second-news-run' }), {
       stopReason: 'toolUse',
     }),
-    fauxAssistantMessage([
-      fauxToolCall('search_news_by_keyword', {}, { id: repeatedId }),
-      fauxToolCall('search_news_by_keyword', {}, { id: '' }),
-    ], { stopReason: 'toolUse' }),
-    async (context) => {
-      assert.ok(createdSessionId)
-      const ledger = await events.list(createdSessionId, 0)
-      const sealed = ledger.filter(({ operationId }) => operationId.includes(':specialist-tool:'))
-      assert.equal(sealed.length, 8)
-      assert.equal(new Set(sealed.map(({ operationId }) => operationId)).size, 8)
-      assert.equal(context.messages.filter(({ role }) => role === 'toolResult').length, 2)
-      const replay = sealed[0]!
-      const replayed = await events.append({
-        sessionId: createdSessionId, executionId: (await events.getSession(createdSessionId))!.executionId,
-        operationId: replay.operationId,
-        event: replay.payload, createdAt: new Date().toISOString(),
-      })
-      assert.equal(replayed.created, false)
-      assert.equal((await events.list(createdSessionId, 0)).filter(
-        ({ operationId }) => operationId.includes(':specialist-tool:'),
-      ).length, 8)
-      return fauxAssistantMessage('第二次专项完成')
+    (context) => {
+      compactResults.push(...specialistResults(context))
+      const latest = compactResults.at(-1)!
+      return fauxAssistantMessage(fauxToolCall('submit_analysis_report', integratedReport({
+        ...report, ...specialistReportFields([{ ...latest, domain: 'news' }]),
+      })), { stopReason: 'toolUse' })
     },
-    fauxAssistantMessage(fauxToolCall('submit_analysis_report', integratedReport(report)), { stopReason: 'toolUse' }),
   ] })
+  const newsModel = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall('submit_specialist_report', {
+      kind: 'specialist', domain: 'news', availability: 'partial', status: 'partial',
+      gaps: [{ capability: 'news', reason: 'empty_fixture', impact: '不形成消息判断' }],
+      limitations: ['测试上下文为空'], keyJudgments: [],
+    }), { stopReason: 'toolUse' }),
+  ] })
+  const model = { ...mainModel, analyzeNews: newsModel.analyzeNews }
   const app = buildApp({
     productDatabase: { checkSchema: () => checkSchema(pool), close: () => pool.end() },
     portfolioRepository: createPortfolioRepository(pool), analysisRepository: analyses,
@@ -1857,35 +1970,51 @@ test('同一 execution 两次专项 invocation 在真实 PostgreSQL 各自封存
     toolProjectionRepository: createToolProjectionRepository(pool),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({ symbol, gaps: [], facts: [], financials: {} }),
-    searchNews: async () => ({ facts: [] }), model,
+    searchNewsCandidates: async () => ({ facts: [] }),
+    readNewsDocument: async () => ({ facts: [] }), listCompanyEvents: async () => ({ facts: [] }),
+    model,
   })
   await app.ready()
   const created = (await app.inject({
     method: 'POST', url: '/api/analyses', payload: { symbol: 'PGMSP' },
   })).json() as { analysisId: string; sessionId: string }
-  createdSessionId = created.sessionId
   try {
     await waitForAnalysisStatus(app, created.analysisId, 'partial')
-    const executionId = (await events.getSession(created.sessionId))!.executionId
-    await waitForOperation(events, created.sessionId,
-      `execution:${executionId}:specialist:financial-specialist-2:completed`)
-    const runtime = await createToolProjectionRepository(pool).replay(executionId)
-    assert.equal(runtime.modelRequests.filter(({ id }) => id.includes(':fundamental:invocation:')).length, 4)
-    assert.equal(runtime.toolBatches.filter(({ id }) => id.includes(':fundamental:invocation:')).length, 2)
-    const lifecycle = (await events.list(created.sessionId, 0)).filter(({ operationId }) => (
-      operationId.includes(':specialist:financial-specialist-')
-      && (operationId.endsWith(':waiting') || operationId.endsWith(':completed'))
-    ))
-    assert.deepEqual(lifecycle.map(({ operationId }) => operationId), [
-      `execution:${executionId}:specialist:financial-specialist-1:waiting`,
-      `execution:${executionId}:specialist:financial-specialist-1:completed`,
-      `execution:${executionId}:specialist:financial-specialist-2:waiting`,
-      `execution:${executionId}:specialist:financial-specialist-2:completed`,
-    ])
-    const replayBody = (await app.inject({
-      method: 'GET', url: `/api/agent-sessions/${created.sessionId}/events`,
-    })).body
-    assert.equal((replayBody.match(/event: waiting_for_specialists/g) ?? []).length, 2)
+    const research = (await app.inject({
+      method: 'GET', url: `/api/research/${created.analysisId}`,
+    })).json()
+    const newsAgents = research.specialistAgents.filter((agent: any) => agent.domain === 'news')
+    assert.equal(newsAgents.length, 1)
+    assert.equal(compactResults.length, 2)
+    const compactVersions = compactResults.map(({ sessionId, reportId, reportVersion, status }) => ({
+      sessionId, reportId, reportVersion, status,
+    }))
+    assert.deepEqual(compactVersions.map(({ sessionId, reportVersion, status }) => ({
+      sessionId, reportVersion, status,
+    })), [1, 2].map((reportVersion) => ({
+      sessionId: compactResults[0]!.sessionId, reportVersion, status: 'partial',
+    })))
+    const versions = (await app.inject({
+      method: 'GET', url: `/api/research/${created.analysisId}/report-versions`,
+    })).json().items
+    assert.deepEqual(versions.filter((version: any) => version.kind === 'specialist')
+      .map((version: any) => version.version), [1, 2])
+    const integrated = versions.find((version: any) => version.kind === 'integrated')
+    assert.equal(integrated.report.specialistReferences[0].reportId, compactResults[1]!.reportId)
+    assert.equal(integrated.report.specialistReferences[0].version, 2)
+    const mainLedger = await events.list(created.sessionId, 0)
+    const replay = mainLedger.find(({ payload }) => (
+      payload.type === 'tool_result' && payload.name === 'run_news_analysis'
+    ))!
+    const replayed = await events.append({
+      sessionId: created.sessionId,
+      executionId: (await events.getSession(created.sessionId))!.executionId,
+      operationId: replay.operationId, event: replay.payload, createdAt: new Date().toISOString(),
+    })
+    assert.equal(replayed.created, false)
+    assert.equal((await events.list(created.sessionId, 0)).filter(
+      ({ operationId }) => operationId === replay.operationId,
+    ).length, 1)
   } finally {
     await app.close()
   }
@@ -1940,6 +2069,7 @@ test('三个专项经真实 PostgreSQL、HTTP 与 SSE 并行重叠且整批终�
         supportingEvidence: [], contraryEvidence: [], keyJudgments: [], scenarios: [],
         invalidationConditions: [], valuation: null, personalImpact: null,
         conditionalSuggestion: null, limitations: [],
+        ...specialistReportFields(specialistResults(context)),
       })), { stopReason: 'toolUse' })
     },
   ] })
