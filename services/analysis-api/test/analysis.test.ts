@@ -288,8 +288,15 @@ test('主 Agent 启动的技术面 Agent 拥有独立 Session、受限工具和�
     evidenceLevel: 'deterministic_technical', source: 'deterministic-calculation',
     value: {
       actualStart: '2025-01-01', actualEnd: '2026-01-20', totalBarCount: 260,
-      structures: { '20d': {}, '60d': {}, '120d': {}, '252d': {} },
-      indicators: {}, volatility: {}, drawdown: {}, volumePrice: {}, keyLevels: {}, conflicts: [],
+      structures: Object.fromEntries([20, 60, 120, 252].map((size) => [
+        `${size}d`, { status: 'available', barCount: size, returnPct: 0.1, high: 130, low: 90 },
+      ])),
+      indicators: { ma_5: 120, ma_20: 115, macd: { line: 1, signal: 0.5, histogram: 0.5 },
+        rsi_14: 58, annualized_volatility: 0.3, max_drawdown: -0.2,
+        volume_ratio_5_to_20: 1.1 },
+      volatility: { annualized: 0.3 }, drawdown: { maximum: -0.2 },
+      volumePrice: { volumeRatio5To20: 1.1 }, keyLevels: { support: 90, resistance: 130 },
+      conflicts: [],
     },
   }
   const specialistReport = {

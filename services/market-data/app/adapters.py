@@ -301,7 +301,7 @@ class AlpacaHistorySource(AlpacaSource):
             params["page_token"] = page_token
         if not result:
             raise ValueError("empty_alpaca_history")
-        return result[-180:]
+        return result
 
 
 class AlpacaNewsSource(AlpacaSource):

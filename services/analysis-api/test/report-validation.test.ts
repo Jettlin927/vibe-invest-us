@@ -387,8 +387,15 @@ test('技术判断接受宿主确定性技术证据且宿主目标价事实可�
     { id: 'fact:technical', type: 'technical_evidence', evidenceLevel: 'deterministic_technical',
       value: {
         actualStart: '2025-01-01', actualEnd: '2026-01-20', totalBarCount: 260,
-        structures: { '20d': {}, '60d': {}, '120d': {}, '252d': {} },
-        indicators: {}, volatility: {}, drawdown: {}, volumePrice: {}, keyLevels: {}, conflicts: [],
+        structures: Object.fromEntries([20, 60, 120, 252].map((size) => [
+          `${size}d`, { status: 'available', barCount: size, returnPct: 0.1, high: 130, low: 90 },
+        ])),
+        indicators: { ma_5: 120, ma_20: 115, macd: { line: 1, signal: 0.5, histogram: 0.5 },
+          rsi_14: 58, annualized_volatility: 0.3, max_drawdown: -0.2,
+          volume_ratio_5_to_20: 1.1 },
+        volatility: { annualized: 0.3 }, drawdown: { maximum: -0.2 },
+        volumePrice: { volumeRatio5To20: 1.1 }, keyLevels: { support: 90, resistance: 130 },
+        conflicts: [],
       } },
     { id: 'fact:valuation', type: 'deterministic_valuation', evidenceLevel: 'deterministic_valuation',
       value: { method: 'DCF', status: 'available', inputs: ['fact:valuation'],
@@ -410,6 +417,32 @@ test('技术判断拒绝只有标签但没有真实范围和多周期结构的�
   }, { role: 'technical', knownFacts: [{
     id: 'fact:technical', type: 'technical_evidence', evidenceLevel: 'deterministic_technical',
     value: { totalBarCount: 20 },
+  }] })
+
+  assert.equal(result.ok, false)
+  if (result.ok) return
+  assert.equal(result.errors[0]?.rule, 'evidence_qualification')
+})
+
+test('技术判断拒绝空壳窗口、非有限指标和倒置关键价位', () => {
+  const candidate = {
+    kind: 'specialist', domain: 'technical', availability: 'available', status: 'completed',
+    gaps: [], limitations: [], keyJudgments: [{
+      type: 'technical', statement: '技术结构偏强', direction: 'bullish', confidence: 'medium',
+      supportingEvidence: ['fact:technical'], contraryEvidence: [],
+      contraryEvidenceStatus: 'none_found', invalidationConditions: ['跌破支撑'],
+    }],
+  }
+  const base = {
+    actualStart: '2025-01-01', actualEnd: '2026-01-20', totalBarCount: 260,
+    structures: { '20d': {}, '60d': {}, '120d': {}, '252d': {} },
+    indicators: { ma_5: Number.NaN }, volatility: { annualized: Number.POSITIVE_INFINITY },
+    drawdown: { maximum: -0.2 }, volumePrice: { volumeRatio5To20: 1.1 },
+    keyLevels: { support: 130, resistance: 90 }, conflicts: [],
+  }
+  const result = validateReportCandidate(candidate, { role: 'technical', knownFacts: [{
+    id: 'fact:technical', type: 'technical_evidence', evidenceLevel: 'deterministic_technical',
+    value: base,
   }] })
 
   assert.equal(result.ok, false)

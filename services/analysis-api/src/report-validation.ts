@@ -258,15 +258,41 @@ function qualifiedTechnicalEvidence(fact: ReportFact) {
   if (fact.type !== 'technical_evidence') return false
   const evidence = asRecord(fact.value)
   const structures = asRecord(evidence.structures)
+  const indicators = asRecord(evidence.indicators)
+  const macd = asRecord(indicators.macd)
+  const volatility = asRecord(evidence.volatility)
+  const drawdown = asRecord(evidence.drawdown)
+  const volumePrice = asRecord(evidence.volumePrice)
+  const keyLevels = asRecord(evidence.keyLevels)
+  const finite = (value: unknown) => typeof value === 'number' && Number.isFinite(value)
+  const validWindow = (name: string, size: number) => {
+    const window = asRecord(structures[name])
+    if (window.status === 'available') {
+      return window.barCount === size && finite(window.returnPct)
+        && finite(window.high) && finite(window.low) && Number(window.low) <= Number(window.high)
+    }
+    return window.status === 'unavailable'
+      && Number.isInteger(window.barCount) && Number(window.barCount) >= 0
+      && Number(window.barCount) < size
+      && typeof window.reason === 'string' && window.reason.trim() !== ''
+  }
   return typeof evidence.actualStart === 'string' && evidence.actualStart.trim() !== ''
     && typeof evidence.actualEnd === 'string' && evidence.actualEnd.trim() !== ''
     && typeof evidence.totalBarCount === 'number' && Number.isInteger(evidence.totalBarCount)
     && evidence.totalBarCount >= 20
-    && ['20d', '60d', '120d', '252d'].every((window) => isRecord(structures[window]))
-    && ['indicators', 'volatility', 'drawdown', 'volumePrice', 'keyLevels']
-      .every((field) => isRecord(evidence[field]))
+    && [['20d', 20], ['60d', 60], ['120d', 120], ['252d', 252]]
+      .every(([name, size]) => validWindow(String(name), Number(size)))
+    && ['ma_5', 'ma_20', 'rsi_14', 'annualized_volatility', 'max_drawdown',
+      'volume_ratio_5_to_20'].every((field) => finite(indicators[field]))
+    && ['line', 'signal', 'histogram'].every((field) => finite(macd[field]))
+    && finite(volatility.annualized) && Number(volatility.annualized) >= 0
+    && finite(drawdown.maximum) && Number(drawdown.maximum) <= 0
+    && finite(volumePrice.volumeRatio5To20) && Number(volumePrice.volumeRatio5To20) >= 0
+    && finite(keyLevels.support) && finite(keyLevels.resistance)
+    && Number(keyLevels.support) <= Number(keyLevels.resistance)
     && Array.isArray(evidence.conflicts)
-    && evidence.conflicts.every((value) => typeof value === 'string')
+    && evidence.conflicts.every((value) => typeof value === 'string'
+      && /^(20d|60d|120d|252d)_vs_(20d|60d|120d|252d)$/.test(value))
 }
 
 function allowedEvidenceFor(judgmentType: string) {

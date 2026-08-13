@@ -85,6 +85,26 @@ def test_alpaca_history_follows_page_token_and_normalizes_daily_bars(monkeypatch
     assert calls[1][1]["page_token"] == "page-2"
 
 
+def test_alpaca_history_keeps_all_paginated_bars_for_252_day_structure(monkeypatch):
+    provider_bars = [{
+        "t": f"2025-01-{index + 1:02d}T04:00:00Z", "o": index + 1,
+        "h": index + 2, "l": index, "c": index + 1.5, "v": 100 + index,
+    } for index in range(20)]
+    provider_bars.extend({
+        "t": f"2025-{index // 28 + 2:02d}-{index % 28 + 1:02d}T04:00:00Z", "o": index + 21,
+        "h": index + 22, "l": index + 20, "c": index + 21.5, "v": 120 + index,
+    } for index in range(240))
+    pages = iter([
+        {"bars": provider_bars[:130], "next_page_token": "page-2"},
+        {"bars": provider_bars[130:], "next_page_token": None},
+    ])
+    monkeypatch.setattr(AlpacaHistorySource, "read", lambda *_args, **_kwargs: next(pages))
+
+    result = AlpacaHistorySource().fetch_range("NVDA", "2025-01-01", "2026-01-01")
+
+    assert len(result) == 260
+
+
 def test_alpaca_news_follows_page_token_and_maps_metadata(monkeypatch):
     calls = []
     pages = iter([
