@@ -526,7 +526,7 @@ export function createTestProductDatabase() {
 
   return {
     productDatabase: {
-      checkSchema: async () => ({ status: 'ok' as const, version: 15 }),
+      checkSchema: async () => ({ status: 'ok' as const, version: 16 }),
       close: async () => {},
     },
     portfolioRepository,

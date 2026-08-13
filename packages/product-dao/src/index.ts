@@ -6,7 +6,7 @@ import {
   type ExecutionSettingsSnapshot, type RuntimeSettings, type RuntimeSettingsRevision,
 } from '@vibe-invest/contracts'
 
-export const schemaVersion = 15
+export const schemaVersion = 16
 
 const migrationSql = `
 CREATE TABLE IF NOT EXISTS product_schema_migrations (
@@ -287,6 +287,15 @@ CREATE TABLE IF NOT EXISTS tool_batch_calls (
     CHECK ((status = 'running') = (completed_at IS NULL))
 );
 
+CREATE TABLE IF NOT EXISTS tool_event_migration_provenance (
+  session_id text NOT NULL,
+  sequence integer NOT NULL,
+  provenance text NOT NULL CHECK (provenance = 'pre_registry_v12'),
+  recorded_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (session_id, sequence),
+  FOREIGN KEY (session_id, sequence) REFERENCES agent_events(session_id, sequence) ON DELETE CASCADE
+);
+
 ALTER TABLE model_requests DROP CONSTRAINT IF EXISTS model_requests_projection_id_fkey;
 ALTER TABLE model_requests DROP CONSTRAINT IF EXISTS model_requests_projection_id_execution_id_fkey;
 ALTER TABLE tool_call_batches DROP CONSTRAINT IF EXISTS tool_call_batches_projection_id_fkey;
@@ -317,6 +326,13 @@ ALTER TABLE tool_projection_versions ADD CONSTRAINT tool_projection_versions_sta
 ALTER TABLE tool_batch_calls ADD COLUMN IF NOT EXISTS started_at timestamptz;
 ALTER TABLE tool_batch_calls ADD COLUMN IF NOT EXISTS completion_order integer;
 ALTER TABLE tool_batch_calls ADD COLUMN IF NOT EXISTS result_payload_json jsonb;
+INSERT INTO tool_event_migration_provenance (session_id, sequence, provenance)
+SELECT event.session_id, event.sequence, 'pre_registry_v12'
+FROM agent_events event
+CROSS JOIN vibe_invest_migration_provenance provenance
+WHERE provenance.max_version <= 12
+  AND event.payload_json->>'type' IN ('tool_call', 'tool_result')
+ON CONFLICT (session_id, sequence) DO NOTHING;
 UPDATE tool_batch_calls call SET
   completion_order = COALESCE(call.completion_order, call.position),
   result_payload_json = CASE WHEN call.tool_name = 'tool_not_available' THEN jsonb_build_object(
@@ -333,14 +349,18 @@ DO $$
 DECLARE
   target record;
   candidate_count integer;
-  relevant_batch_count integer;
   authoritative_call_id text;
   authoritative_name text;
 BEGIN
   FOR target IN
-    SELECT event.session_id, event.sequence, event.operation_id, event.payload_json, event.created_at
+    SELECT event.session_id, event.sequence, event.operation_id, event.payload_json
     FROM agent_events event
     WHERE event.payload_json->>'type' IN ('tool_call', 'tool_result')
+      AND NOT EXISTS (
+        SELECT 1 FROM tool_event_migration_provenance provenance
+        WHERE provenance.session_id = event.session_id AND provenance.sequence = event.sequence
+          AND provenance.provenance = 'pre_registry_v12'
+      )
   LOOP
     SELECT count(*), min(call.tool_call_id), min(call.tool_name)
       INTO candidate_count, authoritative_call_id, authoritative_name
@@ -350,7 +370,6 @@ BEGIN
     JOIN tool_projection_versions projection ON projection.id = batch.projection_id
     JOIN tool_batch_calls call ON call.batch_id = batch.id
     WHERE session.id = target.session_id
-      AND target.created_at >= batch.created_at
       AND target.operation_id IN (
         'execution:' || batch.execution_id || ':'
           || CASE projection.role WHEN 'main' THEN 'tool' WHEN 'fundamental' THEN 'specialist-tool' END
@@ -361,18 +380,6 @@ BEGIN
           || ':' || call.tool_call_id
       )
       AND (projection.visible_tool_names_json ? call.tool_name OR call.tool_name = 'tool_not_available');
-    IF candidate_count = 0 THEN
-      SELECT count(*) INTO relevant_batch_count
-      FROM agent_executions execution
-      JOIN tool_call_batches batch ON batch.execution_id = execution.id
-      WHERE execution.session_id = target.session_id
-        AND target.created_at >= batch.created_at
-        AND (
-          target.operation_id LIKE 'execution:' || execution.id || ':%'
-          OR target.operation_id LIKE batch.id || ':cancelled-%'
-        );
-      IF relevant_batch_count = 0 THEN CONTINUE; END IF;
-    END IF;
     IF candidate_count <> 1 THEN
       RAISE EXCEPTION 'tool_event_call_association_failed:%:%', target.session_id, target.sequence;
     END IF;
@@ -491,6 +498,10 @@ INSERT INTO product_schema_migrations (version)
 VALUES (15)
 ON CONFLICT (version) DO NOTHING;
 
+INSERT INTO product_schema_migrations (version)
+VALUES (16)
+ON CONFLICT (version) DO NOTHING;
+
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM vibe_invest_app;
 REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM vibe_invest_app;
 GRANT SELECT ON product_schema_migrations TO vibe_invest_app;
@@ -521,6 +532,43 @@ export async function migrate(connectionString: string) {
   try {
     await client.query('BEGIN')
     await client.query('SELECT pg_advisory_xact_lock($1)', [8_613_091])
+    const migrationTable = await client.query<{ exists: boolean }>(
+      `SELECT to_regclass('public.product_schema_migrations') IS NOT NULL AS exists`,
+    )
+    let provenance: {
+      max_version: number
+      had_v13: boolean; v13_applied_at: string | null
+      had_v14: boolean; v14_applied_at: string | null
+    } = {
+      max_version: 0,
+      had_v13: false, v13_applied_at: null, had_v14: false, v14_applied_at: null,
+    }
+    if (migrationTable.rows[0]?.exists) {
+      const existing = await client.query<typeof provenance>(
+        `SELECT
+           COALESCE(max(version), 0)::integer AS max_version,
+           EXISTS (SELECT 1 FROM product_schema_migrations WHERE version = 13) AS had_v13,
+           (SELECT applied_at::text FROM product_schema_migrations WHERE version = 13) AS v13_applied_at,
+           EXISTS (SELECT 1 FROM product_schema_migrations WHERE version = 14) AS had_v14,
+           (SELECT applied_at::text FROM product_schema_migrations WHERE version = 14) AS v14_applied_at
+         FROM product_schema_migrations`,
+      )
+      provenance = existing.rows[0]!
+    }
+    await client.query(
+      `CREATE TEMP TABLE vibe_invest_migration_provenance (
+         max_version integer NOT NULL,
+         had_v13 boolean NOT NULL, v13_applied_at timestamptz,
+         had_v14 boolean NOT NULL, v14_applied_at timestamptz
+       ) ON COMMIT DROP`,
+    )
+    await client.query(
+      `INSERT INTO vibe_invest_migration_provenance
+         (max_version, had_v13, v13_applied_at, had_v14, v14_applied_at)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [provenance.max_version, provenance.had_v13, provenance.v13_applied_at,
+        provenance.had_v14, provenance.v14_applied_at],
+    )
     await client.query(migrationSql)
     await client.query('COMMIT')
   } catch (error) {

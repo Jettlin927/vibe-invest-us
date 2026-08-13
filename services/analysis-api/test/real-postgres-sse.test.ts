@@ -20,7 +20,7 @@ import { createPiModel, type ModelEvent, type ToolRuntime } from '../src/model.j
 const databaseUrl = process.env.TEST_DATABASE_URL
 const migrationDatabaseUrl = process.env.TEST_MIGRATION_DATABASE_URL
 
-test('真实 v12 历史 Tool 事件升级后经 DAO、HTTP 与 SSE 原样读取', {
+test('真实 v12 历史 Tool 事件升级到 v16 后经 DAO、HTTP 与 SSE 原样读取', {
   skip: !databaseUrl || !migrationDatabaseUrl,
   concurrency: false,
 }, async () => {
@@ -36,7 +36,8 @@ test('真实 v12 历史 Tool 事件升级后经 DAO、HTTP 与 SSE 原样读取'
   await migrate(migrationDatabaseUrl!)
   try {
     await migrationPool.query(
-      'DROP TABLE tool_batch_calls, tool_call_batches, model_requests, tool_projection_versions',
+      `DROP TABLE tool_event_migration_provenance, tool_batch_calls,
+         tool_call_batches, model_requests, tool_projection_versions`,
     )
     await migrationPool.query('DELETE FROM product_schema_migrations WHERE version > 12')
     await migrationPool.query(
@@ -152,7 +153,7 @@ test('真实 v14 Tool 事件迁移后经 DAO、HTTP 与 SSE 只公开稳定调�
       [sessionId, `execution:${executionId}:tool:${toolCallId}:call`,
         `execution:${executionId}:tool:${toolCallId}:result`],
     )
-    await migrationPool.query('DELETE FROM product_schema_migrations WHERE version = 15')
+    await migrationPool.query('DELETE FROM product_schema_migrations WHERE version = 16')
     await migrate(migrationDatabaseUrl!)
 
     const pool = createPool(databaseUrl!)
