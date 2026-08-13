@@ -104,16 +104,11 @@ export type AnalyzeInput = {
     researchQuestion: string
     reason: string
   }) => Promise<Record<string, unknown>>
-  searchNews?: (
-    keyword: string,
-    signal: AbortSignal,
-  ) => Promise<{ facts: Fact[]; [key: string]: unknown }>
-  fetchTechnicalIndicators?: (
-    symbol: string,
-    startDate: string,
-    endDate: string,
-    signal: AbortSignal,
-  ) => Promise<{ facts: Fact[]; [key: string]: unknown }>
+  runFundamentalSpecialist?: (input: {
+    launch: boolean
+    researchQuestion: string
+    reason: string
+  }) => Promise<Record<string, unknown>>
   signal?: AbortSignal
   executionDeadlineSignal?: AbortSignal
   activeBudget?: ActiveBudget
@@ -137,6 +132,33 @@ export type AnalyzeNewsInput = {
   ) => Promise<{ facts: Fact[]; [key: string]: unknown }>
   readNewsDocument: (
     candidate: Fact, signal: AbortSignal,
+  ) => Promise<{ facts: Fact[]; [key: string]: unknown }>
+  listCompanyEvents: (
+    symbol: string, signal: AbortSignal,
+  ) => Promise<{ facts: Fact[]; [key: string]: unknown }>
+  signal?: AbortSignal
+  executionDeadlineSignal?: AbortSignal
+  activeBudget?: ActiveBudget
+  acquireModelSlot?: (signal: AbortSignal) => Promise<() => void>
+  acquireToolSlot?: (signal: AbortSignal) => Promise<() => void>
+  toolRuntime: ToolRuntime
+}
+
+export type AnalyzeFundamentalInput = {
+  executionId: string
+  runtimeSettings: RuntimeSettings
+  symbol: string
+  systemPrompt: string
+  researchQuestion: string
+  knownFacts: Fact[]
+  getFinancialOverview: (
+    symbol: string, signal: AbortSignal,
+  ) => Promise<{ facts: Fact[]; [key: string]: unknown }>
+  getFinancialMetricSeries: (
+    symbol: string, metric: string, cursor: string | undefined, signal: AbortSignal,
+  ) => Promise<{ facts: Fact[]; [key: string]: unknown }>
+  readFilingDocument: (
+    symbol: string, filingId: string, cursor: string | undefined, signal: AbortSignal,
   ) => Promise<{ facts: Fact[]; [key: string]: unknown }>
   listCompanyEvents: (
     symbol: string, signal: AbortSignal,

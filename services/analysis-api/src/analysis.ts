@@ -9,8 +9,12 @@ import {
   type AgentExecutionStatus, type RuntimeSettings,
 } from '@vibe-invest/contracts'
 
-import type { AnalyzeInput, AnalyzeNewsInput, AnalysisReport, ModelEvent, ToolRuntime } from './model.js'
-import type { FactQueryResult, FinancialContext, FinancialFact } from './financial-data-client.js'
+import type {
+  AnalyzeFundamentalInput, AnalyzeInput, AnalyzeNewsInput, AnalysisReport, ModelEvent, ToolRuntime,
+} from './model.js'
+import type {
+  FactQueryResult, FinancialContext, FinancialFact, PaginatedFactQueryResult,
+} from './financial-data-client.js'
 import { acquireActiveSlot, createActiveBudget, createConcurrencyGate } from './runtime-policy.js'
 import { analysisModelTools } from './tools.js'
 
@@ -18,6 +22,7 @@ type Fact = FinancialFact
 type Model = {
   analyze(input: AnalyzeInput): AsyncIterable<ModelEvent>
   analyzeNews?: (input: AnalyzeNewsInput) => AsyncIterable<ModelEvent>
+  analyzeFundamental?: (input: AnalyzeFundamentalInput) => AsyncIterable<ModelEvent>
 }
 
 export function createAnalysisService(options: {
@@ -32,6 +37,16 @@ export function createAnalysisService(options: {
   searchWebEvidence?: (query: string, signal: AbortSignal) => Promise<FactQueryResult>
   readNewsDocument?: (candidate: Fact, signal: AbortSignal) => Promise<FactQueryResult>
   listCompanyEvents?: (symbol: string, signal: AbortSignal) => Promise<FactQueryResult>
+  listOfficialCompanyEvents?: (symbol: string, signal: AbortSignal) => Promise<FactQueryResult>
+  getFinancialOverview?: (
+    symbol: string, signal: AbortSignal,
+  ) => Promise<{ facts: FinancialFact[]; overview: Record<string, unknown>; sources?: unknown[] }>
+  getFinancialMetricSeries?: (
+    symbol: string, metric: string, cursor: string | undefined, signal: AbortSignal,
+  ) => Promise<PaginatedFactQueryResult>
+  readFilingDocument?: (
+    symbol: string, filingId: string, cursor: string | undefined, signal: AbortSignal,
+  ) => Promise<PaginatedFactQueryResult>
   fetchTechnicalIndicators?: (
     symbol: string, startDate: string, endDate: string, signal: AbortSignal,
   ) => Promise<FactQueryResult>
@@ -393,6 +408,9 @@ export function createAnalysisService(options: {
       const runtimeContext = createInitialRuntimeContext(modelContext, portfolioContext)
       const newsRuntimeAvailable = Boolean(options.model.analyzeNews && options.searchNewsCandidates
         && options.readNewsDocument && options.listCompanyEvents)
+      const fundamentalRuntimeAvailable = Boolean(options.model.analyzeFundamental
+        && options.getFinancialOverview && options.getFinancialMetricSeries
+        && options.readFilingDocument && options.listOfficialCompanyEvents)
       const runNewsSpecialist = async (request: {
         launch: boolean; researchQuestion: string; reason: string
       }) => {
@@ -504,6 +522,115 @@ export function createAnalysisService(options: {
           ...specialistResultProjection(specialistReportVersion.report, request.researchQuestion),
         }
       }
+      const runFundamentalSpecialist = async (request: {
+        launch: boolean; researchQuestion: string; reason: string
+      }) => {
+        if (!options.model.analyzeFundamental || !options.getFinancialOverview
+          || !options.getFinancialMetricSeries || !options.readFilingDocument
+          || !options.listOfficialCompanyEvents) throw new Error('fundamental_specialist_runtime_unavailable')
+        await setStatus(
+          sessionId, executionId,
+          `execution:${executionId}:fundamental-specialist:waiting`, 'waiting_for_specialists', {},
+          '基本面专项分析',
+        )
+        const specialistSessionId = randomUUID()
+        const specialistExecutionId = randomUUID()
+        const createdAt = new Date().toISOString()
+        const specialistSession = await options.eventRepository.createSpecialistSession({
+          id: specialistSessionId, analysisId, executionId: specialistExecutionId,
+          domain: 'fundamental_valuation', segmentId: randomUUID(), status: 'planning',
+          operationId: `session:${specialistSessionId}:created`,
+          event: {
+            type: 'specialist_context', domain: 'fundamental_valuation', launch: request.launch,
+            researchQuestion: request.researchQuestion, reason: request.reason,
+            status: 'planning', at: createdAt,
+          },
+          createdAt,
+        })
+        if (!specialistSession.created) {
+          const versions = await options.eventRepository.listReportVersions(analysisId)
+          const existing = versions.filter(({ sessionId }) => sessionId === specialistSession.sessionId).at(-1)
+          await setStatus(
+            sessionId, executionId,
+            `execution:${executionId}:fundamental-specialist:resumed`, 'running_tools', {},
+          )
+          return {
+            launched: true, status: existing ? 'completed' : 'not_started',
+            sessionId: specialistSession.sessionId, executionId: specialistSession.executionId,
+            ...(existing ? { reportId: existing.id, reportVersion: existing.version } : {}),
+            summary: request.researchQuestion, keyFactIds: [], contraryFactIds: [], gaps: [],
+          }
+        }
+        let specialistStatus = 'failed'
+        let specialistReportVersion: ReturnType<typeof finalReportVersion> | undefined
+        try {
+          await setStatus(
+            specialistSessionId, specialistExecutionId,
+            `execution:${specialistExecutionId}:running-model`, 'running_model', {}, '基本面专项模型',
+          )
+          for await (const specialistEvent of options.model.analyzeFundamental({
+            executionId: specialistExecutionId, runtimeSettings, symbol: job.symbol,
+            systemPrompt: '你是独立基本面 Agent。只使用财务概览、指标序列、Filing 和官方公司事件；每项判断引用正式或确定性财务事实，禁止个人买卖或仓位建议。',
+            researchQuestion: request.researchQuestion, knownFacts: modelContext.facts,
+            getFinancialOverview: options.getFinancialOverview,
+            getFinancialMetricSeries: options.getFinancialMetricSeries,
+            readFilingDocument: options.readFilingDocument,
+            listCompanyEvents: options.listOfficialCompanyEvents,
+            signal: controller.signal, executionDeadlineSignal: wallDeadline, activeBudget,
+            acquireModelSlot: (signal) => modelGate.acquire(signal),
+            acquireToolSlot: (signal) => toolGate.acquire(signal), toolRuntime,
+          })) {
+            if (specialistEvent.type === 'lifecycle') await setStatus(
+              specialistSessionId, specialistExecutionId, specialistEvent.operationId,
+              specialistEvent.status, {
+                terminal: specialistEvent.status === 'budget_exhausted' ? false : undefined,
+              }, specialistEvent.waitTarget,
+            )
+            else if (specialistEvent.type === 'trace'
+              && (specialistEvent.entry.type !== 'tool_result'
+                || typeof specialistEvent.entry.operationId !== 'string')) {
+              await appendTrace(specialistSessionId, specialistExecutionId, specialistEvent.entry)
+            }
+            else if (specialistEvent.type === 'text_delta') await appendTrace(
+              specialistSessionId, specialistExecutionId, specialistEvent.operationId
+                ? specialistEvent : { ...specialistEvent,
+                    operationId: `execution:${specialistExecutionId}:text:${Date.now()}` },
+            )
+            else if (specialistEvent.type === 'completed' && specialistEvent.reportVersion) {
+              const candidate = specialistEvent.reportVersion
+              const candidateReport = candidate.report as Record<string, unknown>
+              const status = candidateReport.status === 'partial' ? 'partial' : 'completed'
+              specialistStatus = status
+              specialistReportVersion = finalReportVersion(
+                specialistExecutionId, candidate, specialistEvent.report, status, [],
+              )
+              await setStatus(
+                specialistSessionId, specialistExecutionId,
+                `execution:${specialistExecutionId}:status-${status}`, status,
+                { reportVersion: specialistReportVersion },
+              )
+            }
+          }
+          if (!specialistReportVersion) throw new Error('specialist_report_required')
+        } catch (error) {
+          await setStatus(
+            specialistSessionId, specialistExecutionId,
+            `execution:${specialistExecutionId}:status-failed`, 'failed',
+            { error: error instanceof Error ? error.message : String(error) },
+          )
+          throw error
+        }
+        await setStatus(
+          sessionId, executionId,
+          `execution:${executionId}:fundamental-specialist:completed`, 'running_tools', {},
+        )
+        return {
+          launched: true, status: specialistStatus, sessionId: specialistSessionId,
+          executionId: specialistExecutionId, reportId: specialistReportVersion.id,
+          reportVersion: 1,
+          ...specialistResultProjection(specialistReportVersion.report, request.researchQuestion),
+        }
+      }
       await appendEvent(
         sessionId, executionId, operationId('running-model'),
         { type: 'status', status: 'running_model' },
@@ -524,9 +651,8 @@ export function createAnalysisService(options: {
         activeBudget,
         acquireModelSlot: (signal) => modelGate.acquire(signal),
         acquireToolSlot: (signal) => toolGate.acquire(signal),
-        searchNews: options.searchNews,
         runNewsSpecialist: newsRuntimeAvailable ? runNewsSpecialist : undefined,
-        fetchTechnicalIndicators: options.fetchTechnicalIndicators,
+        runFundamentalSpecialist: fundamentalRuntimeAvailable ? runFundamentalSpecialist : undefined,
         toolRuntime,
       })) {
         resumeProcessing()
@@ -692,11 +818,12 @@ export function createAnalysisService(options: {
         ...(reportVersion ? { reportVersion } : {}),
       } : null
     }))
-    const newsDecision = trace.find((event) => {
-      if (event.type !== 'tool_result' || event.name !== 'run_news_analysis') return false
+    const specialistDecision = (toolName: string) => trace.find((event) => {
+      if (event.type !== 'tool_result' || event.name !== toolName) return false
       const result = event.result as Record<string, unknown> | undefined
       return result?.launched === false
     })
+    const newsDecision = specialistDecision('run_news_analysis')
     const newsResult = newsDecision?.result as Record<string, unknown> | undefined
     const projectedSpecialists: Array<Record<string, unknown>> = specialistAgents.filter(
       (specialist): specialist is NonNullable<typeof specialist> => specialist !== null,
@@ -708,6 +835,17 @@ export function createAnalysisService(options: {
       } : {
         domain: 'news', status: 'not_started',
         reason: '主 Agent 尚未作出消息面专项启动决定。',
+      })
+    }
+    const fundamentalDecision = specialistDecision('run_fundamental_analysis')
+    const fundamentalResult = fundamentalDecision?.result as Record<string, unknown> | undefined
+    if (!projectedSpecialists.some((specialist) => specialist?.domain === 'fundamental_valuation')) {
+      projectedSpecialists.push(fundamentalResult ? {
+        domain: 'fundamental_valuation', status: 'not_started',
+        researchQuestion: fundamentalResult.researchQuestion, reason: fundamentalResult.reason,
+      } : {
+        domain: 'fundamental_valuation', status: 'not_started',
+        reason: '主 Agent 尚未作出基本面专项启动决定。',
       })
     }
     return {
@@ -813,7 +951,7 @@ function waitTarget(status: AgentExecutionStatus) {
 }
 
 const ANALYSIS_SYSTEM_PROMPT = `你是个人美股研究助手，分析周期为未来一至四周。
-你可以自主规划分析路径。建议先确认本次冻结的金融上下文；按需调用 fetch_financial_context，遇到需要深入解释财报时可调用 analyze_financials。财报专家可通过受控工具补查关键词新闻和指定日期范围的技术指标。只能使用提供的只读工具，最终必须调用 submit_analysis_report 提交报告。
+你可以自主规划分析路径。建议先确认本次冻结的金融上下文；按需调用 fetch_financial_context。需要深入解释正式财务事实时，必须通过 run_fundamental_analysis 明确决定是否启动独立基本面 Agent；消息面同理通过 run_news_analysis 明确决定。专项 Agent 只接收本领域受控工具，主 Agent 最终必须调用 submit_analysis_report 提交报告。
 不得编造行情、新闻、财报、估值或持仓；所有事实判断只能引用工具结果中真实存在的事实 ID。
 每条 keyJudgments 都必须关联一个或多个事实 ID；supportingEvidence 和 contraryEvidence 也必须引用事实 ID。
 财报增长率、利润率、TTM、自由现金流、质量标记、技术指标与估值结果由宿主程序计算，你只负责解释，不重新计算或改写输入数字。

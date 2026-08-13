@@ -5,12 +5,13 @@ from typing import Literal, List, Optional
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-from app.adapters import read_limited_document, search_web
+from app.adapters import SecFilingSource, read_limited_document, search_web
 from app.context import (
     build_financial_context, company_event_facts, read_news_document_fact,
-    search_news_facts, technical_indicator_facts, web_search_lead_facts,
+    filing_document_page, financial_metric_series_result, financial_overview_facts, search_news_facts,
+    official_company_event_facts, technical_indicator_facts, web_search_lead_facts,
 )
-from app.models import AtomicFact, FactQueryResult, FinancialContext, NewsDocumentResult, QuoteBatch, QuoteSnapshot, SourceStatus
+from app.models import AtomicFact, FactQueryResult, FilingDocumentResult, FinancialContext, FinancialOverviewResult, NewsDocumentResult, PaginatedFactResult, QuoteBatch, QuoteSnapshot, SourceStatus
 from app.source_config import build_sources, load_source_config
 
 
@@ -38,6 +39,32 @@ def financial_context(symbol: str) -> FinancialContext:
         news_sources=build_sources(source_config, "news"),
         fundamentals_source=next(iter(build_sources(source_config, "fundamentals")), None),
         valuation_source=next(iter(build_sources(source_config, "valuation")), None),
+    )
+
+
+@app.post("/v1/financial-overview", operation_id="getFinancialOverview", response_model=FinancialOverviewResult)
+def financial_overview(symbol: str) -> FinancialOverviewResult:
+    overview, facts, sources = financial_overview_facts(
+        symbol.strip().upper(), datetime.now(timezone.utc),
+        next(iter(build_sources(source_config, "fundamentals")), None),
+    )
+    return FinancialOverviewResult(overview=overview, facts=facts, sources=sources)
+
+
+@app.post("/v1/financial-metric-series", operation_id="getFinancialMetricSeries", response_model=PaginatedFactResult)
+def financial_metric_series_endpoint(symbol: str, metric: str, cursor: Optional[str] = None) -> PaginatedFactResult:
+    return financial_metric_series_result(
+        symbol.strip().upper(), metric, cursor,
+        next(iter(build_sources(source_config, "fundamentals")), None), datetime.now(timezone.utc),
+    )
+
+
+@app.post("/v1/filing-document", operation_id="readFilingDocument", response_model=FilingDocumentResult)
+def filing_document(symbol: str, filing_id: str, cursor: Optional[str] = None) -> FilingDocumentResult:
+    normalized_symbol = symbol.strip().upper()
+    filing = SecFilingSource(timeout=10).fetch(normalized_symbol, filing_id)
+    return filing_document_page(
+        normalized_symbol, filing_id, cursor, filing, datetime.now(timezone.utc),
     )
 
 
@@ -90,6 +117,14 @@ def web_search(query: str) -> FactQueryResult:
 def company_events(symbol: str) -> FactQueryResult:
     facts, sources = company_event_facts(
         symbol, datetime.now(timezone.utc), build_sources(source_config, "news"),
+    )
+    return FactQueryResult(facts=facts, sources=sources)
+
+
+@app.post("/v1/official-company-events", operation_id="listOfficialCompanyEvents", response_model=FactQueryResult)
+def official_company_events(symbol: str) -> FactQueryResult:
+    facts, sources = official_company_event_facts(
+        symbol, datetime.now(timezone.utc), SecFilingSource(timeout=10),
     )
     return FactQueryResult(facts=facts, sources=sources)
 

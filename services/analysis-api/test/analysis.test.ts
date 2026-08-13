@@ -169,6 +169,7 @@ test('主 Agent 启动的消息面 Agent 拥有独立 Session、轨迹和不可�
     searchNewsCandidates: async () => ({ facts: [] }),
     readNewsDocument: async () => ({ facts: [] }),
     listCompanyEvents: async () => ({ facts: [] }),
+    listOfficialCompanyEvents: async () => ({ facts: [] }),
     model,
   })
   await app.ready()
@@ -180,11 +181,11 @@ test('主 Agent 启动的消息面 Agent 拥有独立 Session、轨迹和不可�
   const research = (await app.inject({
     method: 'GET', url: `/api/research/${created.analysisId}`,
   })).json()
-  assert.equal(research.specialistAgents.length, 1)
-  assert.equal(research.specialistAgents[0].domain, 'news')
-  assert.equal(research.specialistAgents[0].isPrimary, false)
-  assert.equal(research.specialistAgents[0].execution.status, 'completed')
-  assert.match(JSON.stringify(research.specialistAgents[0].events), /近 30 天是否有重大公司事件/)
+  const newsAgent = research.specialistAgents.find((agent: any) => agent.domain === 'news')
+  assert.equal(newsAgent.domain, 'news')
+  assert.equal(newsAgent.isPrimary, false)
+  assert.equal(newsAgent.execution.status, 'completed')
+  assert.match(JSON.stringify(newsAgent.events), /近 30 天是否有重大公司事件/)
   assert.ok(research.mainAgent.events.some((event: Record<string, unknown>) => (
     event.status === 'waiting_for_specialists'
   )))
@@ -198,6 +199,79 @@ test('主 Agent 启动的消息面 Agent 拥有独立 Session、轨迹和不可�
     { kind: 'specialist', domain: 'news' },
     { kind: 'integrated', domain: null },
   ])
+  await app.close()
+})
+
+test('主 Agent 启动的基本面 Agent 拥有独立 Session、受限工具和不可变专项报告版本', async () => {
+  const database = createTestProductDatabase()
+  const fundamentalFact = {
+    ...fact, id: 'fact:fundamental:revenue', type: 'reported_financial',
+    evidenceLevel: 'reported_financial', source: 'sec',
+    sourceReference: 'https://www.sec.gov/Archives/example',
+  }
+  const specialistReport = {
+    kind: 'specialist' as const, domain: 'fundamental_valuation', availability: 'available' as const,
+    status: 'completed' as const, gaps: [], limitations: [], keyJudgments: [{
+      type: 'fundamental', statement: '收入质量稳定', direction: 'bullish', confidence: 'medium',
+      supportingEvidence: [fundamentalFact.id], contraryEvidence: [],
+      contraryEvidenceStatus: 'none_found', invalidationConditions: ['正式财报下修收入'],
+    }],
+  }
+  const model = {
+    async *analyze(input: Parameters<ReturnType<typeof createPiModel>['analyze']>[0]) {
+      const result = await input.runFundamentalSpecialist!({
+        launch: true, researchQuestion: '最新财务质量是否改变方向？', reason: '需要核实正式财务证据。',
+      })
+      assert.equal(result.status, 'completed')
+      yield { type: 'completed' as const, report, reportVersion: {
+        kind: 'integrated' as const, report: reportCandidate,
+      } }
+    },
+    async *analyzeFundamental(input: any) {
+      assert.equal(input.portfolioContext, undefined)
+      yield { type: 'trace' as const, entry: {
+        type: 'tool_result' as const, name: 'get_financial_overview', toolCallId: 'overview',
+        result: { facts: [fundamentalFact], overview: { latestPeriod: '2026-Q2' } },
+        isError: false, startedAt: null, completedAt: '2026-08-13T03:00:00.000Z', completionOrder: 1,
+        operationId: `execution:${input.executionId}:fundamental-tool:overview:result`,
+      } }
+      yield { type: 'completed' as const, report: specialistReport, reportVersion: {
+        kind: 'specialist' as const, report: specialistReport,
+      } }
+    },
+  }
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fundamentalFact], gaps: [] }),
+    getFinancialOverview: async () => ({ facts: [fundamentalFact], overview: { latestPeriod: '2026-Q2' } }),
+    getFinancialMetricSeries: async () => ({
+      facts: [], returnedCount: 0, totalCount: 0, nextCursor: null, truncated: false,
+    }),
+    readFilingDocument: async () => ({
+      facts: [], items: [], returnedCount: 0, totalCount: 0, nextCursor: null, truncated: false,
+    }),
+    listCompanyEvents: async () => ({ facts: [] }),
+    listOfficialCompanyEvents: async () => ({ facts: [] }), model,
+  } as any)
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'FUNDAGENT' },
+  })).json()
+  await waitForStatus(app as any, created.analysisId, 'completed')
+
+  const research = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  const specialist = research.specialistAgents.find((agent: any) => agent.domain === 'fundamental_valuation')
+  assert.equal(specialist.execution.status, 'completed')
+  assert.match(JSON.stringify(specialist.events), /最新财务质量是否改变方向/)
+  const versions = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}/report-versions`,
+  })).json().items
+  assert.ok(versions.some(({ kind, report: versionReport }: any) => (
+    kind === 'specialist' && versionReport.domain === 'fundamental_valuation'
+  )))
   await app.close()
 })
 
@@ -239,6 +313,9 @@ test('主 Agent 未启动消息面 Agent 时研究投影保留研究问题和理
     domain: 'news', status: 'not_started',
     researchQuestion: '近期是否有改变预期的公司事件？',
     reason: '当前事实已覆盖研究问题。',
+  }, {
+    domain: 'fundamental_valuation', status: 'not_started',
+    reason: '主 Agent 尚未作出基本面专项启动决定。',
   }])
   await app.close()
 })
@@ -265,6 +342,9 @@ test('主 Agent 尚未决定时研究投影也固定显示消息面专项视角'
   })).json()
   assert.deepEqual(research.specialistAgents, [{
     domain: 'news', status: 'not_started', reason: '主 Agent 尚未作出消息面专项启动决定。',
+  }, {
+    domain: 'fundamental_valuation', status: 'not_started',
+    reason: '主 Agent 尚未作出基本面专项启动决定。',
   }])
   await app.close()
 })
@@ -1269,7 +1349,7 @@ test('首次研究起始资料完整描述能力、工具与报告目标且不�
   assert.equal(runtimeContext.capabilityStatus.news.status, 'unavailable')
   assert.equal(runtimeContext.capabilityStatus.valuation.status, 'unavailable')
   assert.deepEqual(runtimeContext.availableTools.map(({ name }: { name: string }) => name), [
-    'fetch_financial_context', 'analyze_financials', 'run_news_analysis', 'submit_analysis_report',
+    'fetch_financial_context', 'run_fundamental_analysis', 'run_news_analysis', 'submit_analysis_report',
   ])
   assert.deepEqual(runtimeContext.specialistCapabilities, [
     { domain: 'news', responsibility: '核实消息、公司事件及相反证据' },

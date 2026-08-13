@@ -49,6 +49,14 @@ const app = buildApp({
   searchWebEvidence: (query, signal) => financialData.searchWeb(query, signal),
   readNewsDocument: (candidate, signal) => financialData.readNewsDocument(candidate, signal),
   listCompanyEvents: (symbol, signal) => financialData.companyEvents(symbol, signal),
+  listOfficialCompanyEvents: (symbol, signal) => financialData.officialCompanyEvents(symbol, signal),
+  getFinancialOverview: (symbol, signal) => financialData.financialOverview(symbol, signal),
+  getFinancialMetricSeries: (symbol, metric, cursor, signal) => (
+    financialData.financialMetricSeries(symbol, metric, cursor, signal)
+  ),
+  readFilingDocument: (symbol, filingId, cursor, signal) => (
+    financialData.filingDocument(symbol, filingId, cursor, signal)
+  ),
   fetchTechnicalIndicators: (symbol, startDate, endDate, signal) => (
     financialData.technicalIndicators(symbol, startDate, endDate, signal)
   ),

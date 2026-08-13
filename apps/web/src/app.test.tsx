@@ -345,6 +345,47 @@ test('研究页独立展示消息面专项的工具轨迹、证据缺口和版�
   assert.match(specialist.textContent ?? '', /产品事件对近期预期偏正面.*中等/)
 })
 
+test('研究页固定展示基本面专项，并独立展示工具轨迹和不可变版本', async () => {
+  setupDom()
+  const record = {
+    id: 'fundamental-completed', symbol: 'NVDA', status: 'completed', report: null, facts: [], trace: [],
+    specialistAgents: [{
+      id: 'fundamental-session', domain: 'fundamental_valuation', status: 'completed',
+      researchQuestion: '最新财务质量是否改变方向？', reason: '需要核验正式财务事实。',
+      execution: { id: 'fundamental-execution', generation: 1, status: 'completed' },
+      events: [
+        { sequence: 1, type: 'tool_call', name: 'get_financial_overview', createdAt: '2026-08-13T03:00:00Z' },
+        { sequence: 2, type: 'tool_call', name: 'read_filing_document', createdAt: '2026-08-13T03:00:01Z' },
+      ],
+      reportVersion: { version: 1, report: {
+        gaps: [{ capability: 'guidance', reason: '未发现正式指引', impact: '置信度受限' }],
+        keyJudgments: [{ statement: '正式财务事实支持基本面偏强', direction: 'bullish', confidence: 'medium' }],
+      } },
+    }],
+  }
+  globalThis.fetch = async (input) => {
+    const url = String(input)
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok' }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/settings') return Response.json({ ...settingsResponse(), model: { configured: false } })
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+    if (url === '/api/portfolio') return Response.json(portfolioResponse([]))
+    if (url === '/api/research') return Response.json({ records: [{ id: record.id, symbol: record.symbol, status: record.status }] })
+    if (url === '/api/research/fundamental-completed') return Response.json(record)
+    throw new Error(`unexpected_fetch:${url}`)
+  }
+  const view = render(React.createElement(App))
+  const user = userEvent.setup({ document: window.document })
+  await user.click(await view.findByRole('button', { name: '新建分析' }))
+  await user.click(await view.findByRole('button', { name: /打开 NVDA/ }))
+
+  const specialist = await view.findByRole('region', { name: '基本面专项 Agent' })
+  assert.match(specialist.textContent ?? '', /get_financial_overview/)
+  assert.match(specialist.textContent ?? '', /read_filing_document/)
+  assert.match(specialist.textContent ?? '', /报告版本 1/)
+  assert.match(specialist.textContent ?? '', /未发现正式指引.*置信度受限/)
+  assert.match(specialist.textContent ?? '', /正式财务事实支持基本面偏强.*中等/)
+})
+
 test('模型未配置时首次研究创建后立即打开主 Agent 生命周期', async () => {
   setupDom()
   let created = false

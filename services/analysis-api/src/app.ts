@@ -11,7 +11,9 @@ import type {
 
 import { createAnalysisService } from './analysis.js'
 import type { ModelEvent } from './model.js'
-import type { FactQueryResult, FinancialContext } from './financial-data-client.js'
+import type {
+  FactQueryResult, FinancialContext, PaginatedFactQueryResult,
+} from './financial-data-client.js'
 import { createPortfolio, isValidSymbol, normalizeSymbol } from './portfolio.js'
 
 type AppDependencies = {
@@ -34,6 +36,16 @@ type AppDependencies = {
     candidate: import('./financial-data-client.js').FinancialFact, signal: AbortSignal,
   ) => Promise<FactQueryResult>
   listCompanyEvents?: (symbol: string, signal: AbortSignal) => Promise<FactQueryResult>
+  listOfficialCompanyEvents?: (symbol: string, signal: AbortSignal) => Promise<FactQueryResult>
+  getFinancialOverview?: (
+    symbol: string, signal: AbortSignal,
+  ) => Promise<{ facts: import('./financial-data-client.js').FinancialFact[]; overview: Record<string, unknown>; sources?: unknown[] }>
+  getFinancialMetricSeries?: (
+    symbol: string, metric: string, cursor: string | undefined, signal: AbortSignal,
+  ) => Promise<PaginatedFactQueryResult>
+  readFilingDocument?: (
+    symbol: string, filingId: string, cursor: string | undefined, signal: AbortSignal,
+  ) => Promise<PaginatedFactQueryResult>
   fetchTechnicalIndicators?: (
     symbol: string, startDate: string, endDate: string, signal: AbortSignal,
   ) => Promise<FactQueryResult>
@@ -41,6 +53,7 @@ type AppDependencies = {
   model?: {
     analyze(input: any): AsyncIterable<ModelEvent>
     analyzeNews?: (input: any) => AsyncIterable<ModelEvent>
+    analyzeFundamental?: (input: any) => AsyncIterable<ModelEvent>
   }
   modelConfigured?: boolean
   now?: () => Date
@@ -67,6 +80,10 @@ export function buildApp(dependencies: AppDependencies) {
         searchWebEvidence: dependencies.searchWebEvidence,
         readNewsDocument: dependencies.readNewsDocument,
         listCompanyEvents: dependencies.listCompanyEvents,
+        listOfficialCompanyEvents: dependencies.listOfficialCompanyEvents,
+        getFinancialOverview: dependencies.getFinancialOverview,
+        getFinancialMetricSeries: dependencies.getFinancialMetricSeries,
+        readFilingDocument: dependencies.readFilingDocument,
         fetchTechnicalIndicators: dependencies.fetchTechnicalIndicators,
         fetchMarketPrices: dependencies.fetchMarketPrices,
         listPortfolioSymbols: async () => (await portfolio.list()).map((position) => position.symbol),

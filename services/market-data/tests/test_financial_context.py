@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 
 from app.context import (
     build_financial_context, company_event_facts, read_news_document_fact, search_news_facts,
-    technical_indicator_facts, web_search_lead_facts,
+    official_company_event_facts, technical_indicator_facts, web_search_lead_facts,
 )
 from app.models import DailyBar, NewsItem, Quote
 
@@ -133,6 +133,23 @@ def test_keyword_news_query_returns_traceable_facts_without_symbol_filter():
     assert sources[0].status == "ok"
 
 
+def test_official_company_events_are_qualified_and_do_not_use_news_titles():
+    facts, sources = official_company_event_facts("NVDA", NOW, Source("sec", [{
+        "filingId": "0001045810-26-000123", "form": "10-Q", "filedAt": "2026-07-31",
+        "eventType": "earnings", "sourceReference": "https://www.sec.gov/Archives/event.htm",
+    }]))
+
+    assert len(facts) == 1
+    assert facts[0].type == "company_event"
+    assert facts[0].evidenceLevel == "official_company_event"
+    assert facts[0].sourceReference == "https://www.sec.gov/Archives/event.htm"
+    assert facts[0].value == {
+        "symbol": "NVDA", "filingId": "0001045810-26-000123", "form": "10-Q",
+        "filedAt": "2026-07-31", "eventType": "earnings",
+    }
+    assert sources[0].status == "ok"
+
+
 def test_three_news_sources_must_all_fail_qualification_before_web_search_eligibility():
     irrelevant = NewsItem(title="Unrelated macro update", source="Yahoo", published_at=NOW,
                           fetched_at=NOW, url="https://example.com/macro", summary="Rates", symbols=[])
@@ -233,6 +250,50 @@ def test_company_events_are_distinct_title_only_candidates_with_source_status():
         "symbol": "NVDA", "title": item.title, "summary": item.summary, "url": item.url,
     }
     assert sources[0].status == "ok"
+
+
+def test_financial_metric_series_pages_normalized_periods_without_xbrl_fields():
+    from app.context import financial_metric_series
+    normalized = {
+        "derived_metrics": [
+            {"fact_id": f"fact:revenue:{index}", "metric": "revenue_yoy", "scope": "quarter",
+             "period": f"202{index}-Q1", "value": index / 10, "input_fact_ids": [f"input:{index}"]}
+            for index in range(5)
+        ],
+        "sourceReference": "https://www.sec.gov/Archives/example",
+    }
+
+    result = financial_metric_series("NVDA", "revenue_yoy", "2", normalized, NOW, page_size=2)
+
+    assert result.returnedCount == 2
+    assert result.totalCount == 5
+    assert result.nextCursor == "4"
+    assert result.truncated is True
+    assert [fact.value["period"] for fact in result.facts] == ["2022-Q1", "2023-Q1"]
+    assert all(field not in result.model_dump_json() for field in ["concept", "unit", "form", "frame"])
+
+
+def test_filing_document_pages_official_sections_without_retaining_full_text():
+    from app.context import filing_document_page
+    filing = {
+        "filingId": "0001045810-26-000123", "form": "10-Q", "filedAt": "2026-07-31",
+        "sourceReference": "https://www.sec.gov/Archives/edgar/data/example.htm",
+        "sections": [
+            {"name": "results", "summary": "Revenue increased."},
+            {"name": "guidance", "summary": "Management raised guidance."},
+            {"name": "capital", "summary": "Repurchases continued."},
+        ],
+    }
+
+    result = filing_document_page("NVDA", filing["filingId"], "1", filing, NOW, page_size=1)
+
+    assert result.returnedCount == 1
+    assert result.totalCount == 3
+    assert result.nextCursor == "2"
+    assert result.truncated is True
+    assert result.items == [{"name": "guidance", "summary": "Management raised guidance."}]
+    assert result.facts[0].evidenceLevel == "official_filing"
+    assert "fullText" not in result.model_dump_json()
 
 
 def test_technical_query_filters_requested_range_and_returns_indicator_fact():

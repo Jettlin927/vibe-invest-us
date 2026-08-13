@@ -458,6 +458,80 @@ class SecFundamentalsSource(TimedSource):
         }
 
 
+class SecFilingSource(TimedSource):
+    name = "sec"
+
+    def _recent(self, symbol: str):
+        user_agent = os.getenv("SEC_USER_AGENT")
+        if not user_agent:
+            raise RuntimeError("SEC_USER_AGENT_missing")
+        headers = {"User-Agent": user_agent, "Accept-Encoding": "gzip, deflate"}
+        mapping = json.loads(_read(
+            "https://www.sec.gov/files/company_tickers.json", headers=headers, timeout=self.timeout,
+        ))
+        company = next((value for value in mapping.values() if value.get("ticker") == symbol), None)
+        if not company:
+            raise ValueError("sec_ticker_not_found")
+        cik = str(company["cik_str"]).zfill(10)
+        submissions = json.loads(_read(
+            f"https://data.sec.gov/submissions/CIK{cik}.json", headers=headers, timeout=self.timeout,
+        ))
+        return cik, submissions.get("filings", {}).get("recent", {})
+
+    def fetch(self, symbol: str, filing_id: str):
+        cik, recent = self._recent(symbol)
+        accessions = recent.get("accessionNumber", [])
+        try:
+            index = accessions.index(filing_id)
+            form = recent["form"][index]
+            filed_at = recent["filingDate"][index]
+            primary_document = recent["primaryDocument"][index]
+        except (ValueError, IndexError, KeyError) as error:
+            raise ValueError("filing_not_found") from error
+        accession_path = filing_id.replace("-", "")
+        source_reference = (
+            f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession_path}/{primary_document}"
+        )
+        payload, _content_type, _truncated, final_url = read_limited_document(
+            source_reference, 65536, timeout=min(self.timeout, 10),
+        )
+        text = payload.decode("utf-8", errors="replace")
+        headings = list(re.finditer(r"<h[1-3][^>]*>(.*?)</h[1-3]>", text, re.I | re.S))
+        sections = []
+        for position, heading in enumerate(headings[:20]):
+            end = headings[position + 1].start() if position + 1 < len(headings) else len(text)
+            name = " ".join(re.sub(r"<[^>]+>", " ", heading.group(1)).split())[:120]
+            summary = " ".join(re.sub(r"<[^>]+>", " ", text[heading.end():end]).split())[:500]
+            if name and summary:
+                sections.append({"name": name, "summary": summary})
+        return {
+            "filingId": filing_id, "form": form, "filedAt": filed_at,
+            "sourceReference": final_url, "sections": sections,
+        }
+
+    def list_events(self, symbol: str):
+        cik, recent = self._recent(symbol)
+        supported = {"10-K": "earnings", "10-Q": "earnings", "8-K": "company_event", "S-3": "dilution"}
+        events = []
+        for filing_id, form, filed_at, primary_document in zip(
+            recent.get("accessionNumber", []), recent.get("form", []),
+            recent.get("filingDate", []), recent.get("primaryDocument", []),
+        ):
+            if form not in supported:
+                continue
+            events.append({
+                "filingId": filing_id, "form": form, "filedAt": filed_at,
+                "eventType": supported[form],
+                "sourceReference": (
+                    f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/"
+                    f"{filing_id.replace('-', '')}/{primary_document}"
+                ),
+            })
+            if len(events) >= 20:
+                break
+        return events
+
+
 COMPARABLES = {
     "NVDA": ("semiconductor", ["AMD", "AVGO", "QCOM"]),
     "AMD": ("semiconductor", ["NVDA", "AVGO", "QCOM"]),

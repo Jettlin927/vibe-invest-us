@@ -88,6 +88,21 @@ class FactQueryResult(BaseModel):
     eligibility: Optional[Any] = None
 
 
+class FinancialOverviewResult(FactQueryResult):
+    overview: Any
+
+
+class PaginatedFactResult(FactQueryResult):
+    returnedCount: int
+    totalCount: int
+    nextCursor: Optional[str] = None
+    truncated: bool
+
+
+class FilingDocumentResult(PaginatedFactResult):
+    items: List[Any]
+
+
 class NewsDocumentResult(FactQueryResult):
     excerpt: str
 

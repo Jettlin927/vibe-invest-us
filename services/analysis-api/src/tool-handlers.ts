@@ -5,11 +5,12 @@ export type RegisteredToolHandler = (
 
 export const registeredToolHandlers: Record<string, RegisteredToolHandler> = {
   fetch_financial_context: async (_params, context) => required(context, 'loadFinancialContext')(),
-  analyze_financials: async (_params, context) => required(context, 'runFinancialSpecialist')(),
+  get_financial_overview: async (params, context) => required(context, 'getFinancialOverview')(params),
+  get_financial_metric_series: async (params, context) => required(context, 'getFinancialMetricSeries')(params),
+  read_filing_document: async (params, context) => required(context, 'readFilingDocument')(params),
+  run_fundamental_analysis: async (params, context) => required(context, 'runFundamentalSpecialist')(params),
   run_news_analysis: async (params, context) => required(context, 'runNewsSpecialist')(params),
   submit_analysis_report: async (params, context) => required(context, 'submitAnalysisReport')(params),
-  search_news_by_keyword: async (params, context) => required(context, 'searchNews')(params),
-  get_technical_indicators: async (params, context) => required(context, 'fetchTechnicalIndicators')(params),
   search_news_candidates: async (params, context) => required(context, 'searchNewsCandidates')(params),
   search_web_evidence: async (params, context) => required(context, 'searchWebEvidence')(params),
   read_news_document: async (params, context) => required(context, 'readNewsDocument')(params),

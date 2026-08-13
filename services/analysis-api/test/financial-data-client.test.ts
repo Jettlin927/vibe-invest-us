@@ -123,3 +123,39 @@ test('TS 客户端只把已知 title_only 候选交给受限新闻文档端点',
   assert.equal(result.facts[0]?.evidenceLevel, 'verified_news')
   await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
 })
+
+test('TS 客户端读取基本面高层工具并完整保留分页元数据', async (t) => {
+  const requests: string[] = []
+  const fact = {
+    id: 'fact:NVDA:financial:1', type: 'reported_financial', value: { period: '2026-Q2' },
+    observedAt: '2026-07-31', fetchedAt: '2026-08-13T00:00:00Z', source: 'sec',
+    sourceReference: 'https://www.sec.gov/Archives/example', evidenceLevel: 'reported_financial',
+  }
+  const server = createServer((request, response) => {
+    requests.push(request.url ?? '')
+    response.writeHead(200, { 'content-type': 'application/json' })
+    response.end(JSON.stringify(request.url?.includes('financial-overview')
+      ? { overview: { symbol: 'NVDA', latestPeriod: '2026-Q2' }, facts: [fact], sources: [] }
+      : request.url?.includes('filing-document')
+        ? { items: [{ name: 'guidance', summary: 'Raised.' }], facts: [fact], sources: [],
+            returnedCount: 1, totalCount: 3, nextCursor: '2', truncated: true }
+        : { facts: [fact], sources: [], returnedCount: 1, totalCount: 4, nextCursor: '3', truncated: true }))
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  t.after(() => new Promise<void>((resolve, reject) => server.close(
+    (error) => error ? reject(error) : resolve(),
+  )))
+  const address = server.address()
+  assert.ok(address && typeof address !== 'string')
+  const client = createFinancialDataClient(`http://127.0.0.1:${address.port}`)
+
+  assert.equal((await client.financialOverview('NVDA')).overview.latestPeriod, '2026-Q2')
+  assert.deepEqual(await client.financialMetricSeries('NVDA', 'revenue_yoy', '2'), {
+    facts: [fact], sources: [], returnedCount: 1, totalCount: 4, nextCursor: '3', truncated: true,
+  })
+  assert.equal((await client.filingDocument('NVDA', '0001', '1')).items[0]?.name, 'guidance')
+  assert.deepEqual(await client.officialCompanyEvents('NVDA'), { facts: [fact], sources: [] })
+  assert.match(requests.join('\n'), /financial-metric-series.*metric=revenue_yoy.*cursor=2/)
+  assert.match(requests.join('\n'), /filing-document.*filing_id=0001.*cursor=1/)
+  assert.match(requests.join('\n'), /official-company-events.*symbol=NVDA/)
+})

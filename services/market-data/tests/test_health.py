@@ -27,6 +27,65 @@ def test_openapi_contract_matches_application():
     assert app.openapi() == contract
 
 
+def test_financial_overview_hides_xbrl_mapping_and_returns_official_facts(monkeypatch):
+    from app.models import AtomicFact, FactQueryResult
+    expected = FactQueryResult(facts=[AtomicFact(
+        id="fact:NVDA:financial:revenue:2026-Q2", type="reported_financial",
+        value={"metric": "revenue", "period": "2026-Q2", "value": 30_000_000_000, "currency": "USD"},
+        observedAt="2026-07-31T00:00:00Z", fetchedAt="2026-08-13T00:00:00Z",
+        source="sec", sourceReference="https://www.sec.gov/Archives/example", evidenceLevel="reported_financial",
+    )])
+    monkeypatch.setattr("app.main.financial_overview_facts", lambda symbol, now, source: (
+        {"symbol": symbol, "latestPeriod": "2026-Q2", "qualityFlags": []}, expected.facts, expected.sources,
+    ))
+
+    response = TestClient(app).post("/v1/financial-overview", params={"symbol": "nvda"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["overview"] == {"symbol": "NVDA", "latestPeriod": "2026-Q2", "qualityFlags": []}
+    assert payload["facts"][0]["evidenceLevel"] == "reported_financial"
+    assert all(key not in json.dumps(payload) for key in ["concept", "unit", "form", "frame"])
+
+
+def test_financial_metric_series_http_returns_complete_pagination_metadata(monkeypatch):
+    from app.models import PaginatedFactResult
+    monkeypatch.setattr("app.main.financial_metric_series_result", lambda symbol, metric, cursor, source, now: (
+        PaginatedFactResult(
+            facts=[], returnedCount=0, totalCount=4, nextCursor=None, truncated=False,
+        )
+    ))
+
+    response = TestClient(app).post("/v1/financial-metric-series", params={
+        "symbol": "nvda", "metric": "revenue_yoy", "cursor": "2",
+    })
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "facts": [], "sources": [], "eligibility": None,
+        "returnedCount": 0, "totalCount": 4, "nextCursor": None, "truncated": False,
+    }
+
+
+def test_filing_document_http_uses_sec_adapter_and_returns_bounded_page(monkeypatch):
+    monkeypatch.setattr("app.main.SecFilingSource.fetch", lambda self, symbol, filing_id: {
+        "filingId": filing_id, "form": "10-Q", "filedAt": "2026-07-31",
+        "sourceReference": "https://www.sec.gov/Archives/edgar/data/example.htm",
+        "sections": [{"name": "results", "summary": "Revenue increased."}],
+    })
+
+    response = TestClient(app).post("/v1/filing-document", params={
+        "symbol": "nvda", "filing_id": "0001045810-26-000123",
+    })
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["returnedCount"] == payload["totalCount"] == 1
+    assert payload["nextCursor"] is None
+    assert payload["truncated"] is False
+    assert payload["facts"][0]["evidenceLevel"] == "official_filing"
+
+
 def test_quote_batch_uses_fallback_without_exposing_provider_payload(monkeypatch):
     class FailedSource:
         name = "primary"

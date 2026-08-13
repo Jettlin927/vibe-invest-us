@@ -15,6 +15,8 @@ from app.models import (
     Quote,
     SourceObservation,
     SourceStatus,
+    PaginatedFactResult,
+    FilingDocumentResult,
 )
 
 
@@ -83,20 +85,104 @@ def build_financial_context(
             source=valuation.source, sourceReference="https://finance.yahoo.com/",
         ))
     return FinancialContext(
-        symbol=normalized_symbol,
-        fetched_at=now,
-        quote=quote,
-        history=history,
-        news=news,
-        fundamentals=fundamentals,
-        indicators=indicators,
-        valuation=valuation,
-        valuation_sources=valuation_sources,
-        facts=facts,
-        gaps=gaps,
+        symbol=normalized_symbol, fetched_at=now, quote=quote, history=history, news=news,
+        fundamentals=fundamentals, indicators=indicators, valuation=valuation,
+        valuation_sources=valuation_sources, facts=facts, gaps=gaps,
     )
 
 
+def financial_overview_facts(symbol: str, now: datetime, fundamentals_source: Optional[Any]):
+    normalized_symbol = symbol.strip().upper()
+    result = _first_available(
+        [] if fundamentals_source is None else [fundamentals_source], normalized_symbol,
+    )
+    facts: List[AtomicFact] = []
+    if isinstance(result.value, dict):
+        _append_financial_facts(facts, normalized_symbol, now, result)
+    value = result.value if isinstance(result.value, dict) else {}
+    periods = [*value.get("quarters", []), *value.get("annuals", [])]
+    overview = {
+        "symbol": normalized_symbol,
+        "latestPeriod": periods[0].get("period") if periods else None,
+        "qualityFlags": [
+            {key: flag.get(key) for key in ("flag_type", "severity", "period")}
+            for flag in value.get("quality_flags", [])
+        ],
+    }
+    return overview, facts, result.sources
+
+
+def financial_metric_series(symbol: str, metric: str, cursor: Optional[str],
+                            normalized: Any, now: datetime, page_size: int = 20) -> PaginatedFactResult:
+    normalized_symbol = symbol.strip().upper()
+    offset = int(cursor or "0")
+    if offset < 0 or page_size < 1:
+        raise ValueError("financial_metric_cursor_invalid")
+    records = [
+        record for record in normalized.get("derived_metrics", [])
+        if record.get("metric") == metric
+    ] if isinstance(normalized, dict) else []
+    page = records[offset:offset + page_size]
+    facts = [AtomicFact(
+        id=record["fact_id"], type="derived_financial_metric",
+        value={
+            "classification": "derived", "metric": record["metric"],
+            "scope": record["scope"], "period": record["period"], "value": record["value"],
+            "inputFactIds": record.get("input_fact_ids", []),
+        },
+        observedAt=record["period"], fetchedAt=now.isoformat(),
+        source="deterministic-calculation",
+        sourceReference=normalized.get("sourceReference", "https://www.sec.gov/"),
+        evidenceLevel="deterministic_financial_metric",
+    ) for record in page]
+    next_offset = offset + len(page)
+    return PaginatedFactResult(
+        facts=facts, returnedCount=len(facts), totalCount=len(records),
+        nextCursor=str(next_offset) if next_offset < len(records) else None,
+        truncated=next_offset < len(records),
+    )
+
+
+def financial_metric_series_result(symbol: str, metric: str, cursor: Optional[str],
+                                   fundamentals_source: Optional[Any], now: datetime) -> PaginatedFactResult:
+    if fundamentals_source is None:
+        raise ValueError("fundamentals_source_unavailable")
+    normalized = fundamentals_source.fetch(symbol.strip().upper())
+    return financial_metric_series(symbol, metric, cursor, normalized, now)
+
+
+def filing_document_page(symbol: str, filing_id: str, cursor: Optional[str],
+                         filing: Any, now: datetime, page_size: int = 10) -> FilingDocumentResult:
+    normalized_symbol = symbol.strip().upper()
+    if not isinstance(filing, dict) or filing.get("filingId") != filing_id:
+        raise ValueError("filing_not_found")
+    source_reference = str(filing.get("sourceReference", ""))
+    if not source_reference.startswith("https://www.sec.gov/") \
+            and not source_reference.startswith("https://sec.gov/"):
+        raise ValueError("filing_source_not_official")
+    offset = int(cursor or "0")
+    if offset < 0 or page_size < 1:
+        raise ValueError("filing_cursor_invalid")
+    sections = filing.get("sections", []) if isinstance(filing.get("sections", []), list) else []
+    page = [
+        {"name": str(section.get("name", "")), "summary": str(section.get("summary", ""))}
+        for section in sections[offset:offset + page_size] if isinstance(section, dict)
+    ]
+    next_offset = offset + len(page)
+    fact = AtomicFact(
+        id=f"fact:{normalized_symbol}:filing:{filing_id}", type="filing_document",
+        value={
+            "symbol": normalized_symbol, "filingId": filing_id,
+            "form": filing.get("form"), "filedAt": filing.get("filedAt"),
+        },
+        observedAt=str(filing.get("filedAt") or now.isoformat()), fetchedAt=now.isoformat(),
+        source="sec", sourceReference=source_reference, evidenceLevel="official_filing",
+    )
+    return FilingDocumentResult(
+        facts=[fact], items=page, returnedCount=len(page), totalCount=len(sections),
+        nextCursor=str(next_offset) if next_offset < len(sections) else None,
+        truncated=next_offset < len(sections),
+    )
 def search_news_facts(keyword: str, now: datetime, news_sources: Iterable[Any],
                       include_eligibility: bool = False, qualified_urls=None):
     normalized_keyword = " ".join(keyword.strip().split())
@@ -197,6 +283,31 @@ def company_event_facts(symbol: str, now: datetime, news_sources: Iterable[Any])
         },
     }) for fact in news_facts]
     return facts, statuses
+
+
+def official_company_event_facts(symbol: str, now: datetime, source: Any):
+    normalized_symbol = symbol.strip().upper()
+    try:
+        events = source.list_events(normalized_symbol) if hasattr(source, "list_events") \
+            else source.fetch(normalized_symbol)
+        facts = [AtomicFact(
+            id=f"fact:{normalized_symbol}:official-event:{event['filingId']}",
+            type="company_event",
+            value={
+                "symbol": normalized_symbol, "filingId": event["filingId"],
+                "form": event["form"], "filedAt": event["filedAt"],
+                "eventType": event["eventType"],
+            },
+            observedAt=event["filedAt"], fetchedAt=now.isoformat(), source=source.name,
+            sourceReference=event["sourceReference"], evidenceLevel="official_company_event",
+        ) for event in events[:20]]
+        return facts, [SourceStatus(
+            source=source.name, status="ok" if facts else "empty", item_count=len(facts),
+        )]
+    except Exception as error:
+        return [], [SourceStatus(
+            source=source.name, status="failed", error=_safe_error(error), item_count=0,
+        )]
 
 
 def web_search_lead_facts(query: str, now: datetime, searcher):
@@ -314,7 +425,7 @@ def _append_financial_facts(facts, symbol, now, fundamentals):
                 "scope": reported["scope"], "period": reported["period"], "value": reported["value"],
             },
             observedAt=reported.get("observed_at") or reported["period"], fetchedAt=now.isoformat(),
-            source=source, sourceReference=source_reference,
+            source=source, sourceReference=source_reference, evidenceLevel="reported_financial",
         ))
         reported_fact_ids.add(reported["fact_id"])
     emitted_fact_ids = set(reported_fact_ids)
@@ -330,6 +441,7 @@ def _append_financial_facts(facts, symbol, now, fundamentals):
                 },
                 observedAt=cell.get("observed_at") or period.get("observed_at") or now.isoformat(),
                 fetchedAt=now.isoformat(), source="deterministic-calculation", sourceReference=source_reference,
+                evidenceLevel="deterministic_financial_metric",
             ))
             emitted_fact_ids.add(cell["fact_id"])
     for metric in value.get("derived_metrics", []):
@@ -343,7 +455,7 @@ def _append_financial_facts(facts, symbol, now, fundamentals):
                 "inputFactIds": metric["input_fact_ids"],
             },
             observedAt=metric["period"], fetchedAt=now.isoformat(), source="deterministic-calculation",
-            sourceReference=source_reference,
+            sourceReference=source_reference, evidenceLevel="deterministic_financial_metric",
         ))
         emitted_fact_ids.add(metric["fact_id"])
     for flag in value.get("quality_flags", []):
@@ -354,7 +466,7 @@ def _append_financial_facts(facts, symbol, now, fundamentals):
                 "period": flag["period"], "evidenceFactIds": flag["evidence_fact_ids"],
             },
             observedAt=flag["period"], fetchedAt=now.isoformat(), source="deterministic-calculation",
-            sourceReference=source_reference,
+            sourceReference=source_reference, evidenceLevel="deterministic_financial_metric",
         ))
 
     # Preserve the four original annual fact types for stored-report and UI compatibility.

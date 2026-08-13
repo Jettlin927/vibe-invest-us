@@ -70,6 +70,11 @@ export function validateReportCandidate(
   if (context.role === 'news' && candidate.kind === 'specialist' && candidate.domain !== 'news') envelopeErrors.push({
     path: '/domain', rule: 'role_policy', message: '消息面 Agent 只能提交 news 领域报告', allowedEvidenceTypes: [],
   })
+  if (context.role === 'fundamental_valuation' && candidate.kind === 'specialist'
+    && candidate.domain !== 'fundamental_valuation') envelopeErrors.push({
+    path: '/domain', rule: 'role_policy',
+    message: '基本面 Agent 只能提交 fundamental_valuation 领域报告', allowedEvidenceTypes: [],
+  })
   if (Array.isArray(candidate.gaps)) candidate.gaps.forEach((value, index) => {
     const gap = asRecord(value)
     for (const field of ['capability', 'reason', 'impact']) {
@@ -121,6 +126,10 @@ export function validateReportCandidate(
     if (context.role === 'news' && judgment.type !== 'news') envelopeErrors.push({
       path: `/keyJudgments/${index}/type`, rule: 'role_policy',
       message: '消息面 Agent 只能提交 news 判断', allowedEvidenceTypes: [],
+    })
+    if (context.role === 'fundamental_valuation' && judgment.type !== 'fundamental') envelopeErrors.push({
+      path: `/keyJudgments/${index}/type`, rule: 'role_policy',
+      message: '基本面 Agent 只能提交 fundamental 判断', allowedEvidenceTypes: [],
     })
   })
   if (envelopeErrors.length) return { ok: false, errors: envelopeErrors }

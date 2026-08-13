@@ -38,11 +38,12 @@ test('唯一 Registry 中每个工具独立声明完整权限、保留、网络�
   const registry = createToolRegistry(registeredToolDefinitions, registeredToolHandlers)
   assert.deepEqual(registry.list().map((tool) => tool.model.name), [
     'fetch_financial_context',
-    'analyze_financials',
+    'run_fundamental_analysis',
     'run_news_analysis',
     'submit_analysis_report',
-    'search_news_by_keyword',
-    'get_technical_indicators',
+    'get_financial_overview',
+    'get_financial_metric_series',
+    'read_filing_document',
     'search_news_candidates',
     'search_web_evidence',
     'read_news_document',
@@ -134,6 +135,17 @@ test('消息面 Agent 只获得新闻候选、文档、公司事件和专项报�
     'submit_specialist_report',
   ])
   assert.deepEqual(registry.project({ role: 'main', stage: 'research' }).map(({ name }) => name), [
-    'fetch_financial_context', 'analyze_financials', 'run_news_analysis', 'submit_analysis_report',
+    'fetch_financial_context', 'run_fundamental_analysis', 'run_news_analysis', 'submit_analysis_report',
+  ])
+})
+
+test('基本面 Agent 只获得高层财务、Filing、官方事件和专项报告工具', () => {
+  const registry = createToolRegistry(registeredToolDefinitions, registeredToolHandlers)
+  assert.deepEqual(registry.project({ role: 'fundamental', stage: 'research' }).map(({ name }) => name), [
+    'get_financial_overview', 'get_financial_metric_series', 'read_filing_document',
+    'list_company_events', 'submit_specialist_report',
+  ])
+  assert.deepEqual(registry.project({ role: 'fundamental', stage: 'finalization' }).map(({ name }) => name), [
+    'submit_specialist_report',
   ])
 })

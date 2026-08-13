@@ -62,6 +62,173 @@
         }
       }
     },
+    "/v1/financial-overview": {
+      "post": {
+        "summary": "Financial Overview",
+        "operationId": "getFinancialOverview",
+        "parameters": [
+          {
+            "name": "symbol",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Symbol"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FinancialOverviewResult"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/financial-metric-series": {
+      "post": {
+        "summary": "Financial Metric Series Endpoint",
+        "operationId": "getFinancialMetricSeries",
+        "parameters": [
+          {
+            "name": "symbol",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Symbol"
+            }
+          },
+          {
+            "name": "metric",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Metric"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PaginatedFactResult"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/filing-document": {
+      "post": {
+        "summary": "Filing Document",
+        "operationId": "readFilingDocument",
+        "parameters": [
+          {
+            "name": "symbol",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Symbol"
+            }
+          },
+          {
+            "name": "filing_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Filing Id"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FilingDocumentResult"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/news-search": {
       "post": {
         "summary": "News Search",
@@ -182,6 +349,45 @@
       "post": {
         "summary": "Company Events",
         "operationId": "listCompanyEvents",
+        "parameters": [
+          {
+            "name": "symbol",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Symbol"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FactQueryResult"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/official-company-events": {
+      "post": {
+        "summary": "Official Company Events",
+        "operationId": "listOfficialCompanyEvents",
         "parameters": [
           {
             "name": "symbol",
@@ -494,6 +700,71 @@
         ],
         "title": "FactQueryResult"
       },
+      "FilingDocumentResult": {
+        "properties": {
+          "facts": {
+            "items": {
+              "$ref": "#/components/schemas/AtomicFact"
+            },
+            "type": "array",
+            "title": "Facts"
+          },
+          "sources": {
+            "items": {
+              "$ref": "#/components/schemas/SourceStatus"
+            },
+            "type": "array",
+            "title": "Sources",
+            "default": []
+          },
+          "eligibility": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Eligibility"
+          },
+          "returnedCount": {
+            "type": "integer",
+            "title": "Returnedcount"
+          },
+          "totalCount": {
+            "type": "integer",
+            "title": "Totalcount"
+          },
+          "nextCursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Nextcursor"
+          },
+          "truncated": {
+            "type": "boolean",
+            "title": "Truncated"
+          },
+          "items": {
+            "items": {},
+            "type": "array",
+            "title": "Items"
+          }
+        },
+        "type": "object",
+        "required": [
+          "facts",
+          "returnedCount",
+          "totalCount",
+          "truncated",
+          "items"
+        ],
+        "title": "FilingDocumentResult"
+      },
       "FinancialContext": {
         "properties": {
           "symbol": {
@@ -572,6 +843,43 @@
           "gaps"
         ],
         "title": "FinancialContext"
+      },
+      "FinancialOverviewResult": {
+        "properties": {
+          "facts": {
+            "items": {
+              "$ref": "#/components/schemas/AtomicFact"
+            },
+            "type": "array",
+            "title": "Facts"
+          },
+          "sources": {
+            "items": {
+              "$ref": "#/components/schemas/SourceStatus"
+            },
+            "type": "array",
+            "title": "Sources",
+            "default": []
+          },
+          "eligibility": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Eligibility"
+          },
+          "overview": {
+            "title": "Overview"
+          }
+        },
+        "type": "object",
+        "required": [
+          "facts",
+          "overview"
+        ],
+        "title": "FinancialOverviewResult"
       },
       "HTTPValidationError": {
         "properties": {
@@ -720,6 +1028,65 @@
           "excerpt"
         ],
         "title": "NewsDocumentResult"
+      },
+      "PaginatedFactResult": {
+        "properties": {
+          "facts": {
+            "items": {
+              "$ref": "#/components/schemas/AtomicFact"
+            },
+            "type": "array",
+            "title": "Facts"
+          },
+          "sources": {
+            "items": {
+              "$ref": "#/components/schemas/SourceStatus"
+            },
+            "type": "array",
+            "title": "Sources",
+            "default": []
+          },
+          "eligibility": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Eligibility"
+          },
+          "returnedCount": {
+            "type": "integer",
+            "title": "Returnedcount"
+          },
+          "totalCount": {
+            "type": "integer",
+            "title": "Totalcount"
+          },
+          "nextCursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Nextcursor"
+          },
+          "truncated": {
+            "type": "boolean",
+            "title": "Truncated"
+          }
+        },
+        "type": "object",
+        "required": [
+          "facts",
+          "returnedCount",
+          "totalCount",
+          "truncated"
+        ],
+        "title": "PaginatedFactResult"
       },
       "QuoteBatch": {
         "properties": {

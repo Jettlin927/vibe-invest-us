@@ -27,6 +27,14 @@ export type FactQueryResult = {
   eligibility?: unknown
 }
 
+export type PaginatedFactQueryResult = FactQueryResult & {
+  returnedCount: number
+  totalCount: number
+  nextCursor: string | null
+  truncated: boolean
+  items?: unknown[]
+}
+
 export function createFinancialDataClient(baseUrl: string) {
   return {
     async health(): Promise<FinancialDataHealth> {
@@ -77,6 +85,32 @@ export function createFinancialDataClient(baseUrl: string) {
     async companyEvents(symbol: string, signal?: AbortSignal): Promise<FactQueryResult> {
       return factQuery(`/v1/company-events?symbol=${encodeURIComponent(symbol)}`, signal)
     },
+    async officialCompanyEvents(symbol: string, signal?: AbortSignal): Promise<FactQueryResult> {
+      return factQuery(`/v1/official-company-events?symbol=${encodeURIComponent(symbol)}`, signal)
+    },
+    async financialOverview(symbol: string, signal?: AbortSignal) {
+      const result = await rawFactQuery(
+        `/v1/financial-overview?symbol=${encodeURIComponent(symbol)}`, signal,
+      )
+      if (!result.overview || typeof result.overview !== 'object') {
+        throw new Error('financial_data_overview_contract_invalid')
+      }
+      return { overview: result.overview as Record<string, unknown>, facts: result.facts, sources: result.sources }
+    },
+    async financialMetricSeries(
+      symbol: string, metric: string, cursor?: string, signal?: AbortSignal,
+    ): Promise<PaginatedFactQueryResult> {
+      const query = new URLSearchParams({ symbol, metric })
+      if (cursor) query.set('cursor', cursor)
+      return paginatedFactQuery(`/v1/financial-metric-series?${query}`, signal)
+    },
+    async filingDocument(
+      symbol: string, filingId: string, cursor?: string, signal?: AbortSignal,
+    ): Promise<PaginatedFactQueryResult> {
+      const query = new URLSearchParams({ symbol, filing_id: filingId })
+      if (cursor) query.set('cursor', cursor)
+      return paginatedFactQuery(`/v1/filing-document?${query}`, signal, true)
+    },
     async technicalIndicators(
       symbol: string, startDate: string, endDate: string, signal?: AbortSignal,
     ): Promise<FactQueryResult> {
@@ -102,18 +136,46 @@ export function createFinancialDataClient(baseUrl: string) {
   }
 
   async function factQuery(path: string, signal?: AbortSignal): Promise<FactQueryResult> {
+    const value = await rawFactQuery(path, signal)
+    return {
+      facts: value.facts, sources: value.sources,
+      ...('eligibility' in value ? { eligibility: value.eligibility } : {}),
+    }
+  }
+
+  async function rawFactQuery(
+    path: string, signal?: AbortSignal,
+  ): Promise<Record<string, unknown> & { facts: FinancialFact[]; sources: unknown[] }> {
     const response = await fetch(new URL(path, baseUrl), {
       method: 'POST',
       signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(30_000)]) : AbortSignal.timeout(30_000),
     })
     if (!response.ok) throw new Error(`financial_data_fact_query_http_${response.status}`)
-    const value = await response.json() as { facts?: unknown; sources?: unknown[]; eligibility?: unknown }
+    const value = await response.json() as Record<string, unknown>
     if (!Array.isArray(value.facts) || !value.facts.every(isFinancialFact)) {
       throw new Error('financial_data_fact_query_contract_invalid')
     }
     return {
-      facts: value.facts, sources: Array.isArray(value.sources) ? value.sources : [],
-      ...('eligibility' in value ? { eligibility: value.eligibility } : {}),
+      ...value, facts: value.facts as FinancialFact[],
+      sources: Array.isArray(value.sources) ? value.sources : [],
+    }
+  }
+
+  async function paginatedFactQuery(
+    path: string, signal?: AbortSignal, includeItems = false,
+  ): Promise<PaginatedFactQueryResult> {
+    const value = await rawFactQuery(path, signal)
+    if (!Number.isInteger(value.returnedCount) || !Number.isInteger(value.totalCount)
+      || typeof value.truncated !== 'boolean'
+      || !(value.nextCursor === null || typeof value.nextCursor === 'string')
+      || (includeItems && !Array.isArray(value.items))) {
+      throw new Error('financial_data_pagination_contract_invalid')
+    }
+    return {
+      facts: value.facts, sources: value.sources,
+      returnedCount: value.returnedCount as number, totalCount: value.totalCount as number,
+      nextCursor: value.nextCursor as string | null, truncated: value.truncated,
+      ...(includeItems ? { items: value.items as unknown[] } : {}),
     }
   }
 }

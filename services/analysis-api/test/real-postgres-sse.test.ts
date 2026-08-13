@@ -1032,6 +1032,134 @@ test('Web Search 只在三源资格事件后投影并经正文核实生成专项
   } finally { await app.close() }
 })
 
+test('主 Agent 经真实 PostgreSQL、HTTP 与 SSE 启动并展示独立基本面 Agent', {
+  skip: !databaseUrl,
+  concurrency: false,
+}, async () => {
+  const pool = createPool(databaseUrl!)
+  const events = createAgentEventRepository(pool)
+  const reported = {
+    id: `fact:fundamental:e2e:reported:${crypto.randomUUID()}`, type: 'reported_financial',
+    value: { metric: 'revenue', period: '2026-Q2', value: 46_743_000_000 },
+    evidenceLevel: 'reported_financial', observedAt: '2026-07-31',
+    fetchedAt: '2026-08-13T12:00:00Z', source: 'sec',
+    sourceReference: 'https://www.sec.gov/Archives/edgar/data/1045810/q2.htm',
+  }
+  const filing = {
+    ...reported, id: `fact:fundamental:e2e:filing:${crypto.randomUUID()}`,
+    type: 'filing_document', evidenceLevel: 'official_filing',
+    value: { filingId: '0001045810-26-000123', form: '10-Q', filedAt: '2026-07-31' },
+  }
+  const officialEvent = {
+    ...reported, id: `fact:fundamental:e2e:event:${crypto.randomUUID()}`,
+    type: 'company_event', evidenceLevel: 'official_company_event',
+    value: { filingId: '0001045810-26-000123', form: '10-Q', eventType: 'earnings' },
+  }
+  const specialistReport = {
+    kind: 'specialist' as const, domain: 'fundamental_valuation',
+    availability: 'available' as const, status: 'completed' as const, gaps: [], limitations: [],
+    keyJudgments: [{
+      type: 'fundamental', statement: '正式财报支持基本面质量偏强',
+      direction: 'bullish', confidence: 'medium',
+      supportingEvidence: [reported.id, filing.id], contraryEvidence: [],
+      contraryEvidenceStatus: 'none_found', invalidationConditions: ['下期收入同比转负'],
+    }],
+  }
+  const mainModel = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall('run_fundamental_analysis', {
+      launch: true, researchQuestion: '最新正式财务事实是否改变基本面方向？',
+      reason: '需要核验财报、指标序列与官方事件。',
+    }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('submit_analysis_report', integratedReport({
+      title: '基本面专项闭环', marketState: '数据有限', trend: '震荡', drivers: [],
+      supportingEvidence: [], contraryEvidence: [], keyJudgments: [], scenarios: [],
+      invalidationConditions: [], valuation: null, personalImpact: null,
+      conditionalSuggestion: null, limitations: [],
+    })), { stopReason: 'toolUse' }),
+  ] })
+  const specialistModel = createPiModel({ fauxResponses: [
+    fauxAssistantMessage([
+      fauxToolCall('get_financial_overview', { symbol: 'NVDA' }, { id: 'fundamental-overview' }),
+      fauxToolCall('get_financial_metric_series', {
+        symbol: 'NVDA', metric: 'revenue_yoy',
+      }, { id: 'fundamental-series' }),
+      fauxToolCall('read_filing_document', {
+        symbol: 'NVDA', filingId: '0001045810-26-000123',
+      }, { id: 'fundamental-filing' }),
+      fauxToolCall('list_company_events', { symbol: 'NVDA' }, { id: 'fundamental-events' }),
+    ], { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('submit_specialist_report', specialistReport), {
+      stopReason: 'toolUse',
+    }),
+  ] })
+  const model = { ...mainModel, analyzeFundamental: specialistModel.analyzeFundamental }
+  const app = buildApp({
+    productDatabase: { checkSchema: () => checkSchema(pool), close: () => pool.end() },
+    portfolioRepository: createPortfolioRepository(pool),
+    analysisRepository: createAnalysisRepository(pool), agentEventRepository: events,
+    runtimeSettingsRepository: createRuntimeSettingsRepository(pool),
+    toolProjectionRepository: createToolProjectionRepository(pool),
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, gaps: [], facts: [] }),
+    getFinancialOverview: async () => ({
+      overview: { symbol: 'NVDA', latestPeriod: '2026-Q2', qualityFlags: [] },
+      facts: [reported], sources: [],
+    }),
+    getFinancialMetricSeries: async () => ({
+      facts: [], returnedCount: 0, totalCount: 23, nextCursor: '20', truncated: true,
+    }),
+    readFilingDocument: async () => ({
+      facts: [filing], items: [{ name: 'MD&A', summary: 'Revenue increased.' }],
+      returnedCount: 1, totalCount: 4, nextCursor: '1', truncated: true,
+    }),
+    listOfficialCompanyEvents: async () => ({ facts: [officialEvent], sources: [] }), model,
+  })
+  await app.listen({ host: '127.0.0.1', port: 0 })
+  const address = app.server.address()
+  assert.ok(address && typeof address === 'object')
+  const baseUrl = `http://127.0.0.1:${address.port}`
+  const created = await fetch(`${baseUrl}/api/analyses`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ symbol: 'NVDA' }),
+  }).then((response) => response.json()) as { analysisId: string; sessionId: string }
+  try {
+    await waitForAnalysisStatus(app, created.analysisId, 'completed')
+    const research = await fetch(`${baseUrl}/api/research/${created.analysisId}`)
+      .then((response) => response.json())
+    const fundamental = research.specialistAgents.find(
+      (agent: { domain: string }) => agent.domain === 'fundamental_valuation',
+    )
+    assert.equal(fundamental.execution.status, 'completed')
+    const serialized = JSON.stringify(fundamental.events)
+    for (const tool of [
+      'get_financial_overview', 'get_financial_metric_series',
+      'read_filing_document', 'list_company_events', 'submit_specialist_report',
+    ]) assert.match(serialized, new RegExp(tool))
+    assert.match(serialized, new RegExp(reported.id))
+    assert.match(serialized, new RegExp(filing.id))
+    assert.match(serialized, /"totalCount":23/)
+    assert.match(serialized, /"nextCursor":"20"/)
+    assert.equal(fundamental.researchQuestion, '最新正式财务事实是否改变基本面方向？')
+    assert.equal(fundamental.reason, '需要核验财报、指标序列与官方事件。')
+
+    const replay = await fetch(`${baseUrl}/api/agent-sessions/${fundamental.id}/events`)
+      .then((response) => response.text())
+    assert.match(replay, /event: tool_call/)
+    assert.match(replay, /event: tool_result/)
+    assert.match(replay, /event: completed/)
+    const versions = await fetch(`${baseUrl}/api/research/${created.analysisId}/report-versions`)
+      .then((response) => response.json())
+    const specialistVersion = versions.items.find(
+      (version: { kind: string }) => version.kind === 'specialist',
+    )
+    assert.equal(specialistVersion.sessionId, fundamental.id)
+    assert.equal(specialistVersion.version, 1)
+    assert.equal(specialistVersion.report.domain, 'fundamental_valuation')
+    assert.deepEqual(specialistVersion.report.keyJudgments[0].supportingEvidence, [reported.id, filing.id])
+    assert.match(specialistVersion.payloadHash, /^[a-f0-9]{64}$/)
+  } finally { await app.close() }
+})
+
 test('生产 Pi 经 HTTP、SSE 与真实 PostgreSQL 留存工具及预算收口状态序列', {
   skip: !databaseUrl,
   concurrency: false,

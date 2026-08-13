@@ -11,7 +11,9 @@ import {
   createPiAgentAdapter, type PiAgentAdapterMessage, type PiAgentAdapterStream,
   type PiAgentAdapterStreamFn, type PiAgentAdapterTool,
 } from './agent-runtime/pi-agent-adapter.js'
-import type { AnalysisReport, AnalyzeInput, AnalyzeNewsInput, ModelEvent, ModelOptions } from './model.js'
+import type {
+  AnalysisReport, AnalyzeFundamentalInput, AnalyzeInput, AnalyzeNewsInput, ModelEvent, ModelOptions,
+} from './model.js'
 import {
   acquireActiveSlot, createActiveBudget, createConcurrencyGate, deadlineSignal, type ActiveBudget,
 } from './runtime-policy.js'
@@ -71,8 +73,8 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
         for (const fact of facts) knownFacts.set(fact.id, fact)
       }
       let frozenContext: Awaited<ReturnType<AnalyzeInput['fetchFinancialContext']>> | undefined
-      let specialistInvocation = 0
       let newsDecisionRecorded = false
+      let fundamentalDecisionRecorded = false
       const reportValidationState = { failures: 0, exhausted: false }
 
       const loadFrozenContext = async (symbol: string) => {
@@ -163,51 +165,19 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
                 : modelResult)
             } catch (error) { return failedMainTool(name, error) }
           }
-          if (name === 'analyze_financials') {
-            const symbol = stringParam(params, 'symbol') || input.symbol
-            const invocationId = `financial-specialist-${++specialistInvocation}`
-            let financialContext: Awaited<ReturnType<AnalyzeInput['fetchFinancialContext']>>
-            try {
-              financialContext = await withMainToolSlot(name, onStart, async (toolSignal) => {
-                if (symbol.trim().toUpperCase() !== input.symbol.trim().toUpperCase()) {
-                  throw new Error('tool_symbol_not_allowed')
-                }
-                if (!frozenContext) {
-                  frozenContext = await input.fetchFinancialContext(symbol, toolSignal)
-                  rememberFacts(frozenContext.facts)
-                }
-                return frozenContext
-              })
-            } catch (error) { return failedMainTool(name, error) }
-            queue.push({
-              type: 'lifecycle', status: 'waiting_for_specialists',
-              operationId: `execution:${input.executionId}:specialist:${invocationId}:waiting`,
-              waitTarget: '财报专项分析',
-            })
-            const specialist = await toolRegistry.handler(name)!(params, {
-              runFinancialSpecialist: async () => runProjectedAgent({
-                role: 'fundamental', input, options, settings, executionSignal: agentSignal, activeBudget,
-                invocationId,
-                onPolicyFailure: (error) => { policyFailure ??= error },
-                modelGate, toolGate, provider, queue,
-                initialTools: projectedSpecialistTools(input),
-                systemPrompt: '你是独立财报分析专家。仅使用输入和投影工具中的事实；每项判断引用事实 ID，数据不足时明确说明。',
-                userPrompt: JSON.stringify({
-                  symbol: input.symbol, financials: financialContext.financials ?? null,
-                  facts: financialContext.facts,
-                }),
-                execute: (toolName, toolParams, toolSignal, toolStart) => executeSpecialistTool(
-                  toolName, toolParams, toolSignal, toolStart,
-                  input, options, settings, activeBudget, toolGate,
-                ),
-              }),
-            }) as Awaited<ReturnType<typeof runProjectedAgent>>
-            queue.push({
-              type: 'lifecycle', status: 'running_tools',
-              operationId: `execution:${input.executionId}:specialist:${invocationId}:completed`,
-            })
-            rememberFacts(specialist.facts)
-            return succeeded({ analysis: specialist.text, facts: specialist.facts })
+          if (name === 'run_fundamental_analysis') {
+            await onStart()
+            fundamentalDecisionRecorded = true
+            const request = asRecord(params) as {
+              launch?: unknown; researchQuestion?: unknown; reason?: unknown
+            }
+            const reason = asString(request.reason)
+            const researchQuestion = asString(request.researchQuestion)
+            if (request.launch !== true) {
+              return succeeded({ launched: false, status: 'not_started', reason, researchQuestion })
+            }
+            if (!input.runFundamentalSpecialist) return failed('fundamental_specialist_runtime_unavailable')
+            return succeeded(await input.runFundamentalSpecialist({ launch: true, researchQuestion, reason }))
           }
           if (name === 'run_news_analysis') {
             await onStart()
@@ -230,6 +200,9 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
               await onStart()
               if (input.runNewsSpecialist && !newsDecisionRecorded) {
                 return failed('news_specialist_decision_required')
+              }
+              if (input.runFundamentalSpecialist && !fundamentalDecisionRecorded) {
+                return failed('fundamental_specialist_decision_required')
               }
               return await toolRegistry.handler(name)!(params, {
                 submitAnalysisReport: async (submitted) => {
@@ -453,11 +426,122 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
         await task.catch(() => undefined)
       }
     },
+    async *analyzeFundamental(input: AnalyzeFundamentalInput): AsyncGenerator<ModelEvent> {
+      const settings = input.runtimeSettings
+      modelGate.setLimit(settings.modelConcurrency)
+      toolGate.setLimit(settings.toolConcurrency)
+      const runtimeMinuteMs = options.runtimeMinuteMs ?? 60_000
+      const executionSignal = deadlineSignal(
+        input.signal, settings.executionWallClockMinutes * runtimeMinuteMs,
+        input.executionDeadlineSignal,
+      )
+      const activeBudget = input.activeBudget ?? createActiveBudget(
+        settings.researchActiveMinutes * runtimeMinuteMs, options.activeNow,
+        options.activeTimeoutSignal,
+      )
+      const consumer = new AbortController()
+      const agentSignal = AbortSignal.any([executionSignal, consumer.signal])
+      const provider = createProviderRuntime(options)
+      const queue = createAsyncQueue<ModelEvent>()
+      const knownFacts = new Map(input.knownFacts.map((fact) => [fact.id, fact]))
+      const validationState = { failures: 0, exhausted: false }
+      let policyFailure: Error | undefined
+      queue.push(trace({
+        type: 'system_prompt', content: input.systemPrompt,
+        operationId: `execution:${input.executionId}:system-prompt`,
+      }))
+      queue.push(trace({
+        type: 'user_input', content: input.researchQuestion,
+        operationId: `execution:${input.executionId}:research-question`,
+      }))
+      const runTool = async (
+        name: string, onStart: () => Promise<void>, signal: AbortSignal,
+        task: (toolSignal: AbortSignal) => Promise<unknown>,
+      ) => {
+        const owner = await acquireActiveSlot({
+          acquire: () => input.acquireToolSlot
+            ? input.acquireToolSlot(signal) : toolGate.acquire(signal),
+          activeBudget, signal,
+        })
+        try {
+          await onStart()
+          const result = await task(toolSignal(options, settings, owner.signal))
+          const facts = asRecord(result).facts
+          if (Array.isArray(facts)) for (const fact of facts as Fact[]) knownFacts.set(fact.id, fact)
+          return succeeded(result)
+        } catch (error) {
+          return failed(error instanceof Error ? error.message : String(error))
+        } finally { owner.finish() }
+      }
+      const fundamental = runProjectedAgent({
+        role: 'fundamental', input, options, settings, executionSignal: agentSignal, activeBudget,
+        onPolicyFailure: (error) => { policyFailure ??= error }, modelGate, toolGate,
+        provider, queue, initialTools: financialSpecialistTools,
+        systemPrompt: input.systemPrompt, userPrompt: input.researchQuestion,
+        shouldRejectNextTurn: () => validationState.exhausted,
+        execute: async (name, params, signal, onStart) => {
+          if (name === unavailableToolName) { await onStart(); return failed('tool_not_available') }
+          const symbol = stringParam(params, 'symbol') || input.symbol
+          if (symbol.trim().toUpperCase() !== input.symbol.trim().toUpperCase()) {
+            await onStart(); return failed('tool_symbol_not_allowed')
+          }
+          if (name === 'get_financial_overview') return runTool(
+            name, onStart, signal, (toolSignal) => input.getFinancialOverview(symbol, toolSignal),
+          )
+          if (name === 'get_financial_metric_series') return runTool(
+            name, onStart, signal, (toolSignal) => input.getFinancialMetricSeries(
+              symbol, stringParam(params, 'metric'), stringParam(params, 'cursor') || undefined, toolSignal,
+            ),
+          )
+          if (name === 'read_filing_document') return runTool(
+            name, onStart, signal, (toolSignal) => input.readFilingDocument(
+              symbol, stringParam(params, 'filingId'), stringParam(params, 'cursor') || undefined, toolSignal,
+            ),
+          )
+          if (name === 'list_company_events') return runTool(
+            name, onStart, signal, (toolSignal) => input.listCompanyEvents(symbol, toolSignal),
+          )
+          if (name === 'submit_specialist_report') {
+            await onStart()
+            const validation = validateReportCandidate(params, {
+              role: 'fundamental_valuation', knownFacts: [...knownFacts.values()],
+            })
+            if (!validation.ok) {
+              validationState.failures += 1
+              if (validationState.failures >= 3) validationState.exhausted = true
+              return failedReportValidation(validation.errors, params)
+            }
+            return {
+              ...succeeded({ submitted: true }), report: legacyReport(validation.report),
+              reportVersion: { kind: 'specialist', report: validation.report }, terminate: true,
+            }
+          }
+          return failed('tool_not_available')
+        },
+      })
+      const task = fundamental.then((outcome) => {
+        if (policyFailure) throw policyFailure
+        if (!outcome.report || !outcome.reportVersion) throw new Error('specialist_report_required')
+        queue.push({
+          type: 'completed', report: outcome.report, reportVersion: outcome.reportVersion,
+          usage: outcome.usage, stopReason: outcome.stopReason,
+          operationId: `execution:${input.executionId}:report`,
+        })
+      }).then(() => queue.end(), (error) => queue.fail(error))
+      try {
+        for await (const event of queue) yield event
+        await task
+      } finally {
+        consumer.abort(new Error('model_consumer_closed'))
+        queue.end()
+        await task.catch(() => undefined)
+      }
+    },
   }
 }
 
 async function runProjectedAgent(config: {
-  role: Role; input: AnalyzeInput | AnalyzeNewsInput; options: ModelOptions; settings: RuntimeSettings
+  role: Role; input: AnalyzeInput | AnalyzeNewsInput | AnalyzeFundamentalInput; options: ModelOptions; settings: RuntimeSettings
   executionSignal: AbortSignal; activeBudget: ActiveBudget
   modelGate: ReturnType<typeof createConcurrencyGate>; toolGate: ReturnType<typeof createConcurrencyGate>
   provider: ReturnType<typeof createProviderRuntime>; queue: ReturnType<typeof createAsyncQueue<ModelEvent>>
@@ -532,9 +616,8 @@ async function runProjectedAgent(config: {
       }
       else if (stage === 'finalization' && config.role === 'main'
         && definition.name !== 'submit_analysis_report') executed = failed('tool_not_available')
-      else if (stage === 'finalization' && config.role === 'fundamental') {
-        executed = failed('tool_not_available')
-      }
+      else if (stage === 'finalization' && config.role !== 'main'
+        && definition.name !== 'submit_specialist_report') executed = failed('tool_not_available')
       else if (stage === 'research' && config.activeBudget.exhausted()) {
         executed = failed('research_active_timeout')
       }
@@ -709,9 +792,7 @@ async function runProjectedAgent(config: {
     afterToolCall: async ({ result, isError }) => ({
       isError: Boolean((result.details as { audit?: ToolAudit } | undefined)?.audit?.isError ?? isError),
     }),
-    shouldStopAfterTurn: async () => config.role === 'fundamental'
-      ? Boolean(finalText)
-      : Boolean(completedReport),
+    shouldStopAfterTurn: async () => Boolean(completedReport),
     prepareNextTurn: async () => {
       if (completedReport || finalText) return undefined
       const hasToolBatch = Boolean(currentBatch)
@@ -742,10 +823,10 @@ async function runProjectedAgent(config: {
       const next = config.role === 'main'
         ? stage === 'finalization' ? finalizationModelTools : analysisModelTools
         : stage === 'finalization'
-          ? config.role === 'news' ? toolRegistry.project({ role: 'news', stage: 'finalization' }) : []
+          ? toolRegistry.project({ role: config.role, stage: 'finalization' })
           : config.role === 'news'
             ? config.nextResearchTools?.() ?? newsSpecialistTools
-            : projectedSpecialistTools(input as AnalyzeInput)
+            : financialSpecialistTools
       if (hasToolBatch) await completeCurrentBatch({ tools: next, causativeEvent })
       else {
         const turnAdvance = {
@@ -780,14 +861,11 @@ async function runProjectedAgent(config: {
       const calls = event.message.content.filter((content) => content.type === 'toolCall')
       lastAssistantHadCalls = calls.length > 0
       if (!calls.length) {
-        if (config.role === 'fundamental') finalText = contentText(event.message.content as never)
-        else {
-          const submitTool = config.role === 'news'
-            ? 'submit_specialist_report' : 'submit_analysis_report'
-          adapter.followUp(userMessage(stage === 'finalization'
-            ? `请立即调用 ${submitTool} 提交受限报告。`
-            : `请继续自主规划，准备好后调用 ${submitTool}。`))
-        }
+        const submitTool = config.role === 'main'
+          ? 'submit_analysis_report' : 'submit_specialist_report'
+        adapter.followUp(userMessage(stage === 'finalization'
+          ? `请立即调用 ${submitTool} 提交受限报告。`
+          : `请继续自主规划，准备好后调用 ${submitTool}。`))
         return
       }
       const roleScope = config.invocationId
@@ -874,58 +952,6 @@ type ExecutedTool = {
   completedAt?: string
 }
 
-async function executeSpecialistTool(
-  name: string, params: unknown, signal: AbortSignal, onStart: () => Promise<void>, input: AnalyzeInput,
-  options: ModelOptions, settings: RuntimeSettings, activeBudget: ActiveBudget,
-  toolGate: ReturnType<typeof createConcurrencyGate>,
-): Promise<ExecutedTool> {
-  if (name === unavailableToolName) { await onStart(); return failed('tool_not_available') }
-  const owner = await acquireActiveSlot({
-    acquire: () => acquireToolSlot(input, toolGate, signal), activeBudget, signal,
-    onStart: () => options.log?.({
-      type: 'tool_request_start', executionId: input.executionId, toolName: name,
-    }),
-    onEnd: () => options.log?.({
-      type: 'tool_request_end', executionId: input.executionId, toolName: name,
-    }),
-  })
-  let executed: ExecutedTool
-  try {
-    await onStart()
-    if (name === 'search_news_by_keyword') {
-      if (!input.searchNews) executed = failed('tool_not_available')
-      else {
-      const keyword = stringParam(params, 'keyword') || input.symbol
-      executed = succeeded(await toolRegistry.handler(name)!(params, {
-        searchNews: async () => input.searchNews!(
-          keyword, toolSignal(options, settings, owner.signal),
-        ),
-      }))
-      }
-    }
-    else if (name === 'get_technical_indicators') {
-      if (!input.fetchTechnicalIndicators) executed = failed('tool_not_available')
-      else {
-      const symbol = stringParam(params, 'symbol') || input.symbol
-      const endDate = stringParam(params, 'endDate') || new Date().toISOString().slice(0, 10)
-      const startDate = stringParam(params, 'startDate') || oneYearBefore(endDate)
-      executed = succeeded(await toolRegistry.handler(name)!(params, {
-        fetchTechnicalIndicators: async () => input.fetchTechnicalIndicators!(
-          symbol, startDate, endDate, toolSignal(options, settings, owner.signal),
-        ),
-      }))
-      }
-    }
-    else executed = failed('tool_not_available')
-  } catch (error) {
-    executed = failed(error instanceof Error ? error.message : String(error))
-  } finally {
-    executed!.completedAt = new Date().toISOString()
-    owner.finish()
-  }
-  return executed!
-}
-
 function createProviderRuntime(options: ModelOptions) {
   const models = (options.modelsFactory ?? createModels)()
   let model: Model<Api>
@@ -958,7 +984,7 @@ function createProviderRuntime(options: ModelOptions) {
 }
 
 async function beginBudgetedModelRequest(config: {
-  input: AnalyzeInput | AnalyzeNewsInput; options: ModelOptions; settings: RuntimeSettings
+  input: AnalyzeInput | AnalyzeNewsInput | AnalyzeFundamentalInput; options: ModelOptions; settings: RuntimeSettings
   executionSignal: AbortSignal; activeBudget: ActiveBudget
   modelGate: ReturnType<typeof createConcurrencyGate>
 }, specialist: boolean) {
@@ -1138,6 +1164,7 @@ function modelToolResult(name: string, result: Record<string, unknown>) {
   const allowed = [
     'facts', 'gaps', 'summary', 'analysis', 'error', 'source', 'sources',
     'cursor', 'nextCursor', 'pagination', 'truncated', 'resultCount',
+    'returnedCount', 'totalCount', 'items', 'overview',
   ]
   return Object.fromEntries(allowed.flatMap((key) => key in result ? [[key, result[key]]] : []))
 }
@@ -1157,11 +1184,6 @@ function validWebSearchReasons(reasons: Array<{ source: string; reason: string }
     && new Set(reasons.map(({ source }) => source)).size === 3
     && reasons.every(({ source, reason }) => Boolean(source) && allowed.includes(reason))
 }
-function projectedSpecialistTools(input: AnalyzeInput) {
-  return financialSpecialistTools.filter(({ name }) => (
-    name === 'search_news_by_keyword' ? Boolean(input.searchNews) : Boolean(input.fetchTechnicalIndicators)
-  ))
-}
 function acquireToolSlot(
   input: AnalyzeInput, gate: ReturnType<typeof createConcurrencyGate>, signal: AbortSignal,
 ) { return input.acquireToolSlot ? input.acquireToolSlot(signal) : gate.acquire(signal) }
@@ -1170,10 +1192,6 @@ function toolSignal(options: ModelOptions, settings: RuntimeSettings, signal: Ab
     signal, AbortSignal.timeout(options.toolTimeoutMs ?? 30_000),
     AbortSignal.timeout(settings.modelRequestTimeoutMinutes * (options.runtimeMinuteMs ?? 60_000)),
   ])
-}
-function oneYearBefore(endDate: string) {
-  const value = new Date(`${endDate}T00:00:00Z`); value.setUTCFullYear(value.getUTCFullYear() - 1)
-  return value.toISOString().slice(0, 10)
 }
 function userMessage(content: string): PiAgentAdapterMessage {
   return { role: 'user', content, timestamp: Date.now() }
