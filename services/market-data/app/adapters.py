@@ -1,14 +1,18 @@
 import gzip
+import http.client
+import ipaddress
 import json
 import os
 import re
+import socket
+import ssl
 import time
 from hashlib import sha256
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import List
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urljoin, urlsplit, urlunsplit
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from xml.etree import ElementTree
@@ -39,6 +43,92 @@ def _read(url: str, params=None, headers=None, timeout=15) -> bytes:
             payload = gzip.decompress(payload)
     _diagnose(target, payload)
     return payload
+
+
+ALLOWED_DOCUMENT_CONTENT_TYPES = {"text/html", "text/plain", "application/xhtml+xml"}
+
+
+def validate_document_url(url: str) -> str:
+    return _resolve_document_url(url)[0]
+
+
+def _resolve_document_url(url: str):
+    parsed = urlsplit(url)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError("news_document_url_not_public")
+    port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+    try:
+        addresses = socket.getaddrinfo(parsed.hostname, port, type=socket.SOCK_STREAM)
+    except OSError as error:
+        raise ValueError("news_document_url_not_public") from error
+    if not addresses:
+        raise ValueError("news_document_url_not_public")
+    verified_addresses = []
+    for address in addresses:
+        ip = ipaddress.ip_address(address[4][0])
+        if not ip.is_global:
+            raise ValueError("news_document_url_not_public")
+        verified_addresses.append(str(ip))
+    host = parsed.hostname.lower()
+    default_port = (parsed.scheme.lower() == "https" and parsed.port in {None, 443}) \
+        or (parsed.scheme.lower() == "http" and parsed.port in {None, 80})
+    normalized_host = f"[{host}]" if ":" in host else host
+    authority = normalized_host if default_port else f"{normalized_host}:{parsed.port}"
+    normalized = urlunsplit((parsed.scheme.lower(), authority, parsed.path or "/", parsed.query, ""))
+    return normalized, verified_addresses[0], port, host
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, hostname: str, pinned_ip: str, port: int, timeout: float):
+        super().__init__(hostname, port=port, timeout=timeout)
+        self._pinned_ip = pinned_ip
+
+    def connect(self):
+        self.sock = socket.create_connection(
+            (self._pinned_ip, self.port), self.timeout, self.source_address,
+        )
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, hostname: str, pinned_ip: str, port: int, timeout: float):
+        super().__init__(hostname, port=port, timeout=timeout, context=ssl.create_default_context())
+        self._pinned_ip = pinned_ip
+
+    def connect(self):
+        raw_socket = socket.create_connection(
+            (self._pinned_ip, self.port), self.timeout, self.source_address,
+        )
+        self.sock = self._context.wrap_socket(raw_socket, server_hostname=self.host)
+
+
+def read_limited_document(url: str, max_bytes: int, timeout: float = 10):
+    target = url
+    for _redirect in range(6):
+        safe_url, pinned_ip, port, hostname = _resolve_document_url(target)
+        parsed = urlsplit(safe_url)
+        connection_class = _PinnedHTTPSConnection if parsed.scheme == "https" else _PinnedHTTPConnection
+        connection = connection_class(hostname, pinned_ip, port, timeout)
+        path = urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
+        try:
+            connection.request("GET", path, headers={"User-Agent": USER_AGENT, "Host": parsed.netloc})
+            response = connection.getresponse()
+            if response.status in {301, 302, 303, 307, 308}:
+                location = response.headers.get("Location")
+                if not location:
+                    raise ValueError("news_document_redirect_invalid")
+                target = urljoin(safe_url, location)
+                continue
+            if response.status < 200 or response.status >= 300:
+                raise ValueError("news_document_http_status")
+            content_type = response.headers.get_content_type()
+            if content_type not in ALLOWED_DOCUMENT_CONTENT_TYPES:
+                raise ValueError("news_document_content_type_not_allowed")
+            payload = response.read(max_bytes + 1)
+            truncated = len(payload) > max_bytes
+            return payload[:max_bytes], content_type, truncated, safe_url
+        finally:
+            connection.close()
+    raise ValueError("news_document_redirect_limit")
 
 
 def _diagnose(target: str, payload: bytes):

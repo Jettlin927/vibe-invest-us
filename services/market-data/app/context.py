@@ -120,8 +120,53 @@ def search_news_facts(keyword: str, now: datetime, news_sources: Iterable[Any]):
             type="news", value={"keyword": normalized_keyword, "title": item.title, "summary": item.summary, "url": item.url},
             observedAt=item.published_at.isoformat(), fetchedAt=now.isoformat(),
             source=item.source, sourceReference=item.url,
+            evidenceLevel="title_only",
         ))
     return facts[:30], statuses
+
+
+def read_news_document_fact(candidate: AtomicFact, now: datetime, reader, max_bytes: int = 65536):
+    read_result = reader(candidate.sourceReference, max_bytes)
+    payload, content_type = read_result[:2]
+    truncated = bool(read_result[2]) if len(read_result) > 2 else False
+    final_url = read_result[3] if len(read_result) > 3 else candidate.sourceReference
+    bounded = bytes(payload[:max_bytes])
+    text = re.sub(r"<[^>]+>", " ", bounded.decode("utf-8", errors="replace"))
+    excerpt = " ".join(text.split())[:max_bytes]
+    return AtomicFact(
+        id=f"fact:news-document:{sha256(candidate.id.encode()).hexdigest()[:16]}:{sha256(bounded).hexdigest()[:16]}",
+        type="news_document",
+        value={
+            "candidateFactId": candidate.id,
+            "url": final_url,
+            "summary": excerpt[:500],
+            "contentHash": sha256(bounded).hexdigest(),
+            "metadata": {
+                "contentType": content_type, "excerptBytes": len(excerpt.encode()),
+                "truncated": truncated,
+            },
+        },
+        observedAt=candidate.observedAt,
+        fetchedAt=now.isoformat(),
+        source=candidate.source,
+        sourceReference=final_url,
+        evidenceLevel="verified_news",
+    )
+
+
+def company_event_facts(symbol: str, now: datetime, news_sources: Iterable[Any]):
+    normalized_symbol = symbol.strip().upper()
+    news_facts, statuses = search_news_facts(normalized_symbol, now, news_sources)
+    facts = [fact.model_copy(update={
+        "id": fact.id.replace("fact:news-search:", "fact:company-event:"),
+        "type": "company_event",
+        "value": {
+            "symbol": normalized_symbol,
+            "title": fact.value["title"], "summary": fact.value["summary"],
+            "url": fact.value["url"],
+        },
+    }) for fact in news_facts]
+    return facts, statuses
 
 
 def technical_indicator_facts(symbol: str, start_date: str, end_date: str, now: datetime, history_sources: Iterable[Any]):

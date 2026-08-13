@@ -39,9 +39,14 @@ test('唯一 Registry 中每个工具独立声明完整权限、保留、网络�
   assert.deepEqual(registry.list().map((tool) => tool.model.name), [
     'fetch_financial_context',
     'analyze_financials',
+    'run_news_analysis',
     'submit_analysis_report',
     'search_news_by_keyword',
     'get_technical_indicators',
+    'search_news_candidates',
+    'read_news_document',
+    'list_company_events',
+    'submit_specialist_report',
   ])
   for (const tool of registry.list()) {
     assert.ok(tool.allowedRoles.length > 0)
@@ -116,4 +121,18 @@ test('Registry 只按角色和阶段返回模型定义且不提供隐藏工具 d
   ])
   assert.equal('get' in registry, false)
   assert.equal('has' in registry, false)
+})
+
+test('消息面 Agent 只获得新闻候选、文档、公司事件和专项报告工具', () => {
+  const registry = createToolRegistry(registeredToolDefinitions, registeredToolHandlers)
+  assert.deepEqual(registry.project({ role: 'news', stage: 'research' }).map(({ name }) => name), [
+    'search_news_candidates', 'read_news_document', 'list_company_events',
+    'submit_specialist_report',
+  ])
+  assert.deepEqual(registry.project({ role: 'news', stage: 'finalization' }).map(({ name }) => name), [
+    'submit_specialist_report',
+  ])
+  assert.deepEqual(registry.project({ role: 'main', stage: 'research' }).map(({ name }) => name), [
+    'fetch_financial_context', 'analyze_financials', 'run_news_analysis', 'submit_analysis_report',
+  ])
 })

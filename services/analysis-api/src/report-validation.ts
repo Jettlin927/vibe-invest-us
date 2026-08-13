@@ -67,6 +67,9 @@ export function validateReportCandidate(
   if (context.role === 'main' && candidate.kind === 'specialist') envelopeErrors.push({
     path: '/kind', rule: 'role_policy', message: '主 Agent 只能提交 integrated 报告', allowedEvidenceTypes: [],
   })
+  if (context.role === 'news' && candidate.kind === 'specialist' && candidate.domain !== 'news') envelopeErrors.push({
+    path: '/domain', rule: 'role_policy', message: '消息面 Agent 只能提交 news 领域报告', allowedEvidenceTypes: [],
+  })
   if (Array.isArray(candidate.gaps)) candidate.gaps.forEach((value, index) => {
     const gap = asRecord(value)
     for (const field of ['capability', 'reason', 'impact']) {
@@ -113,7 +116,12 @@ export function validateReportCandidate(
     }
   })
   if (Array.isArray(candidate.keyJudgments)) candidate.keyJudgments.forEach((value, index) => {
-    validateJudgmentSchema(asRecord(value), index, envelopeErrors)
+    const judgment = asRecord(value)
+    validateJudgmentSchema(judgment, index, envelopeErrors)
+    if (context.role === 'news' && judgment.type !== 'news') envelopeErrors.push({
+      path: `/keyJudgments/${index}/type`, rule: 'role_policy',
+      message: '消息面 Agent 只能提交 news 判断', allowedEvidenceTypes: [],
+    })
   })
   if (envelopeErrors.length) return { ok: false, errors: envelopeErrors }
   const facts = new Map(context.knownFacts.map((fact) => [fact.id, fact]))

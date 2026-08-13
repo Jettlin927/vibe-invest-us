@@ -26,6 +26,7 @@ const facts = [{
 function createPiModel(options: ModelOptions = {}) {
   const model = createProductionPiModel(options)
   return {
+    ...model,
     analyze(input: AnalyzeInput) {
       return model.analyze({ ...input, toolRuntime: input.toolRuntime ?? createTestToolRuntime() })
     },
@@ -101,11 +102,169 @@ function legacyOperationId(operationId: string) {
 
 test('主分析模型和财报专家使用不同的显式工具集', () => {
   assert.deepEqual(analysisModelTools.map((tool) => tool.name), [
-    'fetch_financial_context', 'analyze_financials', 'submit_analysis_report',
+    'fetch_financial_context', 'analyze_financials', 'run_news_analysis', 'submit_analysis_report',
   ])
   assert.deepEqual(financialSpecialistTools.map((tool) => tool.name), [
     'search_news_by_keyword', 'get_technical_indicators',
   ])
+})
+
+test('主 Agent 可以明确不启动消息面 Agent 并保留理由', async () => {
+  let specialistCalls = 0
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall('run_news_analysis', {
+      launch: false, researchQuestion: '近期是否有重大公司事件？', reason: '已有资料足够，无需追加。',
+    }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('submit_analysis_report', validReport), { stopReason: 'toolUse' }),
+  ] })
+  const events = []
+  for await (const event of model.analyze({
+    executionId: 'news-not-launched', runtimeSettings: runtimeSettings(),
+    symbol: 'NVDA', systemPrompt: 'system', userPrompt: 'user', knownFacts: facts,
+    fetchFinancialContext: async () => ({ facts }),
+    runNewsSpecialist: async () => { specialistCalls += 1; throw new Error('must_not_run') },
+  })) events.push(event)
+
+  assert.equal(specialistCalls, 0)
+  const result = events.find((event) => event.type === 'trace' && event.entry.type === 'tool_result'
+    && event.entry.name === 'run_news_analysis')
+  assert.match(JSON.stringify(result), /已有资料足够，无需追加/)
+  assert.match(JSON.stringify(result), /not_started/)
+})
+
+test('主 Agent 启动消息面 Agent 时把研究问题和理由原样交给 Runtime', async () => {
+  const requests: unknown[] = []
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall('run_news_analysis', {
+      launch: true, researchQuestion: '检查近 30 天是否有改变预期的公司事件。',
+      reason: '当前资料缺少消息面反方证据。',
+    }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('submit_analysis_report', validReport), { stopReason: 'toolUse' }),
+  ] })
+  for await (const _event of model.analyze({
+    executionId: 'news-launched', runtimeSettings: runtimeSettings(),
+    symbol: 'NVDA', systemPrompt: 'system', userPrompt: 'user', knownFacts: facts,
+    fetchFinancialContext: async () => ({ facts }),
+    runNewsSpecialist: async (request) => {
+      requests.push(request)
+      return {
+        launched: true, status: 'completed', sessionId: 'news-session',
+        executionId: 'news-execution', reportId: 'news-report', reportVersion: 1,
+        summary: '未发现改变预期的事件。', keyFactIds: [], contraryFactIds: [], gaps: [],
+      }
+    },
+  })) { /* consume */ }
+
+  assert.deepEqual(requests, [{
+    launch: true, researchQuestion: '检查近 30 天是否有改变预期的公司事件。',
+    reason: '当前资料缺少消息面反方证据。',
+  }])
+})
+
+test('消息面能力可用时主 Agent 未作启动决定不能直接提交综合报告', async () => {
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall('submit_analysis_report', validReport), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('run_news_analysis', {
+      launch: false, researchQuestion: '近期是否有重大事件？', reason: '现有事实已足够。',
+    }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('submit_analysis_report', validReport), { stopReason: 'toolUse' }),
+  ] })
+  const events = []
+  for await (const event of model.analyze({
+    executionId: 'news-decision-required', runtimeSettings: runtimeSettings(), symbol: 'NVDA',
+    systemPrompt: 'system', knownFacts: facts, fetchFinancialContext: async () => ({ facts }),
+    runNewsSpecialist: async () => ({}),
+  })) events.push(event)
+  assert.match(JSON.stringify(events), /news_specialist_decision_required/)
+  assert.equal(events.filter((event) => event.type === 'completed').length, 1)
+})
+
+test('消息面正文只能读取当前专项候选工具返回的 Fact', async () => {
+  const priorCandidate = { ...facts[0]!, id: 'fact:prior-news', type: 'news', evidenceLevel: 'title_only' }
+  let reads = 0
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall('read_news_document', { factId: priorCandidate.id }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('search_news_candidates', { query: 'NVDA' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('read_news_document', { factId: priorCandidate.id }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('submit_specialist_report', {
+      kind: 'specialist', domain: 'news', availability: 'partial', status: 'partial',
+      gaps: [{ capability: 'verified_news', reason: '正文不可用', impact: '无法形成关键判断' }],
+      limitations: ['正文不可用'], keyJudgments: [],
+    }), { stopReason: 'toolUse' }),
+  ] })
+  const events = []
+  for await (const event of model.analyzeNews!({
+    executionId: 'news-candidate-provenance', runtimeSettings: { ...runtimeSettings(), specialistAgentToolRounds: 3 },
+    symbol: 'NVDA', systemPrompt: 'news', researchQuestion: 'question', knownFacts: [priorCandidate],
+    searchNewsCandidates: async () => ({ facts: [priorCandidate] }),
+    readNewsDocument: async () => { reads += 1; return { facts: [] } },
+    listCompanyEvents: async () => ({ facts: [] }), toolRuntime: createTestToolRuntime(),
+  })) events.push(event)
+  assert.match(JSON.stringify(events), /news_candidate_not_found/)
+  assert.equal(reads, 1)
+})
+
+test('消息面 Agent 只使用领域工具并提交可追溯专项报告', async () => {
+  const candidate = {
+    ...facts[0]!, id: 'fact:news:candidate', type: 'news',
+    value: {
+      title: 'NVDA 发布新产品', summary: '标题级候选',
+      url: 'https://example.com/news', evidenceLevel: 'title_only',
+    },
+    evidenceLevel: 'title_only',
+  }
+  const verified = {
+    ...candidate, id: 'fact:news:document', evidenceLevel: 'verified_news',
+    value: {
+      ...candidate.value, summary: '有限正文摘要', excerpt: '受限片段',
+      contentHash: 'a'.repeat(64), metadata: { contentType: 'text/html', excerptBytes: 12 },
+      evidenceLevel: 'verified_news',
+    },
+  }
+  const report = {
+    kind: 'specialist' as const, domain: 'news', availability: 'available' as const,
+    status: 'completed' as const, gaps: [], limitations: [],
+    keyJudgments: [{
+      type: 'news', statement: '新产品发布对近期预期偏正面', direction: 'bullish',
+      confidence: 'medium', supportingEvidence: [verified.id], contraryEvidence: [],
+      contraryEvidenceStatus: 'none_found', invalidationConditions: ['公司取消发布'],
+    }],
+  }
+  const visible: string[][] = []
+  const model = createPiModel({ fauxResponses: [
+    (context) => {
+      visible.push(context.tools.map(({ name }) => name))
+      return fauxAssistantMessage(fauxToolCall('search_news_candidates', {
+        query: 'NVDA 新产品',
+      }), { stopReason: 'toolUse' })
+    },
+    fauxAssistantMessage(fauxToolCall('read_news_document', {
+      factId: candidate.id,
+    }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('submit_specialist_report', report), { stopReason: 'toolUse' }),
+  ] })
+  const events = []
+  for await (const event of model.analyzeNews!({
+    executionId: 'news-execution', runtimeSettings: runtimeSettings(), symbol: 'NVDA',
+    systemPrompt: '消息面专项', researchQuestion: '近期事件是否改变预期？', knownFacts: [],
+    searchNewsCandidates: async () => ({ facts: [candidate] }),
+    readNewsDocument: async (input) => {
+      assert.equal(input.id, candidate.id)
+      return { facts: [verified] }
+    },
+    listCompanyEvents: async () => ({ facts: [] }),
+    toolRuntime: createTestToolRuntime(),
+  })) events.push(event)
+
+  assert.deepEqual(visible[0], [
+    'search_news_candidates', 'read_news_document', 'list_company_events',
+    'submit_specialist_report',
+  ])
+  const completed = events.find((event) => event.type === 'completed')
+  assert.equal(completed?.type, 'completed')
+  if (completed?.type === 'completed') assert.deepEqual(completed.reportVersion?.report, report)
+  assert.match(JSON.stringify(events), /fact:news:candidate/)
+  assert.match(JSON.stringify(events), /fact:news:document/)
 })
 
 test('宽松报告允许证据和情景数组为空', async () => {

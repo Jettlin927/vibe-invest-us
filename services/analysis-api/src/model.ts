@@ -90,6 +90,11 @@ export type AnalyzeInput = {
     signal: AbortSignal,
   ) => Promise<{ facts: Fact[]; [key: string]: unknown }>
   financialContextToolViews?: FinancialContextToolViews
+  runNewsSpecialist?: (input: {
+    launch: boolean
+    researchQuestion: string
+    reason: string
+  }) => Promise<Record<string, unknown>>
   searchNews?: (
     keyword: string,
     signal: AbortSignal,
@@ -108,6 +113,30 @@ export type AnalyzeInput = {
   toolRuntime?: ToolRuntime
 }
 
+export type AnalyzeNewsInput = {
+  executionId: string
+  runtimeSettings: RuntimeSettings
+  symbol: string
+  systemPrompt: string
+  researchQuestion: string
+  knownFacts: Fact[]
+  searchNewsCandidates: (
+    query: string, signal: AbortSignal,
+  ) => Promise<{ facts: Fact[]; [key: string]: unknown }>
+  readNewsDocument: (
+    candidate: Fact, signal: AbortSignal,
+  ) => Promise<{ facts: Fact[]; [key: string]: unknown }>
+  listCompanyEvents: (
+    symbol: string, signal: AbortSignal,
+  ) => Promise<{ facts: Fact[]; [key: string]: unknown }>
+  signal?: AbortSignal
+  executionDeadlineSignal?: AbortSignal
+  activeBudget?: ActiveBudget
+  acquireModelSlot?: (signal: AbortSignal) => Promise<() => void>
+  acquireToolSlot?: (signal: AbortSignal) => Promise<() => void>
+  toolRuntime: ToolRuntime
+}
+
 export type FinancialContextToolViews = {
   model: { facts: Fact[]; [key: string]: unknown }
   retained: { facts: Fact[]; [key: string]: unknown }
@@ -123,7 +152,7 @@ export type RuntimeContext = {
 export type ToolRuntime = {
   ensureProjection(input: {
     executionId: string
-    role: 'main' | 'fundamental'
+    role: 'main' | 'fundamental' | 'news'
     stage: 'research' | 'finalization'
     tools: Tool[]
     createdAt: string
@@ -138,7 +167,7 @@ export type ToolRuntime = {
   beginModelRequest(input: {
     requestId: string
     executionId: string
-    role: 'main' | 'fundamental'
+    role: 'main' | 'fundamental' | 'news'
     stage: 'research' | 'finalization'
     turnIndex: number
     tools: Tool[]

@@ -8,6 +8,7 @@ export type FinancialFact = {
   fetchedAt: string
   source: string
   sourceReference: string
+  evidenceLevel?: string
 }
 
 export type FinancialContext = {
@@ -22,6 +23,7 @@ export type FinancialContext = {
 export type FactQueryResult = {
   facts: FinancialFact[]
   sources?: unknown[]
+  excerpt?: string
 }
 
 export function createFinancialDataClient(baseUrl: string) {
@@ -51,6 +53,25 @@ export function createFinancialDataClient(baseUrl: string) {
     },
     async searchNews(keyword: string, signal?: AbortSignal): Promise<FactQueryResult> {
       return factQuery(`/v1/news-search?keyword=${encodeURIComponent(keyword)}`, signal)
+    },
+    async readNewsDocument(candidate: FinancialFact, signal?: AbortSignal): Promise<FactQueryResult> {
+      const response = await fetch(new URL('/v1/news-document', baseUrl), {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ candidate }),
+        signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(30_000)]) : AbortSignal.timeout(30_000),
+      })
+      if (!response.ok) throw new Error(`financial_data_news_document_http_${response.status}`)
+      const value = await response.json() as { facts?: unknown; sources?: unknown[]; excerpt?: unknown }
+      if (!Array.isArray(value.facts) || !value.facts.every(isFinancialFact)) {
+        throw new Error('financial_data_news_document_contract_invalid')
+      }
+      return {
+        facts: value.facts, sources: Array.isArray(value.sources) ? value.sources : [],
+        ...(typeof value.excerpt === 'string' ? { excerpt: value.excerpt } : {}),
+      }
+    },
+    async companyEvents(symbol: string, signal?: AbortSignal): Promise<FactQueryResult> {
+      return factQuery(`/v1/company-events?symbol=${encodeURIComponent(symbol)}`, signal)
     },
     async technicalIndicators(
       symbol: string, startDate: string, endDate: string, signal?: AbortSignal,

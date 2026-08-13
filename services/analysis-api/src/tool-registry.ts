@@ -4,7 +4,12 @@ import addFormatsModule from 'ajv-formats'
 import { analyzeFinancialsDefinition } from './tool-definitions/analyze-financials.js'
 import { fetchFinancialContextDefinition } from './tool-definitions/fetch-financial-context.js'
 import { getTechnicalIndicatorsDefinition } from './tool-definitions/get-technical-indicators.js'
+import { listCompanyEventsDefinition } from './tool-definitions/list-company-events.js'
+import { readNewsDocumentDefinition } from './tool-definitions/read-news-document.js'
+import { runNewsAnalysisDefinition } from './tool-definitions/run-news-analysis.js'
+import { searchNewsCandidatesDefinition } from './tool-definitions/search-news-candidates.js'
 import { searchNewsByKeywordDefinition } from './tool-definitions/search-news-by-keyword.js'
+import { submitSpecialistReportDefinition } from './tool-definitions/submit-specialist-report.js'
 import { submitAnalysisReportDefinition } from './tool-definitions/submit-analysis-report.js'
 import type {
   RegisteredToolDefinition, ToolRole, ToolStage,
@@ -17,9 +22,14 @@ export { registeredToolHandlers } from './tool-handlers.js'
 export const registeredToolDefinitions = [
   fetchFinancialContextDefinition,
   analyzeFinancialsDefinition,
+  runNewsAnalysisDefinition,
   submitAnalysisReportDefinition,
   searchNewsByKeywordDefinition,
   getTechnicalIndicatorsDefinition,
+  searchNewsCandidatesDefinition,
+  readNewsDocumentDefinition,
+  listCompanyEventsDefinition,
+  submitSpecialistReportDefinition,
 ]
 
 export function createToolRegistry(
@@ -34,7 +44,7 @@ export function createToolRegistry(
     if (!validSchema(definition.resultSchema)) invalid(name, 'result_schema')
     if (typeof handlers[name] !== 'function') invalid(name, 'handler')
     if (!definition.allowedRoles?.length
-      || !definition.allowedRoles.every((role) => oneOf(role, ['main', 'fundamental']))) {
+      || !definition.allowedRoles.every((role) => oneOf(role, ['main', 'fundamental', 'news']))) {
       invalid(name, 'allowed_roles')
     }
     if (!definition.allowedStages?.length

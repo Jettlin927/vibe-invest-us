@@ -795,7 +795,7 @@ test('真实 PostgreSQL migration 幂等且 application role 没有 DDL 权限',
   await migrate(migrationUrl!)
 
   const pool = createPool(applicationUrl!)
-  assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 17 })
+  assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 18 })
   const privileges = await pool.query<{ can_create: boolean; can_temp: boolean }>(
     `SELECT has_schema_privilege(current_user, 'public', 'CREATE') AS can_create,
             has_database_privilege(current_user, current_database(), 'TEMP') AS can_temp`,
@@ -852,7 +852,7 @@ test('真实 PostgreSQL migration receipt 为空时按 max=0 升级', {
     )
     await pool.query('DELETE FROM product_schema_migrations')
     await migrate(migrationUrl!)
-    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 17 })
+    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 18 })
     assert.deepEqual((await pool.query<{ sequence: number; provenance: string }>(
       `SELECT sequence, provenance FROM tool_event_migration_provenance WHERE session_id = $1`,
       [sessionId],
@@ -882,7 +882,7 @@ test('真实 PostgreSQL 拒绝未发布的 schema 13、14、15 候选状态', {
       )).rows, [{ version }])
       await pool.query(
         `INSERT INTO product_schema_migrations (version)
-         SELECT generate_series($1, 17) ON CONFLICT (version) DO NOTHING`,
+         SELECT generate_series($1, 18) ON CONFLICT (version) DO NOTHING`,
         [version + 1],
       )
     }
@@ -919,23 +919,23 @@ test('真实 PostgreSQL 拒绝未来 schema 且不修改数据库', {
   })
   try {
     await pool.query('DROP TABLE tool_event_migration_provenance')
-    await pool.query('INSERT INTO product_schema_migrations (version) VALUES (18)')
+    await pool.query('INSERT INTO product_schema_migrations (version) VALUES (19)')
     const before = await fingerprint()
 
     await assert.rejects(
       migrate(migrationUrl!),
-      /product_schema_future_version_unsupported:18/,
+      /product_schema_future_version_unsupported:19/,
     )
 
     assert.deepEqual(await fingerprint(), before)
   } finally {
-    await pool.query('DELETE FROM product_schema_migrations WHERE version = 18')
+    await pool.query('DELETE FROM product_schema_migrations WHERE version = 19')
     await migrate(migrationUrl!)
     await pool.end()
   }
 })
 
-test('真实 PostgreSQL v12 无 Tool Batch 的历史工具事件原样升级到 v17', {
+test('真实 PostgreSQL v12 无 Tool Batch 的历史工具事件原样升级到 v18', {
   skip: !migrationUrl,
   concurrency: false,
 }, async () => {
@@ -979,7 +979,7 @@ test('真实 PostgreSQL v12 无 Tool Batch 的历史工具事件原样升级到 
 
     await migrate(migrationUrl!)
 
-    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 17 })
+    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 18 })
     assert.deepEqual((await pool.query<{ sequence: number; provenance: string }>(
       `SELECT sequence, provenance FROM tool_event_migration_provenance
        WHERE session_id = $1 ORDER BY sequence`, [sessionId],
@@ -1478,6 +1478,42 @@ test('真实 PostgreSQL 同一 analysis 可拥有多个独立 Agent Session 账�
       assert.deepEqual((await events.list(session.id, 0)).map(({ sequence }) => sequence),
         session.isPrimary ? [1] : [1, 2])
     }
+  } finally {
+    await analyses.removeResearch(analysisId)
+    await pool.end()
+  }
+})
+
+test('真实 PostgreSQL 每个研究只允许一个长期消息面 Session', {
+  skip: !applicationUrl,
+  concurrency: false,
+}, async () => {
+  const pool = createPool(applicationUrl!)
+  const analyses = createAnalysisRepository(pool)
+  const events = createAgentEventRepository(pool)
+  const analysisId = `unique-news-${crypto.randomUUID()}`
+  const now = '2026-08-13T13:00:00.000Z'
+  try {
+    await events.createResearch({
+      analysisId, sessionId: `${analysisId}:main`, executionId: `${analysisId}:main:execution`,
+      symbol: `N${crypto.randomUUID().slice(0, 8)}`, status: 'planning',
+      operationId: 'create-main', event: { type: 'runtime_context' }, createdAt: now,
+    })
+    const first = await events.createSpecialistSession({
+      id: `${analysisId}:news`, analysisId, domain: 'news',
+      executionId: `${analysisId}:news:execution`, status: 'planning',
+      operationId: 'create-news', event: { type: 'specialist_context', domain: 'news' }, createdAt: now,
+    })
+    const replay = await events.createSpecialistSession({
+      id: `${analysisId}:news:duplicate`, analysisId, domain: 'news',
+      executionId: `${analysisId}:news:duplicate:execution`, status: 'planning',
+      operationId: 'create-news-duplicate', event: { type: 'specialist_context', domain: 'news' }, createdAt: now,
+    })
+
+    assert.equal(first.created, true)
+    assert.equal(replay.created, false)
+    assert.equal(replay.sessionId, first.sessionId)
+    assert.equal((await events.listSessions(analysisId)).filter(({ isPrimary }) => !isPrimary).length, 1)
   } finally {
     await analyses.removeResearch(analysisId)
     await pool.end()

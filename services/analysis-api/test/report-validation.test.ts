@@ -121,6 +121,26 @@ test('专项 Runtime 拒绝候选伪装为综合报告', () => {
   }])
 })
 
+test('消息面 Runtime 拒绝其他领域和判断类型的专项报告', () => {
+  const result = validateReportCandidate({
+    kind: 'specialist', domain: 'technical', availability: 'available', status: 'completed',
+    gaps: [], limitations: [], keyJudgments: [{
+      type: 'technical', statement: '趋势偏强', direction: 'bullish', confidence: 'medium',
+      supportingEvidence: ['fact:technical'], contraryEvidence: [],
+      contraryEvidenceStatus: 'none_found', invalidationConditions: ['跌破均线'],
+    }],
+  }, { role: 'news', knownFacts: [{
+    id: 'fact:technical', type: 'technical_indicator', evidenceLevel: 'deterministic_technical',
+  }] })
+
+  assert.equal(result.ok, false)
+  if (result.ok) return
+  assert.deepEqual(result.errors.map(({ path, rule }) => ({ path, rule })), [
+    { path: '/domain', rule: 'role_policy' },
+    { path: '/keyJudgments/0/type', rule: 'role_policy' },
+  ])
+})
+
 test('每项关键判断必须至少有一个合格支持证据', () => {
   const result = validateReportCandidate({
     kind: 'integrated', availability: 'available', status: 'completed', gaps: [], limitations: [],

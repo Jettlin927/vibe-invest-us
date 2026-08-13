@@ -9,13 +9,16 @@ import {
   type AgentExecutionStatus, type RuntimeSettings,
 } from '@vibe-invest/contracts'
 
-import type { AnalyzeInput, AnalysisReport, ModelEvent, ToolRuntime } from './model.js'
+import type { AnalyzeInput, AnalyzeNewsInput, AnalysisReport, ModelEvent, ToolRuntime } from './model.js'
 import type { FactQueryResult, FinancialContext, FinancialFact } from './financial-data-client.js'
 import { acquireActiveSlot, createActiveBudget, createConcurrencyGate } from './runtime-policy.js'
 import { analysisModelTools } from './tools.js'
 
 type Fact = FinancialFact
-type Model = { analyze(input: AnalyzeInput): AsyncIterable<ModelEvent> }
+type Model = {
+  analyze(input: AnalyzeInput): AsyncIterable<ModelEvent>
+  analyzeNews?: (input: AnalyzeNewsInput) => AsyncIterable<ModelEvent>
+}
 
 export function createAnalysisService(options: {
   repository: AnalysisRepository
@@ -25,6 +28,9 @@ export function createAnalysisService(options: {
   model: Model
   fetchFinancialContext: (symbol: string, signal: AbortSignal) => Promise<FinancialContext>
   searchNews?: (keyword: string, signal: AbortSignal) => Promise<FactQueryResult>
+  searchNewsCandidates?: (query: string, signal: AbortSignal) => Promise<FactQueryResult>
+  readNewsDocument?: (candidate: Fact, signal: AbortSignal) => Promise<FactQueryResult>
+  listCompanyEvents?: (symbol: string, signal: AbortSignal) => Promise<FactQueryResult>
   fetchTechnicalIndicators?: (
     symbol: string, startDate: string, endDate: string, signal: AbortSignal,
   ) => Promise<FactQueryResult>
@@ -369,6 +375,118 @@ export function createAnalysisService(options: {
       assertPolicy()
       const modelContext = createModelContext(snapshot)
       const runtimeContext = createInitialRuntimeContext(modelContext, portfolioContext)
+      const newsRuntimeAvailable = Boolean(options.model.analyzeNews && options.searchNewsCandidates
+        && options.readNewsDocument && options.listCompanyEvents)
+      const runNewsSpecialist = async (request: {
+        launch: boolean; researchQuestion: string; reason: string
+      }) => {
+        if (!options.model.analyzeNews || !options.searchNewsCandidates
+          || !options.readNewsDocument || !options.listCompanyEvents) {
+          throw new Error('news_specialist_runtime_unavailable')
+        }
+        await setStatus(
+          sessionId, executionId,
+          `execution:${executionId}:news-specialist:waiting`, 'waiting_for_specialists', {},
+          '消息面专项分析',
+        )
+        const specialistSessionId = randomUUID()
+        const specialistExecutionId = randomUUID()
+        const createdAt = new Date().toISOString()
+        const specialistSession = await options.eventRepository.createSpecialistSession({
+          id: specialistSessionId, analysisId, executionId: specialistExecutionId,
+          domain: 'news',
+          segmentId: randomUUID(), status: 'planning',
+          operationId: `session:${specialistSessionId}:created`,
+          event: {
+            type: 'specialist_context', domain: 'news', launch: request.launch,
+            researchQuestion: request.researchQuestion, reason: request.reason,
+            status: 'planning', at: createdAt,
+          },
+          createdAt,
+        })
+        if (!specialistSession.created) {
+          const versions = await options.eventRepository.listReportVersions(analysisId)
+          const existing = versions.filter(({ sessionId }) => sessionId === specialistSession.sessionId).at(-1)
+          await setStatus(
+            sessionId, executionId,
+            `execution:${executionId}:news-specialist:resumed`, 'running_tools', {},
+          )
+          return {
+            launched: true, status: existing ? 'completed' : 'not_started',
+            sessionId: specialistSession.sessionId, executionId: specialistSession.executionId,
+            ...(existing ? { reportId: existing.id, reportVersion: existing.version } : {}),
+            summary: request.researchQuestion, keyFactIds: [], contraryFactIds: [], gaps: [],
+          }
+        }
+        let specialistStatus = 'failed'
+        let specialistReportVersion: ReturnType<typeof finalReportVersion> | undefined
+        try {
+          await setStatus(
+            specialistSessionId, specialistExecutionId,
+            `execution:${specialistExecutionId}:running-model`, 'running_model', {}, '消息面专项模型',
+          )
+          for await (const specialistEvent of options.model.analyzeNews({
+            executionId: specialistExecutionId, runtimeSettings, symbol: job.symbol,
+            systemPrompt: '你是独立消息面 Agent。只使用新闻候选、新闻文档和公司事件工具；每项判断引用合格事实 ID，禁止个人买卖或仓位建议。',
+            researchQuestion: request.researchQuestion, knownFacts: modelContext.facts,
+            searchNewsCandidates: options.searchNewsCandidates,
+            readNewsDocument: options.readNewsDocument,
+            listCompanyEvents: options.listCompanyEvents,
+            signal: controller.signal, executionDeadlineSignal: wallDeadline, activeBudget,
+            acquireModelSlot: (signal) => modelGate.acquire(signal),
+            acquireToolSlot: (signal) => toolGate.acquire(signal), toolRuntime,
+          })) {
+            if (specialistEvent.type === 'lifecycle') await setStatus(
+              specialistSessionId, specialistExecutionId, specialistEvent.operationId,
+              specialistEvent.status, {
+                terminal: specialistEvent.status === 'budget_exhausted' ? false : undefined,
+              }, specialistEvent.waitTarget,
+            )
+            else if (specialistEvent.type === 'trace'
+              && (specialistEvent.entry.type !== 'tool_result'
+                || typeof specialistEvent.entry.operationId !== 'string')) {
+              await appendTrace(specialistSessionId, specialistExecutionId, specialistEvent.entry)
+            }
+            else if (specialistEvent.type === 'text_delta') await appendTrace(
+              specialistSessionId, specialistExecutionId, specialistEvent.operationId
+                ? specialistEvent : { ...specialistEvent,
+                    operationId: `execution:${specialistExecutionId}:text:${Date.now()}` },
+            )
+            else if (specialistEvent.type === 'completed' && specialistEvent.reportVersion) {
+              const candidate = specialistEvent.reportVersion
+              const candidateReport = candidate.report as Record<string, unknown>
+              const status = candidateReport.status === 'partial' ? 'partial' : 'completed'
+              specialistStatus = status
+              specialistReportVersion = finalReportVersion(
+                specialistExecutionId, candidate, specialistEvent.report, status, [],
+              )
+              await setStatus(
+                specialistSessionId, specialistExecutionId,
+                `execution:${specialistExecutionId}:status-${status}`, status,
+                { reportVersion: specialistReportVersion },
+              )
+            }
+          }
+          if (!specialistReportVersion) throw new Error('specialist_report_required')
+        } catch (error) {
+          await setStatus(
+            specialistSessionId, specialistExecutionId,
+            `execution:${specialistExecutionId}:status-failed`, 'failed',
+            { error: error instanceof Error ? error.message : String(error) },
+          )
+          throw error
+        }
+        await setStatus(
+          sessionId, executionId,
+          `execution:${executionId}:news-specialist:completed`, 'running_tools', {},
+        )
+        return {
+          launched: true, status: specialistStatus, sessionId: specialistSessionId,
+          executionId: specialistExecutionId, reportId: specialistReportVersion.id,
+          reportVersion: 1,
+          ...specialistResultProjection(specialistReportVersion.report, request.researchQuestion),
+        }
+      }
       await appendEvent(
         sessionId, executionId, operationId('running-model'),
         { type: 'status', status: 'running_model' },
@@ -390,6 +508,7 @@ export function createAnalysisService(options: {
         acquireModelSlot: (signal) => modelGate.acquire(signal),
         acquireToolSlot: (signal) => toolGate.acquire(signal),
         searchNews: options.searchNews,
+        runNewsSpecialist: newsRuntimeAvailable ? runNewsSpecialist : undefined,
         fetchTechnicalIndicators: options.fetchTechnicalIndicators,
         toolRuntime,
       })) {
@@ -542,9 +661,42 @@ export function createAnalysisService(options: {
     const trace = session
       ? (await options.eventRepository.list(session.id, 0)).map(({ payload }) => payload)
       : []
+    const specialistSessions = (await options.eventRepository.listSessions(analysisId))
+      .filter(({ isPrimary }) => !isPrimary)
+    const reportVersions = await options.eventRepository.listReportVersions(analysisId)
+    const specialistAgents = await Promise.all(specialistSessions.map(async (specialist) => {
+      const lifecycle = await options.eventRepository.sessionLifecycle(specialist.id)
+      const events = lifecycle?.events as Array<Record<string, unknown>> | undefined
+      const created = events?.find((event) => event.type === 'specialist_context')
+      const reportVersion = reportVersions.filter(({ sessionId }) => sessionId === specialist.id).at(-1)
+      return lifecycle ? {
+        ...lifecycle, domain: created?.domain ?? 'unknown',
+        researchQuestion: created?.researchQuestion, reason: created?.reason,
+        ...(reportVersion ? { reportVersion } : {}),
+      } : null
+    }))
+    const newsDecision = trace.find((event) => {
+      if (event.type !== 'tool_result' || event.name !== 'run_news_analysis') return false
+      const result = event.result as Record<string, unknown> | undefined
+      return result?.launched === false
+    })
+    const newsResult = newsDecision?.result as Record<string, unknown> | undefined
+    const projectedSpecialists: Array<Record<string, unknown>> = specialistAgents.filter(
+      (specialist): specialist is NonNullable<typeof specialist> => specialist !== null,
+    )
+    if (!projectedSpecialists.some((specialist) => specialist?.domain === 'news')) {
+      projectedSpecialists.push(newsResult ? {
+        domain: 'news', status: 'not_started',
+        researchQuestion: newsResult.researchQuestion, reason: newsResult.reason,
+      } : {
+        domain: 'news', status: 'not_started',
+        reason: '主 Agent 尚未作出消息面专项启动决定。',
+      })
+    }
     return {
       ...record, trace,
       mainAgent: await options.eventRepository.primaryLifecycle(analysisId),
+      specialistAgents: projectedSpecialists,
     }
   }
   async function listResearch(symbol?: string) {
@@ -731,6 +883,22 @@ function finalReportVersion(
     kind: candidate.kind,
     payloadHash,
     report: payload,
+  }
+}
+
+function specialistResultProjection(report: Record<string, unknown>, fallbackSummary: string) {
+  const judgments = Array.isArray(report.keyJudgments)
+    ? report.keyJudgments.filter((item): item is Record<string, unknown> => Boolean(item)
+      && typeof item === 'object' && !Array.isArray(item)) : []
+  const keyFactIds = judgments.flatMap((judgment) => Array.isArray(judgment.supportingEvidence)
+    ? judgment.supportingEvidence.filter((id): id is string => typeof id === 'string') : [])
+  const contraryFactIds = judgments.flatMap((judgment) => Array.isArray(judgment.contraryEvidence)
+    ? judgment.contraryEvidence.filter((id): id is string => typeof id === 'string') : [])
+  const firstStatement = judgments.find(({ statement }) => typeof statement === 'string')?.statement
+  return {
+    summary: typeof firstStatement === 'string' ? firstStatement : fallbackSummary,
+    keyFactIds: [...new Set(keyFactIds)], contraryFactIds: [...new Set(contraryFactIds)],
+    gaps: Array.isArray(report.gaps) ? report.gaps : [],
   }
 }
 

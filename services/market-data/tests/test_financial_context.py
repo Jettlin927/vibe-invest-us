@@ -1,6 +1,9 @@
 from datetime import datetime, timezone
 
-from app.context import build_financial_context, search_news_facts, technical_indicator_facts
+from app.context import (
+    build_financial_context, company_event_facts, read_news_document_fact, search_news_facts,
+    technical_indicator_facts,
+)
 from app.models import DailyBar, NewsItem, Quote
 
 
@@ -126,6 +129,46 @@ def test_keyword_news_query_returns_traceable_facts_without_symbol_filter():
     assert len(facts) == 1
     assert facts[0].value["keyword"] == "NAND pricing"
     assert facts[0].sourceReference == item.url
+    assert facts[0].evidenceLevel == "title_only"
+    assert sources[0].status == "ok"
+
+
+def test_news_document_read_preserves_bounded_excerpt_summary_hash_and_metadata():
+    candidate = search_news_facts("NAND pricing", NOW, [Source("google", [NewsItem(
+        title="NAND pricing improves", source="Google", published_at=NOW,
+        fetched_at=NOW, url="https://example.com/nand", summary="Candidate summary", symbols=[],
+    )])])[0][0]
+    html = ("<html><body><h1>NAND pricing improves</h1><p>Verified detail "
+            + "x" * 2000 + "</p></body></html>").encode()
+
+    fact = read_news_document_fact(candidate, NOW, lambda url, max_bytes: (
+        html[:max_bytes], "text/html", False, "https://example.com/nand",
+    ), max_bytes=512)
+
+    assert fact.type == "news_document"
+    assert fact.evidenceLevel == "verified_news"
+    assert fact.value["candidateFactId"] == candidate.id
+    assert fact.value["url"] == "https://example.com/nand"
+    assert 0 < len(fact.value["summary"].encode()) <= 500
+    assert "excerpt" not in fact.value
+    assert len(fact.value["contentHash"]) == 64
+    assert fact.value["metadata"] == {
+        "contentType": "text/html", "excerptBytes": len(fact.value["summary"].encode()),
+        "truncated": False,
+    }
+
+
+def test_company_events_are_distinct_title_only_candidates_with_source_status():
+    item = NewsItem(title="NVDA schedules product event", source="IR", published_at=NOW,
+                    fetched_at=NOW, url="https://example.com/event", summary="Event scheduled", symbols=["NVDA"])
+    facts, sources = company_event_facts("NVDA", NOW, [Source("ir-news", [item])])
+
+    assert len(facts) == 1
+    assert facts[0].type == "company_event"
+    assert facts[0].evidenceLevel == "title_only"
+    assert facts[0].value == {
+        "symbol": "NVDA", "title": item.title, "summary": item.summary, "url": item.url,
+    }
     assert sources[0].status == "ok"
 
 

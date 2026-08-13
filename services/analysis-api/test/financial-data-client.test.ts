@@ -87,3 +87,37 @@ test('TS 客户端查询关键词新闻和日期范围技术指标', async () =>
   assert.match(requests[1] ?? '', /symbol=SNDK.*start_date=2026-01-01.*end_date=2026-08-12/)
   await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
 })
+
+test('TS 客户端只把已知 title_only 候选交给受限新闻文档端点', async () => {
+  let body: unknown
+  const candidate = {
+    id: 'fact:news:candidate', type: 'news',
+    value: { title: 'Event', summary: 'Lead', url: 'https://example.com/event' },
+    observedAt: '2026-08-12T12:00:00Z', fetchedAt: '2026-08-12T12:01:00Z',
+    source: 'google-news', sourceReference: 'https://example.com/event',
+    evidenceLevel: 'title_only',
+  }
+  const document = {
+    ...candidate, id: 'fact:news:document', type: 'news_document', evidenceLevel: 'verified_news',
+    value: { excerpt: 'bounded', summary: 'bounded', contentHash: 'a'.repeat(64), metadata: {} },
+  }
+  const server = createServer(async (request, response) => {
+    body = await new Promise((resolve) => {
+      let text = ''
+      request.on('data', (chunk) => { text += chunk })
+      request.on('end', () => resolve(JSON.parse(text)))
+    })
+    response.writeHead(200, { 'content-type': 'application/json' })
+    response.end(JSON.stringify({ facts: [document], sources: [] }))
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  assert.ok(address && typeof address === 'object')
+
+  const client = createFinancialDataClient(`http://127.0.0.1:${address.port}`)
+  const result = await client.readNewsDocument(candidate)
+
+  assert.deepEqual(body, { candidate })
+  assert.equal(result.facts[0]?.evidenceLevel, 'verified_news')
+  await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+})

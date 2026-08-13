@@ -11,16 +11,18 @@ import {
   createPiAgentAdapter, type PiAgentAdapterMessage, type PiAgentAdapterStream,
   type PiAgentAdapterStreamFn, type PiAgentAdapterTool,
 } from './agent-runtime/pi-agent-adapter.js'
-import type { AnalysisReport, AnalyzeInput, ModelEvent, ModelOptions } from './model.js'
+import type { AnalysisReport, AnalyzeInput, AnalyzeNewsInput, ModelEvent, ModelOptions } from './model.js'
 import {
   acquireActiveSlot, createActiveBudget, createConcurrencyGate, deadlineSignal, type ActiveBudget,
 } from './runtime-policy.js'
 import { toolRegistry } from './tool-registry.js'
-import { analysisModelTools, finalizationModelTools, financialSpecialistTools } from './tools.js'
+import {
+  analysisModelTools, finalizationModelTools, financialSpecialistTools, newsSpecialistTools,
+} from './tools.js'
 import { validateReportCandidate } from './report-validation.js'
 
 type Fact = AnalyzeInput['knownFacts'][number]
-type Role = 'main' | 'fundamental'
+type Role = 'main' | 'fundamental' | 'news'
 type Stage = 'research' | 'finalization'
 type ToolStatus = 'completed' | 'failed' | 'cancelled'
 type ToolAudit = {
@@ -70,6 +72,7 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
       }
       let frozenContext: Awaited<ReturnType<AnalyzeInput['fetchFinancialContext']>> | undefined
       let specialistInvocation = 0
+      let newsDecisionRecorded = false
       const reportValidationState = { failures: 0, exhausted: false }
 
       const loadFrozenContext = async (symbol: string) => {
@@ -206,9 +209,28 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
             rememberFacts(specialist.facts)
             return succeeded({ analysis: specialist.text, facts: specialist.facts })
           }
+          if (name === 'run_news_analysis') {
+            await onStart()
+            newsDecisionRecorded = true
+            const request = asRecord(params) as {
+              launch?: unknown; researchQuestion?: unknown; reason?: unknown
+            }
+            const reason = asString(request.reason)
+            const researchQuestion = asString(request.researchQuestion)
+            if (request.launch !== true) {
+              return succeeded({ launched: false, status: 'not_started', reason, researchQuestion })
+            }
+            if (!input.runNewsSpecialist) return failed('news_specialist_runtime_unavailable')
+            return succeeded(await input.runNewsSpecialist({
+              launch: true, researchQuestion, reason,
+            }))
+          }
           if (name === 'submit_analysis_report') {
             try {
               await onStart()
+              if (input.runNewsSpecialist && !newsDecisionRecorded) {
+                return failed('news_specialist_decision_required')
+              }
               return await toolRegistry.handler(name)!(params, {
                 submitAnalysisReport: async (submitted) => {
                   const validation = validateReportCandidate(submitted, {
@@ -256,11 +278,138 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
         await task.catch(() => undefined)
       }
     },
+    async *analyzeNews(input: AnalyzeNewsInput): AsyncGenerator<ModelEvent> {
+      const settings = input.runtimeSettings
+      modelGate.setLimit(settings.modelConcurrency)
+      toolGate.setLimit(settings.toolConcurrency)
+      const runtimeMinuteMs = options.runtimeMinuteMs ?? 60_000
+      const executionSignal = deadlineSignal(
+        input.signal, settings.executionWallClockMinutes * runtimeMinuteMs,
+        input.executionDeadlineSignal,
+      )
+      const activeBudget = input.activeBudget ?? createActiveBudget(
+        settings.researchActiveMinutes * runtimeMinuteMs, options.activeNow,
+        options.activeTimeoutSignal,
+      )
+      const consumer = new AbortController()
+      const agentSignal = AbortSignal.any([executionSignal, consumer.signal])
+      const provider = createProviderRuntime(options)
+      const queue = createAsyncQueue<ModelEvent>()
+      const knownFacts = new Map(input.knownFacts.map((fact) => [fact.id, fact]))
+      const candidateFactIds = new Set<string>()
+      const validationState = { failures: 0, exhausted: false }
+      let policyFailure: Error | undefined
+      queue.push(trace({
+        type: 'system_prompt', content: input.systemPrompt,
+        operationId: `execution:${input.executionId}:system-prompt`,
+      }))
+      queue.push(trace({
+        type: 'user_input', content: input.researchQuestion,
+        operationId: `execution:${input.executionId}:research-question`,
+      }))
+      const runTool = async (
+        name: string, onStart: () => Promise<void>, signal: AbortSignal,
+        task: (toolSignal: AbortSignal) => Promise<unknown>,
+      ) => {
+        const owner = await acquireActiveSlot({
+          acquire: () => input.acquireToolSlot
+            ? input.acquireToolSlot(signal) : toolGate.acquire(signal),
+          activeBudget, signal,
+        })
+        try {
+          await onStart()
+          const result = await task(toolSignal(options, settings, owner.signal))
+          const facts = asRecord(result).facts
+          if (Array.isArray(facts)) for (const fact of facts as Fact[]) knownFacts.set(fact.id, fact)
+          return succeeded(result)
+        } catch (error) {
+          return failed(error instanceof Error ? error.message : String(error))
+        } finally { owner.finish() }
+      }
+      const news = runProjectedAgent({
+        role: 'news', input, options, settings, executionSignal: agentSignal, activeBudget,
+        onPolicyFailure: (error) => { policyFailure ??= error }, modelGate, toolGate,
+        provider, queue, initialTools: newsSpecialistTools,
+        systemPrompt: input.systemPrompt, userPrompt: input.researchQuestion,
+        shouldRejectNextTurn: () => validationState.exhausted,
+        execute: async (name, params, signal, onStart) => {
+          if (name === unavailableToolName) { await onStart(); return failed('tool_not_available') }
+          if (name === 'search_news_candidates') {
+            const query = stringParam(params, 'query')
+            const result = await runTool(name, onStart, signal, (toolSignal) => (
+              input.searchNewsCandidates(query, toolSignal)
+            ))
+            const facts = asRecord(result.result).facts
+            if (Array.isArray(facts)) for (const fact of facts as Fact[]) candidateFactIds.add(fact.id)
+            return result
+          }
+          if (name === 'read_news_document') {
+            const factId = stringParam(params, 'factId')
+            const candidate = knownFacts.get(factId)
+            if (!candidate || !candidateFactIds.has(factId)) {
+              await onStart(); return failed('news_candidate_not_found')
+            }
+            const result = await runTool(name, onStart, signal, (toolSignal) => (
+              input.readNewsDocument(candidate, toolSignal)
+            ))
+            return result.isError ? result : {
+              ...result,
+              result: {
+                facts: result.result.facts, sources: result.result.sources,
+                modelProjection: result.result,
+              },
+            }
+          }
+          if (name === 'list_company_events') {
+            const symbol = stringParam(params, 'symbol') || input.symbol
+            if (symbol.trim().toUpperCase() !== input.symbol.trim().toUpperCase()) {
+              await onStart(); return failed('tool_symbol_not_allowed')
+            }
+            return runTool(name, onStart, signal, (toolSignal) => (
+              input.listCompanyEvents(symbol, toolSignal)
+            ))
+          }
+          if (name === 'submit_specialist_report') {
+            await onStart()
+            const validation = validateReportCandidate(params, {
+              role: 'news', knownFacts: [...knownFacts.values()],
+            })
+            if (!validation.ok) {
+              validationState.failures += 1
+              if (validationState.failures >= 3) validationState.exhausted = true
+              return failedReportValidation(validation.errors, params)
+            }
+            return {
+              ...succeeded({ submitted: true }), report: legacyReport(validation.report),
+              reportVersion: { kind: 'specialist', report: validation.report }, terminate: true,
+            }
+          }
+          return failed('tool_not_available')
+        },
+      })
+      const task = news.then((outcome) => {
+        if (policyFailure) throw policyFailure
+        if (!outcome.report || !outcome.reportVersion) throw new Error('specialist_report_required')
+        queue.push({
+          type: 'completed', report: outcome.report, reportVersion: outcome.reportVersion,
+          usage: outcome.usage, stopReason: outcome.stopReason,
+          operationId: `execution:${input.executionId}:report`,
+        })
+      }).then(() => queue.end(), (error) => queue.fail(error))
+      try {
+        for await (const event of queue) yield event
+        await task
+      } finally {
+        consumer.abort(new Error('model_consumer_closed'))
+        queue.end()
+        await task.catch(() => undefined)
+      }
+    },
   }
 }
 
 async function runProjectedAgent(config: {
-  role: Role; input: AnalyzeInput; options: ModelOptions; settings: RuntimeSettings
+  role: Role; input: AnalyzeInput | AnalyzeNewsInput; options: ModelOptions; settings: RuntimeSettings
   executionSignal: AbortSignal; activeBudget: ActiveBudget
   modelGate: ReturnType<typeof createConcurrencyGate>; toolGate: ReturnType<typeof createConcurrencyGate>
   provider: ReturnType<typeof createProviderRuntime>; queue: ReturnType<typeof createAsyncQueue<ModelEvent>>
@@ -316,7 +465,7 @@ async function runProjectedAgent(config: {
       let executed: ExecutedTool
       let validatedParams = params
       try {
-        if (definition.name === 'submit_analysis_report') throw new Error('report_schema_validated_by_runtime')
+        if (isReportSubmit(definition.name)) throw new Error('report_schema_validated_by_runtime')
         validatedParams = validateToolCall([definition], {
           type: 'toolCall', id: callId, name: definition.name,
           arguments: params as Record<string, unknown>,
@@ -349,7 +498,7 @@ async function runProjectedAgent(config: {
         toolCallId: callId, toolName: definition.name, status, startedAt: startedAt!,
         completedAt: executed.completedAt ?? new Date().toISOString(),
         completionOrder: ++completionOrder,
-        result: executed.result, isError: status !== 'completed',
+        result: retainedToolResult(executed.result), isError: status !== 'completed',
         operationId: toolOperationId(config.role, input.executionId, callId, 'result'),
       }
       currentBatch?.results.set(callId, audit)
@@ -447,7 +596,7 @@ async function runProjectedAgent(config: {
     },
     signal: config.executionSignal,
     streamFn: async (model, context, streamOptions) => {
-      const request = await beginBudgetedModelRequest(config, config.role === 'fundamental')
+      const request = await beginBudgetedModelRequest(config, config.role !== 'main')
       try {
         turnIndex += 1
         const roleScope = config.invocationId
@@ -482,9 +631,9 @@ async function runProjectedAgent(config: {
     afterToolCall: async ({ result, isError }) => ({
       isError: Boolean((result.details as { audit?: ToolAudit } | undefined)?.audit?.isError ?? isError),
     }),
-    shouldStopAfterTurn: async () => config.role === 'main'
-      ? Boolean(completedReport)
-      : Boolean(finalText),
+    shouldStopAfterTurn: async () => config.role === 'fundamental'
+      ? Boolean(finalText)
+      : Boolean(completedReport),
     prepareNextTurn: async () => {
       if (completedReport || finalText) return undefined
       if (config.shouldRejectNextTurn?.()) throw new Error('report_validation_repair_exhausted')
@@ -506,7 +655,9 @@ async function runProjectedAgent(config: {
       }
       const next = config.role === 'main'
         ? stage === 'finalization' ? finalizationModelTools : analysisModelTools
-        : stage === 'finalization' ? [] : projectedSpecialistTools(input)
+        : stage === 'finalization'
+          ? config.role === 'news' ? toolRegistry.project({ role: 'news', stage: 'finalization' }) : []
+          : config.role === 'news' ? newsSpecialistTools : projectedSpecialistTools(input as AnalyzeInput)
       return { tools: await prepareProjection(next) }
     },
     commitToolProjection: async ({ tools }) => ({ tools }),
@@ -533,9 +684,13 @@ async function runProjectedAgent(config: {
       lastAssistantHadCalls = calls.length > 0
       if (!calls.length) {
         if (config.role === 'fundamental') finalText = contentText(event.message.content as never)
-        else adapter.followUp(userMessage(stage === 'finalization'
-          ? '请立即调用 submit_analysis_report 提交受限报告。'
-          : '请继续自主规划，准备好后调用 submit_analysis_report。'))
+        else {
+          const submitTool = config.role === 'news'
+            ? 'submit_specialist_report' : 'submit_analysis_report'
+          adapter.followUp(userMessage(stage === 'finalization'
+            ? `请立即调用 ${submitTool} 提交受限报告。`
+            : `请继续自主规划，准备好后调用 ${submitTool}。`))
+        }
         return
       }
       const roleScope = config.invocationId
@@ -546,7 +701,9 @@ async function runProjectedAgent(config: {
         const providerId = call.id || 'missing'
         call.id = config.role === 'fundamental'
           ? `${providerId}:specialist-invocation:${encodeURIComponent(config.invocationId ?? 'default')}:attempt:${turnIndex}:position:${index + 1}`
-          : `${providerId}:main-attempt:${turnIndex}:position:${index + 1}`
+          : config.role === 'news'
+            ? `${providerId}:news-attempt:${turnIndex}:position:${index + 1}`
+            : `${providerId}:main-attempt:${turnIndex}:position:${index + 1}`
         if (!visibleTools.some(({ name }) => name === call.name)) call.name = unavailableToolName
         batch.calls.push({
           toolCallId: call.id, toolName: call.name, position: index + 1,
@@ -567,7 +724,7 @@ async function runProjectedAgent(config: {
     if (event.type === 'tool_execution_end' && currentBatch
       && !currentBatch.results.has(event.toolCallId)) {
       const now = new Date().toISOString()
-      const result = adapterToolResult(event.result)
+      const result = retainedToolResult(adapterToolResult(event.result))
       const didStart = callStartedAt.has(event.toolCallId)
       currentBatch.results.set(event.toolCallId, {
         toolCallId: event.toolCallId, toolName: event.toolName,
@@ -706,7 +863,7 @@ function createProviderRuntime(options: ModelOptions) {
 }
 
 async function beginBudgetedModelRequest(config: {
-  input: AnalyzeInput; options: ModelOptions; settings: RuntimeSettings
+  input: AnalyzeInput | AnalyzeNewsInput; options: ModelOptions; settings: RuntimeSettings
   executionSignal: AbortSignal; activeBudget: ActiveBudget
   modelGate: ReturnType<typeof createConcurrencyGate>
 }, specialist: boolean) {
@@ -857,8 +1014,12 @@ function toAdapterTool(
 function toolOperationId(
   role: Role, executionId: string, callId: string, suffix: 'call' | 'result',
 ) {
-  const namespace = role === 'fundamental' ? 'specialist-tool' : 'tool'
+  const namespace = role === 'main' ? 'tool'
+    : role === 'fundamental' ? 'specialist-tool' : 'news-tool'
   return `execution:${executionId}:${namespace}:${callId}:${suffix}`
+}
+function isReportSubmit(name: string) {
+  return name === 'submit_analysis_report' || name === 'submit_specialist_report'
 }
 
 function succeeded(result: unknown): ExecutedTool {
@@ -884,6 +1045,11 @@ function modelToolResult(name: string, result: Record<string, unknown>) {
     'cursor', 'nextCursor', 'pagination', 'truncated', 'resultCount',
   ]
   return Object.fromEntries(allowed.flatMap((key) => key in result ? [[key, result[key]]] : []))
+}
+function retainedToolResult(result: Record<string, unknown>) {
+  if (!('modelProjection' in result)) return result
+  const { modelProjection: _temporary, ...retained } = result
+  return retained
 }
 function stringParam(value: unknown, key: string) {
   const entry = value && typeof value === 'object' ? (value as Record<string, unknown>)[key] : undefined

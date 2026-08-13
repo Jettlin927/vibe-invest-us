@@ -5,7 +5,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.adapters import _diagnose, configure_diagnostics
+from app.adapters import _PinnedHTTPConnection, _diagnose, configure_diagnostics, validate_document_url
 from app.models import Quote
 from datetime import datetime, timezone
 
@@ -82,3 +82,35 @@ def test_diagnostic_sample_is_bounded_redacted_and_expires(tmp_path):
     assert "me@example.com" not in content
     assert len(samples[0].read_bytes()) <= 128
     configure_diagnostics(False, tmp_path, max_bytes=128, retention_hours=1)
+
+
+def test_document_url_rejects_non_http_and_non_public_addresses(monkeypatch):
+    monkeypatch.setattr("app.adapters.socket.getaddrinfo", lambda host, port, type=0: [
+        (2, 1, 6, "", ("127.0.0.1", port)),
+    ])
+    for url in ["file:///etc/passwd", "http://127.0.0.1/", "http://169.254.169.254/latest/meta-data"]:
+        try:
+            validate_document_url(url)
+        except ValueError as error:
+            assert str(error) == "news_document_url_not_public"
+        else:
+            raise AssertionError(f"unsafe_url_accepted:{url}")
+
+
+def test_document_url_normalizes_public_http_address(monkeypatch):
+    monkeypatch.setattr("app.adapters.socket.getaddrinfo", lambda host, port, type=0: [
+        (2, 1, 6, "", ("93.184.216.34", port)),
+    ])
+    assert validate_document_url("HTTPS://Example.COM:443/news#fragment") == "https://example.com/news"
+
+
+def test_document_connection_uses_the_prevalidated_ip_without_resolving_hostname(monkeypatch):
+    connected = []
+    sentinel = object()
+    monkeypatch.setattr("app.adapters.socket.create_connection", lambda address, *args: (
+        connected.append(address) or sentinel
+    ))
+    connection = _PinnedHTTPConnection("example.com", "93.184.216.34", 80, 1)
+    connection.connect()
+    assert connection.sock is sentinel
+    assert connected == [("93.184.216.34", 80)]

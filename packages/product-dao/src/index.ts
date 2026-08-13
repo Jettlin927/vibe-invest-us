@@ -6,7 +6,7 @@ import {
   type ExecutionSettingsSnapshot, type RuntimeSettings, type RuntimeSettingsRevision,
 } from '@vibe-invest/contracts'
 
-export const schemaVersion = 17
+export const schemaVersion = 18
 
 const migrationSql = `
 CREATE TABLE IF NOT EXISTS product_schema_migrations (
@@ -98,6 +98,7 @@ CREATE TABLE IF NOT EXISTS agent_sessions (
 ALTER TABLE agent_sessions DROP CONSTRAINT IF EXISTS agent_sessions_analysis_id_key;
 ALTER TABLE agent_sessions ADD COLUMN IF NOT EXISTS is_primary boolean NOT NULL DEFAULT false;
 ALTER TABLE agent_sessions ADD COLUMN IF NOT EXISTS execution_id text;
+ALTER TABLE agent_sessions ADD COLUMN IF NOT EXISTS domain text;
 UPDATE agent_sessions SET execution_id = 'legacy:' || id WHERE execution_id IS NULL;
 ALTER TABLE agent_sessions ALTER COLUMN execution_id SET NOT NULL;
 UPDATE agent_sessions SET is_primary = true
@@ -107,6 +108,8 @@ WHERE NOT EXISTS (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS agent_sessions_one_primary_per_analysis
 ON agent_sessions (analysis_id) WHERE is_primary;
+CREATE UNIQUE INDEX IF NOT EXISTS agent_sessions_one_specialist_per_domain
+ON agent_sessions (analysis_id, domain) WHERE domain IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS agent_events (
   session_id text NOT NULL REFERENCES agent_sessions(id) ON DELETE CASCADE,
@@ -247,7 +250,7 @@ CREATE TABLE IF NOT EXISTS tool_projection_versions (
   execution_id text NOT NULL REFERENCES agent_executions(id) ON DELETE CASCADE,
   version integer NOT NULL CHECK (version > 0),
   role text NOT NULL CONSTRAINT tool_projection_versions_role_check
-    CHECK (role IN ('main', 'fundamental')),
+    CHECK (role IN ('main', 'fundamental', 'news')),
   stage text NOT NULL CONSTRAINT tool_projection_versions_stage_check
     CHECK (stage IN ('research', 'finalization')),
   schema_hash text NOT NULL CHECK (schema_hash <> ''),
@@ -333,7 +336,7 @@ ALTER TABLE tool_batch_calls ADD CONSTRAINT tool_batch_calls_completion_check
 ALTER TABLE tool_projection_versions DROP CONSTRAINT IF EXISTS tool_projection_versions_role_check;
 UPDATE tool_projection_versions SET role = 'fundamental' WHERE role = 'fundamental_specialist';
 ALTER TABLE tool_projection_versions ADD CONSTRAINT tool_projection_versions_role_check
-  CHECK (role IN ('main', 'fundamental'));
+  CHECK (role IN ('main', 'fundamental', 'news'));
 ALTER TABLE tool_projection_versions DROP CONSTRAINT IF EXISTS tool_projection_versions_stage_check;
 ALTER TABLE tool_projection_versions ADD CONSTRAINT tool_projection_versions_stage_check
   CHECK (stage IN ('research', 'finalization'));
@@ -437,6 +440,10 @@ ON CONFLICT (version) DO NOTHING;
 
 INSERT INTO product_schema_migrations (version)
 VALUES (17)
+ON CONFLICT (version) DO NOTHING;
+
+INSERT INTO product_schema_migrations (version)
+VALUES (18)
 ON CONFLICT (version) DO NOTHING;
 
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM vibe_invest_app;
@@ -1367,6 +1374,64 @@ export function createAgentEventRepository(pool: Pool) {
         client.release()
       }
     },
+    async createSpecialistSession(input: {
+      id: string; analysisId: string; domain: 'news' | 'fundamental_valuation' | 'technical'
+      executionId: string; segmentId?: string; status: string; operationId: string
+      event: Record<string, unknown>; createdAt: string
+    }) {
+      const client = await pool.connect()
+      try {
+        await client.query('BEGIN')
+        const analysis = await client.query(
+          'SELECT id FROM analyses WHERE id = $1 FOR KEY SHARE', [input.analysisId],
+        )
+        if (!analysis.rowCount) throw new Error('analysis_not_found')
+        const inserted = await client.query<{ id: string }>(
+          `INSERT INTO agent_sessions (
+             id, analysis_id, is_primary, domain, execution_id, status,
+             latest_sequence, created_at, updated_at
+           ) VALUES ($1, $2, false, $3, $4, $5, 1, $6, $6)
+           ON CONFLICT (analysis_id, domain) WHERE domain IS NOT NULL DO NOTHING
+           RETURNING id`,
+          [input.id, input.analysisId, input.domain, input.executionId, input.status, input.createdAt],
+        )
+        if (!inserted.rows[0]) {
+          const existing = await client.query<{ id: string; execution_id: string }>(
+            `SELECT id, execution_id FROM agent_sessions
+             WHERE analysis_id = $1 AND domain = $2`, [input.analysisId, input.domain],
+          )
+          await client.query('COMMIT')
+          return {
+            sessionId: existing.rows[0]!.id, executionId: existing.rows[0]!.execution_id,
+            created: false,
+          }
+        }
+        await client.query(
+          `INSERT INTO agent_events (
+             session_id, sequence, operation_id, payload_json, created_at
+           ) VALUES ($1, 1, $2, $3, $4)`,
+          [input.id, input.operationId, JSON.stringify(input.event), input.createdAt],
+        )
+        const waitReason = { kind: 'database', target: '专项研究规划', startedAt: input.createdAt }
+        await client.query(
+          `INSERT INTO agent_executions (
+             id, session_id, generation, status, wait_reason_json, terminal, created_at, updated_at
+           ) VALUES ($1, $2, 1, 'planning', $3, false, $4, $4)`,
+          [input.executionId, input.id, JSON.stringify(waitReason), input.createdAt],
+        )
+        await client.query(
+          `INSERT INTO conversation_segments (id, session_id, ordinal, created_at)
+           VALUES ($1, $2, 1, $3)`,
+          [input.segmentId ?? `${input.id}:segment:1`, input.id, input.createdAt],
+        )
+        await freezeExecutionSettings(client, input.executionId, input.createdAt)
+        await client.query('COMMIT')
+        return { sessionId: input.id, executionId: input.executionId, created: true }
+      } catch (error) {
+        await client.query('ROLLBACK')
+        throw error
+      } finally { client.release() }
+    },
     async append(input: {
       sessionId: string
       executionId: string
@@ -1633,6 +1698,9 @@ export function createAgentEventRepository(pool: Pool) {
       )
       return result.rows.map(mapAgentSessionRow)
     },
+    async sessionLifecycle(sessionId: string) {
+      return readSessionLifecycle(pool, sessionId)
+    },
     async primaryLifecycle(analysisId: string) {
       const client = await pool.connect()
       try {
@@ -1695,6 +1763,60 @@ export function createAgentEventRepository(pool: Pool) {
 
 export type AgentEventRepository = ReturnType<typeof createAgentEventRepository>
 
+async function readSessionLifecycle(pool: Pool, sessionId: string) {
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
+    const sessionResult = await client.query<AgentSessionRow>(
+      `SELECT id, analysis_id, is_primary, execution_id, status, latest_sequence,
+              created_at::text, updated_at::text
+       FROM agent_sessions WHERE id = $1`, [sessionId],
+    )
+    const sessionRow = sessionResult.rows[0]
+    if (!sessionRow) { await client.query('COMMIT'); return null }
+    const session = mapAgentSessionRow(sessionRow)
+    const execution = await client.query<{
+      id: string; generation: number; status: string; terminal: boolean
+      wait_reason_json: Record<string, unknown> | null; created_at: string; updated_at: string
+    }>(
+      `SELECT id, generation, status, terminal, wait_reason_json,
+              created_at::text, updated_at::text
+       FROM agent_executions WHERE session_id = $1 ORDER BY generation DESC LIMIT 1`,
+      [sessionId],
+    )
+    const segments = await client.query<{ id: string; ordinal: number; created_at: string }>(
+      `SELECT id, ordinal, created_at::text FROM conversation_segments
+       WHERE session_id = $1 ORDER BY ordinal`, [sessionId],
+    )
+    const eventRows = await client.query<AgentEventRow>(
+      `SELECT session_id, sequence, operation_id, payload_json, created_at::text
+       FROM agent_events WHERE session_id = $1 ORDER BY sequence`, [sessionId],
+    )
+    const current = execution.rows[0]
+    if (!current) { await client.query('COMMIT'); return null }
+    const lifecycle = {
+      ...session, status: current.status, waitReason: current.wait_reason_json,
+      execution: {
+        id: current.id, generation: current.generation, status: current.status,
+        terminal: current.terminal, createdAt: new Date(current.created_at).toISOString(),
+        updatedAt: new Date(current.updated_at).toISOString(),
+      },
+      segments: segments.rows.map((segment) => ({
+        id: segment.id, ordinal: segment.ordinal,
+        createdAt: new Date(segment.created_at).toISOString(),
+      })),
+      events: eventRows.rows.map(mapAgentEventRow).map((event) => ({
+        sequence: event.sequence, createdAt: event.createdAt, ...event.payload,
+      })),
+    }
+    await client.query('COMMIT')
+    return lifecycle
+  } catch (error) {
+    await client.query('ROLLBACK')
+    throw error
+  } finally { client.release() }
+}
+
 type ToolProjectionRow = {
   id: string; execution_id: string; version: number; role: string; stage: string
   schema_hash: string; projected_tools_json: unknown[]
@@ -1702,7 +1824,7 @@ type ToolProjectionRow = {
   created_at: string
 }
 
-export type ToolProjectionRole = 'main' | 'fundamental'
+export type ToolProjectionRole = 'main' | 'fundamental' | 'news'
 export type ToolProjectionStage = 'research' | 'finalization'
 
 export function createToolProjectionRepository(pool: Pool) {

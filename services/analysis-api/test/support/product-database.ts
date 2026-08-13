@@ -244,6 +244,17 @@ export function createTestProductDatabase() {
         sequence: 1, created: true, event,
       }
     },
+    async createSpecialistSession(input) {
+      const existing = [...agentSessions.values()].find((session) => (
+        session.analysisId === input.analysisId
+        && (agentEvents.get(session.id)?.[0]?.payload as Record<string, unknown> | undefined)?.domain === input.domain
+      ))
+      if (existing) return {
+        sessionId: existing.id, executionId: existing.executionId, created: false,
+      }
+      await this.createSession(input)
+      return { sessionId: input.id, executionId: input.executionId, created: true }
+    },
     async createSession(input) {
       if (!analyses.has(input.analysisId)) throw new Error('analysis_not_found')
       const event = {
@@ -352,6 +363,18 @@ export function createTestProductDatabase() {
       return [...agentSessions.values()].filter((session) => session.analysisId === analysisId)
         .sort((left, right) => Number(right.isPrimary) - Number(left.isPrimary)
           || left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id))
+    },
+    async sessionLifecycle(sessionId) {
+      const session = agentSessions.get(sessionId)
+      const lifecycle = lifecycles.get(sessionId)
+      if (!session || !lifecycle) return null
+      return {
+        ...session, status: lifecycle.execution.status, waitReason: lifecycle.waitReason,
+        execution: lifecycle.execution, segments: lifecycle.segments,
+        events: (agentEvents.get(sessionId) ?? []).map((event) => ({
+          sequence: event.sequence, createdAt: event.createdAt, ...event.payload,
+        })),
+      }
     },
     async primaryLifecycle(analysisId) {
       const session = [...agentSessions.values()].find((candidate) => candidate.analysisId === analysisId && candidate.isPrimary)
@@ -541,7 +564,7 @@ export function createTestProductDatabase() {
 
   return {
     productDatabase: {
-      checkSchema: async () => ({ status: 'ok' as const, version: 17 }),
+      checkSchema: async () => ({ status: 'ok' as const, version: 18 }),
       close: async () => {},
     },
     portfolioRepository,

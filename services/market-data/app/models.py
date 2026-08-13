@@ -79,11 +79,16 @@ class AtomicFact(BaseModel):
     fetchedAt: str
     source: str
     sourceReference: str
+    evidenceLevel: Optional[str] = None
 
 
 class FactQueryResult(BaseModel):
     facts: List[AtomicFact]
     sources: List[SourceStatus] = []
+
+
+class NewsDocumentResult(FactQueryResult):
+    excerpt: str
 
 
 class FinancialContext(BaseModel):

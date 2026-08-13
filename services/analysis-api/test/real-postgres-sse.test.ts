@@ -30,7 +30,7 @@ function integratedReport<T extends Record<string, unknown>>(report: T) {
   }
 }
 
-test('真实 v12 历史 Tool 事件升级到 v17 后经 DAO、HTTP 与 SSE 原样读取', {
+test('真实 v12 历史 Tool 事件升级到 v18 后经 DAO、HTTP 与 SSE 原样读取', {
   skip: !databaseUrl || !migrationDatabaseUrl,
   concurrency: false,
 }, async () => {
@@ -819,6 +819,128 @@ test('首次研究经真实 PostgreSQL 与 HTTP SSE 展示 Runtime Context、工
   }
 })
 
+test('主 Agent 经真实 PostgreSQL、HTTP 与 SSE 启动并展示独立消息面 Agent', {
+  skip: !databaseUrl,
+  concurrency: false,
+}, async () => {
+  const pool = createPool(databaseUrl!)
+  const events = createAgentEventRepository(pool)
+  const candidate = {
+    id: 'fact:news:e2e:candidate', type: 'news',
+    value: {
+      title: 'NVDA product event', summary: 'title lead',
+      url: 'https://example.com/event', evidenceLevel: 'title_only',
+    },
+    evidenceLevel: 'title_only', observedAt: '2026-08-12T12:00:00Z',
+    fetchedAt: '2026-08-13T12:00:00Z', source: 'google-news',
+    sourceReference: 'https://example.com/event',
+  }
+  const verified = {
+    ...candidate, id: 'fact:news:e2e:document', type: 'news_document',
+    evidenceLevel: 'verified_news', value: {
+      ...candidate.value, summary: 'bounded verified summary',
+      contentHash: 'a'.repeat(64), evidenceLevel: 'verified_news',
+      metadata: { contentType: 'text/html', excerptBytes: 24, truncated: false },
+    },
+  }
+  const specialistReport = {
+    kind: 'specialist' as const, domain: 'news', availability: 'available' as const,
+    status: 'completed' as const, gaps: [], limitations: [], keyJudgments: [{
+      type: 'news', statement: '产品事件对近期预期偏正面', direction: 'bullish', confidence: 'medium',
+      supportingEvidence: [verified.id], contraryEvidence: [],
+      contraryEvidenceStatus: 'none_found', invalidationConditions: ['公司取消活动'],
+    }],
+  }
+  const mainReport = integratedReport({
+    title: '消息面专项闭环', marketState: '数据有限', trend: '震荡', drivers: [],
+    supportingEvidence: [], contraryEvidence: [], keyJudgments: [], scenarios: [],
+    invalidationConditions: [], valuation: null, personalImpact: null,
+    conditionalSuggestion: null, limitations: [],
+  })
+  const mainModel = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall('run_news_analysis', {
+      launch: true, researchQuestion: '近 30 天是否有改变预期的事件？',
+      reason: '缺少消息面反方证据。',
+    }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('submit_analysis_report', mainReport), { stopReason: 'toolUse' }),
+  ] })
+  const newsModel = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall('search_news_candidates', {
+      query: 'NVDA product event',
+    }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('read_news_document', {
+      factId: candidate.id,
+    }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('submit_specialist_report', specialistReport), {
+      stopReason: 'toolUse',
+    }),
+  ] })
+  const model = { ...mainModel, analyzeNews: newsModel.analyzeNews }
+  const app = buildApp({
+    productDatabase: { checkSchema: () => checkSchema(pool), close: () => pool.end() },
+    portfolioRepository: createPortfolioRepository(pool),
+    analysisRepository: createAnalysisRepository(pool), agentEventRepository: events,
+    runtimeSettingsRepository: createRuntimeSettingsRepository(pool),
+    toolProjectionRepository: createToolProjectionRepository(pool),
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, gaps: [], facts: [] }),
+    searchNewsCandidates: async () => ({ facts: [candidate] }),
+    readNewsDocument: async (input) => {
+      assert.equal(input.id, candidate.id)
+      return { facts: [verified], excerpt: 'bounded verified excerpt' }
+    },
+    listCompanyEvents: async () => ({ facts: [] }), model,
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: `N${crypto.randomUUID().slice(0, 8)}` },
+  })).json() as { analysisId: string; sessionId: string }
+  try {
+    await waitForAnalysisStatus(app, created.analysisId, 'completed')
+    const research = (await app.inject({
+      method: 'GET', url: `/api/research/${created.analysisId}`,
+    })).json()
+    assert.equal(research.specialistAgents.length, 1)
+    const news = research.specialistAgents[0]
+    assert.equal(news.domain, 'news')
+    assert.equal(news.execution.status, 'completed')
+    assert.match(JSON.stringify(news.events), /search_news_candidates/)
+    assert.match(JSON.stringify(news.events), /read_news_document/)
+    assert.match(JSON.stringify(news.events), /fact:news:e2e:candidate/)
+    assert.match(JSON.stringify(news.events), /fact:news:e2e:document/)
+    assert.doesNotMatch(JSON.stringify(news.events), /bounded verified excerpt/)
+    assert.match(JSON.stringify(news.events), /bounded verified summary/)
+    assert.equal(news.researchQuestion, '近 30 天是否有改变预期的事件？')
+    assert.equal(news.reason, '缺少消息面反方证据。')
+
+    const mainLedger = await events.list(created.sessionId, 0)
+    const specialistResult = mainLedger.find(({ payload }) => (
+      payload.type === 'tool_result' && payload.name === 'run_news_analysis'
+    ))?.payload.result
+    assert.match(JSON.stringify(specialistResult), /产品事件对近期预期偏正面/)
+    assert.match(JSON.stringify(specialistResult), new RegExp(verified.id))
+
+    const sse = await app.inject({
+      method: 'GET', url: `/api/agent-sessions/${news.id}/events`,
+    })
+    assert.match(sse.body, /event: tool_call/)
+    assert.match(sse.body, /event: tool_result/)
+    assert.match(sse.body, /event: completed/)
+    const versions = (await app.inject({
+      method: 'GET', url: `/api/research/${created.analysisId}/report-versions`,
+    })).json().items
+    assert.deepEqual(versions.map((version: any) => ({
+      kind: version.kind, sessionId: version.sessionId,
+      domain: version.report.domain ?? null, evidence: version.report.keyJudgments?.[0]?.supportingEvidence ?? [],
+    })), [
+      { kind: 'specialist', sessionId: news.id, domain: 'news', evidence: [verified.id] },
+      { kind: 'integrated', sessionId: created.sessionId, domain: null, evidence: [] },
+    ])
+  } finally {
+    await app.close()
+  }
+})
+
 test('生产 Pi 经 HTTP、SSE 与真实 PostgreSQL 留存工具及预算收口状态序列', {
   skip: !databaseUrl,
   concurrency: false,
@@ -904,7 +1026,7 @@ test('生产 Pi 经 HTTP、SSE 与真实 PostgreSQL 留存工具及预算收口�
     assert.deepEqual(toolRuntime.projections.map((projection: { visibleToolNames: string[] }) => (
       projection.visibleToolNames
     )), [[
-      'fetch_financial_context', 'analyze_financials', 'submit_analysis_report',
+      'fetch_financial_context', 'analyze_financials', 'run_news_analysis', 'submit_analysis_report',
     ], ['submit_analysis_report']])
     assert.equal(JSON.stringify(toolRuntime).includes('hidden_tool'), false)
     assert.equal(JSON.stringify(toolRuntime).includes('allowedStages'), false)

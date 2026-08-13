@@ -28,11 +28,19 @@ type AppDependencies = {
   staticDir?: string
   fetchFinancialContext?: (symbol: string, signal: AbortSignal) => Promise<FinancialContext>
   searchNews?: (keyword: string, signal: AbortSignal) => Promise<FactQueryResult>
+  searchNewsCandidates?: (query: string, signal: AbortSignal) => Promise<FactQueryResult>
+  readNewsDocument?: (
+    candidate: import('./financial-data-client.js').FinancialFact, signal: AbortSignal,
+  ) => Promise<FactQueryResult>
+  listCompanyEvents?: (symbol: string, signal: AbortSignal) => Promise<FactQueryResult>
   fetchTechnicalIndicators?: (
     symbol: string, startDate: string, endDate: string, signal: AbortSignal,
   ) => Promise<FactQueryResult>
   fetchMarketPrices?: (symbols: string[], signal: AbortSignal) => Promise<Record<string, number>>
-  model?: { analyze(input: Record<string, unknown>): AsyncIterable<ModelEvent> }
+  model?: {
+    analyze(input: any): AsyncIterable<ModelEvent>
+    analyzeNews?: (input: any) => AsyncIterable<ModelEvent>
+  }
   modelConfigured?: boolean
   now?: () => Date
   runtimeMinuteMs?: number
@@ -54,6 +62,9 @@ export function buildApp(dependencies: AppDependencies) {
         fetchFinancialContext: dependencies.fetchFinancialContext
           ?? (async () => { throw new Error('model_not_configured') }),
         searchNews: dependencies.searchNews,
+        searchNewsCandidates: dependencies.searchNewsCandidates,
+        readNewsDocument: dependencies.readNewsDocument,
+        listCompanyEvents: dependencies.listCompanyEvents,
         fetchTechnicalIndicators: dependencies.fetchTechnicalIndicators,
         fetchMarketPrices: dependencies.fetchMarketPrices,
         listPortfolioSymbols: async () => (await portfolio.list()).map((position) => position.symbol),

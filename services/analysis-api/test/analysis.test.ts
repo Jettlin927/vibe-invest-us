@@ -136,6 +136,139 @@ test('创建分析立即返回标识并自动保存完成报告、快照、事�
   await app.close()
 })
 
+test('主 Agent 启动的消息面 Agent 拥有独立 Session、轨迹和不可变专项报告版本', async () => {
+  const database = createTestProductDatabase()
+  const specialistReport = {
+    kind: 'specialist' as const, domain: 'news', availability: 'available' as const,
+    status: 'completed' as const, gaps: [], limitations: [], keyJudgments: [],
+  }
+  const model = {
+    async *analyze(input: Parameters<ReturnType<typeof createPiModel>['analyze']>[0]) {
+      const result = await input.runNewsSpecialist!({
+        launch: true, researchQuestion: '近 30 天是否有重大公司事件？', reason: '缺少消息面反方证据。',
+      })
+      assert.equal(result.status, 'completed')
+      yield { type: 'completed' as const, report, reportVersion: {
+        kind: 'integrated' as const, report: reportCandidate,
+      } }
+    },
+    async *analyzeNews(input: Parameters<NonNullable<ReturnType<typeof createPiModel>['analyzeNews']>>[0]) {
+      yield { type: 'trace' as const, entry: {
+        type: 'user_input' as const, content: input.researchQuestion,
+        operationId: `execution:${input.executionId}:research-question`,
+      } }
+      yield { type: 'completed' as const, report: {
+        ...report, title: '消息面专项', keyJudgments: [], limitations: [],
+      }, reportVersion: { kind: 'specialist' as const, report: specialistReport } }
+    },
+  }
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [], indicators: {} }),
+    searchNewsCandidates: async () => ({ facts: [] }),
+    readNewsDocument: async () => ({ facts: [] }),
+    listCompanyEvents: async () => ({ facts: [] }),
+    model,
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'NEWSAGENT' },
+  })).json()
+  await waitForStatus(app as any, created.analysisId, 'completed')
+
+  const research = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  assert.equal(research.specialistAgents.length, 1)
+  assert.equal(research.specialistAgents[0].domain, 'news')
+  assert.equal(research.specialistAgents[0].isPrimary, false)
+  assert.equal(research.specialistAgents[0].execution.status, 'completed')
+  assert.match(JSON.stringify(research.specialistAgents[0].events), /近 30 天是否有重大公司事件/)
+  assert.ok(research.mainAgent.events.some((event: Record<string, unknown>) => (
+    event.status === 'waiting_for_specialists'
+  )))
+
+  const versions = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}/report-versions`,
+  })).json().items
+  assert.deepEqual(versions.map(({ kind, report: versionReport }: any) => ({
+    kind, domain: versionReport.domain ?? null,
+  })), [
+    { kind: 'specialist', domain: 'news' },
+    { kind: 'integrated', domain: null },
+  ])
+  await app.close()
+})
+
+test('主 Agent 未启动消息面 Agent 时研究投影保留研究问题和理由', async () => {
+  const database = createTestProductDatabase()
+  const model = {
+    async *analyze() {
+      yield { type: 'trace' as const, entry: {
+        type: 'tool_result' as const, name: 'run_news_analysis', toolCallId: 'news-decision',
+        result: {
+          launched: false, status: 'not_started',
+          researchQuestion: '近期是否有改变预期的公司事件？',
+          reason: '当前事实已覆盖研究问题。',
+        },
+        isError: false, startedAt: null, completedAt: '2026-08-13T03:00:00.000Z',
+        completionOrder: 1,
+      } }
+      yield { type: 'completed' as const, report, reportVersion: {
+        kind: 'integrated' as const, report: reportCandidate,
+      } }
+    },
+  }
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [], indicators: {} }),
+    model,
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'NEWSNO' },
+  })).json()
+  await waitForStatus(app as any, created.analysisId, 'completed')
+
+  const research = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  assert.deepEqual(research.specialistAgents, [{
+    domain: 'news', status: 'not_started',
+    researchQuestion: '近期是否有改变预期的公司事件？',
+    reason: '当前事实已覆盖研究问题。',
+  }])
+  await app.close()
+})
+
+test('主 Agent 尚未决定时研究投影也固定显示消息面专项视角', async () => {
+  const database = createTestProductDatabase()
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [], indicators: {} }),
+    model: { async *analyze() {
+      await new Promise((resolve) => setTimeout(resolve, 100))
+      yield { type: 'completed' as const, report, reportVersion: {
+        kind: 'integrated' as const, report: reportCandidate,
+      } }
+    } },
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'NEWSWAIT' },
+  })).json()
+  const research = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  assert.deepEqual(research.specialistAgents, [{
+    domain: 'news', status: 'not_started', reason: '主 Agent 尚未作出消息面专项启动决定。',
+  }])
+  await app.close()
+})
+
 test('创建 execution 冻结当前 settings revision 且后续修改不影响运行值', async () => {
   const database = createTestProductDatabase()
   await database.runtimeSettingsRepository.save({ mainAgentToolRounds: 100 }, '2026-08-13T03:00:00.000Z')
@@ -1136,7 +1269,7 @@ test('首次研究起始资料完整描述能力、工具与报告目标且不�
   assert.equal(runtimeContext.capabilityStatus.news.status, 'unavailable')
   assert.equal(runtimeContext.capabilityStatus.valuation.status, 'unavailable')
   assert.deepEqual(runtimeContext.availableTools.map(({ name }: { name: string }) => name), [
-    'fetch_financial_context', 'analyze_financials', 'submit_analysis_report',
+    'fetch_financial_context', 'analyze_financials', 'run_news_analysis', 'submit_analysis_report',
   ])
   assert.deepEqual(runtimeContext.specialistCapabilities, [
     { domain: 'news', responsibility: '核实消息、公司事件及相反证据' },

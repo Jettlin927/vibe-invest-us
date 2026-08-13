@@ -101,6 +101,83 @@
         }
       }
     },
+    "/v1/news-document": {
+      "post": {
+        "summary": "News Document",
+        "operationId": "readNewsDocument",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewsDocumentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NewsDocumentResult"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/company-events": {
+      "post": {
+        "summary": "Company Events",
+        "operationId": "listCompanyEvents",
+        "parameters": [
+          {
+            "name": "symbol",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Symbol"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FactQueryResult"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/technical-indicators": {
       "post": {
         "summary": "Technical Indicators",
@@ -247,6 +324,17 @@
           "sourceReference": {
             "type": "string",
             "title": "Sourcereference"
+          },
+          "evidenceLevel": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Evidencelevel"
           }
         },
         "type": "object",
@@ -534,6 +622,47 @@
           "histogram"
         ],
         "title": "Macd"
+      },
+      "NewsDocumentRequest": {
+        "properties": {
+          "candidate": {
+            "$ref": "#/components/schemas/AtomicFact"
+          }
+        },
+        "type": "object",
+        "required": [
+          "candidate"
+        ],
+        "title": "NewsDocumentRequest"
+      },
+      "NewsDocumentResult": {
+        "properties": {
+          "facts": {
+            "items": {
+              "$ref": "#/components/schemas/AtomicFact"
+            },
+            "type": "array",
+            "title": "Facts"
+          },
+          "sources": {
+            "items": {
+              "$ref": "#/components/schemas/SourceStatus"
+            },
+            "type": "array",
+            "title": "Sources",
+            "default": []
+          },
+          "excerpt": {
+            "type": "string",
+            "title": "Excerpt"
+          }
+        },
+        "type": "object",
+        "required": [
+          "facts",
+          "excerpt"
+        ],
+        "title": "NewsDocumentResult"
       },
       "QuoteBatch": {
         "properties": {

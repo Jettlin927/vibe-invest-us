@@ -272,6 +272,79 @@ test('研究页展示主 Agent、execution、conversation segment、waitReason �
   assert.match(runtime.textContent ?? '', /等待 首次研究初始化/)
 })
 
+test('研究页固定展示未启动的消息面专项及理由', async () => {
+  setupDom()
+  const record = {
+    id: 'news-not-started', symbol: 'NVDA', status: 'completed',
+    report: null, facts: [], trace: [],
+    specialistAgents: [{
+      domain: 'news', status: 'not_started',
+      researchQuestion: '近期是否有改变预期的公司事件？',
+      reason: '当前事实已覆盖研究问题。',
+    }],
+  }
+  globalThis.fetch = async (input) => {
+    const url = String(input)
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok' }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/settings') return Response.json({ ...settingsResponse(), model: { configured: false } })
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+    if (url === '/api/portfolio') return Response.json(portfolioResponse([]))
+    if (url === '/api/research') return Response.json({ records: [{ id: record.id, symbol: record.symbol, status: record.status }] })
+    if (url === '/api/research/news-not-started') return Response.json(record)
+    throw new Error(`unexpected_fetch:${url}`)
+  }
+  const view = render(React.createElement(App))
+  const user = userEvent.setup({ document: window.document })
+  await user.click(await view.findByRole('button', { name: '新建分析' }))
+  await user.click(await view.findByRole('button', { name: /打开 NVDA/ }))
+
+  const specialist = await view.findByRole('region', { name: '消息面专项 Agent' })
+  assert.match(specialist.textContent ?? '', /未启动/)
+  assert.match(specialist.textContent ?? '', /近期是否有改变预期的公司事件/)
+  assert.match(specialist.textContent ?? '', /当前事实已覆盖研究问题/)
+})
+
+test('研究页独立展示消息面专项的工具轨迹、证据缺口和版本报告', async () => {
+  setupDom()
+  const record = {
+    id: 'news-completed', symbol: 'NVDA', status: 'completed', report: null, facts: [], trace: [],
+    specialistAgents: [{
+      id: 'news-session', domain: 'news', status: 'completed',
+      researchQuestion: '近期事件是否改变预期？', reason: '需要核验消息面。',
+      execution: { id: 'news-execution', generation: 1, status: 'completed' },
+      events: [
+        { sequence: 1, type: 'tool_call', name: 'search_news_candidates', createdAt: '2026-08-13T03:00:00Z' },
+        { sequence: 2, type: 'tool_call', name: 'read_news_document', createdAt: '2026-08-13T03:00:01Z' },
+      ],
+      reportVersion: { version: 1, report: {
+        gaps: [{ capability: 'contrary_news', reason: '未找到独立反方来源', impact: '置信度受限' }],
+        keyJudgments: [{ statement: '产品事件对近期预期偏正面', direction: 'bullish', confidence: 'medium' }],
+      } },
+    }],
+  }
+  globalThis.fetch = async (input) => {
+    const url = String(input)
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok' }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/settings') return Response.json({ ...settingsResponse(), model: { configured: false } })
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+    if (url === '/api/portfolio') return Response.json(portfolioResponse([]))
+    if (url === '/api/research') return Response.json({ records: [{ id: record.id, symbol: record.symbol, status: record.status }] })
+    if (url === '/api/research/news-completed') return Response.json(record)
+    throw new Error(`unexpected_fetch:${url}`)
+  }
+  const view = render(React.createElement(App))
+  const user = userEvent.setup({ document: window.document })
+  await user.click(await view.findByRole('button', { name: '新建分析' }))
+  await user.click(await view.findByRole('button', { name: /打开 NVDA/ }))
+
+  const specialist = await view.findByRole('region', { name: '消息面专项 Agent' })
+  assert.match(specialist.textContent ?? '', /search_news_candidates/)
+  assert.match(specialist.textContent ?? '', /read_news_document/)
+  assert.match(specialist.textContent ?? '', /报告版本 1/)
+  assert.match(specialist.textContent ?? '', /未找到独立反方来源.*置信度受限/)
+  assert.match(specialist.textContent ?? '', /产品事件对近期预期偏正面.*中等/)
+})
+
 test('模型未配置时首次研究创建后立即打开主 Agent 生命周期', async () => {
   setupDom()
   let created = false

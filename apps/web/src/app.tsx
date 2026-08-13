@@ -47,6 +47,16 @@ type ResearchRecord = ResearchSummary & {
       waitReason?: { kind: string; target: string; startedAt: string } | null
     }>
   }
+  specialistAgents?: Array<{
+    id?: string; domain: string; status?: string
+    researchQuestion?: string; reason?: string
+    execution?: { id: string; generation: number; status: string }
+    events?: Array<{ sequence: number; type?: string; name?: string; createdAt: string }>
+    reportVersion?: { version: number; report: {
+      gaps?: Array<{ capability?: string; reason?: string; impact?: string }>
+      keyJudgments?: Array<{ statement?: string; direction?: string; confidence?: string }>
+    } }
+  }>
 }
 
 const pages: Array<{ id: Page; label: string }> = [
@@ -307,9 +317,34 @@ function ResearchPage({ records, record, onOpen, onUpdate, onDelete, freshnessDa
     <div className="research-layout">
       <aside className="research-index"><p className="micro">全部记录 · {records.length}</p>{records.map((item) => <button className={record?.id === item.id ? 'active' : ''} key={item.id} onClick={() => void onOpen(item.id)}><strong>{item.symbol}</strong><span>{item.report?.title ?? statusLabel(item.status)}</span><small>{item.starred ? `已标记 · ${statusLabel(item.status)}` : statusLabel(item.status)}</small></button>)}</aside>
       <ResearchReport record={record} onUpdate={onUpdate} onDelete={onDelete} freshnessDays={freshnessDays} />
-      <div><AgentRuntime agent={record?.mainAgent} /><TraceSummary trace={record?.trace ?? []} /></div>
+      <div><AgentRuntime agent={record?.mainAgent} /><SpecialistAgents agents={record?.specialistAgents} /><TraceSummary trace={record?.trace ?? []} /></div>
     </div>
   </>
+}
+
+function SpecialistAgents({ agents = [] }: { agents?: ResearchRecord['specialistAgents'] }) {
+  return <>{agents?.filter(({ domain }) => domain === 'news').map((agent) => (
+    <section className="agent-runtime" role="region" aria-label="消息面专项 Agent" key={agent.id ?? agent.domain}>
+      <p className="micro">消息面专项 Agent</p>
+      <h2>{statusLabel(agent.execution?.status ?? agent.status ?? 'not_started')}</h2>
+      {agent.researchQuestion && <p>研究问题：{agent.researchQuestion}</p>}
+      {agent.reason && <p>理由：{agent.reason}</p>}
+      {agent.id && <p>Session {agent.id}</p>}
+      {agent.execution && <p>Execution {agent.execution.id} · Generation {agent.execution.generation}</p>}
+      {agent.events?.some(({ type }) => type === 'tool_call') && <ol>{agent.events.filter(({ type }) => type === 'tool_call').map((event) => (
+        <li key={event.sequence}>#{event.sequence} {event.name} · {formatTime(event.createdAt)}</li>
+      ))}</ol>}
+      {agent.reportVersion && <div>
+        <h3>报告版本 {agent.reportVersion.version}</h3>
+        {agent.reportVersion.report.keyJudgments?.map((judgment, index) => (
+          <p key={index}>{judgment.statement} · {directionLabel(judgment.direction)} · {confidenceLabel(judgment.confidence)}</p>
+        ))}
+        {agent.reportVersion.report.gaps?.map((gap, index) => (
+          <p key={index}>证据缺口：{gap.reason}{gap.impact ? ` · ${gap.impact}` : ''}</p>
+        ))}
+      </div>}
+    </section>
+  ))}</>
 }
 
 function AgentRuntime({ agent }: { agent?: ResearchRecord['mainAgent'] }) {
@@ -636,7 +671,9 @@ function pipelineIndex(status: string, stages: string[]) { if (['completed', 'pa
 function pipelineLabel(stage: string) { return ({ queued: '创建分析任务', running: '准备市场与持仓材料', financial_context: '冻结金融上下文', model_event: 'AI 综合判断', model_completed: '校验结构化报告', completed: '保存研究记录' } as Record<string, string>)[stage] }
 function safeReference(value: string) { return value.startsWith('http://') || value.startsWith('https://') ? value : undefined }
 function factLabel(type: string) { return ({ quote: '当前价格', daily_bar: '历史行情', news: '相关新闻', indicators: '技术指标', valuation: '估值结果', dilutedEps: '每股收益', revenue: '营业收入', netIncome: '净利润', operatingCashFlow: '经营现金流' } as Record<string, string>)[type] ?? '结构化事实' }
-function statusLabel(status: string) { return ({ queued: '排队中', planning: '规划中', running: '分析中', running_model: '模型分析中', running_tools: '工具执行中', waiting_for_specialists: '等待专项分析', finalizing: '报告收口中', completed: '已完成', partial: '部分完成', failed: '失败', stopping: '正在停止', stopped: '已停止', interrupted: '服务中断', budget_exhausted: '预算已耗尽' } as Record<string, string>)[status] ?? status }
+function statusLabel(status: string) { return ({ queued: '排队中', planning: '规划中', not_started: '未启动', running: '分析中', running_model: '模型分析中', running_tools: '工具执行中', waiting_for_specialists: '等待专项分析', finalizing: '报告收口中', completed: '已完成', partial: '部分完成', failed: '失败', stopping: '正在停止', stopped: '已停止', interrupted: '服务中断', budget_exhausted: '预算已耗尽' } as Record<string, string>)[status] ?? status }
+function directionLabel(direction?: string) { return ({ bullish: '偏多', bearish: '偏空', neutral: '中性' } as Record<string, string>)[direction ?? ''] ?? direction ?? '方向未知' }
+function confidenceLabel(confidence?: string) { return ({ low: '低置信度', medium: '中等置信度', high: '高置信度' } as Record<string, string>)[confidence ?? ''] ?? confidence ?? '置信度未知' }
 function trendVerdict(trend?: string) { if (!trend) return '受限'; if (/偏强|看涨|上升/.test(trend)) return '谨慎偏多'; if (/偏弱|看跌|下降/.test(trend)) return '谨慎偏空'; return '中性观察' }
 function formatTime(value: string) { const date = new Date(value); return Number.isNaN(date.valueOf()) ? value : date.toLocaleString('zh-CN', { dateStyle: 'medium', timeStyle: 'short' }) }
 function formatMoney(value: number) { return Number.isFinite(value) ? new Intl.NumberFormat('zh-CN', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 }).format(value) : '—' }

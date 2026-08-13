@@ -1,11 +1,16 @@
 from datetime import date, datetime, timedelta, timezone
+import re
 from typing import Literal, List, Optional
 
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-from app.context import build_financial_context, search_news_facts, technical_indicator_facts
-from app.models import FactQueryResult, FinancialContext, QuoteBatch, QuoteSnapshot, SourceStatus
+from app.adapters import read_limited_document
+from app.context import (
+    build_financial_context, company_event_facts, read_news_document_fact,
+    search_news_facts, technical_indicator_facts,
+)
+from app.models import AtomicFact, FactQueryResult, FinancialContext, NewsDocumentResult, QuoteBatch, QuoteSnapshot, SourceStatus
 from app.source_config import build_sources, load_source_config
 
 
@@ -40,6 +45,38 @@ def financial_context(symbol: str) -> FinancialContext:
 def news_search(keyword: str) -> FactQueryResult:
     facts, sources = search_news_facts(
         keyword, datetime.now(timezone.utc), build_sources(source_config, "news"),
+    )
+    return FactQueryResult(facts=facts, sources=sources)
+
+
+class NewsDocumentRequest(BaseModel):
+    candidate: AtomicFact
+
+
+@app.post("/v1/news-document", operation_id="readNewsDocument", response_model=NewsDocumentResult)
+def news_document(request: NewsDocumentRequest) -> NewsDocumentResult:
+    candidate = request.candidate
+    if candidate.type != "news" or candidate.evidenceLevel != "title_only":
+        raise ValueError("news_candidate_invalid")
+
+    def reader(url: str, max_bytes: int):
+        return read_limited_document(url, max_bytes, timeout=10)
+
+    payload, _content_type, _truncated, _final_url = reader(candidate.sourceReference, 65536)
+    text = " ".join(re.sub(r"<[^>]+>", " ", payload.decode("utf-8", errors="replace")).split())
+    fact = read_news_document_fact(
+        candidate, datetime.now(timezone.utc),
+        lambda _url, _max_bytes: (payload, _content_type, _truncated, _final_url),
+    )
+    return NewsDocumentResult(facts=[fact], excerpt=text[:2048], sources=[SourceStatus(
+        source=candidate.source, status="ok", item_count=1,
+    )])
+
+
+@app.post("/v1/company-events", operation_id="listCompanyEvents", response_model=FactQueryResult)
+def company_events(symbol: str) -> FactQueryResult:
+    facts, sources = company_event_facts(
+        symbol, datetime.now(timezone.utc), build_sources(source_config, "news"),
     )
     return FactQueryResult(facts=facts, sources=sources)
 
