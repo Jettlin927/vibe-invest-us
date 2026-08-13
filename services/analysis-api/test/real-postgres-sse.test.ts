@@ -490,7 +490,8 @@ test('真实 PostgreSQL 取消在 PG、HTTP 与 SSE reconnect 统一为 stopping
       toolCallId: 'old-call', startedAt: createdAt,
       operationId: `execution:${originalExecutionId}:tool:old-call:call`,
       eventPayload: {
-        type: 'tool_call', name: 'fetch_financial_context', input: {}, startedAt: createdAt,
+        type: 'tool_call', name: 'fetch_financial_context', toolCallId: 'old-call',
+        input: {}, startedAt: createdAt,
       },
     })
     await toolRuntime.completeToolBatch({
@@ -502,7 +503,8 @@ test('真实 PostgreSQL 取消在 PG、HTTP 与 SSE reconnect 统一为 stopping
         resultPayload: { toolName: 'fetch_financial_context', result: { facts: [] }, isError: false },
         operationId: `execution:${originalExecutionId}:tool:old-call:result`,
         eventPayload: {
-          type: 'tool_result', name: 'fetch_financial_context', result: { facts: [] }, isError: false,
+          type: 'tool_result', name: 'fetch_financial_context', toolCallId: 'old-call',
+          result: { facts: [] }, isError: false,
         },
       }],
     })
@@ -768,6 +770,7 @@ test('Pi Runtime 使用持久 executionId 派生工具 operationId 且真实 Pos
       completedAt: typeof sealedBatch[3].payload.completedAt,
     }, {
       type: 'tool_result', name: 'fetch_financial_context',
+      toolCallId: `${cancelledAfterReportCallId}:main-attempt:2:position:2`,
       result: { error: 'cancelled_after_report_submission', facts: [] },
       isError: true, startedAt: 'string', completedAt: 'string', completionOrder: 2,
       operationId: `${cancelledPrefix}:result`,
@@ -799,7 +802,7 @@ test('主 Agent 校验失败与合法调用在下一轮前按原序封存到真�
   }
   const model = createPiModel({ fauxResponses: [
     fauxAssistantMessage([
-      fauxToolCall('hidden_main_tool', {}, { id: unknownCallId }),
+      fauxToolCall('hidden_main_tool', { secret: 'must-not-leak' }, { id: unknownCallId }),
       fauxToolCall('fetch_financial_context', { symbol: '' }, { id: invalidCallId }),
       fauxToolCall('fetch_financial_context', {}, { id: validCallId }),
     ], { stopReason: 'toolUse' }),
@@ -824,12 +827,14 @@ test('主 Agent 校验失败与合法调用在下一轮前按原序封存到真�
       })), [
         {
           type: 'tool_result', name: 'tool_not_available',
+          toolCallId: runtimeIds[0],
           result: { error: 'tool_not_available', facts: [] }, isError: true,
           startedAt: 'string', completedAt: 'string', completionOrder: 1,
           operationId: `${prefix}:${runtimeIds[0]}:result`,
         },
         {
           type: 'tool_result', name: 'fetch_financial_context',
+          toolCallId: runtimeIds[1],
           result: { error: 'invalid_tool_arguments', facts: [] }, isError: true,
           startedAt: 'string', completedAt: 'string', completionOrder: 2,
           operationId: `${prefix}:${runtimeIds[1]}:result`,
@@ -840,6 +845,7 @@ test('主 Agent 校验失败与合法调用在下一轮前按原序封存到真�
         ...runtimeIds,
       ])
       providerObservedSealedLedger = true
+      assert.doesNotMatch(JSON.stringify(sealed), /hidden_main_tool|must-not-leak/)
       return fauxAssistantMessage(
         fauxToolCall('submit_analysis_report', report, { id: reportCallId }),
         { stopReason: 'toolUse' },
@@ -869,6 +875,26 @@ test('主 Agent 校验失败与合法调用在下一轮前按原序封存到真�
     await waitForAnalysisStatus(app, created.analysisId, 'partial')
     assert.equal(providerObservedSealedLedger, true)
     assert.equal(validCalls, 1)
+    const session = await events.getSession(created.sessionId)
+    assert.ok(session)
+    const [researchResponse, runtimeResponse, sseResponse] = await Promise.all([
+      app.inject({ method: 'GET', url: `/api/research/${created.analysisId}` }),
+      app.inject({
+        method: 'GET',
+        url: `/api/agent-sessions/${created.sessionId}/tool-runtime?executionId=${session.executionId}`,
+      }),
+      app.inject({ method: 'GET', url: `/api/agent-sessions/${created.sessionId}/events` }),
+    ])
+    const publicReadback = JSON.stringify({
+      research: researchResponse.json(), runtime: runtimeResponse.json(), sse: sseResponse.body,
+    })
+    assert.doesNotMatch(publicReadback, /hidden_main_tool|must-not-leak/)
+    const publicUnknown = researchResponse.json().trace.find((payload: Record<string, unknown>) => (
+      payload.type === 'tool_result' && payload.name === 'tool_not_available'
+    ))
+    assert.equal(publicUnknown.toolCallId,
+      `${unknownCallId}:main-attempt:1:position:1`)
+    assert.doesNotMatch(sseResponse.body, /hidden_main_tool|must-not-leak/)
   } finally {
     await app.close()
   }

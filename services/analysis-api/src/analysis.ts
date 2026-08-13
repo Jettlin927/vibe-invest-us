@@ -97,9 +97,11 @@ export function createAnalysisService(options: {
           },
           operationId: result.operationId,
           eventPayload: {
-            type: 'tool_result', name: result.toolName, result: result.result,
+            type: 'tool_result', name: result.toolName, toolCallId: result.toolCallId,
+            result: result.result,
             isError: result.isError, startedAt: result.startedAt,
             completedAt: result.completedAt, completionOrder: result.completionOrder,
+            ...(result.startedAt === null ? { notStarted: true } : {}),
             operationId: result.operationId,
           },
         })),

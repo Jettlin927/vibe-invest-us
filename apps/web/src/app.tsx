@@ -533,7 +533,8 @@ function ToolTrace({ entries }: { entries: Array<Record<string, unknown>> }) {
     const startedAt = typeof entry.startedAt === 'string' ? entry.startedAt : null
     const completedAt = typeof entry.completedAt === 'string' ? entry.completedAt : null
     const duration = startedAt && completedAt ? Math.max(0, new Date(completedAt).getTime() - new Date(startedAt).getTime()) : null
-    return <li key={`${String(entry.name)}-${String(entry.completionOrder ?? index)}`}><strong>{String(entry.name ?? '工具')}</strong>{startedAt && <span>开始 {formatTime(startedAt)}</span>}{completedAt && <span>完成 {formatTime(completedAt)}</span>}{duration !== null && <small>耗时 {duration.toLocaleString('zh-CN')} 毫秒 · 完成序 #{String(entry.completionOrder)}</small>}</li>
+    const cancelledBeforeStart = entry.type === 'tool_result' && entry.notStarted === true
+    return <li key={`${String(entry.toolCallId ?? entry.name)}-${String(entry.completionOrder ?? index)}`} data-tool-call-id={String(entry.toolCallId ?? '')}><strong>{String(entry.name ?? '工具')}</strong>{cancelledBeforeStart ? <span>未开始即取消</span> : startedAt && <span>开始 {formatTime(startedAt)}</span>}{completedAt && <span>完成 {formatTime(completedAt)}</span>}{duration !== null && <small>耗时 {duration.toLocaleString('zh-CN')} 毫秒 · 完成序 #{String(entry.completionOrder)}</small>}</li>
   })}</ol>
 }
 

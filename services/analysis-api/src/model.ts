@@ -35,10 +35,14 @@ type TraceEntry =
   | { type: 'user_input'; content: string; operationId?: string }
   | { type: 'runtime_policy'; settings: RuntimeSettings; operationId?: string }
   | { type: 'model_event'; event: unknown; operationId?: string }
-  | { type: 'tool_call'; name: string; input: unknown; startedAt: string; operationId: string }
   | {
-    type: 'tool_result'; name: string; result: unknown; isError: boolean
-    startedAt: string; completedAt: string; completionOrder: number; operationId: string
+    type: 'tool_call'; name: string; toolCallId: string
+    input: unknown; startedAt: string; operationId: string
+  }
+  | {
+    type: 'tool_result'; name: string; toolCallId: string; result: unknown; isError: boolean
+    startedAt: string | null; completedAt: string; completionOrder: number
+    notStarted?: boolean; operationId: string
   }
   | { type: 'cancelled'; operationId?: string }
   | {
@@ -150,7 +154,7 @@ export type ToolRuntime = {
       toolCallId: string
       toolName: string
       status: 'completed' | 'failed' | 'cancelled'
-      startedAt: string
+      startedAt: string | null
       completedAt: string
       completionOrder: number
       result: unknown

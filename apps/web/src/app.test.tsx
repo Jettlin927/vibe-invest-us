@@ -177,8 +177,9 @@ test('用户创建分析并打开研究记录后能看到报告依据', async ()
         { id: 'valuation-1', type: 'valuation', value: { methods: { pe: { multiple: 70.28 } }, historical_ranges: { pe: [30.74, 56.58] } }, observedAt: '2026-08-12T13:48:38Z', source: 'yahoo-timeseries', sourceReference: 'https://example.com' },
       ],
       trace: [
-        { type: 'tool_call', name: 'search_news_by_keyword', startedAt: '2026-08-12T13:48:38.000Z' },
-        { type: 'tool_result', name: 'search_news_by_keyword', startedAt: '2026-08-12T13:48:38.000Z', completedAt: '2026-08-12T13:48:38.125Z', completionOrder: 1 },
+        { type: 'tool_call', name: 'search_news_by_keyword', toolCallId: 'news-call', startedAt: '2026-08-12T13:48:38.000Z' },
+        { type: 'tool_result', name: 'search_news_by_keyword', toolCallId: 'news-call', startedAt: '2026-08-12T13:48:38.000Z', completedAt: '2026-08-12T13:48:38.125Z', completionOrder: 1 },
+        { type: 'tool_result', name: 'get_technical_indicators', toolCallId: 'cancelled-call', startedAt: null, notStarted: true, completedAt: '2026-08-12T13:48:38.125Z', completionOrder: 2, isError: true },
         { type: 'status', status: 'completed' },
       ],
     })
@@ -201,6 +202,9 @@ test('用户创建分析并打开研究记录后能看到报告依据', async ()
   assert.ok(view.getAllByText(/开始/).some((item) => /2026/.test(item.textContent ?? '')))
   await user.click(view.getByText('工具返回事实'))
   await view.findByText('耗时 125 毫秒 · 完成序 #1')
+  await view.findByText('未开始即取消')
+  assert.equal(document.querySelector('[data-tool-call-id="news-call"]') !== null, true)
+  assert.equal(document.querySelector('[data-tool-call-id="cancelled-call"]') !== null, true)
 })
 
 test('新建分析页展示分析历史并能重新打开报告', async () => {

@@ -132,7 +132,7 @@ test('真实 PostgreSQL 持久化 Tool Projection 版本、模型请求与批次
       results: [{
         toolCallId: 'call-1', status: 'completed', startedAt: '2026-08-13T04:00:04.100Z',
         completedAt: '2026-08-13T04:00:05.000Z', completionOrder: 1,
-        resultPayload: { content: 'first', isError: false }, operationId: 'batch-1:result:call-1',
+        resultPayload: { toolCallId: 'call-1', content: 'first', isError: false }, operationId: 'batch-1:result:call-1',
         eventPayload: { type: 'trace', kind: 'tool_result', toolCallId: 'call-1', content: 'first' },
       }],
       completedAt: '2026-08-13T04:00:06.000Z',
@@ -144,12 +144,12 @@ test('真实 PostgreSQL 持久化 Tool Projection 版本、模型请求与批次
       results: [{
         toolCallId: 'call-2', status: 'failed', startedAt: '2026-08-13T04:00:04.200Z',
         completedAt: '2026-08-13T04:00:05.500Z', completionOrder: 2,
-        resultPayload: { content: 'second', isError: true }, operationId: 'batch-1:result:call-2',
+        resultPayload: { toolCallId: 'call-2', content: 'second', isError: true }, operationId: 'batch-1:result:call-2',
         eventPayload: { type: 'trace', kind: 'tool_result', toolCallId: 'call-2', content: 'second' },
       }, {
         toolCallId: 'call-1', status: 'completed', startedAt: '2026-08-13T04:00:04.100Z',
         completedAt: '2026-08-13T04:00:05.000Z', completionOrder: 1,
-        resultPayload: { content: 'first', isError: false }, operationId: 'batch-1:result:call-1',
+        resultPayload: { toolCallId: 'call-1', content: 'first', isError: false }, operationId: 'batch-1:result:call-1',
         eventPayload: { type: 'trace', kind: 'tool_result', toolCallId: 'call-1', content: 'first' },
       }],
       completedAt: '2026-08-13T04:00:06.000Z',
@@ -161,7 +161,9 @@ test('真实 PostgreSQL 持久化 Tool Projection 版本、模型请求与批次
         : result),
     }), /tool_batch_started_at_conflict/)
     const firstCompletionEvents = await projections.completeToolBatch(completedBatch)
-    assert.deepEqual(await projections.startToolCall(call1Start), firstStart)
+    const ledgerAfterCompletion = await events.list(sessionId, 0)
+    await assert.rejects(projections.startToolCall(call1Start), /tool_call_not_running/)
+    assert.deepEqual(await events.list(sessionId, 0), ledgerAfterCompletion)
     const retriedCompletionEvents = await projections.completeToolBatch(completedBatch)
     assert.deepEqual(retriedCompletionEvents, firstCompletionEvents)
     assert.equal((await events.list(sessionId, 1)).length, 4)
@@ -211,7 +213,8 @@ test('真实 PostgreSQL 持久化 Tool Projection 版本、模型请求与批次
       { toolCallId: 'call-2', status: 'failed', completionOrder: 2 },
     ])
     assert.deepEqual(replay.toolBatches[0]?.results.map(({ resultPayload }) => resultPayload), [
-      { content: 'first', isError: false }, { content: 'second', isError: true },
+      { toolCallId: 'call-1', content: 'first', isError: false },
+      { toolCallId: 'call-2', content: 'second', isError: true },
     ])
     const resultEvents = (await events.list(sessionId, 1)).map(({ operationId, payload }) => ({
       operationId, toolCallId: payload.toolCallId,
@@ -287,7 +290,9 @@ test('真实 PostgreSQL execution 终态事务会取消未完成 Tool Batch', {
       projection: { status: 'failed', executionStatus: 'failed', terminal: true },
       createdAt: '2026-08-13T04:10:03.000Z',
     })
-    assert.deepEqual(await projections.startToolCall(terminalStart), terminalStartEvent)
+    const ledgerBeforeLateStart = await events.list(sessionId, 0)
+    await assert.rejects(projections.startToolCall(terminalStart), /agent_execution_fenced/)
+    assert.deepEqual(await events.list(sessionId, 0), ledgerBeforeLateStart)
     const replay = await projections.replay(executionId)
     assert.equal(replay.toolBatches[0]?.status, 'cancelled')
     assert.deepEqual(replay.toolBatches[0]?.results.map(({ status }) => status), ['cancelled'])
@@ -297,7 +302,7 @@ test('真实 PostgreSQL execution 终态事务会取消未完成 Tool Batch', {
     })), [{
       startedAt: '2026-08-13T04:10:02.500Z', completedAt: '2026-08-13T04:10:03.000Z',
       completionOrder: 1, resultPayload: {
-        toolName: 'fetch_financial_context',
+        toolName: 'fetch_financial_context', toolCallId: 'terminal-call',
         result: { error: 'tool_execution_interrupted', facts: [] }, isError: true,
       },
     }])
@@ -631,18 +636,45 @@ test('真实 PostgreSQL execution fence 先于既有 operationId 幂等判定', 
     })
     await projections.beginToolBatch({
       id: `${executionId}:batch`, executionId, projectionId: projection.id, turnIndex: 1,
-      calls: [{ toolCallId: `${executionId}:call`, toolName: 'fetch_financial_context', position: 1 }],
+      calls: [
+        { toolCallId: `${executionId}:done`, toolName: 'fetch_financial_context', position: 1 },
+        { toolCallId: `${executionId}:call`, toolName: 'fetch_financial_context', position: 2 },
+      ],
       createdAt: '2026-08-13T03:20:01.000Z',
     })
+    await projections.startToolCall({
+      batchId: `${executionId}:batch`, executionId, toolCallId: `${executionId}:done`,
+      startedAt: '2026-08-13T03:20:01.100Z', operationId: 'partial-call-start',
+      eventPayload: {
+        type: 'tool_call', name: 'fetch_financial_context', toolCallId: `${executionId}:done`,
+        startedAt: '2026-08-13T03:20:01.100Z',
+      },
+    })
+    await pool.query(
+      `UPDATE tool_batch_calls SET status = 'completed', completed_at = $1,
+         completion_order = 1, result_payload_json = $2
+       WHERE batch_id = $3 AND tool_call_id = $4`,
+      ['2026-08-13T03:20:01.500Z', JSON.stringify({
+        toolCallId: `${executionId}:done`, result: { facts: [] }, isError: false,
+      }), `${executionId}:batch`, `${executionId}:done`],
+    )
     const stopped = await events.fenceForStopping({
       sessionId, executionId, fenceExecutionId, operationId: 'current-stopping',
       event: { type: 'status', status: 'stopping' }, createdAt: '2026-08-13T03:20:02.000Z',
     })
     assert.equal((await projections.replay(executionId)).toolBatches[0]?.status, 'cancelled')
     assert.deepEqual(stopped.cancelledToolEvents.map(({ payload }) => payload.type),
-      ['tool_call', 'tool_result'])
-    assert.deepEqual((stopped.cancelledToolEvents[1]?.payload as { name?: string }).name,
+      ['tool_result'])
+    assert.deepEqual((stopped.cancelledToolEvents[0]?.payload as { name?: string }).name,
       'fetch_financial_context')
+    assert.equal(stopped.cancelledToolEvents[0]?.payload.startedAt, null)
+    assert.equal(stopped.cancelledToolEvents[0]?.payload.notStarted, true)
+    assert.equal(stopped.cancelledToolEvents[0]?.payload.completionOrder, 2)
+    assert.deepEqual((await projections.replay(executionId)).toolBatches[0]?.results
+      .map(({ toolCallId, completionOrder }) => ({ toolCallId, completionOrder })), [
+      { toolCallId: `${executionId}:done`, completionOrder: 1 },
+      { toolCallId: `${executionId}:call`, completionOrder: 2 },
+    ])
     assert.deepEqual(await events.fenceForStopping({
       sessionId, executionId, fenceExecutionId, operationId: 'current-stopping',
       event: { type: 'status', status: 'stopping' }, createdAt: '2026-08-13T03:20:02.000Z',
@@ -1267,13 +1299,13 @@ test('真实 PostgreSQL 启动恢复在一个事务内中断全部活跃 Session
     assert.deepEqual(interrupted.map(({ sessionId, sequence, operationId, cancelledToolEvents }) => ({
       sessionId, sequence, operationId, cancelledTypes: cancelledToolEvents.map(({ payload }) => payload.type),
     })), [{
-      sessionId: 'interrupt-all-main', sequence: 4,
-      operationId: 'startup:interrupt:interrupt-all-main:4',
-      cancelledTypes: ['tool_call', 'tool_result'],
+      sessionId: 'interrupt-all-main', sequence: 3,
+      operationId: 'startup:interrupt:interrupt-all-main:3',
+      cancelledTypes: ['tool_result'],
     }, {
-      sessionId: 'interrupt-all-specialist', sequence: 4,
-      operationId: 'startup:interrupt:interrupt-all-specialist:4',
-      cancelledTypes: ['tool_call', 'tool_result'],
+      sessionId: 'interrupt-all-specialist', sequence: 3,
+      operationId: 'startup:interrupt:interrupt-all-specialist:3',
+      cancelledTypes: ['tool_result'],
     }])
     assert.deepEqual(await events.interruptActiveSessions('2026-08-13T00:00:01.000Z'), [])
     assert.deepEqual((await events.listSessions(analysisId)).map(({ status }) => status),

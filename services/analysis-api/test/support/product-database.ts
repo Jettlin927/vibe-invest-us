@@ -36,7 +36,7 @@ export function createTestProductDatabase() {
     id: string; executionId: string; projectionId: string; turnIndex: number; status: string
     calls: Array<{ toolCallId: string; toolName: string; position: number }>
     results: Array<{
-      toolCallId: string; status: string; startedAt: string; completedAt: string
+      toolCallId: string; status: string; startedAt: string | null; completedAt: string
       completionOrder: number; resultPayload: Record<string, unknown>
     }>
   }>()
@@ -448,13 +448,17 @@ export function createTestProductDatabase() {
       toolBatches.set(input.id, { ...structuredClone(input), status: 'running', results: [] })
     },
     async startToolCall(input) {
+      const session = [...agentSessions.values()].find(({ executionId }) => executionId === input.executionId)
+      if (!session) throw new Error('agent_execution_fenced')
+      const lifecycle = lifecycles.get(session.id)
+      if (!lifecycle || lifecycle.execution.id !== input.executionId
+        || ['completed', 'partial', 'failed', 'stopped', 'interrupted', 'budget_exhausted']
+          .includes(lifecycle.execution.status)) throw new Error('agent_execution_fenced')
       const batch = toolBatches.get(input.batchId)
       if (!batch || batch.executionId !== input.executionId || batch.status !== 'running'
         || !batch.calls.some(({ toolCallId }) => toolCallId === input.toolCallId)) {
         throw new Error('tool_call_not_running')
       }
-      const session = [...agentSessions.values()].find(({ executionId }) => executionId === input.executionId)
-      if (!session) throw new Error('agent_session_not_found')
       const existing = agentEvents.get(session.id) ?? []
       const prior = existing.find(({ operationId }) => operationId === input.operationId)
       if (prior) return structuredClone(prior)

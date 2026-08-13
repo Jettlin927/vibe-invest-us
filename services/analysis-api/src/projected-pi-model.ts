@@ -23,8 +23,8 @@ type Stage = 'research' | 'finalization'
 type ToolStatus = 'completed' | 'failed' | 'cancelled'
 type ToolAudit = {
   toolCallId: string; toolName: string; status: ToolStatus
-  startedAt: string; completedAt: string; completionOrder: number
-  result: unknown; isError: boolean; operationId: string
+  startedAt: string | null; completedAt: string; completionOrder: number
+  result: unknown; isError: boolean; notStarted?: boolean; operationId: string
 }
 type Batch = {
   id: string; turnIndex: number
@@ -348,11 +348,13 @@ async function runProjectedAgent(config: {
       batchId: currentBatch.id, executionId: input.executionId,
       toolCallId: call.toolCallId, startedAt, operationId,
       eventPayload: {
-        type: 'tool_call', name: call.toolName, input: call.input, startedAt, operationId,
+        type: 'tool_call', name: call.toolName, toolCallId: call.toolCallId,
+        input: call.input, startedAt, operationId,
       },
     })
     config.queue.push(trace({
-      type: 'tool_call', name: call.toolName, input: call.input, startedAt, operationId,
+      type: 'tool_call', name: call.toolName, toolCallId: call.toolCallId,
+      input: call.input, startedAt, operationId,
     }))
   }
 
@@ -373,8 +375,9 @@ async function runProjectedAgent(config: {
       for (const call of batch.calls) if (!batch.results.has(call.toolCallId)) {
         batch.results.set(call.toolCallId, {
           ...call, status: config.executionSignal.aborted ? 'cancelled' : 'failed',
-          startedAt: callStartedAt.get(call.toolCallId) ?? now, completedAt: now,
+          startedAt: callStartedAt.get(call.toolCallId) ?? null, completedAt: now,
           completionOrder: ++completionOrder,
+          notStarted: !callStartedAt.has(call.toolCallId),
           result: { error: 'tool_execution_interrupted', facts: [] }, isError: true,
           operationId: toolOperationId(config.role, input.executionId, call.toolCallId, 'result'),
         })
@@ -387,9 +390,11 @@ async function runProjectedAgent(config: {
     for (const result of [...batch.results.values()].sort((left, right) => (
       left.completionOrder - right.completionOrder
     ))) config.queue.push(trace({
-      type: 'tool_result', name: result.toolName, result: result.result,
+      type: 'tool_result', name: result.toolName, toolCallId: result.toolCallId,
+      result: result.result,
       isError: result.isError, startedAt: result.startedAt,
       completedAt: result.completedAt, completionOrder: result.completionOrder,
+      ...(result.notStarted ? { notStarted: true } : {}),
       operationId: result.operationId,
     }))
     currentBatch = undefined
@@ -522,11 +527,16 @@ async function runProjectedAgent(config: {
       && !currentBatch.results.has(event.toolCallId)) {
       const now = new Date().toISOString()
       const result = adapterToolResult(event.result)
+      const didStart = callStartedAt.has(event.toolCallId)
       currentBatch.results.set(event.toolCallId, {
         toolCallId: event.toolCallId, toolName: event.toolName,
-        status: config.executionSignal.aborted ? 'cancelled' : event.isError ? 'failed' : 'completed',
-        startedAt: callStartedAt.get(event.toolCallId) ?? now, completedAt: now,
-        completionOrder: ++completionOrder, result, isError: event.isError,
+        status: didStart
+          ? config.executionSignal.aborted ? 'cancelled' : event.isError ? 'failed' : 'completed'
+          : 'cancelled',
+        startedAt: callStartedAt.get(event.toolCallId) ?? null, completedAt: now,
+        completionOrder: ++completionOrder, result,
+        isError: !didStart || config.executionSignal.aborted || event.isError,
+        notStarted: !didStart,
         operationId: toolOperationId(config.role, input.executionId, event.toolCallId, 'result'),
       })
     }

@@ -520,6 +520,7 @@ test('主 Agent 非法参数只拒绝当前 call 且同批合法工具仍执行'
     completedAt: typeof invalidResult.entry.completedAt,
   } }, { type: 'trace', entry: {
     type: 'tool_result', name: 'fetch_financial_context',
+    toolCallId: 'invalid-arguments:main-attempt:1:position:1',
     result: { error: 'invalid_tool_arguments', facts: [] }, isError: true,
     startedAt: 'string', completedAt: 'string', completionOrder: 1,
     operationId: 'execution:invalid-main:tool:invalid-arguments:main-attempt:1:position:1:result',
