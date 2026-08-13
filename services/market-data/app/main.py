@@ -62,7 +62,8 @@ def financial_metric_series_endpoint(symbol: str, metric: str, cursor: Optional[
 @app.post("/v1/filing-document", operation_id="readFilingDocument", response_model=FilingDocumentResult)
 def filing_document(symbol: str, filing_id: str, cursor: Optional[str] = None) -> FilingDocumentResult:
     normalized_symbol = symbol.strip().upper()
-    filing = SecFilingSource(timeout=10).fetch(normalized_symbol, filing_id)
+    source = SecFilingSource(timeout=10)
+    filing = source.fetch_page(source.fetch(normalized_symbol, filing_id), cursor)
     return filing_document_page(
         normalized_symbol, filing_id, cursor, filing, datetime.now(timezone.utc),
     )

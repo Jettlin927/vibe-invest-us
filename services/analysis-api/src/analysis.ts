@@ -411,225 +411,157 @@ export function createAnalysisService(options: {
       const fundamentalRuntimeAvailable = Boolean(options.model.analyzeFundamental
         && options.getFinancialOverview && options.getFinancialMetricSeries
         && options.readFilingDocument && options.listOfficialCompanyEvents)
-      const runNewsSpecialist = async (request: {
+      type SpecialistRequest = {
         launch: boolean; researchQuestion: string; reason: string
+      }
+      const runSpecialistLifecycle = async (config: {
+        domain: 'news' | 'fundamental_valuation'
+        label: string
+        request: SpecialistRequest
+        events: (executionId: string, runtime: ToolRuntime) => AsyncIterable<ModelEvent>
       }) => {
+        const slug = config.domain === 'news' ? 'news' : 'fundamental'
+        await setStatus(
+          sessionId, executionId, `execution:${executionId}:${slug}-specialist:waiting`,
+          'waiting_for_specialists', {}, `${config.label}专项分析`,
+        )
+        const requestedSessionId = randomUUID()
+        const requestedExecutionId = randomUUID()
+        const createdAt = new Date().toISOString()
+        const specialistSession = await options.eventRepository.createSpecialistSession({
+          id: requestedSessionId, analysisId, executionId: requestedExecutionId,
+          domain: config.domain, segmentId: randomUUID(), status: 'planning',
+          operationId: `session:${requestedSessionId}:created`,
+          event: {
+            type: 'specialist_context', domain: config.domain, launch: config.request.launch,
+            researchQuestion: config.request.researchQuestion, reason: config.request.reason,
+            status: 'planning', at: createdAt,
+          },
+          createdAt,
+        })
+        if (!specialistSession.created) {
+          const versions = await options.eventRepository.listReportVersions(analysisId)
+          const existing = versions.filter(
+            ({ sessionId }) => sessionId === specialistSession.sessionId,
+          ).at(-1)
+          await setStatus(
+            sessionId, executionId,
+            `execution:${executionId}:${slug}-specialist:resumed`, 'running_tools', {},
+          )
+          return {
+            launched: true, status: existing ? 'completed' : 'not_started',
+            sessionId: specialistSession.sessionId, executionId: specialistSession.executionId,
+            ...(existing ? { reportId: existing.id, reportVersion: existing.version } : {}),
+            summary: config.request.researchQuestion,
+            keyFactIds: [], contraryFactIds: [], gaps: [],
+          }
+        }
+        let specialistStatus = 'failed'
+        let specialistReportVersion: ReturnType<typeof finalReportVersion> | undefined
+        try {
+          await setStatus(
+            requestedSessionId, requestedExecutionId,
+            `execution:${requestedExecutionId}:running-model`,
+            'running_model', {}, `${config.label}专项模型`,
+          )
+          for await (const specialistEvent of config.events(requestedExecutionId, toolRuntime)) {
+            if (specialistEvent.type === 'lifecycle') await setStatus(
+              requestedSessionId, requestedExecutionId, specialistEvent.operationId,
+              specialistEvent.status, {
+                terminal: specialistEvent.status === 'budget_exhausted' ? false : undefined,
+              }, specialistEvent.waitTarget,
+            )
+            else if (specialistEvent.type === 'trace'
+              && (specialistEvent.entry.type !== 'tool_result'
+                || typeof specialistEvent.entry.operationId !== 'string')) {
+              await appendTrace(requestedSessionId, requestedExecutionId, specialistEvent.entry)
+            }
+            else if (specialistEvent.type === 'text_delta') await appendTrace(
+              requestedSessionId, requestedExecutionId, specialistEvent.operationId
+                ? specialistEvent : {
+                    ...specialistEvent,
+                    operationId: `execution:${requestedExecutionId}:text:${Date.now()}`,
+                  },
+            )
+            else if (specialistEvent.type === 'completed' && specialistEvent.reportVersion) {
+              const candidate = specialistEvent.reportVersion
+              const candidateReport = candidate.report as Record<string, unknown>
+              const status = candidateReport.status === 'partial' ? 'partial' : 'completed'
+              specialistStatus = status
+              specialistReportVersion = finalReportVersion(
+                requestedExecutionId, candidate, specialistEvent.report, status, [],
+              )
+              await setStatus(
+                requestedSessionId, requestedExecutionId,
+                `execution:${requestedExecutionId}:status-${status}`, status,
+                { reportVersion: specialistReportVersion },
+              )
+            }
+          }
+          if (!specialistReportVersion) throw new Error('specialist_report_required')
+        } catch (error) {
+          await setStatus(
+            requestedSessionId, requestedExecutionId,
+            `execution:${requestedExecutionId}:status-failed`, 'failed',
+            { error: error instanceof Error ? error.message : String(error) },
+          )
+          throw error
+        }
+        await setStatus(
+          sessionId, executionId,
+          `execution:${executionId}:${slug}-specialist:completed`, 'running_tools', {},
+        )
+        return {
+          launched: true, status: specialistStatus, sessionId: requestedSessionId,
+          executionId: requestedExecutionId, reportId: specialistReportVersion.id,
+          reportVersion: 1,
+          ...specialistResultProjection(
+            specialistReportVersion.report, config.request.researchQuestion,
+          ),
+        }
+      }
+      const runNewsSpecialist = async (request: SpecialistRequest) => {
         if (!options.model.analyzeNews || !options.searchNewsCandidates
           || !options.readNewsDocument || !options.listCompanyEvents) {
           throw new Error('news_specialist_runtime_unavailable')
         }
-        await setStatus(
-          sessionId, executionId,
-          `execution:${executionId}:news-specialist:waiting`, 'waiting_for_specialists', {},
-          '消息面专项分析',
-        )
-        const specialistSessionId = randomUUID()
-        const specialistExecutionId = randomUUID()
-        const createdAt = new Date().toISOString()
-        const specialistSession = await options.eventRepository.createSpecialistSession({
-          id: specialistSessionId, analysisId, executionId: specialistExecutionId,
-          domain: 'news',
-          segmentId: randomUUID(), status: 'planning',
-          operationId: `session:${specialistSessionId}:created`,
-          event: {
-            type: 'specialist_context', domain: 'news', launch: request.launch,
-            researchQuestion: request.researchQuestion, reason: request.reason,
-            status: 'planning', at: createdAt,
-          },
-          createdAt,
-        })
-        if (!specialistSession.created) {
-          const versions = await options.eventRepository.listReportVersions(analysisId)
-          const existing = versions.filter(({ sessionId }) => sessionId === specialistSession.sessionId).at(-1)
-          await setStatus(
-            sessionId, executionId,
-            `execution:${executionId}:news-specialist:resumed`, 'running_tools', {},
-          )
-          return {
-            launched: true, status: existing ? 'completed' : 'not_started',
-            sessionId: specialistSession.sessionId, executionId: specialistSession.executionId,
-            ...(existing ? { reportId: existing.id, reportVersion: existing.version } : {}),
-            summary: request.researchQuestion, keyFactIds: [], contraryFactIds: [], gaps: [],
-          }
-        }
-        let specialistStatus = 'failed'
-        let specialistReportVersion: ReturnType<typeof finalReportVersion> | undefined
-        try {
-          await setStatus(
-            specialistSessionId, specialistExecutionId,
-            `execution:${specialistExecutionId}:running-model`, 'running_model', {}, '消息面专项模型',
-          )
-          for await (const specialistEvent of options.model.analyzeNews({
+        return runSpecialistLifecycle({
+          domain: 'news', label: '消息面', request,
+          events: (specialistExecutionId, specialistRuntime) => options.model.analyzeNews!({
             executionId: specialistExecutionId, runtimeSettings, symbol: job.symbol,
             systemPrompt: '你是独立消息面 Agent。只使用新闻候选、新闻文档和公司事件工具；每项判断引用合格事实 ID，禁止个人买卖或仓位建议。',
             researchQuestion: request.researchQuestion, knownFacts: modelContext.facts,
-            searchNewsCandidates: options.searchNewsCandidates,
+            searchNewsCandidates: options.searchNewsCandidates!,
             searchWebEvidence: options.searchWebEvidence,
-            readNewsDocument: options.readNewsDocument,
-            listCompanyEvents: options.listCompanyEvents,
+            readNewsDocument: options.readNewsDocument!,
+            listCompanyEvents: options.listCompanyEvents!,
             signal: controller.signal, executionDeadlineSignal: wallDeadline, activeBudget,
             acquireModelSlot: (signal) => modelGate.acquire(signal),
-            acquireToolSlot: (signal) => toolGate.acquire(signal), toolRuntime,
-          })) {
-            if (specialistEvent.type === 'lifecycle') await setStatus(
-              specialistSessionId, specialistExecutionId, specialistEvent.operationId,
-              specialistEvent.status, {
-                terminal: specialistEvent.status === 'budget_exhausted' ? false : undefined,
-              }, specialistEvent.waitTarget,
-            )
-            else if (specialistEvent.type === 'trace'
-              && (specialistEvent.entry.type !== 'tool_result'
-                || typeof specialistEvent.entry.operationId !== 'string')) {
-              await appendTrace(specialistSessionId, specialistExecutionId, specialistEvent.entry)
-            }
-            else if (specialistEvent.type === 'text_delta') await appendTrace(
-              specialistSessionId, specialistExecutionId, specialistEvent.operationId
-                ? specialistEvent : { ...specialistEvent,
-                    operationId: `execution:${specialistExecutionId}:text:${Date.now()}` },
-            )
-            else if (specialistEvent.type === 'completed' && specialistEvent.reportVersion) {
-              const candidate = specialistEvent.reportVersion
-              const candidateReport = candidate.report as Record<string, unknown>
-              const status = candidateReport.status === 'partial' ? 'partial' : 'completed'
-              specialistStatus = status
-              specialistReportVersion = finalReportVersion(
-                specialistExecutionId, candidate, specialistEvent.report, status, [],
-              )
-              await setStatus(
-                specialistSessionId, specialistExecutionId,
-                `execution:${specialistExecutionId}:status-${status}`, status,
-                { reportVersion: specialistReportVersion },
-              )
-            }
-          }
-          if (!specialistReportVersion) throw new Error('specialist_report_required')
-        } catch (error) {
-          await setStatus(
-            specialistSessionId, specialistExecutionId,
-            `execution:${specialistExecutionId}:status-failed`, 'failed',
-            { error: error instanceof Error ? error.message : String(error) },
-          )
-          throw error
-        }
-        await setStatus(
-          sessionId, executionId,
-          `execution:${executionId}:news-specialist:completed`, 'running_tools', {},
-        )
-        return {
-          launched: true, status: specialistStatus, sessionId: specialistSessionId,
-          executionId: specialistExecutionId, reportId: specialistReportVersion.id,
-          reportVersion: 1,
-          ...specialistResultProjection(specialistReportVersion.report, request.researchQuestion),
-        }
+            acquireToolSlot: (signal) => toolGate.acquire(signal), toolRuntime: specialistRuntime,
+          }),
+        })
       }
-      const runFundamentalSpecialist = async (request: {
-        launch: boolean; researchQuestion: string; reason: string
-      }) => {
+      const runFundamentalSpecialist = async (request: SpecialistRequest) => {
         if (!options.model.analyzeFundamental || !options.getFinancialOverview
           || !options.getFinancialMetricSeries || !options.readFilingDocument
-          || !options.listOfficialCompanyEvents) throw new Error('fundamental_specialist_runtime_unavailable')
-        await setStatus(
-          sessionId, executionId,
-          `execution:${executionId}:fundamental-specialist:waiting`, 'waiting_for_specialists', {},
-          '基本面专项分析',
-        )
-        const specialistSessionId = randomUUID()
-        const specialistExecutionId = randomUUID()
-        const createdAt = new Date().toISOString()
-        const specialistSession = await options.eventRepository.createSpecialistSession({
-          id: specialistSessionId, analysisId, executionId: specialistExecutionId,
-          domain: 'fundamental_valuation', segmentId: randomUUID(), status: 'planning',
-          operationId: `session:${specialistSessionId}:created`,
-          event: {
-            type: 'specialist_context', domain: 'fundamental_valuation', launch: request.launch,
-            researchQuestion: request.researchQuestion, reason: request.reason,
-            status: 'planning', at: createdAt,
-          },
-          createdAt,
-        })
-        if (!specialistSession.created) {
-          const versions = await options.eventRepository.listReportVersions(analysisId)
-          const existing = versions.filter(({ sessionId }) => sessionId === specialistSession.sessionId).at(-1)
-          await setStatus(
-            sessionId, executionId,
-            `execution:${executionId}:fundamental-specialist:resumed`, 'running_tools', {},
-          )
-          return {
-            launched: true, status: existing ? 'completed' : 'not_started',
-            sessionId: specialistSession.sessionId, executionId: specialistSession.executionId,
-            ...(existing ? { reportId: existing.id, reportVersion: existing.version } : {}),
-            summary: request.researchQuestion, keyFactIds: [], contraryFactIds: [], gaps: [],
-          }
+          || !options.listOfficialCompanyEvents) {
+          throw new Error('fundamental_specialist_runtime_unavailable')
         }
-        let specialistStatus = 'failed'
-        let specialistReportVersion: ReturnType<typeof finalReportVersion> | undefined
-        try {
-          await setStatus(
-            specialistSessionId, specialistExecutionId,
-            `execution:${specialistExecutionId}:running-model`, 'running_model', {}, '基本面专项模型',
-          )
-          for await (const specialistEvent of options.model.analyzeFundamental({
+        return runSpecialistLifecycle({
+          domain: 'fundamental_valuation', label: '基本面', request,
+          events: (specialistExecutionId, specialistRuntime) => options.model.analyzeFundamental!({
             executionId: specialistExecutionId, runtimeSettings, symbol: job.symbol,
             systemPrompt: '你是独立基本面 Agent。只使用财务概览、指标序列、Filing 和官方公司事件；每项判断引用正式或确定性财务事实，禁止个人买卖或仓位建议。',
             researchQuestion: request.researchQuestion, knownFacts: modelContext.facts,
-            getFinancialOverview: options.getFinancialOverview,
-            getFinancialMetricSeries: options.getFinancialMetricSeries,
-            readFilingDocument: options.readFilingDocument,
-            listCompanyEvents: options.listOfficialCompanyEvents,
+            getFinancialOverview: options.getFinancialOverview!,
+            getFinancialMetricSeries: options.getFinancialMetricSeries!,
+            readFilingDocument: options.readFilingDocument!,
+            listCompanyEvents: options.listOfficialCompanyEvents!,
             signal: controller.signal, executionDeadlineSignal: wallDeadline, activeBudget,
             acquireModelSlot: (signal) => modelGate.acquire(signal),
-            acquireToolSlot: (signal) => toolGate.acquire(signal), toolRuntime,
-          })) {
-            if (specialistEvent.type === 'lifecycle') await setStatus(
-              specialistSessionId, specialistExecutionId, specialistEvent.operationId,
-              specialistEvent.status, {
-                terminal: specialistEvent.status === 'budget_exhausted' ? false : undefined,
-              }, specialistEvent.waitTarget,
-            )
-            else if (specialistEvent.type === 'trace'
-              && (specialistEvent.entry.type !== 'tool_result'
-                || typeof specialistEvent.entry.operationId !== 'string')) {
-              await appendTrace(specialistSessionId, specialistExecutionId, specialistEvent.entry)
-            }
-            else if (specialistEvent.type === 'text_delta') await appendTrace(
-              specialistSessionId, specialistExecutionId, specialistEvent.operationId
-                ? specialistEvent : { ...specialistEvent,
-                    operationId: `execution:${specialistExecutionId}:text:${Date.now()}` },
-            )
-            else if (specialistEvent.type === 'completed' && specialistEvent.reportVersion) {
-              const candidate = specialistEvent.reportVersion
-              const candidateReport = candidate.report as Record<string, unknown>
-              const status = candidateReport.status === 'partial' ? 'partial' : 'completed'
-              specialistStatus = status
-              specialistReportVersion = finalReportVersion(
-                specialistExecutionId, candidate, specialistEvent.report, status, [],
-              )
-              await setStatus(
-                specialistSessionId, specialistExecutionId,
-                `execution:${specialistExecutionId}:status-${status}`, status,
-                { reportVersion: specialistReportVersion },
-              )
-            }
-          }
-          if (!specialistReportVersion) throw new Error('specialist_report_required')
-        } catch (error) {
-          await setStatus(
-            specialistSessionId, specialistExecutionId,
-            `execution:${specialistExecutionId}:status-failed`, 'failed',
-            { error: error instanceof Error ? error.message : String(error) },
-          )
-          throw error
-        }
-        await setStatus(
-          sessionId, executionId,
-          `execution:${executionId}:fundamental-specialist:completed`, 'running_tools', {},
-        )
-        return {
-          launched: true, status: specialistStatus, sessionId: specialistSessionId,
-          executionId: specialistExecutionId, reportId: specialistReportVersion.id,
-          reportVersion: 1,
-          ...specialistResultProjection(specialistReportVersion.report, request.researchQuestion),
-        }
+            acquireToolSlot: (signal) => toolGate.acquire(signal), toolRuntime: specialistRuntime,
+          }),
+        })
       }
       await appendEvent(
         sessionId, executionId, operationId('running-model'),

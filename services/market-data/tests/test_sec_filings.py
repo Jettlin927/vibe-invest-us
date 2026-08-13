@@ -3,7 +3,7 @@ import json
 from app.adapters import SecFilingSource
 
 
-def test_sec_filing_resolves_accession_to_official_document_and_bounded_sections(monkeypatch):
+def test_sec_filing_resolves_accession_to_official_document_without_reading_body(monkeypatch):
     calls = []
 
     def read(url, params=None, headers=None, timeout=15):
@@ -17,11 +17,6 @@ def test_sec_filing_resolves_accession_to_official_document_and_bounded_sections
 
     monkeypatch.setenv("SEC_USER_AGENT", "vibe-invest test@example.com")
     monkeypatch.setattr("app.adapters._read", read)
-    monkeypatch.setattr("app.adapters.read_limited_document", lambda url, max_bytes, timeout=10: (
-        b"<h1>Results</h1><p>Revenue increased.</p><h1>Guidance</h1><p>Guidance raised.</p>",
-        "text/html", False, url,
-    ))
-
     filing = SecFilingSource().fetch("NVDA", "0001045810-26-000123")
 
     assert filing["sourceReference"] == (
@@ -29,11 +24,29 @@ def test_sec_filing_resolves_accession_to_official_document_and_bounded_sections
     )
     assert filing["form"] == "10-Q"
     assert filing["filedAt"] == "2026-07-31"
-    assert filing["sections"] == [
-        {"name": "Results", "summary": "Revenue increased."},
-        {"name": "Guidance", "summary": "Guidance raised."},
-    ]
+    assert "sections" not in filing
     assert all(headers["User-Agent"] == "vibe-invest test@example.com" for _, headers in calls)
+
+
+def test_sec_filing_reads_real_byte_page_and_preserves_provider_total(monkeypatch):
+    filing = {
+        "filingId": "0001045810-26-000123", "form": "10-Q", "filedAt": "2026-07-31",
+        "sourceReference": "https://www.sec.gov/Archives/edgar/data/1045810/q2.htm",
+    }
+    monkeypatch.setattr("app.adapters.read_document_page", lambda url, cursor, max_bytes, timeout=10: {
+        "payload": b"<h1>Guidance</h1><p>Management raised guidance.</p>",
+        "contentType": "text/html", "sourceReference": url,
+        "startByte": 65536, "endByte": 65590, "totalBytes": 200000,
+        "nextCursor": "65591", "truncated": True,
+    })
+
+    page = SecFilingSource().fetch_page(filing, "65536")
+
+    assert page["startByte"] == 65536
+    assert page["totalBytes"] == 200000
+    assert page["nextCursor"] == "65591"
+    assert page["summary"] == "Guidance Management raised guidance."
+    assert len(page["contentHash"]) == 64
 
 
 def test_sec_filing_lists_bounded_official_company_events(monkeypatch):

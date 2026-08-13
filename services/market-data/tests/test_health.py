@@ -1,11 +1,15 @@
 import json
 import time
+from email.message import Message
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.adapters import _PinnedHTTPConnection, _diagnose, configure_diagnostics, validate_document_url
+from app.adapters import (
+    _PinnedHTTPConnection, _diagnose, configure_diagnostics, read_document_page,
+    validate_document_url,
+)
 from app.models import Quote
 from datetime import datetime, timezone
 
@@ -71,7 +75,11 @@ def test_filing_document_http_uses_sec_adapter_and_returns_bounded_page(monkeypa
     monkeypatch.setattr("app.main.SecFilingSource.fetch", lambda self, symbol, filing_id: {
         "filingId": filing_id, "form": "10-Q", "filedAt": "2026-07-31",
         "sourceReference": "https://www.sec.gov/Archives/edgar/data/example.htm",
-        "sections": [{"name": "results", "summary": "Revenue increased."}],
+    })
+    monkeypatch.setattr("app.main.SecFilingSource.fetch_page", lambda self, filing, cursor: {
+        **filing, "summary": "Revenue increased.", "contentHash": "a" * 64,
+        "startByte": 0, "endByte": 127, "totalBytes": 400,
+        "nextCursor": "128", "truncated": True,
     })
 
     response = TestClient(app).post("/v1/filing-document", params={
@@ -80,10 +88,12 @@ def test_filing_document_http_uses_sec_adapter_and_returns_bounded_page(monkeypa
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["returnedCount"] == payload["totalCount"] == 1
-    assert payload["nextCursor"] is None
-    assert payload["truncated"] is False
+    assert payload["returnedCount"] == 128
+    assert payload["totalCount"] == 400
+    assert payload["nextCursor"] == "128"
+    assert payload["truncated"] is True
     assert payload["facts"][0]["evidenceLevel"] == "official_filing"
+    assert payload["facts"][0]["value"]["contentHash"] == "a" * 64
 
 
 def test_quote_batch_uses_fallback_without_exposing_provider_payload(monkeypatch):
@@ -173,3 +183,71 @@ def test_document_connection_uses_the_prevalidated_ip_without_resolving_hostname
     connection.connect()
     assert connection.sock is sentinel
     assert connected == [("93.184.216.34", 80)]
+
+
+def test_document_page_sends_byte_range_and_uses_provider_total(monkeypatch):
+    requests = []
+
+    class Response:
+        status = 206
+        headers = Message()
+        headers["Content-Type"] = "text/html"
+        headers["Content-Range"] = "bytes 65536-65540/200000"
+        def read(self, _limit):
+            return b"abcde"
+
+    class Connection:
+        def __init__(self, *args):
+            pass
+        def request(self, method, path, headers):
+            requests.append((method, path, headers))
+        def getresponse(self):
+            return Response()
+        def close(self):
+            pass
+
+    monkeypatch.setattr("app.adapters._resolve_document_url", lambda url: (
+        url, "93.184.216.34", 443, "example.com",
+    ))
+    monkeypatch.setattr("app.adapters._PinnedHTTPSConnection", Connection)
+
+    page = read_document_page("https://example.com/filing", 65536, 65536)
+
+    assert requests[0][2]["Range"] == "bytes=65536-131071"
+    assert page["startByte"] == 65536
+    assert page["endByte"] == 65540
+    assert page["totalBytes"] == 200000
+    assert page["nextCursor"] == "65541"
+    assert page["truncated"] is True
+
+
+def test_document_page_fails_closed_when_provider_ignores_nonzero_range(monkeypatch):
+    class Response:
+        status = 200
+        headers = Message()
+        headers["Content-Type"] = "text/html"
+        headers["Content-Length"] = "200000"
+        def read(self, _limit):
+            return b"abcde"
+
+    class Connection:
+        def __init__(self, *args):
+            pass
+        def request(self, method, path, headers):
+            pass
+        def getresponse(self):
+            return Response()
+        def close(self):
+            pass
+
+    monkeypatch.setattr("app.adapters._resolve_document_url", lambda url: (
+        url, "93.184.216.34", 443, "example.com",
+    ))
+    monkeypatch.setattr("app.adapters._PinnedHTTPSConnection", Connection)
+
+    try:
+        read_document_page("https://example.com/filing", 65536, 65536)
+    except ValueError as error:
+        assert str(error) == "document_range_not_supported"
+    else:
+        raise AssertionError("ignored_range_accepted")

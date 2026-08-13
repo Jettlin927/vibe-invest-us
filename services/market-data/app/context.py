@@ -152,7 +152,7 @@ def financial_metric_series_result(symbol: str, metric: str, cursor: Optional[st
 
 
 def filing_document_page(symbol: str, filing_id: str, cursor: Optional[str],
-                         filing: Any, now: datetime, page_size: int = 10) -> FilingDocumentResult:
+                         filing: Any, now: datetime) -> FilingDocumentResult:
     normalized_symbol = symbol.strip().upper()
     if not isinstance(filing, dict) or filing.get("filingId") != filing_id:
         raise ValueError("filing_not_found")
@@ -161,27 +161,34 @@ def filing_document_page(symbol: str, filing_id: str, cursor: Optional[str],
             and not source_reference.startswith("https://sec.gov/"):
         raise ValueError("filing_source_not_official")
     offset = int(cursor or "0")
-    if offset < 0 or page_size < 1:
+    if offset < 0 or filing.get("startByte") != offset:
         raise ValueError("filing_cursor_invalid")
-    sections = filing.get("sections", []) if isinstance(filing.get("sections", []), list) else []
-    page = [
-        {"name": str(section.get("name", "")), "summary": str(section.get("summary", ""))}
-        for section in sections[offset:offset + page_size] if isinstance(section, dict)
-    ]
-    next_offset = offset + len(page)
+    end_byte = int(filing.get("endByte", offset - 1))
+    total_bytes = filing.get("totalBytes")
+    summary = str(filing.get("summary", ""))[:500]
+    content_hash = str(filing.get("contentHash", ""))
+    if not summary or not re.fullmatch(r"[a-f0-9]{64}", content_hash):
+        raise ValueError("filing_page_not_qualifiable")
+    page = [{
+        "startByte": offset, "endByte": end_byte,
+        "summary": summary, "contentHash": content_hash,
+    }]
     fact = AtomicFact(
-        id=f"fact:{normalized_symbol}:filing:{filing_id}", type="filing_document",
+        id=(f"fact:{normalized_symbol}:filing:{filing_id}:bytes:{offset}-{end_byte}:"
+            f"{content_hash[:16]}"), type="filing_document",
         value={
             "symbol": normalized_symbol, "filingId": filing_id,
             "form": filing.get("form"), "filedAt": filing.get("filedAt"),
+            "startByte": offset, "endByte": end_byte,
+            "summary": summary, "contentHash": content_hash,
         },
         observedAt=str(filing.get("filedAt") or now.isoformat()), fetchedAt=now.isoformat(),
         source="sec", sourceReference=source_reference, evidenceLevel="official_filing",
     )
     return FilingDocumentResult(
-        facts=[fact], items=page, returnedCount=len(page), totalCount=len(sections),
-        nextCursor=str(next_offset) if next_offset < len(sections) else None,
-        truncated=next_offset < len(sections),
+        facts=[fact], items=page, returnedCount=max(0, end_byte - offset + 1),
+        totalCount=total_bytes if isinstance(total_bytes, int) else max(0, end_byte + 1),
+        nextCursor=filing.get("nextCursor"), truncated=bool(filing.get("truncated")),
     )
 def search_news_facts(keyword: str, now: datetime, news_sources: Iterable[Any],
                       include_eligibility: bool = False, qualified_urls=None):

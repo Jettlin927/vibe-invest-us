@@ -102,6 +102,15 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
 
 
 def read_limited_document(url: str, max_bytes: int, timeout: float = 10):
+    page = read_document_page(url, 0, max_bytes, timeout)
+    return (
+        page["payload"], page["contentType"], page["truncated"], page["sourceReference"],
+    )
+
+
+def read_document_page(url: str, cursor: int, max_bytes: int, timeout: float = 10):
+    if cursor < 0 or max_bytes < 1:
+        raise ValueError("document_cursor_invalid")
     target = url
     for _redirect in range(6):
         safe_url, pinned_ip, port, hostname = _resolve_document_url(target)
@@ -110,7 +119,11 @@ def read_limited_document(url: str, max_bytes: int, timeout: float = 10):
         connection = connection_class(hostname, pinned_ip, port, timeout)
         path = urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
         try:
-            connection.request("GET", path, headers={"User-Agent": USER_AGENT, "Host": parsed.netloc})
+            end_byte = cursor + max_bytes - 1
+            connection.request("GET", path, headers={
+                "User-Agent": USER_AGENT, "Host": parsed.netloc,
+                "Range": f"bytes={cursor}-{end_byte}",
+            })
             response = connection.getresponse()
             if response.status in {301, 302, 303, 307, 308}:
                 location = response.headers.get("Location")
@@ -118,14 +131,37 @@ def read_limited_document(url: str, max_bytes: int, timeout: float = 10):
                     raise ValueError("news_document_redirect_invalid")
                 target = urljoin(safe_url, location)
                 continue
-            if response.status < 200 or response.status >= 300:
+            if response.status not in {200, 206}:
                 raise ValueError("news_document_http_status")
             content_type = response.headers.get_content_type()
             if content_type not in ALLOWED_DOCUMENT_CONTENT_TYPES:
                 raise ValueError("news_document_content_type_not_allowed")
-            payload = response.read(max_bytes + 1)
-            truncated = len(payload) > max_bytes
-            return payload[:max_bytes], content_type, truncated, safe_url
+            payload = response.read(max_bytes + 1)[:max_bytes]
+            content_range = response.headers.get("Content-Range")
+            total_bytes = None
+            start_byte = cursor
+            if response.status == 206:
+                match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", content_range or "")
+                if not match or int(match.group(1)) != cursor:
+                    raise ValueError("document_content_range_invalid")
+                start_byte, provider_end, total_bytes = map(int, match.groups())
+                if provider_end != start_byte + len(payload) - 1:
+                    raise ValueError("document_content_range_invalid")
+            elif cursor != 0:
+                raise ValueError("document_range_not_supported")
+            else:
+                content_length = response.headers.get("Content-Length")
+                if content_length and content_length.isdigit():
+                    total_bytes = int(content_length)
+            end_byte = start_byte + len(payload) - 1
+            next_cursor = end_byte + 1 if total_bytes is not None and end_byte + 1 < total_bytes else None
+            truncated = next_cursor is not None or (total_bytes is None and len(payload) == max_bytes)
+            return {
+                "payload": payload, "contentType": content_type, "sourceReference": safe_url,
+                "startByte": start_byte, "endByte": end_byte, "totalBytes": total_bytes,
+                "nextCursor": str(next_cursor) if next_cursor is not None else None,
+                "truncated": truncated,
+            }
         finally:
             connection.close()
     raise ValueError("news_document_redirect_limit")
@@ -492,21 +528,22 @@ class SecFilingSource(TimedSource):
         source_reference = (
             f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession_path}/{primary_document}"
         )
-        payload, _content_type, _truncated, final_url = read_limited_document(
-            source_reference, 65536, timeout=min(self.timeout, 10),
-        )
-        text = payload.decode("utf-8", errors="replace")
-        headings = list(re.finditer(r"<h[1-3][^>]*>(.*?)</h[1-3]>", text, re.I | re.S))
-        sections = []
-        for position, heading in enumerate(headings[:20]):
-            end = headings[position + 1].start() if position + 1 < len(headings) else len(text)
-            name = " ".join(re.sub(r"<[^>]+>", " ", heading.group(1)).split())[:120]
-            summary = " ".join(re.sub(r"<[^>]+>", " ", text[heading.end():end]).split())[:500]
-            if name and summary:
-                sections.append({"name": name, "summary": summary})
         return {
             "filingId": filing_id, "form": form, "filedAt": filed_at,
-            "sourceReference": final_url, "sections": sections,
+            "sourceReference": source_reference,
+        }
+
+    def fetch_page(self, filing: dict, cursor: str = None):
+        offset = int(cursor or "0")
+        page = read_document_page(
+            filing["sourceReference"], offset, 65536, timeout=min(self.timeout, 10),
+        )
+        payload = page.pop("payload")
+        text = " ".join(re.sub(r"<[^>]+>", " ", payload.decode("utf-8", errors="replace")).split())
+        if not text or not isinstance(page.get("totalBytes"), int):
+            raise ValueError("filing_page_not_qualifiable")
+        return {
+            **filing, **page, "summary": text[:500], "contentHash": sha256(payload).hexdigest(),
         }
 
     def list_events(self, symbol: str):

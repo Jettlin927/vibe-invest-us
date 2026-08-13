@@ -273,26 +273,31 @@ def test_financial_metric_series_pages_normalized_periods_without_xbrl_fields():
     assert all(field not in result.model_dump_json() for field in ["concept", "unit", "form", "frame"])
 
 
-def test_filing_document_pages_official_sections_without_retaining_full_text():
+def test_filing_document_page_binds_fact_to_read_byte_range_without_retaining_full_text():
     from app.context import filing_document_page
     filing = {
         "filingId": "0001045810-26-000123", "form": "10-Q", "filedAt": "2026-07-31",
         "sourceReference": "https://www.sec.gov/Archives/edgar/data/example.htm",
-        "sections": [
-            {"name": "results", "summary": "Revenue increased."},
-            {"name": "guidance", "summary": "Management raised guidance."},
-            {"name": "capital", "summary": "Repurchases continued."},
-        ],
+        "summary": "Management raised guidance.", "contentHash": "a" * 64,
+        "startByte": 65536, "endByte": 66035, "totalBytes": 200000,
+        "nextCursor": "66036", "truncated": True,
     }
 
-    result = filing_document_page("NVDA", filing["filingId"], "1", filing, NOW, page_size=1)
+    result = filing_document_page("NVDA", filing["filingId"], "65536", filing, NOW)
 
-    assert result.returnedCount == 1
-    assert result.totalCount == 3
-    assert result.nextCursor == "2"
+    assert result.returnedCount == 500
+    assert result.totalCount == 200000
+    assert result.nextCursor == "66036"
     assert result.truncated is True
-    assert result.items == [{"name": "guidance", "summary": "Management raised guidance."}]
+    assert result.items == [{
+        "startByte": 65536, "endByte": 66035, "summary": "Management raised guidance.",
+        "contentHash": "a" * 64,
+    }]
     assert result.facts[0].evidenceLevel == "official_filing"
+    assert result.facts[0].id.endswith(":bytes:65536-66035:" + "a" * 16)
+    assert result.facts[0].value["summary"] == "Management raised guidance."
+    assert result.facts[0].value["contentHash"] == "a" * 64
+    assert "payload" not in result.model_dump_json()
     assert "fullText" not in result.model_dump_json()
 
 

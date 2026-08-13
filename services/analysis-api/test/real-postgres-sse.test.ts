@@ -1046,9 +1046,12 @@ test('主 Agent 经真实 PostgreSQL、HTTP 与 SSE 启动并展示独立基本�
     sourceReference: 'https://www.sec.gov/Archives/edgar/data/1045810/q2.htm',
   }
   const filing = {
-    ...reported, id: `fact:fundamental:e2e:filing:${crypto.randomUUID()}`,
+    ...reported, id: `fact:fundamental:e2e:filing:bytes:0-65535:${'a'.repeat(16)}`,
     type: 'filing_document', evidenceLevel: 'official_filing',
-    value: { filingId: '0001045810-26-000123', form: '10-Q', filedAt: '2026-07-31' },
+    value: {
+      filingId: '0001045810-26-000123', form: '10-Q', filedAt: '2026-07-31',
+      startByte: 0, endByte: 65535, summary: 'Revenue increased.', contentHash: 'a'.repeat(64),
+    },
   }
   const officialEvent = {
     ...reported, id: `fact:fundamental:e2e:event:${crypto.randomUUID()}`,
@@ -1109,8 +1112,10 @@ test('主 Agent 经真实 PostgreSQL、HTTP 与 SSE 启动并展示独立基本�
       facts: [], returnedCount: 0, totalCount: 23, nextCursor: '20', truncated: true,
     }),
     readFilingDocument: async () => ({
-      facts: [filing], items: [{ name: 'MD&A', summary: 'Revenue increased.' }],
-      returnedCount: 1, totalCount: 4, nextCursor: '1', truncated: true,
+      facts: [filing], items: [{
+        startByte: 0, endByte: 65535, summary: 'Revenue increased.', contentHash: 'a'.repeat(64),
+      }],
+      returnedCount: 65536, totalCount: 200000, nextCursor: '65536', truncated: true,
     }),
     listOfficialCompanyEvents: async () => ({ facts: [officialEvent], sources: [] }), model,
   })
