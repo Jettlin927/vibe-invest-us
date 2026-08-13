@@ -4,10 +4,10 @@ import type { RegisteredToolDefinition } from './types.js'
 export const submitSpecialistReportDefinition: RegisteredToolDefinition = {
   model: {
     name: 'submit_specialist_report',
-    description: '提交经四层校验的消息面或基本面专项报告',
+    description: '提交经四层校验的消息面、基本面或技术面专项报告',
     parameters: Type.Object({
       kind: Type.Literal('specialist'), domain: Type.Union([
-        Type.Literal('news'), Type.Literal('fundamental_valuation'),
+        Type.Literal('news'), Type.Literal('fundamental_valuation'), Type.Literal('technical'),
       ]),
       availability: Type.Union([
         Type.Literal('available'), Type.Literal('partial'), Type.Literal('unavailable'),
@@ -18,7 +18,9 @@ export const submitSpecialistReportDefinition: RegisteredToolDefinition = {
       })),
       limitations: Type.Array(Type.String()),
       keyJudgments: Type.Array(Type.Object({
-        type: Type.Union([Type.Literal('news'), Type.Literal('fundamental')]), statement: Type.String(),
+        type: Type.Union([
+          Type.Literal('news'), Type.Literal('fundamental'), Type.Literal('technical'),
+        ]), statement: Type.String(),
         direction: Type.Union([
           Type.Literal('bullish'), Type.Literal('bearish'), Type.Literal('neutral'),
         ]),
@@ -37,7 +39,7 @@ export const submitSpecialistReportDefinition: RegisteredToolDefinition = {
     }),
   },
   resultSchema: Type.Object({ submitted: Type.Boolean() }),
-  allowedRoles: ['news', 'fundamental'], allowedStages: ['research', 'finalization'], sideEffect: 'creates_report',
+  allowedRoles: ['news', 'fundamental', 'technical'], allowedStages: ['research', 'finalization'], sideEffect: 'creates_report',
   externalNetwork: 'none', resultRetention: 'report_version',
   modelProjection: 'acknowledgement', executionMode: 'sequential', countsAsToolRound: true,
 }

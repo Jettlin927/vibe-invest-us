@@ -1,6 +1,6 @@
 import type { Tool } from '@earendil-works/pi-ai'
 
-export type ToolRole = 'main' | 'fundamental' | 'news'
+export type ToolRole = 'main' | 'fundamental' | 'news' | 'technical'
 export type ToolStage = 'research' | 'finalization'
 
 export type RegisteredToolDefinition = {

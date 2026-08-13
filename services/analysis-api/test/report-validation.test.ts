@@ -158,6 +158,26 @@ test('消息面 Runtime 拒绝其他领域和判断类型的专项报告', () =>
   ])
 })
 
+test('技术面 Runtime 只接受 technical 领域和判断类型', () => {
+  const result = validateReportCandidate({
+    kind: 'specialist', domain: 'fundamental_valuation', availability: 'available',
+    status: 'completed', gaps: [], limitations: [], keyJudgments: [{
+      type: 'fundamental', statement: '收入增长', direction: 'bullish', confidence: 'medium',
+      supportingEvidence: ['fact:technical'], contraryEvidence: [],
+      contraryEvidenceStatus: 'none_found', invalidationConditions: ['结构变化'],
+    }],
+  }, { role: 'technical', knownFacts: [{
+    id: 'fact:technical', type: 'technical_evidence', evidenceLevel: 'deterministic_technical',
+  }] })
+
+  assert.equal(result.ok, false)
+  if (result.ok) return
+  assert.deepEqual(result.errors.map(({ path, rule }) => ({ path, rule })), [
+    { path: '/domain', rule: 'role_policy' },
+    { path: '/keyJudgments/0/type', rule: 'role_policy' },
+  ])
+})
+
 test('每项关键判断必须至少有一个合格支持证据', () => {
   const result = validateReportCandidate({
     kind: 'integrated', availability: 'available', status: 'completed', gaps: [], limitations: [],
@@ -364,7 +384,12 @@ test('技术判断接受宿主确定性技术证据且宿主目标价事实可�
       asOf: '2026-08-13', evidence: ['fact:valuation'],
     },
   }, { role: 'main', knownFacts: [
-    { id: 'fact:technical', type: 'technical_evidence', evidenceLevel: 'deterministic_technical' },
+    { id: 'fact:technical', type: 'technical_evidence', evidenceLevel: 'deterministic_technical',
+      value: {
+        actualStart: '2025-01-01', actualEnd: '2026-01-20', totalBarCount: 260,
+        structures: { '20d': {}, '60d': {}, '120d': {}, '252d': {} },
+        indicators: {}, volatility: {}, drawdown: {}, volumePrice: {}, keyLevels: {}, conflicts: [],
+      } },
     { id: 'fact:valuation', type: 'deterministic_valuation', evidenceLevel: 'deterministic_valuation',
       value: { method: 'DCF', status: 'available', inputs: ['fact:valuation'],
         formula: 'discounted_cash_flow', unit: 'USD/share', unitConversion: 'none',
@@ -372,6 +397,24 @@ test('技术判断接受宿主确定性技术证据且宿主目标价事实可�
   ] })
 
   assert.equal(result.ok, true)
+})
+
+test('技术判断拒绝只有标签但没有真实范围和多周期结构的事实', () => {
+  const result = validateReportCandidate({
+    kind: 'specialist', domain: 'technical', availability: 'available', status: 'completed',
+    gaps: [], limitations: [], keyJudgments: [{
+      type: 'technical', statement: '技术结构偏强', direction: 'bullish', confidence: 'medium',
+      supportingEvidence: ['fact:technical'], contraryEvidence: [],
+      contraryEvidenceStatus: 'none_found', invalidationConditions: ['跌破支撑'],
+    }],
+  }, { role: 'technical', knownFacts: [{
+    id: 'fact:technical', type: 'technical_evidence', evidenceLevel: 'deterministic_technical',
+    value: { totalBarCount: 20 },
+  }] })
+
+  assert.equal(result.ok, false)
+  if (result.ok) return
+  assert.equal(result.errors[0]?.rule, 'evidence_qualification')
 })
 
 test('只有倍数区间或与宿主事实不一致时不能生成目标价', () => {

@@ -109,6 +109,11 @@ export type AnalyzeInput = {
     researchQuestion: string
     reason: string
   }) => Promise<Record<string, unknown>>
+  runTechnicalSpecialist?: (input: {
+    launch: boolean
+    researchQuestion: string
+    reason: string
+  }) => Promise<Record<string, unknown>>
   signal?: AbortSignal
   executionDeadlineSignal?: AbortSignal
   activeBudget?: ActiveBudget
@@ -174,6 +179,28 @@ export type AnalyzeFundamentalInput = {
   toolRuntime: ToolRuntime
 }
 
+export type AnalyzeTechnicalInput = {
+  executionId: string
+  runtimeSettings: RuntimeSettings
+  symbol: string
+  systemPrompt: string
+  researchQuestion: string
+  knownFacts: Fact[]
+  getTechnicalEvidence: (
+    symbol: string, signal: AbortSignal,
+  ) => Promise<{ facts: Fact[]; [key: string]: unknown }>
+  getPriceWindow: (
+    symbol: string, startDate: string, endDate: string,
+    cursor: string | undefined, signal: AbortSignal,
+  ) => Promise<{ facts: Fact[]; [key: string]: unknown }>
+  signal?: AbortSignal
+  executionDeadlineSignal?: AbortSignal
+  activeBudget?: ActiveBudget
+  acquireModelSlot?: (signal: AbortSignal) => Promise<() => void>
+  acquireToolSlot?: (signal: AbortSignal) => Promise<() => void>
+  toolRuntime: ToolRuntime
+}
+
 export type FinancialContextToolViews = {
   model: { facts: Fact[]; [key: string]: unknown }
   retained: { facts: Fact[]; [key: string]: unknown }
@@ -189,7 +216,7 @@ export type RuntimeContext = {
 export type ToolRuntime = {
   ensureProjection(input: {
     executionId: string
-    role: 'main' | 'fundamental' | 'news'
+    role: 'main' | 'fundamental' | 'news' | 'technical'
     stage: 'research' | 'finalization'
     tools: Tool[]
     createdAt: string
@@ -205,7 +232,7 @@ export type ToolRuntime = {
   beginModelRequest(input: {
     requestId: string
     executionId: string
-    role: 'main' | 'fundamental' | 'news'
+    role: 'main' | 'fundamental' | 'news' | 'technical'
     stage: 'research' | 'finalization'
     turnIndex: number
     tools: Tool[]
@@ -249,7 +276,7 @@ export type ToolRuntime = {
     }>
     completedAt: string
     advance?: {
-      role: 'main' | 'fundamental' | 'news'
+      role: 'main' | 'fundamental' | 'news' | 'technical'
       stage: 'research' | 'finalization'
       tools: Tool[]
       toolRounds: number

@@ -6,7 +6,7 @@ import {
   type ExecutionSettingsSnapshot, type RuntimeSettings, type RuntimeSettingsRevision,
 } from '@vibe-invest/contracts'
 
-export const schemaVersion = 18
+export const schemaVersion = 19
 
 const migrationSql = `
 CREATE TABLE IF NOT EXISTS product_schema_migrations (
@@ -250,7 +250,7 @@ CREATE TABLE IF NOT EXISTS tool_projection_versions (
   execution_id text NOT NULL REFERENCES agent_executions(id) ON DELETE CASCADE,
   version integer NOT NULL CHECK (version > 0),
   role text NOT NULL CONSTRAINT tool_projection_versions_role_check
-    CHECK (role IN ('main', 'fundamental', 'news')),
+    CHECK (role IN ('main', 'fundamental', 'news', 'technical')),
   stage text NOT NULL CONSTRAINT tool_projection_versions_stage_check
     CHECK (stage IN ('research', 'finalization')),
   schema_hash text NOT NULL CHECK (schema_hash <> ''),
@@ -336,7 +336,7 @@ ALTER TABLE tool_batch_calls ADD CONSTRAINT tool_batch_calls_completion_check
 ALTER TABLE tool_projection_versions DROP CONSTRAINT IF EXISTS tool_projection_versions_role_check;
 UPDATE tool_projection_versions SET role = 'fundamental' WHERE role = 'fundamental_specialist';
 ALTER TABLE tool_projection_versions ADD CONSTRAINT tool_projection_versions_role_check
-  CHECK (role IN ('main', 'fundamental', 'news'));
+  CHECK (role IN ('main', 'fundamental', 'news', 'technical'));
 ALTER TABLE tool_projection_versions DROP CONSTRAINT IF EXISTS tool_projection_versions_stage_check;
 ALTER TABLE tool_projection_versions ADD CONSTRAINT tool_projection_versions_stage_check
   CHECK (stage IN ('research', 'finalization'));
@@ -444,6 +444,14 @@ ON CONFLICT (version) DO NOTHING;
 
 INSERT INTO product_schema_migrations (version)
 VALUES (18)
+ON CONFLICT (version) DO NOTHING;
+
+ALTER TABLE tool_projection_versions DROP CONSTRAINT IF EXISTS tool_projection_versions_role_check;
+ALTER TABLE tool_projection_versions ADD CONSTRAINT tool_projection_versions_role_check
+  CHECK (role IN ('main', 'fundamental', 'news', 'technical'));
+
+INSERT INTO product_schema_migrations (version)
+VALUES (19)
 ON CONFLICT (version) DO NOTHING;
 
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM vibe_invest_app;
@@ -1824,7 +1832,7 @@ type ToolProjectionRow = {
   created_at: string
 }
 
-export type ToolProjectionRole = 'main' | 'fundamental' | 'news'
+export type ToolProjectionRole = 'main' | 'fundamental' | 'news' | 'technical'
 export type ToolProjectionStage = 'research' | 'finalization'
 
 export function createToolProjectionRepository(pool: Pool) {

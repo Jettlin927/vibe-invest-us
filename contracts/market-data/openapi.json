@@ -535,6 +535,164 @@
         }
       }
     },
+    "/v1/technical-evidence": {
+      "post": {
+        "summary": "Technical Evidence",
+        "operationId": "getTechnicalEvidence",
+        "parameters": [
+          {
+            "name": "symbol",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Symbol"
+            }
+          },
+          {
+            "name": "start_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Start Date"
+            }
+          },
+          {
+            "name": "end_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "End Date"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TechnicalEvidenceResult"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/price-window": {
+      "post": {
+        "summary": "Price Window",
+        "operationId": "getPriceWindow",
+        "parameters": [
+          {
+            "name": "symbol",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Symbol"
+            }
+          },
+          {
+            "name": "start_date",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "date",
+              "title": "Start Date"
+            }
+          },
+          {
+            "name": "end_date",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "date",
+              "title": "End Date"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 60,
+              "title": "Page Size"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PriceWindowResult"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/quotes": {
       "post": {
         "summary": "Quotes",
@@ -1127,6 +1285,94 @@
         ],
         "title": "PaginatedFactResult"
       },
+      "PriceWindowResult": {
+        "properties": {
+          "facts": {
+            "items": {
+              "$ref": "#/components/schemas/AtomicFact"
+            },
+            "type": "array",
+            "title": "Facts"
+          },
+          "sources": {
+            "items": {
+              "$ref": "#/components/schemas/SourceStatus"
+            },
+            "type": "array",
+            "title": "Sources",
+            "default": []
+          },
+          "eligibility": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Eligibility"
+          },
+          "returnedCount": {
+            "type": "integer",
+            "title": "Returnedcount"
+          },
+          "totalCount": {
+            "type": "integer",
+            "title": "Totalcount"
+          },
+          "nextCursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Nextcursor"
+          },
+          "truncated": {
+            "type": "boolean",
+            "title": "Truncated"
+          },
+          "symbol": {
+            "type": "string",
+            "title": "Symbol"
+          },
+          "actualStart": {
+            "type": "string",
+            "title": "Actualstart"
+          },
+          "actualEnd": {
+            "type": "string",
+            "title": "Actualend"
+          },
+          "totalBarCount": {
+            "type": "integer",
+            "title": "Totalbarcount"
+          },
+          "sampling": {
+            "type": "string",
+            "enum": [
+              "daily",
+              "weekly"
+            ],
+            "title": "Sampling"
+          }
+        },
+        "type": "object",
+        "required": [
+          "facts",
+          "returnedCount",
+          "totalCount",
+          "truncated",
+          "symbol",
+          "actualStart",
+          "actualEnd",
+          "totalBarCount",
+          "sampling"
+        ],
+        "title": "PriceWindowResult"
+      },
       "QuoteBatch": {
         "properties": {
           "quotes": {
@@ -1264,6 +1510,218 @@
           "status"
         ],
         "title": "SourceStatus"
+      },
+      "TechnicalDrawdown": {
+        "properties": {
+          "maximum": {
+            "type": "number",
+            "title": "Maximum"
+          }
+        },
+        "type": "object",
+        "required": [
+          "maximum"
+        ],
+        "title": "TechnicalDrawdown"
+      },
+      "TechnicalEvidenceResult": {
+        "properties": {
+          "facts": {
+            "items": {
+              "$ref": "#/components/schemas/AtomicFact"
+            },
+            "type": "array",
+            "title": "Facts"
+          },
+          "sources": {
+            "items": {
+              "$ref": "#/components/schemas/SourceStatus"
+            },
+            "type": "array",
+            "title": "Sources",
+            "default": []
+          },
+          "eligibility": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Eligibility"
+          },
+          "symbol": {
+            "type": "string",
+            "title": "Symbol"
+          },
+          "actualStart": {
+            "type": "string",
+            "title": "Actualstart"
+          },
+          "actualEnd": {
+            "type": "string",
+            "title": "Actualend"
+          },
+          "totalBarCount": {
+            "type": "integer",
+            "title": "Totalbarcount"
+          },
+          "structures": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/TechnicalWindowStructure"
+            },
+            "type": "object",
+            "title": "Structures"
+          },
+          "indicators": {
+            "$ref": "#/components/schemas/Indicators"
+          },
+          "volatility": {
+            "$ref": "#/components/schemas/TechnicalVolatility"
+          },
+          "drawdown": {
+            "$ref": "#/components/schemas/TechnicalDrawdown"
+          },
+          "volumePrice": {
+            "$ref": "#/components/schemas/TechnicalVolumePrice"
+          },
+          "keyLevels": {
+            "$ref": "#/components/schemas/TechnicalKeyLevels"
+          },
+          "conflicts": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Conflicts"
+          }
+        },
+        "type": "object",
+        "required": [
+          "facts",
+          "symbol",
+          "actualStart",
+          "actualEnd",
+          "totalBarCount",
+          "structures",
+          "indicators",
+          "volatility",
+          "drawdown",
+          "volumePrice",
+          "keyLevels",
+          "conflicts"
+        ],
+        "title": "TechnicalEvidenceResult"
+      },
+      "TechnicalKeyLevels": {
+        "properties": {
+          "support": {
+            "type": "number",
+            "title": "Support"
+          },
+          "resistance": {
+            "type": "number",
+            "title": "Resistance"
+          }
+        },
+        "type": "object",
+        "required": [
+          "support",
+          "resistance"
+        ],
+        "title": "TechnicalKeyLevels"
+      },
+      "TechnicalVolatility": {
+        "properties": {
+          "annualized": {
+            "type": "number",
+            "title": "Annualized"
+          }
+        },
+        "type": "object",
+        "required": [
+          "annualized"
+        ],
+        "title": "TechnicalVolatility"
+      },
+      "TechnicalVolumePrice": {
+        "properties": {
+          "volumeRatio5To20": {
+            "type": "number",
+            "title": "Volumeratio5To20"
+          }
+        },
+        "type": "object",
+        "required": [
+          "volumeRatio5To20"
+        ],
+        "title": "TechnicalVolumePrice"
+      },
+      "TechnicalWindowStructure": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "available",
+              "unavailable"
+            ],
+            "title": "Status"
+          },
+          "barCount": {
+            "type": "integer",
+            "title": "Barcount"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "returnPct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Returnpct"
+          },
+          "high": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "High"
+          },
+          "low": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Low"
+          }
+        },
+        "type": "object",
+        "required": [
+          "status",
+          "barCount"
+        ],
+        "title": "TechnicalWindowStructure"
       },
       "ValidationError": {
         "properties": {

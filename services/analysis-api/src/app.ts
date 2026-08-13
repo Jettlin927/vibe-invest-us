@@ -46,6 +46,13 @@ type AppDependencies = {
   getValuationEvidence?: (
     symbol: string, signal: AbortSignal,
   ) => Promise<{ facts: import('./financial-data-client.js').FinancialFact[]; [key: string]: unknown }>
+  getTechnicalEvidence?: (
+    symbol: string, signal: AbortSignal,
+  ) => Promise<{ facts: import('./financial-data-client.js').FinancialFact[]; [key: string]: unknown }>
+  getPriceWindow?: (
+    symbol: string, startDate: string, endDate: string,
+    cursor: string | undefined, signal: AbortSignal,
+  ) => Promise<PaginatedFactQueryResult>
   readFilingDocument?: (
     symbol: string, filingId: string, cursor: string | undefined, signal: AbortSignal,
   ) => Promise<PaginatedFactQueryResult>
@@ -57,6 +64,7 @@ type AppDependencies = {
     analyze(input: any): AsyncIterable<ModelEvent>
     analyzeNews?: (input: any) => AsyncIterable<ModelEvent>
     analyzeFundamental?: (input: any) => AsyncIterable<ModelEvent>
+    analyzeTechnical?: (input: any) => AsyncIterable<ModelEvent>
   }
   modelConfigured?: boolean
   now?: () => Date
@@ -87,6 +95,8 @@ export function buildApp(dependencies: AppDependencies) {
         getFinancialOverview: dependencies.getFinancialOverview,
         getFinancialMetricSeries: dependencies.getFinancialMetricSeries,
         getValuationEvidence: dependencies.getValuationEvidence,
+        getTechnicalEvidence: dependencies.getTechnicalEvidence,
+        getPriceWindow: dependencies.getPriceWindow,
         readFilingDocument: dependencies.readFilingDocument,
         fetchTechnicalIndicators: dependencies.fetchTechnicalIndicators,
         fetchMarketPrices: dependencies.fetchMarketPrices,

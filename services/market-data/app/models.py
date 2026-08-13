@@ -103,6 +103,54 @@ class FilingDocumentResult(PaginatedFactResult):
     items: List[Any]
 
 
+class TechnicalWindowStructure(BaseModel):
+    status: Literal["available", "unavailable"]
+    barCount: int
+    reason: Optional[str] = None
+    returnPct: Optional[float] = None
+    high: Optional[float] = None
+    low: Optional[float] = None
+
+
+class TechnicalVolatility(BaseModel):
+    annualized: float
+
+
+class TechnicalDrawdown(BaseModel):
+    maximum: float
+
+
+class TechnicalVolumePrice(BaseModel):
+    volumeRatio5To20: float
+
+
+class TechnicalKeyLevels(BaseModel):
+    support: float
+    resistance: float
+
+
+class TechnicalEvidenceResult(FactQueryResult):
+    symbol: str
+    actualStart: str
+    actualEnd: str
+    totalBarCount: int
+    structures: dict[str, TechnicalWindowStructure]
+    indicators: Indicators
+    volatility: TechnicalVolatility
+    drawdown: TechnicalDrawdown
+    volumePrice: TechnicalVolumePrice
+    keyLevels: TechnicalKeyLevels
+    conflicts: List[str]
+
+
+class PriceWindowResult(PaginatedFactResult):
+    symbol: str
+    actualStart: str
+    actualEnd: str
+    totalBarCount: int
+    sampling: Literal["daily", "weekly"]
+
+
 class ValuationComparable(BaseModel):
     symbol: str
     pe: Optional[float] = None

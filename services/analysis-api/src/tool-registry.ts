@@ -5,11 +5,14 @@ import { fetchFinancialContextDefinition } from './tool-definitions/fetch-financ
 import { getFinancialMetricSeriesDefinition } from './tool-definitions/get-financial-metric-series.js'
 import { getFinancialOverviewDefinition } from './tool-definitions/get-financial-overview.js'
 import { getValuationEvidenceDefinition } from './tool-definitions/get-valuation-evidence.js'
+import { getTechnicalEvidenceDefinition } from './tool-definitions/get-technical-evidence.js'
+import { getPriceWindowDefinition } from './tool-definitions/get-price-window.js'
 import { listCompanyEventsDefinition } from './tool-definitions/list-company-events.js'
 import { readNewsDocumentDefinition } from './tool-definitions/read-news-document.js'
 import { readFilingDocumentDefinition } from './tool-definitions/read-filing-document.js'
 import { runNewsAnalysisDefinition } from './tool-definitions/run-news-analysis.js'
 import { runFundamentalAnalysisDefinition } from './tool-definitions/run-fundamental-analysis.js'
+import { runTechnicalAnalysisDefinition } from './tool-definitions/run-technical-analysis.js'
 import { searchNewsCandidatesDefinition } from './tool-definitions/search-news-candidates.js'
 import { searchWebEvidenceDefinition } from './tool-definitions/search-web-evidence.js'
 import { submitSpecialistReportDefinition } from './tool-definitions/submit-specialist-report.js'
@@ -26,10 +29,13 @@ export const registeredToolDefinitions = [
   fetchFinancialContextDefinition,
   runFundamentalAnalysisDefinition,
   runNewsAnalysisDefinition,
+  runTechnicalAnalysisDefinition,
   submitAnalysisReportDefinition,
   getFinancialOverviewDefinition,
   getFinancialMetricSeriesDefinition,
   getValuationEvidenceDefinition,
+  getTechnicalEvidenceDefinition,
+  getPriceWindowDefinition,
   readFilingDocumentDefinition,
   searchNewsCandidatesDefinition,
   searchWebEvidenceDefinition,
@@ -50,7 +56,7 @@ export function createToolRegistry(
     if (!validSchema(definition.resultSchema)) invalid(name, 'result_schema')
     if (typeof handlers[name] !== 'function') invalid(name, 'handler')
     if (!definition.allowedRoles?.length
-      || !definition.allowedRoles.every((role) => oneOf(role, ['main', 'fundamental', 'news']))) {
+      || !definition.allowedRoles.every((role) => oneOf(role, ['main', 'fundamental', 'news', 'technical']))) {
       invalid(name, 'allowed_roles')
     }
     if (!definition.allowedStages?.length

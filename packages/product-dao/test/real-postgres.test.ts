@@ -299,6 +299,41 @@ test('真实 PostgreSQL 持久化 Tool Projection 版本、模型请求与批次
   }
 })
 
+test('真实 PostgreSQL v19 接受技术面 Tool Projection 角色', {
+  skip: !migrationUrl || !applicationUrl,
+  concurrency: false,
+}, async () => {
+  await migrate(migrationUrl!)
+  const pool = createPool(applicationUrl!)
+  const events = createAgentEventRepository(pool)
+  const projections = createToolProjectionRepository(pool)
+  const suffix = crypto.randomUUID()
+  const analysisId = `technical-projection-${suffix}`
+  const sessionId = `technical-session-${suffix}`
+  const executionId = `technical-execution-${suffix}`
+  try {
+    await events.createResearch({
+      analysisId, sessionId, executionId, symbol: `T${suffix.slice(0, 8)}`,
+      status: 'planning', analysisStatus: 'queued', operationId: 'runtime-context',
+      event: { type: 'runtime_context', status: 'planning' },
+      createdAt: '2026-08-14T00:00:00.000Z',
+    })
+    const projection = await projections.ensureVersion({
+      executionId, role: 'technical', stage: 'research', schemaHash: 'technical-v1',
+      projectedTools: [{ name: 'get_technical_evidence' }],
+      visibleToolNames: ['get_technical_evidence'], reasons: { role: 'technical' },
+      createdAt: '2026-08-14T00:00:01.000Z',
+    })
+    assert.equal(projection.role, 'technical')
+    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 19 })
+  } finally {
+    const cleanup = createPool(migrationUrl!)
+    await cleanup.query('DELETE FROM analyses WHERE id = $1', [analysisId])
+    await cleanup.end()
+    await pool.end()
+  }
+})
+
 test('真实 PostgreSQL execution 终态事务会取消未完成 Tool Batch', {
   skip: !migrationUrl || !applicationUrl,
   concurrency: false,
@@ -845,7 +880,7 @@ test('真实 PostgreSQL migration 幂等且 application role 没有 DDL 权限',
   await migrate(migrationUrl!)
 
   const pool = createPool(applicationUrl!)
-  assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 18 })
+  assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 19 })
   const privileges = await pool.query<{ can_create: boolean; can_temp: boolean }>(
     `SELECT has_schema_privilege(current_user, 'public', 'CREATE') AS can_create,
             has_database_privilege(current_user, current_database(), 'TEMP') AS can_temp`,
@@ -902,7 +937,7 @@ test('真实 PostgreSQL migration receipt 为空时按 max=0 升级', {
     )
     await pool.query('DELETE FROM product_schema_migrations')
     await migrate(migrationUrl!)
-    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 18 })
+    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 19 })
     assert.deepEqual((await pool.query<{ sequence: number; provenance: string }>(
       `SELECT sequence, provenance FROM tool_event_migration_provenance WHERE session_id = $1`,
       [sessionId],
@@ -932,7 +967,7 @@ test('真实 PostgreSQL 拒绝未发布的 schema 13、14、15 候选状态', {
       )).rows, [{ version }])
       await pool.query(
         `INSERT INTO product_schema_migrations (version)
-         SELECT generate_series($1, 18) ON CONFLICT (version) DO NOTHING`,
+         SELECT generate_series($1, 19) ON CONFLICT (version) DO NOTHING`,
         [version + 1],
       )
     }
@@ -969,23 +1004,23 @@ test('真实 PostgreSQL 拒绝未来 schema 且不修改数据库', {
   })
   try {
     await pool.query('DROP TABLE tool_event_migration_provenance')
-    await pool.query('INSERT INTO product_schema_migrations (version) VALUES (19)')
+    await pool.query('INSERT INTO product_schema_migrations (version) VALUES (20)')
     const before = await fingerprint()
 
     await assert.rejects(
       migrate(migrationUrl!),
-      /product_schema_future_version_unsupported:19/,
+      /product_schema_future_version_unsupported:20/,
     )
 
     assert.deepEqual(await fingerprint(), before)
   } finally {
-    await pool.query('DELETE FROM product_schema_migrations WHERE version = 19')
+    await pool.query('DELETE FROM product_schema_migrations WHERE version = 20')
     await migrate(migrationUrl!)
     await pool.end()
   }
 })
 
-test('真实 PostgreSQL v12 无 Tool Batch 的历史工具事件原样升级到 v18', {
+test('真实 PostgreSQL v12 无 Tool Batch 的历史工具事件原样升级到 v19', {
   skip: !migrationUrl,
   concurrency: false,
 }, async () => {
@@ -1029,7 +1064,7 @@ test('真实 PostgreSQL v12 无 Tool Batch 的历史工具事件原样升级到 
 
     await migrate(migrationUrl!)
 
-    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 18 })
+    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 19 })
     assert.deepEqual((await pool.query<{ sequence: number; provenance: string }>(
       `SELECT sequence, provenance FROM tool_event_migration_provenance
        WHERE session_id = $1 ORDER BY sequence`, [sessionId],

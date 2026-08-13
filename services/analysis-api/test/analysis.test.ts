@@ -281,6 +281,78 @@ test('主 Agent 启动的基本面 Agent 拥有独立 Session、受限工具和�
   await app.close()
 })
 
+test('主 Agent 启动的技术面 Agent 拥有独立 Session、受限工具和不可变专项报告版本', async () => {
+  const database = createTestProductDatabase()
+  const technicalFact = {
+    ...fact, id: 'fact:technical:evidence', type: 'technical_evidence',
+    evidenceLevel: 'deterministic_technical', source: 'deterministic-calculation',
+    value: {
+      actualStart: '2025-01-01', actualEnd: '2026-01-20', totalBarCount: 260,
+      structures: { '20d': {}, '60d': {}, '120d': {}, '252d': {} },
+      indicators: {}, volatility: {}, drawdown: {}, volumePrice: {}, keyLevels: {}, conflicts: [],
+    },
+  }
+  const specialistReport = {
+    kind: 'specialist' as const, domain: 'technical', availability: 'available' as const,
+    status: 'completed' as const, gaps: [], limitations: [], keyJudgments: [{
+      type: 'technical', statement: '多周期结构存在冲突', direction: 'neutral', confidence: 'medium',
+      supportingEvidence: [technicalFact.id], contraryEvidence: [technicalFact.id],
+      contraryEvidenceStatus: 'none_found', invalidationConditions: ['突破关键阻力'],
+    }],
+  }
+  const model = {
+    async *analyze(input: any) {
+      const result = await input.runTechnicalSpecialist({
+        launch: true, researchQuestion: '多周期结构是否一致？', reason: '需要完整历史证据。',
+      })
+      assert.equal(result.status, 'completed')
+      assert.deepEqual(result.keyFactIds, [technicalFact.id])
+      yield { type: 'completed' as const, report, reportVersion: {
+        kind: 'integrated' as const, report: reportCandidate,
+      } }
+    },
+    async *analyzeTechnical(input: any) {
+      assert.equal(input.portfolioContext, undefined)
+      yield { type: 'trace' as const, entry: {
+        type: 'tool_result' as const, name: 'get_technical_evidence', toolCallId: 'technical',
+        result: { facts: [technicalFact], totalBarCount: 260 }, isError: false,
+        startedAt: null, completedAt: '2026-08-13T03:00:00.000Z', completionOrder: 1,
+        operationId: `execution:${input.executionId}:technical-tool:result`,
+      } }
+      yield { type: 'completed' as const, report: specialistReport, reportVersion: {
+        kind: 'specialist' as const, report: specialistReport,
+      } }
+    },
+  }
+  const app = buildProductionApp({
+    ...database, financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [], gaps: [] }),
+    getTechnicalEvidence: async () => ({ facts: [technicalFact], totalBarCount: 260 }),
+    getPriceWindow: async () => ({
+      facts: [], returnedCount: 0, totalCount: 0, nextCursor: null, truncated: false,
+    }), model,
+  } as any)
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'TECHAGENT' },
+  })).json()
+  await waitForStatus(app as any, created.analysisId, 'completed')
+
+  const research = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  const specialist = research.specialistAgents.find((agent: any) => agent.domain === 'technical')
+  assert.equal(specialist.execution.status, 'completed')
+  assert.match(JSON.stringify(specialist.events), /多周期结构是否一致/)
+  const versions = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}/report-versions`,
+  })).json().items
+  assert.ok(versions.some(({ kind, report: versionReport }: any) => (
+    kind === 'specialist' && versionReport.domain === 'technical'
+  )))
+  await app.close()
+})
+
 test('主 Agent 未启动消息面 Agent 时研究投影保留研究问题和理由', async () => {
   const database = createTestProductDatabase()
   const model = {
@@ -322,6 +394,9 @@ test('主 Agent 未启动消息面 Agent 时研究投影保留研究问题和理
   }, {
     domain: 'fundamental_valuation', status: 'not_started',
     reason: '主 Agent 尚未作出基本面专项启动决定。',
+  }, {
+    domain: 'technical', status: 'not_started',
+    reason: '主 Agent 尚未作出技术面专项启动决定。',
   }])
   await app.close()
 })
@@ -351,6 +426,9 @@ test('主 Agent 尚未决定时研究投影也固定显示消息面专项视角'
   }, {
     domain: 'fundamental_valuation', status: 'not_started',
     reason: '主 Agent 尚未作出基本面专项启动决定。',
+  }, {
+    domain: 'technical', status: 'not_started',
+    reason: '主 Agent 尚未作出技术面专项启动决定。',
   }])
   await app.close()
 })
@@ -1355,7 +1433,8 @@ test('首次研究起始资料完整描述能力、工具与报告目标且不�
   assert.equal(runtimeContext.capabilityStatus.news.status, 'unavailable')
   assert.equal(runtimeContext.capabilityStatus.valuation.status, 'unavailable')
   assert.deepEqual(runtimeContext.availableTools.map(({ name }: { name: string }) => name), [
-    'fetch_financial_context', 'run_fundamental_analysis', 'run_news_analysis', 'submit_analysis_report',
+    'fetch_financial_context', 'run_fundamental_analysis', 'run_news_analysis',
+    'run_technical_analysis', 'submit_analysis_report',
   ])
   assert.deepEqual(runtimeContext.specialistCapabilities, [
     { domain: 'news', responsibility: '核实消息、公司事件及相反证据' },

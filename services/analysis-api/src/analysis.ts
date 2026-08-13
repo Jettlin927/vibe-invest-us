@@ -10,7 +10,8 @@ import {
 } from '@vibe-invest/contracts'
 
 import type {
-  AnalyzeFundamentalInput, AnalyzeInput, AnalyzeNewsInput, AnalysisReport, ModelEvent, ToolRuntime,
+  AnalyzeFundamentalInput, AnalyzeInput, AnalyzeNewsInput, AnalyzeTechnicalInput,
+  AnalysisReport, ModelEvent, ToolRuntime,
 } from './model.js'
 import type {
   FactQueryResult, FinancialContext, FinancialFact, PaginatedFactQueryResult,
@@ -23,6 +24,7 @@ type Model = {
   analyze(input: AnalyzeInput): AsyncIterable<ModelEvent>
   analyzeNews?: (input: AnalyzeNewsInput) => AsyncIterable<ModelEvent>
   analyzeFundamental?: (input: AnalyzeFundamentalInput) => AsyncIterable<ModelEvent>
+  analyzeTechnical?: (input: AnalyzeTechnicalInput) => AsyncIterable<ModelEvent>
 }
 
 export function createAnalysisService(options: {
@@ -47,6 +49,13 @@ export function createAnalysisService(options: {
   getValuationEvidence?: (
     symbol: string, signal: AbortSignal,
   ) => Promise<{ facts: FinancialFact[]; [key: string]: unknown }>
+  getTechnicalEvidence?: (
+    symbol: string, signal: AbortSignal,
+  ) => Promise<{ facts: FinancialFact[]; [key: string]: unknown }>
+  getPriceWindow?: (
+    symbol: string, startDate: string, endDate: string,
+    cursor: string | undefined, signal: AbortSignal,
+  ) => Promise<PaginatedFactQueryResult>
   readFilingDocument?: (
     symbol: string, filingId: string, cursor: string | undefined, signal: AbortSignal,
   ) => Promise<PaginatedFactQueryResult>
@@ -415,16 +424,18 @@ export function createAnalysisService(options: {
         && options.getFinancialOverview && options.getFinancialMetricSeries
         && options.getValuationEvidence && options.readFilingDocument
         && options.listOfficialCompanyEvents)
+      const technicalRuntimeAvailable = Boolean(options.model.analyzeTechnical
+        && options.getTechnicalEvidence && options.getPriceWindow)
       type SpecialistRequest = {
         launch: boolean; researchQuestion: string; reason: string
       }
       const runSpecialistLifecycle = async (config: {
-        domain: 'news' | 'fundamental_valuation'
+        domain: 'news' | 'fundamental_valuation' | 'technical'
         label: string
         request: SpecialistRequest
         events: (executionId: string, runtime: ToolRuntime) => AsyncIterable<ModelEvent>
       }) => {
-        const slug = config.domain === 'news' ? 'news' : 'fundamental'
+        const slug = config.domain === 'fundamental_valuation' ? 'fundamental' : config.domain
         await setStatus(
           sessionId, executionId, `execution:${executionId}:${slug}-specialist:waiting`,
           'waiting_for_specialists', {}, `${config.label}专项分析`,
@@ -569,6 +580,25 @@ export function createAnalysisService(options: {
           }),
         })
       }
+      const runTechnicalSpecialist = async (request: SpecialistRequest) => {
+        if (!options.model.analyzeTechnical || !options.getTechnicalEvidence
+          || !options.getPriceWindow) {
+          throw new Error('technical_specialist_runtime_unavailable')
+        }
+        return runSpecialistLifecycle({
+          domain: 'technical', label: '技术面', request,
+          events: (specialistExecutionId, specialistRuntime) => options.model.analyzeTechnical!({
+            executionId: specialistExecutionId, runtimeSettings, symbol: job.symbol,
+            systemPrompt: '你是独立技术面 Agent。只使用宿主确定性技术证据和受控价格窗口；不得把模型上下文裁剪长度称为数据源总历史长度，不自行计算新指标；每项判断保留反方证据与失效条件，禁止个人买卖或仓位建议。',
+            researchQuestion: request.researchQuestion, knownFacts: modelContext.facts,
+            getTechnicalEvidence: options.getTechnicalEvidence!,
+            getPriceWindow: options.getPriceWindow!,
+            signal: controller.signal, executionDeadlineSignal: wallDeadline, activeBudget,
+            acquireModelSlot: (signal) => modelGate.acquire(signal),
+            acquireToolSlot: (signal) => toolGate.acquire(signal), toolRuntime: specialistRuntime,
+          }),
+        })
+      }
       await appendEvent(
         sessionId, executionId, operationId('running-model'),
         { type: 'status', status: 'running_model' },
@@ -591,6 +621,7 @@ export function createAnalysisService(options: {
         acquireToolSlot: (signal) => toolGate.acquire(signal),
         runNewsSpecialist: newsRuntimeAvailable ? runNewsSpecialist : undefined,
         runFundamentalSpecialist: fundamentalRuntimeAvailable ? runFundamentalSpecialist : undefined,
+        runTechnicalSpecialist: technicalRuntimeAvailable ? runTechnicalSpecialist : undefined,
         toolRuntime,
       })) {
         resumeProcessing()
@@ -786,6 +817,17 @@ export function createAnalysisService(options: {
         reason: '主 Agent 尚未作出基本面专项启动决定。',
       })
     }
+    const technicalDecision = specialistDecision('run_technical_analysis')
+    const technicalResult = technicalDecision?.result as Record<string, unknown> | undefined
+    if (!projectedSpecialists.some((specialist) => specialist?.domain === 'technical')) {
+      projectedSpecialists.push(technicalResult ? {
+        domain: 'technical', status: 'not_started',
+        researchQuestion: technicalResult.researchQuestion, reason: technicalResult.reason,
+      } : {
+        domain: 'technical', status: 'not_started',
+        reason: '主 Agent 尚未作出技术面专项启动决定。',
+      })
+    }
     return {
       ...record, trace,
       mainAgent: await options.eventRepository.primaryLifecycle(analysisId),
@@ -889,7 +931,7 @@ function waitTarget(status: AgentExecutionStatus) {
 }
 
 const ANALYSIS_SYSTEM_PROMPT = `你是个人美股研究助手，分析周期为未来一至四周。
-你可以自主规划分析路径。建议先确认本次冻结的金融上下文；按需调用 fetch_financial_context。需要深入解释正式财务事实时，必须通过 run_fundamental_analysis 明确决定是否启动独立基本面 Agent；消息面同理通过 run_news_analysis 明确决定。专项 Agent 只接收本领域受控工具，主 Agent 最终必须调用 submit_analysis_report 提交报告。
+你可以自主规划分析路径。建议先确认本次冻结的金融上下文；按需调用 fetch_financial_context。需要深入解释正式财务事实、消息面或多周期技术结构时，必须分别通过 run_fundamental_analysis、run_news_analysis、run_technical_analysis 明确决定是否启动独立专项 Agent。专项 Agent 只接收本领域受控工具，主 Agent 最终必须调用 submit_analysis_report 提交报告。
 不得编造行情、新闻、财报、估值或持仓；所有事实判断只能引用工具结果中真实存在的事实 ID。
 每条 keyJudgments 都必须关联一个或多个事实 ID；supportingEvidence 和 contraryEvidence 也必须引用事实 ID。
 财报增长率、利润率、TTM、自由现金流、质量标记、技术指标与估值结果由宿主程序计算，你只负责解释，不重新计算或改写输入数字。

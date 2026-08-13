@@ -75,6 +75,11 @@ export function validateReportCandidate(
     path: '/domain', rule: 'role_policy',
     message: '基本面 Agent 只能提交 fundamental_valuation 领域报告', allowedEvidenceTypes: [],
   })
+  if (context.role === 'technical' && candidate.kind === 'specialist'
+    && candidate.domain !== 'technical') envelopeErrors.push({
+    path: '/domain', rule: 'role_policy',
+    message: '技术面 Agent 只能提交 technical 领域报告', allowedEvidenceTypes: [],
+  })
   if (Array.isArray(candidate.gaps)) candidate.gaps.forEach((value, index) => {
     const gap = asRecord(value)
     for (const field of ['capability', 'reason', 'impact']) {
@@ -131,6 +136,10 @@ export function validateReportCandidate(
       path: `/keyJudgments/${index}/type`, rule: 'role_policy',
       message: '基本面 Agent 只能提交 fundamental 判断', allowedEvidenceTypes: [],
     })
+    if (context.role === 'technical' && judgment.type !== 'technical') envelopeErrors.push({
+      path: `/keyJudgments/${index}/type`, rule: 'role_policy',
+      message: '技术面 Agent 只能提交 technical 判断', allowedEvidenceTypes: [],
+    })
   })
   if (envelopeErrors.length) return { ok: false, errors: envelopeErrors }
   const facts = new Map(context.knownFacts.map((fact) => [fact.id, fact]))
@@ -177,7 +186,9 @@ export function validateReportCandidate(
     const allowed = allowedEvidenceFor(String(judgment.type))
     if (allowed.includes(evidenceLevel(fact))
       && (evidenceLevel(fact) !== 'deterministic_valuation'
-        || qualifiedValuationEvidence(fact, facts))) return []
+        || qualifiedValuationEvidence(fact, facts))
+      && (evidenceLevel(fact) !== 'deterministic_technical'
+        || qualifiedTechnicalEvidence(fact))) return []
     return [{ path, rule: 'evidence_qualification',
       message: `${evidenceLevel(fact)} 事实不能支撑 ${String(judgment.type)} 判断`,
       allowedEvidenceTypes: allowed }]
@@ -241,6 +252,21 @@ function qualifiedValuationEvidence(fact: ReportFact, facts: Map<string, ReportF
     && evidence.inputs.every((id) => typeof id === 'string' && facts.has(id))
     && typeof range.low === 'number' && Number.isFinite(range.low)
     && typeof range.high === 'number' && Number.isFinite(range.high) && range.low <= range.high
+}
+
+function qualifiedTechnicalEvidence(fact: ReportFact) {
+  if (fact.type !== 'technical_evidence') return false
+  const evidence = asRecord(fact.value)
+  const structures = asRecord(evidence.structures)
+  return typeof evidence.actualStart === 'string' && evidence.actualStart.trim() !== ''
+    && typeof evidence.actualEnd === 'string' && evidence.actualEnd.trim() !== ''
+    && typeof evidence.totalBarCount === 'number' && Number.isInteger(evidence.totalBarCount)
+    && evidence.totalBarCount >= 20
+    && ['20d', '60d', '120d', '252d'].every((window) => isRecord(structures[window]))
+    && ['indicators', 'volatility', 'drawdown', 'volumePrice', 'keyLevels']
+      .every((field) => isRecord(evidence[field]))
+    && Array.isArray(evidence.conflicts)
+    && evidence.conflicts.every((value) => typeof value === 'string')
 }
 
 function allowedEvidenceFor(judgmentType: string) {

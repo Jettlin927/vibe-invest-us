@@ -96,18 +96,19 @@ function toolTurnOperations(
 function providerCallId(runtimeId: string) {
   return runtimeId
     .replace(/:specialist-invocation:[^:]+:attempt:\d+:position:\d+$/, '')
-    .replace(/:(?:main|specialist|fundamental)-attempt:\d+:position:\d+$/, '')
+    .replace(/:(?:main|specialist|fundamental|technical)-attempt:\d+:position:\d+$/, '')
 }
 
 function legacyOperationId(operationId: string) {
   return operationId
     .replace(/:specialist-invocation:[^:]+:attempt:\d+:position:\d+(?=:(?:call|result)$)/, '')
-    .replace(/:(?:main|specialist|fundamental)-attempt:\d+:position:\d+(?=:(?:call|result)$)/, '')
+    .replace(/:(?:main|specialist|fundamental|technical)-attempt:\d+:position:\d+(?=:(?:call|result)$)/, '')
 }
 
 test('主分析模型和财报专家使用不同的显式工具集', () => {
   assert.deepEqual(analysisModelTools.map((tool) => tool.name), [
-    'fetch_financial_context', 'run_fundamental_analysis', 'run_news_analysis', 'submit_analysis_report',
+    'fetch_financial_context', 'run_fundamental_analysis', 'run_news_analysis',
+    'run_technical_analysis', 'submit_analysis_report',
   ])
   assert.deepEqual(financialSpecialistTools.map((tool) => tool.name), [
     'get_financial_overview', 'get_financial_metric_series', 'get_valuation_evidence', 'read_filing_document',
@@ -200,6 +201,24 @@ test('基本面能力可用时主 Agent 未作启动决定不能直接提交综�
     runFundamentalSpecialist: async () => ({}),
   })) events.push(event)
   assert.match(JSON.stringify(events), /fundamental_specialist_decision_required/)
+  assert.equal(events.filter((event) => event.type === 'completed').length, 1)
+})
+
+test('技术面能力可用时主 Agent 未作启动决定不能直接提交综合报告', async () => {
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall('submit_analysis_report', validReport), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('run_technical_analysis', {
+      launch: false, researchQuestion: '多周期结构是否一致？', reason: '现有技术证据已足够。',
+    }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('submit_analysis_report', validReport), { stopReason: 'toolUse' }),
+  ] })
+  const events = []
+  for await (const event of model.analyze({
+    executionId: 'technical-decision-required', runtimeSettings: runtimeSettings(), symbol: 'NVDA',
+    systemPrompt: 'system', knownFacts: facts, fetchFinancialContext: async () => ({ facts }),
+    runTechnicalSpecialist: async () => ({}),
+  })) events.push(event)
+  assert.match(JSON.stringify(events), /technical_specialist_decision_required/)
   assert.equal(events.filter((event) => event.type === 'completed').length, 1)
 })
 
@@ -459,6 +478,77 @@ test('基本面 Agent 只能读取主标的估值证据并由确定性事实支�
     pe: { status: 'available', targetPrice: 112, range: [80, 128] },
     dcf: { status: 'unavailable', reason: 'not_implemented' },
   })
+  const completed = events.find((event) => event.type === 'completed')
+  assert.equal(completed?.type, 'completed')
+  if (completed?.type === 'completed') assert.deepEqual(completed.reportVersion?.report, report)
+})
+
+test('技术面 Agent 只分析主标的并保留真实历史范围而非上下文裁剪长度', async () => {
+  const technicalFact = {
+    ...facts[0]!, id: 'fact:NVDA:technical-evidence:abc', type: 'technical_evidence',
+    evidenceLevel: 'deterministic_technical', source: 'deterministic-calculation',
+    value: {
+      symbol: 'NVDA', actualStart: '2025-01-01', actualEnd: '2026-01-20', totalBarCount: 260,
+      structures: { '20d': { status: 'available', barCount: 20, returnPct: 0.08 },
+        '60d': { status: 'available', barCount: 60, returnPct: -0.02 },
+        '120d': { status: 'available', barCount: 120, returnPct: 0.04 },
+        '252d': { status: 'available', barCount: 252, returnPct: 0.12 } },
+      indicators: {}, volatility: {}, drawdown: {}, volumePrice: {},
+      conflicts: ['20d_vs_60d'], keyLevels: { support: 100, resistance: 130 },
+    },
+  }
+  const report = {
+    kind: 'specialist' as const, domain: 'technical', availability: 'available' as const,
+    status: 'completed' as const, gaps: [], limitations: [], keyJudgments: [{
+      type: 'technical', statement: '短周期偏强但中周期仍有冲突', direction: 'neutral',
+      confidence: 'medium', supportingEvidence: [technicalFact.id],
+      contraryEvidence: [technicalFact.id], contraryEvidenceStatus: 'none_found',
+      invalidationConditions: ['跌破 100 或突破 130'],
+    }],
+  }
+  let evidenceCalls = 0
+  let windowCalls = 0
+  const providerResults: Array<Record<string, unknown>> = []
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall('get_technical_evidence', { symbol: 'AMD' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('get_technical_evidence', { symbol: 'NVDA' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('get_price_window', {
+      symbol: 'NVDA', startDate: '2025-01-01', endDate: '2026-01-20',
+    }), { stopReason: 'toolUse' }),
+    (context) => {
+      for (const message of context.messages.filter(({ role }) => role === 'toolResult').slice(-2)) {
+        const text = message.role === 'toolResult'
+          ? message.content.find((item) => item.type === 'text')?.text : undefined
+        providerResults.push(JSON.parse(text ?? '{}') as Record<string, unknown>)
+      }
+      return fauxAssistantMessage(fauxToolCall('submit_specialist_report', report), { stopReason: 'toolUse' })
+    },
+  ] })
+  const events = []
+  for await (const event of model.analyzeTechnical!({
+    executionId: 'technical-scope', runtimeSettings: runtimeSettings(), symbol: 'NVDA',
+    systemPrompt: 'technical', researchQuestion: '多周期结构？', knownFacts: facts.slice(0, 20),
+    getTechnicalEvidence: async () => {
+      evidenceCalls += 1
+      return { ...technicalFact.value as Record<string, unknown>, facts: [technicalFact] }
+    },
+    getPriceWindow: async () => {
+      windowCalls += 1
+      return {
+        symbol: 'NVDA', actualStart: '2025-01-01', actualEnd: '2026-01-20', totalBarCount: 260,
+        sampling: 'weekly', returnedCount: 20, totalCount: 52, nextCursor: '20', truncated: true,
+        facts: [],
+      }
+    },
+    toolRuntime: createTestToolRuntime(),
+  })) events.push(event)
+
+  assert.equal(evidenceCalls, 1)
+  assert.equal(windowCalls, 1)
+  assert.match(JSON.stringify(events), /tool_symbol_not_allowed/)
+  assert.equal(providerResults[0]?.totalBarCount, 260)
+  assert.notEqual(providerResults[0]?.totalBarCount, 20)
+  assert.equal(providerResults[1]?.sampling, 'weekly')
   const completed = events.find((event) => event.type === 'completed')
   assert.equal(completed?.type, 'completed')
   if (completed?.type === 'completed') assert.deepEqual(completed.reportVersion?.report, report)

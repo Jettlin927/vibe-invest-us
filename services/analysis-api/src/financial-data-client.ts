@@ -35,6 +35,14 @@ export type PaginatedFactQueryResult = FactQueryResult & {
   items?: unknown[]
 }
 
+export type PriceWindowQueryResult = PaginatedFactQueryResult & {
+  symbol: string
+  actualStart: string
+  actualEnd: string
+  totalBarCount: number
+  sampling: 'daily' | 'weekly'
+}
+
 export function createFinancialDataClient(baseUrl: string) {
   return {
     async health(): Promise<FinancialDataHealth> {
@@ -137,6 +145,42 @@ export function createFinancialDataClient(baseUrl: string) {
       const query = new URLSearchParams({ symbol, start_date: startDate, end_date: endDate })
       return factQuery(`/v1/technical-indicators?${query}`, signal)
     },
+    async technicalEvidence(symbol: string, signal?: AbortSignal) {
+      const result = await rawFactQuery(
+        `/v1/technical-evidence?symbol=${encodeURIComponent(symbol)}`, signal,
+      )
+      if (typeof result.symbol !== 'string' || typeof result.actualStart !== 'string'
+        || typeof result.actualEnd !== 'string' || !Number.isInteger(result.totalBarCount)
+        || !result.structures || typeof result.structures !== 'object'
+        || !result.indicators || typeof result.indicators !== 'object'
+        || !result.volatility || typeof result.volatility !== 'object'
+        || !result.drawdown || typeof result.drawdown !== 'object'
+        || !result.volumePrice || typeof result.volumePrice !== 'object'
+        || !result.keyLevels || typeof result.keyLevels !== 'object'
+        || !Array.isArray(result.conflicts)) {
+        throw new Error('financial_data_technical_evidence_contract_invalid')
+      }
+      return result
+    },
+    async priceWindow(
+      symbol: string, startDate: string, endDate: string,
+      cursor?: string, signal?: AbortSignal,
+    ): Promise<PriceWindowQueryResult> {
+      const query = new URLSearchParams({ symbol, start_date: startDate, end_date: endDate })
+      if (cursor) query.set('cursor', cursor)
+      const value = await rawFactQuery(`/v1/price-window?${query}`, signal)
+      const page = validatePagination(value)
+      if (typeof value.symbol !== 'string' || typeof value.actualStart !== 'string'
+        || typeof value.actualEnd !== 'string' || !Number.isInteger(value.totalBarCount)
+        || (value.sampling !== 'daily' && value.sampling !== 'weekly')) {
+        throw new Error('financial_data_price_window_contract_invalid')
+      }
+      return {
+        ...page,
+        symbol: value.symbol, actualStart: value.actualStart, actualEnd: value.actualEnd,
+        totalBarCount: value.totalBarCount as number, sampling: value.sampling,
+      }
+    },
     async quotes(symbols: string[], signal?: AbortSignal): Promise<Record<string, number>> {
       const response = await fetch(new URL('/v1/quotes', baseUrl), {
         method: 'POST',
@@ -185,17 +229,23 @@ export function createFinancialDataClient(baseUrl: string) {
     path: string, signal?: AbortSignal, includeItems = false,
   ): Promise<PaginatedFactQueryResult> {
     const value = await rawFactQuery(path, signal)
+    return { ...validatePagination(value, includeItems), ...(includeItems ? { items: value.items as unknown[] } : {}) }
+  }
+
+  function validatePagination(
+    value: Record<string, unknown> & { facts: FinancialFact[]; sources: unknown[] },
+    requireItems = false,
+  ): PaginatedFactQueryResult {
     if (!Number.isInteger(value.returnedCount) || !Number.isInteger(value.totalCount)
       || typeof value.truncated !== 'boolean'
       || !(value.nextCursor === null || typeof value.nextCursor === 'string')
-      || (includeItems && !Array.isArray(value.items))) {
+      || (requireItems && !Array.isArray(value.items))) {
       throw new Error('financial_data_pagination_contract_invalid')
     }
     return {
       facts: value.facts, sources: value.sources,
       returnedCount: value.returnedCount as number, totalCount: value.totalCount as number,
       nextCursor: value.nextCursor as string | null, truncated: value.truncated,
-      ...(includeItems ? { items: value.items as unknown[] } : {}),
     }
   }
 }

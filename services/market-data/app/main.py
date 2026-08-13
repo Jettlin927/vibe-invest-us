@@ -9,10 +9,10 @@ from app.adapters import SecFilingSource, read_limited_document, search_web
 from app.context import (
     build_financial_context, company_event_facts, read_news_document_fact,
     filing_document_page, financial_metric_series_result, financial_overview_facts, search_news_facts,
-    official_company_event_facts, technical_indicator_facts, web_search_lead_facts,
-    valuation_evidence_result,
+    official_company_event_facts, price_window_result, technical_evidence_result,
+    technical_indicator_facts, web_search_lead_facts, valuation_evidence_result,
 )
-from app.models import AtomicFact, FactQueryResult, FilingDocumentResult, FinancialContext, FinancialOverviewResult, NewsDocumentResult, PaginatedFactResult, QuoteBatch, QuoteSnapshot, SourceStatus, ValuationEvidenceResult
+from app.models import AtomicFact, FactQueryResult, FilingDocumentResult, FinancialContext, FinancialOverviewResult, NewsDocumentResult, PaginatedFactResult, PriceWindowResult, QuoteBatch, QuoteSnapshot, SourceStatus, TechnicalEvidenceResult, ValuationEvidenceResult
 from app.source_config import build_sources, load_source_config
 
 
@@ -155,6 +155,29 @@ def technical_indicators(
         build_sources(source_config, "history"),
     )
     return FactQueryResult(facts=facts, sources=sources)
+
+
+@app.post("/v1/technical-evidence", operation_id="getTechnicalEvidence", response_model=TechnicalEvidenceResult)
+def technical_evidence(
+    symbol: str, start_date: Optional[date] = None, end_date: Optional[date] = None,
+) -> TechnicalEvidenceResult:
+    end = end_date or datetime.now(timezone.utc).date()
+    start = start_date or end - timedelta(days=550)
+    return technical_evidence_result(
+        symbol, start.isoformat(), end.isoformat(), datetime.now(timezone.utc),
+        build_sources(source_config, "history"),
+    )
+
+
+@app.post("/v1/price-window", operation_id="getPriceWindow", response_model=PriceWindowResult)
+def price_window(
+    symbol: str, start_date: date, end_date: date,
+    cursor: Optional[str] = None, page_size: int = 60,
+) -> PriceWindowResult:
+    return price_window_result(
+        symbol, start_date.isoformat(), end_date.isoformat(), cursor, page_size,
+        datetime.now(timezone.utc), build_sources(source_config, "history"),
+    )
 
 
 @app.post("/v1/quotes", operation_id="createQuoteBatch", response_model=QuoteBatch)

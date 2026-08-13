@@ -31,6 +31,13 @@ def test_openapi_contract_matches_application():
     assert app.openapi() == contract
 
 
+def test_technical_endpoints_publish_scope_and_pagination_contracts():
+    schema = app.openapi()
+
+    assert schema["paths"]["/v1/technical-evidence"]["post"]["operationId"] == "getTechnicalEvidence"
+    assert schema["paths"]["/v1/price-window"]["post"]["operationId"] == "getPriceWindow"
+
+
 def test_yahoo_valuation_preserves_each_metric_fact_date(monkeypatch):
     payload = {"timeseries": {"result": [{
         "meta": {"type": ["trailingDilutedEPS"]},

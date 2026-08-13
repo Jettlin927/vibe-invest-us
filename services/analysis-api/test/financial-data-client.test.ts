@@ -90,6 +90,40 @@ test('TS 客户端查询关键词新闻和日期范围技术指标', async () =>
   await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
 })
 
+test('TS 客户端保留技术证据真实范围和价格窗口分页语义', async () => {
+  const fact = {
+    id: 'fact:technical', type: 'technical_evidence', value: {},
+    observedAt: '2026-08-12', fetchedAt: '2026-08-13T00:00:00Z',
+    source: 'deterministic-calculation', sourceReference: 'source://history',
+    evidenceLevel: 'deterministic_technical',
+  }
+  const server = createServer((request, response) => {
+    response.writeHead(200, { 'content-type': 'application/json' })
+    response.end(JSON.stringify(request.url?.startsWith('/v1/technical-evidence') ? {
+      symbol: 'NVDA', actualStart: '2025-01-01', actualEnd: '2026-01-20', totalBarCount: 260,
+      structures: { '252d': { status: 'available', barCount: 252 } }, conflicts: [],
+      indicators: {}, volatility: {}, drawdown: {}, volumePrice: {}, keyLevels: {},
+      facts: [fact], sources: [],
+    } : {
+      symbol: 'NVDA', actualStart: '2025-01-01', actualEnd: '2026-01-20', totalBarCount: 260,
+      sampling: 'weekly', returnedCount: 20, totalCount: 52, nextCursor: '20', truncated: true,
+      facts: [], sources: [],
+    }))
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  assert.ok(address && typeof address !== 'string')
+  const client = createFinancialDataClient(`http://127.0.0.1:${address.port}`)
+
+  assert.equal((await client.technicalEvidence('NVDA')).totalBarCount, 260)
+  assert.deepEqual(await client.priceWindow('NVDA', '2025-01-01', '2026-01-20'), {
+    facts: [], sources: [], returnedCount: 20, totalCount: 52,
+    nextCursor: '20', truncated: true, symbol: 'NVDA', actualStart: '2025-01-01',
+    actualEnd: '2026-01-20', totalBarCount: 260, sampling: 'weekly',
+  })
+  await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+})
+
 test('TS 客户端只把已知 title_only 候选交给受限新闻文档端点', async () => {
   let body: unknown
   const candidate = {

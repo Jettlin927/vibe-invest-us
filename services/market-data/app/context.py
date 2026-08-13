@@ -19,6 +19,13 @@ from app.models import (
     PaginatedFactResult,
     FilingDocumentResult,
     ValuationEvidenceResult,
+    TechnicalEvidenceResult,
+    TechnicalWindowStructure,
+    TechnicalVolatility,
+    TechnicalDrawdown,
+    TechnicalVolumePrice,
+    TechnicalKeyLevels,
+    PriceWindowResult,
 )
 from app.valuation import valuation_evidence
 
@@ -118,7 +125,10 @@ def financial_overview_facts(symbol: str, now: datetime, fundamentals_source: Op
 def financial_metric_series(symbol: str, metric: str, cursor: Optional[str],
                             normalized: Any, now: datetime, page_size: int = 20) -> PaginatedFactResult:
     normalized_symbol = symbol.strip().upper()
-    offset = int(cursor or "0")
+    try:
+        offset = int(cursor or "0")
+    except ValueError as error:
+        raise ValueError("financial_metric_cursor_invalid") from error
     if offset < 0 or page_size < 1:
         raise ValueError("financial_metric_cursor_invalid")
     records = [
@@ -405,6 +415,136 @@ def technical_indicator_facts(symbol: str, start_date: str, end_date: str, now: 
         sourceReference=f"source://{source}/{normalized_symbol}/history?start={start_date}&end={end_date}",
     )
     return [fact], history.sources
+
+
+def technical_evidence_result(symbol: str, start_date: str, end_date: str, now: datetime,
+                              history_sources: Iterable[Any]) -> TechnicalEvidenceResult:
+    normalized_symbol = symbol.strip().upper()
+    history = _first_available_history_range(history_sources, normalized_symbol, start_date, end_date)
+    bars = sorted([
+        bar if isinstance(bar, DailyBar) else DailyBar(**bar)
+        for bar in (history.value or [])
+    ], key=lambda bar: bar.date)
+    if len(bars) < 20:
+        raise ValueError("technical_history_insufficient")
+    indicators = calculate_indicators(bars)
+    structures = {}
+    directions = []
+    for size in (20, 60, 120, 252):
+        key = f"{size}d"
+        if len(bars) < size:
+            structures[key] = TechnicalWindowStructure(
+                status="unavailable", barCount=len(bars), reason="insufficient_history",
+            )
+            continue
+        window = bars[-size:]
+        change = round(window[-1].close / window[0].close - 1, 4)
+        directions.append((key, change))
+        structures[key] = TechnicalWindowStructure(
+            status="available", barCount=size, returnPct=change,
+            high=max(bar.high for bar in window), low=min(bar.low for bar in window),
+        )
+    conflicts = [
+        f"{left}_vs_{right}"
+        for index, (left, left_change) in enumerate(directions)
+        for right, right_change in directions[index + 1:]
+        if left_change * right_change < 0
+    ]
+    support = min(bar.low for bar in bars[-20:])
+    resistance = max(bar.high for bar in bars[-20:])
+    value = {
+        "symbol": normalized_symbol, "actualStart": bars[0].date, "actualEnd": bars[-1].date,
+        "totalBarCount": len(bars),
+        "structures": {key: item.model_dump(exclude_none=True) for key, item in structures.items()},
+        "indicators": indicators.model_dump(),
+        "volatility": {"annualized": indicators.annualized_volatility},
+        "drawdown": {"maximum": indicators.max_drawdown},
+        "volumePrice": {"volumeRatio5To20": indicators.volume_ratio_5_to_20},
+        "keyLevels": {"support": support, "resistance": resistance},
+        "conflicts": conflicts,
+    }
+    fingerprint = sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
+    fact = AtomicFact(
+        id=f"fact:{normalized_symbol}:technical-evidence:{fingerprint}",
+        type="technical_evidence", value=value, observedAt=bars[-1].date,
+        fetchedAt=now.isoformat(), source="deterministic-calculation",
+        sourceReference=f"source://{history.adopted_source or 'unknown'}/{normalized_symbol}/history",
+        evidenceLevel="deterministic_technical",
+    )
+    return TechnicalEvidenceResult(
+        symbol=normalized_symbol, actualStart=bars[0].date, actualEnd=bars[-1].date,
+        totalBarCount=len(bars), structures=structures, indicators=indicators,
+        volatility=TechnicalVolatility(annualized=indicators.annualized_volatility),
+        drawdown=TechnicalDrawdown(maximum=indicators.max_drawdown),
+        volumePrice=TechnicalVolumePrice(volumeRatio5To20=indicators.volume_ratio_5_to_20),
+        keyLevels=TechnicalKeyLevels(support=support, resistance=resistance),
+        conflicts=conflicts, facts=[fact], sources=history.sources,
+    )
+
+
+def price_window_result(symbol: str, start_date: str, end_date: str, cursor: Optional[str],
+                        page_size: int, now: datetime,
+                        history_sources: Iterable[Any]) -> PriceWindowResult:
+    normalized_symbol = symbol.strip().upper()
+    if page_size < 1 or page_size > 100:
+        raise ValueError("price_window_page_size_invalid")
+    try:
+        offset = int(cursor or "0")
+    except ValueError as error:
+        raise ValueError("price_window_cursor_invalid") from error
+    if offset < 0:
+        raise ValueError("price_window_cursor_invalid")
+    history = _first_available_history_range(history_sources, normalized_symbol, start_date, end_date)
+    bars = sorted([
+        bar if isinstance(bar, DailyBar) else DailyBar(**bar)
+        for bar in (history.value or [])
+    ], key=lambda bar: bar.date)
+    if not bars:
+        raise ValueError("price_window_empty")
+    sampling = "weekly" if len(bars) > 120 else "daily"
+    sampled = _weekly_bars(bars) if sampling == "weekly" else bars
+    page = sampled[offset:offset + page_size]
+    source = history.adopted_source or "unknown"
+    facts = [AtomicFact(
+        id=f"fact:{normalized_symbol}:price-window:{sampling}:{bar.date}",
+        type="price_window_bar", value=bar.model_dump(), observedAt=bar.date,
+        fetchedAt=now.isoformat(), source=source,
+        sourceReference=f"source://{source}/{normalized_symbol}/history",
+        evidenceLevel="market_observation",
+    ) for bar in page]
+    next_offset = offset + len(page)
+    return PriceWindowResult(
+        symbol=normalized_symbol, actualStart=bars[0].date, actualEnd=bars[-1].date,
+        totalBarCount=len(bars), sampling=sampling, facts=facts, sources=history.sources,
+        returnedCount=len(facts), totalCount=len(sampled),
+        nextCursor=str(next_offset) if next_offset < len(sampled) else None,
+        truncated=next_offset < len(sampled),
+    )
+
+
+def _weekly_bars(bars: List[DailyBar]) -> List[DailyBar]:
+    weeks = []
+    current_key = None
+    current = []
+    for bar in bars:
+        calendar = datetime.fromisoformat(bar.date).isocalendar()
+        key = (calendar.year, calendar.week)
+        if current and key != current_key:
+            weeks.append(_aggregate_week(current))
+            current = []
+        current_key = key
+        current.append(bar)
+    if current:
+        weeks.append(_aggregate_week(current))
+    return weeks
+
+
+def _aggregate_week(bars: List[DailyBar]) -> DailyBar:
+    return DailyBar(
+        date=bars[-1].date, open=bars[0].open,
+        high=max(bar.high for bar in bars), low=min(bar.low for bar in bars),
+        close=bars[-1].close, volume=sum(bar.volume for bar in bars),
+    )
 
 
 def _first_available_history_range(sources: Iterable[Any], symbol: str, start_date: str, end_date: str):

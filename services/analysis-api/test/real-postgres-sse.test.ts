@@ -30,7 +30,7 @@ function integratedReport<T extends Record<string, unknown>>(report: T) {
   }
 }
 
-test('真实 v12 历史 Tool 事件升级到 v18 后经 DAO、HTTP 与 SSE 原样读取', {
+test('真实 v12 历史 Tool 事件升级到 v19 后经 DAO、HTTP 与 SSE 原样读取', {
   skip: !databaseUrl || !migrationDatabaseUrl,
   concurrency: false,
 }, async () => {
@@ -1203,6 +1203,118 @@ test('主 Agent 经真实 PostgreSQL、HTTP 与 SSE 启动并展示独立基本�
       asOf: '2026-08-12T14:30:00Z', evidence: [valuationFact.id],
     })
     assert.match(specialistVersion.payloadHash, /^[a-f0-9]{64}$/)
+  } finally { await app.close() }
+})
+
+test('主 Agent 经真实 PostgreSQL、HTTP 与 SSE 启动并展示独立技术面 Agent', {
+  skip: !databaseUrl,
+  concurrency: false,
+}, async () => {
+  const pool = createPool(databaseUrl!)
+  const events = createAgentEventRepository(pool)
+  const technicalFact = {
+    id: `fact:technical:e2e:${crypto.randomUUID()}`, type: 'technical_evidence',
+    evidenceLevel: 'deterministic_technical', observedAt: '2026-01-20',
+    fetchedAt: '2026-01-21T00:00:00Z', source: 'deterministic-calculation',
+    sourceReference: 'source://alpaca/NVDA/history', value: {
+      symbol: 'NVDA', actualStart: '2025-01-01', actualEnd: '2026-01-20', totalBarCount: 260,
+      structures: { '20d': { status: 'available', barCount: 20, returnPct: 0.08 },
+        '60d': { status: 'available', barCount: 60, returnPct: -0.02 },
+        '120d': { status: 'available', barCount: 120, returnPct: 0.04 },
+        '252d': { status: 'available', barCount: 252, returnPct: 0.12 } },
+      indicators: { ma_5: 125, ma_20: 120, rsi_14: 58 },
+      volatility: { annualized: 0.32 }, drawdown: { maximum: -0.18 },
+      volumePrice: { volumeRatio5To20: 1.2 }, keyLevels: { support: 100, resistance: 130 },
+      conflicts: ['20d_vs_60d'],
+    },
+  }
+  const specialistReport = {
+    kind: 'specialist' as const, domain: 'technical', availability: 'available' as const,
+    status: 'completed' as const, gaps: [], limitations: [], keyJudgments: [{
+      type: 'technical', statement: '短周期偏强但中周期存在冲突', direction: 'neutral',
+      confidence: 'medium', supportingEvidence: [technicalFact.id],
+      contraryEvidence: [technicalFact.id], contraryEvidenceStatus: 'none_found',
+      invalidationConditions: ['跌破 100 或突破 130'],
+    }],
+  }
+  const mainModel = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall('run_technical_analysis', {
+      launch: true, researchQuestion: '多周期结构是否一致？', reason: '需要核验完整历史与冲突。',
+    }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('submit_analysis_report', integratedReport({
+      title: '技术专项闭环', marketState: '数据有限', trend: '震荡', drivers: [],
+      supportingEvidence: [], contraryEvidence: [], keyJudgments: [], scenarios: [],
+      invalidationConditions: [], valuation: null, personalImpact: null,
+      conditionalSuggestion: null, limitations: [],
+    })), { stopReason: 'toolUse' }),
+  ] })
+  const specialistModel = createPiModel({ fauxResponses: [
+    fauxAssistantMessage([
+      fauxToolCall('get_technical_evidence', { symbol: 'NVDA' }, { id: 'technical-evidence' }),
+      fauxToolCall('get_price_window', {
+        symbol: 'NVDA', startDate: '2025-01-01', endDate: '2026-01-20',
+      }, { id: 'technical-window' }),
+    ], { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('submit_specialist_report', specialistReport), {
+      stopReason: 'toolUse',
+    }),
+  ] })
+  const model = { ...mainModel, analyzeTechnical: specialistModel.analyzeTechnical }
+  const app = buildApp({
+    productDatabase: { checkSchema: () => checkSchema(pool), close: () => pool.end() },
+    portfolioRepository: createPortfolioRepository(pool),
+    analysisRepository: createAnalysisRepository(pool), agentEventRepository: events,
+    runtimeSettingsRepository: createRuntimeSettingsRepository(pool),
+    toolProjectionRepository: createToolProjectionRepository(pool),
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, gaps: [], facts: [] }),
+    getTechnicalEvidence: async () => ({
+      ...(technicalFact.value as Record<string, unknown>), facts: [technicalFact], sources: [],
+    }),
+    getPriceWindow: async () => ({
+      facts: [], returnedCount: 20, totalCount: 52, nextCursor: '20', truncated: true,
+      symbol: 'NVDA', actualStart: '2025-01-01', actualEnd: '2026-01-20',
+      totalBarCount: 260, sampling: 'weekly', sources: [],
+    }), model,
+  })
+  await app.listen({ host: '127.0.0.1', port: 0 })
+  const address = app.server.address()
+  assert.ok(address && typeof address === 'object')
+  const baseUrl = `http://127.0.0.1:${address.port}`
+  const created = await fetch(`${baseUrl}/api/analyses`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ symbol: 'NVDA' }),
+  }).then((response) => response.json()) as { analysisId: string }
+  try {
+    await waitForAnalysisStatus(app, created.analysisId, 'completed')
+    const research = await fetch(`${baseUrl}/api/research/${created.analysisId}`)
+      .then((response) => response.json())
+    const technical = research.specialistAgents.find(
+      (agent: { domain: string }) => agent.domain === 'technical',
+    )
+    assert.equal(technical.execution.status, 'completed')
+    const serialized = JSON.stringify(technical.events)
+    assert.match(serialized, /get_technical_evidence/)
+    assert.match(serialized, /get_price_window/)
+    assert.match(serialized, /"totalBarCount":260/)
+    assert.match(serialized, /"sampling":"weekly"/)
+    assert.match(serialized, new RegExp(technicalFact.id))
+    const replay = await fetch(`${baseUrl}/api/agent-sessions/${technical.id}/events`)
+      .then((response) => response.text())
+    assert.match(replay, /event: tool_call/)
+    assert.match(replay, /event: tool_result/)
+    assert.match(replay, /event: completed/)
+    const versions = await fetch(`${baseUrl}/api/research/${created.analysisId}/report-versions`)
+      .then((response) => response.json())
+    const version = versions.items.find((item: any) => item.report.domain === 'technical')
+    assert.equal(version.sessionId, technical.id)
+    assert.equal(version.version, 1)
+    assert.deepEqual(version.report.keyJudgments[0].supportingEvidence, [technicalFact.id])
+    const roleRows = await pool.query(
+      'SELECT DISTINCT role FROM tool_projection_versions WHERE execution_id = $1',
+      [technical.execution.id],
+    )
+    assert.deepEqual(roleRows.rows, [{ role: 'technical' }])
   } finally { await app.close() }
 })
 

@@ -324,8 +324,11 @@ function ResearchPage({ records, record, onOpen, onUpdate, onDelete, freshnessDa
 }
 
 function SpecialistAgents({ agents = [] }: { agents?: ResearchRecord['specialistAgents'] }) {
-  return <>{agents?.filter(({ domain }) => ['news', 'fundamental_valuation'].includes(domain)).map((agent) => {
-    const label = agent.domain === 'news' ? '消息面专项 Agent' : '基本面专项 Agent'
+  return <>{agents?.filter(({ domain }) => (
+    ['news', 'fundamental_valuation', 'technical'].includes(domain)
+  )).map((agent) => {
+    const label = agent.domain === 'news' ? '消息面专项 Agent'
+      : agent.domain === 'technical' ? '技术面专项 Agent' : '基本面专项 Agent'
     return (
     <section className="agent-runtime" role="region" aria-label={label} key={agent.id ?? agent.domain}>
       <p className="micro">{label}</p>

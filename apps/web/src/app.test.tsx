@@ -390,6 +390,46 @@ test('研究页固定展示基本面专项，并独立展示工具轨迹和不�
   assert.match(specialist.textContent ?? '', /估值区间.*80.*128.*pe.*2026-08-12T14:30:00Z/)
 })
 
+test('研究页独立展示技术面专项的多周期报告与工具轨迹', async () => {
+  setupDom()
+  const record = {
+    id: 'technical-completed', symbol: 'NVDA', status: 'completed', report: null, facts: [], trace: [],
+    specialistAgents: [{
+      id: 'technical-session', domain: 'technical', status: 'completed',
+      researchQuestion: '多周期结构是否一致？', reason: '需要核验完整历史。',
+      execution: { id: 'technical-execution', generation: 1, status: 'completed' },
+      events: [
+        { sequence: 1, type: 'tool_call', name: 'get_technical_evidence', createdAt: '2026-08-13T03:00:00Z' },
+        { sequence: 2, type: 'tool_call', name: 'get_price_window', createdAt: '2026-08-13T03:00:01Z' },
+      ],
+      reportVersion: { version: 1, report: {
+        gaps: [{ capability: '252d', reason: '长期历史不足', impact: '长期置信度受限' }],
+        keyJudgments: [{ statement: '短周期偏强但中周期冲突', direction: 'neutral', confidence: 'medium' }],
+      } },
+    }],
+  }
+  globalThis.fetch = async (input) => {
+    const url = String(input)
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok' }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/settings') return Response.json({ ...settingsResponse(), model: { configured: false } })
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+    if (url === '/api/portfolio') return Response.json(portfolioResponse([]))
+    if (url === '/api/research') return Response.json({ records: [{ id: record.id, symbol: record.symbol, status: record.status }] })
+    if (url === '/api/research/technical-completed') return Response.json(record)
+    throw new Error(`unexpected_fetch:${url}`)
+  }
+  const view = render(React.createElement(App))
+  const user = userEvent.setup({ document: window.document })
+  await user.click(await view.findByRole('button', { name: '新建分析' }))
+  await user.click(await view.findByRole('button', { name: /打开 NVDA/ }))
+
+  const specialist = await view.findByRole('region', { name: '技术面专项 Agent' })
+  assert.match(specialist.textContent ?? '', /get_technical_evidence/)
+  assert.match(specialist.textContent ?? '', /get_price_window/)
+  assert.match(specialist.textContent ?? '', /短周期偏强但中周期冲突.*中性.*中等/)
+  assert.match(specialist.textContent ?? '', /长期历史不足.*长期置信度受限/)
+})
+
 test('模型未配置时首次研究创建后立即打开主 Agent 生命周期', async () => {
   setupDom()
   let created = false
