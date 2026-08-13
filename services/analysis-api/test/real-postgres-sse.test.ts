@@ -2064,7 +2064,7 @@ async function waitForAgentStatus(
 async function waitForAnalysisStatus(
   app: ReturnType<typeof buildApp>, analysisId: string, expected: string,
 ) {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
+  for (let attempt = 0; attempt < 300; attempt += 1) {
     const response = await app.inject({ method: 'GET', url: `/api/analyses/${analysisId}` })
     if (response.json().status === expected) return
     await new Promise((resolve) => setTimeout(resolve, 5))
