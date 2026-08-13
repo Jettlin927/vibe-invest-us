@@ -91,6 +91,7 @@ export function createAnalysisService(options: {
     operationId: string,
     status: string,
     extra: { report?: unknown; snapshot?: unknown; error?: string; terminal?: boolean } = {},
+    waitTargetOverride?: string,
   ) {
     const executionStatus = status
     await appendEvent(sessionId, executionId, operationId, {
@@ -104,6 +105,7 @@ export function createAnalysisService(options: {
       ...(extra.error !== undefined ? { error: extra.error } : {}),
       ...(isExecutionStatus(executionStatus) ? {
         executionStatus,
+        ...(waitTargetOverride ? { waitTarget: waitTargetOverride } : {}),
         terminal: extra.terminal ?? isTerminalAgentExecutionStatus(executionStatus, true),
       } : {}),
     })
@@ -316,7 +318,7 @@ export function createAnalysisService(options: {
         if (event.type === 'lifecycle') {
           await setStatus(sessionId, executionId, event.operationId, event.status, {
             terminal: event.status === 'budget_exhausted' ? false : undefined,
-          })
+          }, event.waitTarget)
           lifecycleStatus = event.status
         }
         else if (event.type === 'trace') {
@@ -386,7 +388,7 @@ export function createAnalysisService(options: {
           })) {
             if (event.type === 'lifecycle') await setStatus(sessionId, executionId, event.operationId, event.status, {
               terminal: event.status === 'budget_exhausted' ? false : undefined,
-            })
+            }, event.waitTarget)
             if (event.type === 'trace') await appendTrace(sessionId, executionId, event.entry.operationId ? event.entry : {
               ...event.entry, operationId: nextModelOperationId(event.entry.type),
             })

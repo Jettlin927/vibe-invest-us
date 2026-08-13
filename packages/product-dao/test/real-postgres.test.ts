@@ -285,6 +285,58 @@ test('真实 PostgreSQL primaryLifecycle 在并发状态写入期间只返回同
   }
 })
 
+test('真实 PostgreSQL execution fence 先于既有 operationId 幂等判定', {
+  skip: !migrationUrl || !applicationUrl,
+  concurrency: false,
+}, async () => {
+  await migrate(migrationUrl!)
+  const pool = createPool(applicationUrl!)
+  const events = createAgentEventRepository(pool)
+  const analyses = createAnalysisRepository(pool)
+  const analysisId = `fence-replay-${crypto.randomUUID()}`
+  const sessionId = `fence-replay-session-${crypto.randomUUID()}`
+  const executionId = `fence-replay-execution-${crypto.randomUUID()}`
+  const fenceExecutionId = `fence-replay-stop-${crypto.randomUUID()}`
+  const createdAt = '2026-08-13T03:20:00.000Z'
+  const operations = [
+    { id: 'old-status', event: { type: 'status', status: 'running_tools' } },
+    { id: 'old-tool-call', event: { type: 'tool_call', name: 'fetch_financial_context' } },
+    { id: 'old-tool-result', event: { type: 'tool_result', name: 'fetch_financial_context', result: { facts: [] } } },
+  ]
+  try {
+    await events.createResearch({
+      analysisId, sessionId, executionId, symbol: `F${crypto.randomUUID().slice(0, 8)}`,
+      status: 'planning', analysisStatus: 'queued', operationId: 'runtime-context',
+      event: { type: 'runtime_context', status: 'planning' }, createdAt,
+    })
+    for (const operation of operations) await events.append({
+      sessionId, executionId, operationId: operation.id, event: operation.event,
+      createdAt: '2026-08-13T03:20:01.000Z',
+    })
+    await events.fenceForStopping({
+      sessionId, executionId, fenceExecutionId, operationId: 'current-stopping',
+      event: { type: 'status', status: 'stopping' }, createdAt: '2026-08-13T03:20:02.000Z',
+    })
+    const before = await events.list(sessionId, 0)
+    const lifecycleBefore = await events.primaryLifecycle(analysisId)
+
+    for (const operation of operations) await assert.rejects(events.append({
+      sessionId, executionId, operationId: operation.id, event: operation.event,
+      createdAt: '2026-08-13T03:20:03.000Z',
+    }), /agent_execution_fenced/)
+    const currentReplay = await events.append({
+      sessionId, executionId: fenceExecutionId, operationId: 'current-stopping',
+      event: { type: 'status', status: 'stopping' }, createdAt: '2026-08-13T03:20:03.000Z',
+    })
+    assert.equal(currentReplay.created, false)
+    assert.deepEqual(await events.list(sessionId, 0), before)
+    assert.deepEqual(await events.primaryLifecycle(analysisId), lifecycleBefore)
+  } finally {
+    await analyses.removeResearch(analysisId)
+    await pool.end()
+  }
+})
+
 test('真实 PostgreSQL settings snapshot 失败时不残留 Session、execution、segment 或事件', {
   skip: !migrationUrl || !applicationUrl,
   concurrency: false,

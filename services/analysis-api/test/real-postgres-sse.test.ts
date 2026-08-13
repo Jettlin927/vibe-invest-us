@@ -731,6 +731,29 @@ test('专项下一轮 provider 启动前已在真实 PostgreSQL 封存上一批�
   try {
     await waitForAnalysisStatus(app, created.analysisId, 'partial')
     assert.equal(providerObservedSealedLedger, true)
+    const statusEvents = (await events.list(created.sessionId, 0)).filter(
+      ({ payload }) => payload.type === 'status',
+    )
+    assertSubsequence(statusEvents.map(({ payload }) => payload.status as string), [
+      'running_tools', 'waiting_for_specialists', 'running_tools', 'running_model', 'partial',
+    ])
+    const waiting = statusEvents.find(({ payload }) => payload.status === 'waiting_for_specialists')
+    assert.deepEqual(waiting?.payload.waitReason && {
+      kind: (waiting.payload.waitReason as { kind: string }).kind,
+      target: (waiting.payload.waitReason as { target: string }).target,
+      startedAt: typeof (waiting.payload.waitReason as { startedAt: unknown }).startedAt,
+    }, { kind: 'specialists', target: '财报专项分析', startedAt: 'string' })
+    const research = (await app.inject({
+      method: 'GET', url: `/api/research/${created.analysisId}`,
+    })).json()
+    assertSubsequence(research.mainAgent.events.map((event: { status?: string }) => event.status), [
+      'waiting_for_specialists', 'running_tools', 'running_model', 'partial',
+    ])
+    const replay = (await app.inject({
+      method: 'GET', url: `/api/agent-sessions/${created.sessionId}/events`,
+    })).body
+    assert.match(replay, /event: waiting_for_specialists/)
+    assert.match(replay, /"target":"财报专项分析"/)
   } finally {
     await app.close()
   }

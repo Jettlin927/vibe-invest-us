@@ -1185,6 +1185,7 @@ export function createAgentEventRepository(pool: Pool) {
           [input.sessionId],
         )
         if (!session.rows[0]) throw new Error('agent_session_not_found')
+        if (session.rows[0].execution_id !== input.executionId) throw new Error('agent_execution_fenced')
         const existing = await client.query<{ sequence: number }>(
           `SELECT sequence FROM agent_events
            WHERE session_id = $1 AND operation_id = $2`,
@@ -1199,7 +1200,6 @@ export function createAgentEventRepository(pool: Pool) {
           await client.query('COMMIT')
           return { sequence: existing.rows[0].sequence, created: false, event: mapAgentEventRow(event.rows[0]!) }
         }
-        if (session.rows[0].execution_id !== input.executionId) throw new Error('agent_execution_fenced')
         const execution = await client.query<{ id: string; status: string; terminal: boolean }>(
           `SELECT id, status, terminal FROM agent_executions WHERE id = $1 FOR UPDATE`,
           [input.executionId],

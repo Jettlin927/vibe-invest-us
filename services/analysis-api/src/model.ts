@@ -66,6 +66,7 @@ export type ModelEvent =
     status: 'running_model' | 'running_tools' | 'waiting_for_specialists'
       | 'finalizing' | 'budget_exhausted'
     operationId: string
+    waitTarget?: string
   }
   | { type: 'text_delta'; text: string; operationId?: string }
   | { type: 'trace'; entry: TraceEntry }
@@ -421,6 +422,11 @@ export function createPiModel(options: ModelOptions = {}) {
               const toolSymbol = (toolInput as { symbol?: string }).symbol ?? input.symbol
               const financialContext = await loadFrozenContext(toolSymbol)
               if (call.name === 'analyze_financials') {
+                yield {
+                  type: 'lifecycle', status: 'waiting_for_specialists',
+                  operationId: `${toolOperationId}:waiting-for-specialist`,
+                  waitTarget: '财报专项分析',
+                }
                 const specialistContext: Context = {
                   systemPrompt: `你是独立财报分析专家。以给定的冻结财报上下文为基础，可按需通过 search_news_by_keyword 补查新闻，或通过 get_technical_indicators 查询指定股票与日期范围的确定性技术指标。不得使用工具结果之外的信息，不重新计算宿主已经计算的增长率、利润率、TTM、自由现金流或质量标记。每项判断必须引用输入或工具结果中存在的事实 ID；数据不足时明确说明。输出供主分析 Agent 使用的简洁备忘录，不提交最终股票报告。`,
                   messages: [{
@@ -462,6 +468,10 @@ export function createPiModel(options: ModelOptions = {}) {
                 }
                 if (specialist.policyError === 'execution_runtime_timeout') {
                   throw new Error('execution_runtime_timeout')
+                }
+                yield {
+                  type: 'lifecycle', status: 'running_tools',
+                  operationId: `${toolOperationId}:specialist-completed`,
                 }
                 for (const fact of specialist.facts) knownFactIds.add(fact.id)
                 result = { facts: specialist.facts, analysis: specialist.analysis }
