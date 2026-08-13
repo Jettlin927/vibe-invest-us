@@ -6,7 +6,7 @@ import {
   type ExecutionSettingsSnapshot, type RuntimeSettings, type RuntimeSettingsRevision,
 } from '@vibe-invest/contracts'
 
-export const schemaVersion = 19
+export const schemaVersion = 21
 
 const migrationSql = `
 CREATE TABLE IF NOT EXISTS product_schema_migrations (
@@ -147,6 +147,39 @@ CREATE TABLE IF NOT EXISTS conversation_segments (
   ordinal integer NOT NULL CHECK (ordinal > 0),
   created_at timestamptz NOT NULL,
   UNIQUE (session_id, ordinal)
+);
+ALTER TABLE conversation_segments ADD COLUMN IF NOT EXISTS parent_segment_id text
+  REFERENCES conversation_segments(id);
+
+CREATE TABLE IF NOT EXISTS agent_compactions (
+  id text PRIMARY KEY,
+  session_id text NOT NULL REFERENCES agent_sessions(id) ON DELETE CASCADE,
+  execution_id text NOT NULL REFERENCES agent_executions(id) ON DELETE CASCADE,
+  from_segment_id text NOT NULL REFERENCES conversation_segments(id),
+  to_segment_id text NOT NULL REFERENCES conversation_segments(id),
+  context_tokens integer NOT NULL CHECK (context_tokens >= 0),
+  context_window integer NOT NULL CHECK (context_window > 0),
+  reserve_tokens integer NOT NULL CHECK (reserve_tokens > 0),
+  keep_recent_tokens integer NOT NULL CHECK (keep_recent_tokens > 0),
+  tokens_after integer NOT NULL CHECK (tokens_after >= 0),
+  summary_json jsonb NOT NULL CHECK (jsonb_typeof(summary_json) = 'object'),
+  usage_json jsonb NOT NULL CHECK (jsonb_typeof(usage_json) = 'object'),
+  created_at timestamptz NOT NULL,
+  UNIQUE (session_id, to_segment_id)
+);
+ALTER TABLE agent_compactions ADD COLUMN IF NOT EXISTS tokens_after integer NOT NULL DEFAULT 0
+  CHECK (tokens_after >= 0);
+
+CREATE TABLE IF NOT EXISTS agent_compaction_attempts (
+  compaction_id text NOT NULL,
+  session_id text NOT NULL REFERENCES agent_sessions(id) ON DELETE CASCADE,
+  execution_id text NOT NULL REFERENCES agent_executions(id) ON DELETE CASCADE,
+  attempt integer NOT NULL CHECK (attempt IN (1, 2)),
+  status text NOT NULL CHECK (status IN ('completed', 'failed', 'cancelled')),
+  duration_ms integer NOT NULL CHECK (duration_ms >= 0),
+  usage_json jsonb,
+  created_at timestamptz NOT NULL,
+  PRIMARY KEY (compaction_id, attempt)
 );
 
 CREATE TABLE IF NOT EXISTS report_versions (
@@ -454,6 +487,14 @@ INSERT INTO product_schema_migrations (version)
 VALUES (19)
 ON CONFLICT (version) DO NOTHING;
 
+INSERT INTO product_schema_migrations (version)
+VALUES (20)
+ON CONFLICT (version) DO NOTHING;
+
+INSERT INTO product_schema_migrations (version)
+VALUES (21)
+ON CONFLICT (version) DO NOTHING;
+
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM vibe_invest_app;
 REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM vibe_invest_app;
 GRANT SELECT ON product_schema_migrations TO vibe_invest_app;
@@ -464,6 +505,8 @@ GRANT SELECT, INSERT, UPDATE ON agent_sessions TO vibe_invest_app;
 GRANT SELECT, INSERT ON agent_events TO vibe_invest_app;
 GRANT SELECT, INSERT, UPDATE ON agent_executions TO vibe_invest_app;
 GRANT SELECT, INSERT ON conversation_segments TO vibe_invest_app;
+GRANT SELECT, INSERT ON agent_compactions TO vibe_invest_app;
+GRANT SELECT, INSERT ON agent_compaction_attempts TO vibe_invest_app;
 GRANT SELECT, INSERT ON runtime_settings_revisions, execution_settings_snapshots TO vibe_invest_app;
 GRANT SELECT, INSERT ON tool_projection_versions, model_requests, tool_call_batches, tool_batch_calls TO vibe_invest_app;
 GRANT SELECT, INSERT ON report_versions TO vibe_invest_app;
@@ -1251,6 +1294,9 @@ export function createAgentEventRepository(pool: Pool) {
             currentSession.latest_sequence, input.createdAt,
           )
           cancelledToolEvents.push(...cancelled.events)
+          await cancelRunningCompactionAttempts(
+            client, currentSession.id, currentSession.execution_id, input.createdAt,
+          )
           const sequence = cancelled.latestSequence + 1
           const waitReason = input.event.waitReason ?? null
           const fenceExecutionId = currentSession.id === input.sessionId
@@ -1842,6 +1888,235 @@ export function createAgentEventRepository(pool: Pool) {
         createdAt: new Date(row.created_at).toISOString(),
       }))
     },
+    async commitCompaction(input: {
+      id: string; executionId: string; segmentId: string
+      operationId: string; event: Record<string, unknown>
+      contextTokens: number; contextWindow: number; reserveTokens: number
+      keepRecentTokens: number; tokensAfter: number; summary: Record<string, unknown>
+      usage: Record<string, unknown>; attempts: Array<{
+        attempt: number; status: 'completed' | 'failed' | 'cancelled'
+        durationMs: number; usage: unknown
+      }>; createdAt: string
+    }) {
+      const client = await pool.connect()
+      try {
+        await client.query('BEGIN')
+        const identity = await client.query<{ analysis_id: string; session_id: string }>(
+          `SELECT session.analysis_id, session.id AS session_id
+           FROM agent_executions execution
+           JOIN agent_sessions session ON session.id = execution.session_id
+           WHERE execution.id = $1`, [input.executionId],
+        )
+        if (!identity.rows[0]) throw new Error('agent_session_not_found')
+        await client.query(
+          'SELECT id FROM analyses WHERE id = $1 FOR UPDATE', [identity.rows[0].analysis_id],
+        )
+        const session = await client.query<{
+          execution_id: string; latest_sequence: number
+        }>(
+          `SELECT execution_id, latest_sequence FROM agent_sessions
+           WHERE id = $1 FOR UPDATE`, [identity.rows[0].session_id],
+        )
+        if (session.rows[0]?.execution_id !== input.executionId) {
+          throw new Error('agent_execution_fenced')
+        }
+        const execution = await client.query<{ terminal: boolean }>(
+          'SELECT terminal FROM agent_executions WHERE id = $1 FOR UPDATE', [input.executionId],
+        )
+        if (!execution.rows[0] || execution.rows[0].terminal) throw new Error('agent_execution_fenced')
+        const replay = await client.query<AgentEventRow>(
+          `SELECT session_id, sequence, operation_id, payload_json, created_at::text
+           FROM agent_events WHERE session_id = $1 AND operation_id = $2`,
+          [identity.rows[0].session_id, input.operationId],
+        )
+        if (replay.rows[0]) {
+          const compacted = await client.query<{
+            id: string; from_segment_id: string; to_segment_id: string
+            parent_segment_id: string | null
+            context_tokens: number; context_window: number; reserve_tokens: number
+            keep_recent_tokens: number; tokens_after: number
+            summary_json: Record<string, unknown>; usage_json: Record<string, unknown>; created_at: string
+          }>(
+            `SELECT compaction.id, compaction.from_segment_id, compaction.to_segment_id,
+                    target.parent_segment_id,
+                    compaction.context_tokens, compaction.context_window,
+                    compaction.reserve_tokens, compaction.keep_recent_tokens,
+                    compaction.tokens_after, compaction.summary_json,
+                    compaction.usage_json, compaction.created_at::text
+             FROM agent_compactions compaction
+             JOIN conversation_segments target ON target.id = compaction.to_segment_id
+             WHERE compaction.id = $1`, [input.id],
+          )
+          const attempts = await client.query<{
+            attempt: number; status: string; duration_ms: number; usage_json: unknown
+          }>(
+            `SELECT attempt, status, duration_ms, usage_json
+             FROM agent_compaction_attempts WHERE compaction_id = $1 ORDER BY attempt`, [input.id],
+          )
+          if (!compacted.rows[0] || compacted.rows[0].to_segment_id !== input.segmentId
+            || compacted.rows[0].parent_segment_id !== compacted.rows[0].from_segment_id
+            || compacted.rows[0].context_tokens !== input.contextTokens
+            || compacted.rows[0].context_window !== input.contextWindow
+            || compacted.rows[0].reserve_tokens !== input.reserveTokens
+            || compacted.rows[0].keep_recent_tokens !== input.keepRecentTokens
+            || compacted.rows[0].tokens_after !== input.tokensAfter
+            || !jsonValuesEqual(compacted.rows[0].summary_json, input.summary)
+            || !jsonValuesEqual(compacted.rows[0].usage_json, input.usage)
+            || !jsonValuesEqual(attempts.rows.map((attempt) => ({
+              attempt: attempt.attempt, status: attempt.status,
+              durationMs: attempt.duration_ms, usage: attempt.usage_json,
+            })), input.attempts)
+            || !jsonValuesEqual(replay.rows[0].payload_json, input.event)
+            || !sameInstant(compacted.rows[0].created_at, input.createdAt)) {
+            throw new Error('agent_operation_conflict')
+          }
+          await client.query('COMMIT')
+          return { created: false, event: mapAgentEventRow(replay.rows[0]), segmentId: input.segmentId }
+        }
+        const currentSegment = await client.query<{ id: string; ordinal: number }>(
+          `SELECT id, ordinal FROM conversation_segments WHERE session_id = $1
+           ORDER BY ordinal DESC LIMIT 1`, [identity.rows[0].session_id],
+        )
+        if (!currentSegment.rows[0]) throw new Error('conversation_segment_not_found')
+        const sequence = session.rows[0].latest_sequence + 1
+        await client.query(
+          `INSERT INTO conversation_segments (
+             id, session_id, ordinal, parent_segment_id, created_at
+           ) VALUES ($1, $2, $3, $4, $5)`,
+          [input.segmentId, identity.rows[0].session_id, currentSegment.rows[0].ordinal + 1,
+            currentSegment.rows[0].id, input.createdAt],
+        )
+        await client.query(
+          `INSERT INTO agent_compactions (
+             id, session_id, execution_id, from_segment_id, to_segment_id,
+             context_tokens, context_window, reserve_tokens, keep_recent_tokens,
+             tokens_after, summary_json, usage_json, created_at
+           ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+          [input.id, identity.rows[0].session_id, input.executionId, currentSegment.rows[0].id,
+            input.segmentId, input.contextTokens, input.contextWindow, input.reserveTokens,
+            input.keepRecentTokens, input.tokensAfter, JSON.stringify(input.summary),
+            JSON.stringify(input.usage), input.createdAt],
+        )
+        await insertCompactionAttempts(
+          client, input.id, identity.rows[0].session_id, input.executionId,
+          input.attempts, input.createdAt,
+        )
+        await client.query(
+          `INSERT INTO agent_events (session_id, sequence, operation_id, payload_json, created_at)
+           VALUES ($1,$2,$3,$4,$5)`,
+          [identity.rows[0].session_id, sequence, input.operationId,
+            JSON.stringify(input.event), input.createdAt],
+        )
+        await client.query(
+          `UPDATE agent_sessions SET latest_sequence = $1, updated_at = $2 WHERE id = $3`,
+          [sequence, input.createdAt, identity.rows[0].session_id],
+        )
+        await client.query('COMMIT')
+        return {
+          created: true, segmentId: input.segmentId,
+          event: {
+            sessionId: identity.rows[0].session_id, sequence, operationId: input.operationId,
+            payload: input.event, createdAt: input.createdAt,
+          },
+        }
+      } catch (error) {
+        await client.query('ROLLBACK')
+        throw error
+      } finally { client.release() }
+    },
+    async failCompaction(input: {
+      id: string; executionId: string; operationId: string
+      event: Record<string, unknown>; attempts: Array<{
+        attempt: number; status: 'failed' | 'cancelled'; durationMs: number; usage: unknown
+      }>; createdAt: string
+    }) {
+      const client = await pool.connect()
+      try {
+        await client.query('BEGIN')
+        const identity = await client.query<{ session_id: string }>(
+          `SELECT session.id AS session_id FROM agent_executions execution
+           JOIN agent_sessions session ON session.id = execution.session_id
+           WHERE execution.id = $1`, [input.executionId],
+        )
+        if (!identity.rows[0]) throw new Error('agent_execution_fenced')
+        await assertCurrentExecution(client, input.executionId)
+        const sessionId = identity.rows[0].session_id
+        const session = await client.query<{ latest_sequence: number }>(
+          'SELECT latest_sequence FROM agent_sessions WHERE id = $1 FOR UPDATE',
+          [sessionId],
+        )
+        const replay = await client.query<AgentEventRow>(
+          `SELECT session_id, sequence, operation_id, payload_json, created_at::text
+           FROM agent_events WHERE session_id = $1 AND operation_id = $2`,
+          [sessionId, input.operationId],
+        )
+        if (replay.rows[0]) {
+          const attempts = await client.query<{
+            attempt: number; status: string; duration_ms: number; usage_json: unknown
+          }>(
+            `SELECT attempt, status, duration_ms, usage_json
+             FROM agent_compaction_attempts WHERE compaction_id = $1 ORDER BY attempt`, [input.id],
+          )
+          if (!jsonValuesEqual(replay.rows[0].payload_json, input.event)
+            || !sameInstant(replay.rows[0].created_at, input.createdAt)) {
+            throw new Error('agent_operation_conflict')
+          }
+          if (!jsonValuesEqual(attempts.rows.map((attempt) => ({
+            attempt: attempt.attempt, status: attempt.status,
+            durationMs: attempt.duration_ms, usage: attempt.usage_json,
+          })), input.attempts)) throw new Error('agent_operation_conflict')
+          await client.query('COMMIT')
+          return { created: false, event: mapAgentEventRow(replay.rows[0]) }
+        }
+        await insertCompactionAttempts(
+          client, input.id, sessionId, input.executionId, input.attempts, input.createdAt,
+        )
+        const sequence = session.rows[0]!.latest_sequence + 1
+        await client.query(
+          `INSERT INTO agent_events (session_id, sequence, operation_id, payload_json, created_at)
+           VALUES ($1,$2,$3,$4,$5)`,
+          [sessionId, sequence, input.operationId, JSON.stringify(input.event), input.createdAt],
+        )
+        await client.query(
+          `UPDATE agent_sessions SET latest_sequence = $1, updated_at = $2 WHERE id = $3`,
+          [sequence, input.createdAt, sessionId],
+        )
+        await client.query('COMMIT')
+        return { created: true, event: {
+          sessionId, sequence, operationId: input.operationId,
+          payload: input.event, createdAt: input.createdAt,
+        } }
+      } catch (error) {
+        await client.query('ROLLBACK')
+        throw error
+      } finally { client.release() }
+    },
+    async recordCompactionAttempt(input: {
+      id: string; executionId: string; attempt: number
+      status: 'failed' | 'cancelled'; durationMs: number; usage: unknown; createdAt: string
+    }) {
+      const client = await pool.connect()
+      try {
+        await client.query('BEGIN')
+        const identity = await client.query<{ session_id: string }>(
+          `SELECT session.id AS session_id FROM agent_executions execution
+           JOIN agent_sessions session ON session.id = execution.session_id
+           WHERE execution.id = $1`, [input.executionId],
+        )
+        if (!identity.rows[0]) throw new Error('agent_execution_fenced')
+        await assertCurrentExecution(client, input.executionId)
+        await insertCompactionAttempts(
+          client, input.id, identity.rows[0].session_id, input.executionId, [{
+            attempt: input.attempt, status: input.status,
+            durationMs: input.durationMs, usage: input.usage,
+          }], input.createdAt, true,
+        )
+        await client.query('COMMIT')
+      } catch (error) {
+        await client.query('ROLLBACK')
+        throw error
+      } finally { client.release() }
+    },
     async interruptActiveSessions(createdAt: string) {
       const client = await pool.connect()
       try {
@@ -1971,14 +2246,18 @@ export function createAgentEventRepository(pool: Pool) {
            FROM agent_executions WHERE session_id = $1 ORDER BY generation DESC LIMIT 1`,
           [session.id],
         )
-        const segments = await client.query<{ id: string; ordinal: number; created_at: string }>(
-          `SELECT id, ordinal, created_at::text FROM conversation_segments
+        const segments = await client.query<{
+          id: string; ordinal: number; parent_segment_id: string | null; created_at: string
+        }>(
+          `SELECT id, ordinal, parent_segment_id, created_at::text FROM conversation_segments
            WHERE session_id = $1 ORDER BY ordinal`, [session.id],
         )
         const eventRows = await client.query<AgentEventRow>(
           `SELECT session_id, sequence, operation_id, payload_json, created_at::text
            FROM agent_events WHERE session_id = $1 ORDER BY sequence`, [session.id],
         )
+        const compactions = await readCompactions(client, session.id)
+        const compactionAttempts = await readCompactionAttempts(client, session.id)
         const current = execution.rows[0]
         if (!current) { await client.query('COMMIT'); return null }
         const lifecycle = {
@@ -1989,13 +2268,16 @@ export function createAgentEventRepository(pool: Pool) {
             createdAt: new Date(current.created_at).toISOString(),
             updatedAt: new Date(current.updated_at).toISOString(),
           },
-          segments: segments.rows.map((segment) => ({
-            id: segment.id, ordinal: segment.ordinal,
-            createdAt: new Date(segment.created_at).toISOString(),
+        segments: segments.rows.map((segment) => ({
+          id: segment.id, ordinal: segment.ordinal,
+          parentSegmentId: segment.parent_segment_id,
+          createdAt: new Date(segment.created_at).toISOString(),
           })),
           events: eventRows.rows.map(mapAgentEventRow).map((event) => ({
             sequence: event.sequence, createdAt: event.createdAt, ...event.payload,
           })),
+          compactions,
+          compactionAttempts,
         }
         await client.query('COMMIT')
         return lifecycle
@@ -2010,6 +2292,88 @@ export function createAgentEventRepository(pool: Pool) {
 }
 
 export type AgentEventRepository = ReturnType<typeof createAgentEventRepository>
+
+async function insertCompactionAttempts(
+  client: PoolClient, compactionId: string, sessionId: string, executionId: string,
+  attempts: Array<{
+    attempt: number; status: 'completed' | 'failed' | 'cancelled'
+    durationMs: number; usage: unknown
+  }>, createdAt: string, compareCreatedAt = false,
+) {
+  for (const attempt of attempts) {
+    const existing = await client.query<{
+      session_id: string; execution_id: string; status: string; duration_ms: number
+      usage_json: unknown; created_at: string
+    }>(
+      `SELECT session_id, execution_id, status, duration_ms, usage_json, created_at::text
+       FROM agent_compaction_attempts WHERE compaction_id = $1 AND attempt = $2`,
+      [compactionId, attempt.attempt],
+    )
+    if (existing.rows[0]) {
+      const row = existing.rows[0]
+      if (row.session_id !== sessionId || row.execution_id !== executionId
+        || row.status !== attempt.status || row.duration_ms !== attempt.durationMs
+        || !jsonValuesEqual(row.usage_json, attempt.usage)
+        || (compareCreatedAt && !sameInstant(row.created_at, createdAt))) {
+        throw new Error('agent_operation_conflict')
+      }
+      continue
+    }
+    await client.query(
+      `INSERT INTO agent_compaction_attempts (
+         compaction_id, session_id, execution_id, attempt, status, duration_ms, usage_json, created_at
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [compactionId, sessionId, executionId, attempt.attempt, attempt.status,
+        attempt.durationMs, attempt.usage == null ? null : JSON.stringify(attempt.usage), createdAt],
+    )
+  }
+}
+
+async function readCompactions(client: PoolClient, sessionId: string) {
+  const result = await client.query<{
+    id: string; from_segment_id: string; to_segment_id: string
+    summary_json: Record<string, unknown>; usage_json: Record<string, unknown>
+    created_at: string
+  }>(
+    `SELECT id, from_segment_id, to_segment_id, summary_json, usage_json, created_at::text
+     FROM agent_compactions WHERE session_id = $1 ORDER BY created_at, id`, [sessionId],
+  )
+  const attempts = await client.query<{
+    compaction_id: string; attempt: number; status: string; duration_ms: number
+    usage_json: Record<string, unknown> | null
+  }>(
+    `SELECT compaction_id, attempt, status, duration_ms, usage_json
+     FROM agent_compaction_attempts WHERE session_id = $1
+     ORDER BY created_at, compaction_id, attempt`, [sessionId],
+  )
+  return result.rows.map((compaction) => ({
+    id: compaction.id, fromSegmentId: compaction.from_segment_id,
+    toSegmentId: compaction.to_segment_id, summary: compaction.summary_json,
+    usage: compaction.usage_json,
+    attempts: attempts.rows.filter(({ compaction_id }) => compaction_id === compaction.id)
+      .map((attempt) => ({
+        attempt: attempt.attempt, status: attempt.status,
+        durationMs: attempt.duration_ms, usage: attempt.usage_json,
+      })),
+    createdAt: new Date(compaction.created_at).toISOString(),
+  }))
+}
+
+async function readCompactionAttempts(client: PoolClient, sessionId: string) {
+  const result = await client.query<{
+    compaction_id: string; attempt: number; status: string; duration_ms: number
+    usage_json: Record<string, unknown> | null; created_at: string
+  }>(
+    `SELECT compaction_id, attempt, status, duration_ms, usage_json, created_at::text
+     FROM agent_compaction_attempts WHERE session_id = $1
+     ORDER BY created_at, compaction_id, attempt`, [sessionId],
+  )
+  return result.rows.map((attempt) => ({
+    compactionId: attempt.compaction_id, attempt: attempt.attempt, status: attempt.status,
+    durationMs: attempt.duration_ms, usage: attempt.usage_json,
+    createdAt: new Date(attempt.created_at).toISOString(),
+  }))
+}
 
 async function readSessionLifecycle(pool: Pool, sessionId: string) {
   const client = await pool.connect()
@@ -2032,14 +2396,18 @@ async function readSessionLifecycle(pool: Pool, sessionId: string) {
        FROM agent_executions WHERE session_id = $1 ORDER BY generation DESC LIMIT 1`,
       [sessionId],
     )
-    const segments = await client.query<{ id: string; ordinal: number; created_at: string }>(
-      `SELECT id, ordinal, created_at::text FROM conversation_segments
+    const segments = await client.query<{
+      id: string; ordinal: number; parent_segment_id: string | null; created_at: string
+    }>(
+      `SELECT id, ordinal, parent_segment_id, created_at::text FROM conversation_segments
        WHERE session_id = $1 ORDER BY ordinal`, [sessionId],
     )
     const eventRows = await client.query<AgentEventRow>(
       `SELECT session_id, sequence, operation_id, payload_json, created_at::text
        FROM agent_events WHERE session_id = $1 ORDER BY sequence`, [sessionId],
     )
+    const compactions = await readCompactions(client, sessionId)
+    const compactionAttempts = await readCompactionAttempts(client, sessionId)
     const current = execution.rows[0]
     if (!current) { await client.query('COMMIT'); return null }
     const lifecycle = {
@@ -2051,11 +2419,14 @@ async function readSessionLifecycle(pool: Pool, sessionId: string) {
       },
       segments: segments.rows.map((segment) => ({
         id: segment.id, ordinal: segment.ordinal,
+        parentSegmentId: segment.parent_segment_id,
         createdAt: new Date(segment.created_at).toISOString(),
       })),
       events: eventRows.rows.map(mapAgentEventRow).map((event) => ({
         sequence: event.sequence, createdAt: event.createdAt, ...event.payload,
       })),
+      compactions,
+      compactionAttempts,
     }
     await client.query('COMMIT')
     return lifecycle
@@ -2753,6 +3124,36 @@ async function cancelRunningToolBatches(
     [completedAt, executionId],
   )
   return { latestSequence: sequence, events }
+}
+
+async function cancelRunningCompactionAttempts(
+  database: PoolClient, sessionId: string, executionId: string, cancelledAt: string,
+) {
+  const requests = await database.query<{
+    id: string; created_at: string; attempt: number; compaction_id: string
+  }>(
+    `SELECT request.id, request.created_at::text,
+       (regexp_match(request.id, ':compaction:[^:]+:attempt:([12])$'))[1]::integer AS attempt,
+       regexp_replace(request.id, ':attempt:[12]$', '') AS compaction_id
+     FROM model_requests request
+     WHERE request.execution_id = $1 AND request.id ~ ':compaction:[^:]+:attempt:[12]$'
+       AND NOT EXISTS (
+         SELECT 1 FROM agent_compaction_attempts attempt
+         WHERE attempt.compaction_id = regexp_replace(request.id, ':attempt:[12]$', '')
+           AND attempt.attempt = (regexp_match(request.id, ':compaction:[^:]+:attempt:([12])$'))[1]::integer
+       )
+     ORDER BY request.created_at, request.id`,
+    [executionId],
+  )
+  for (const request of requests.rows) {
+    await insertCompactionAttempts(
+      database, request.compaction_id, sessionId, executionId, [{
+        attempt: request.attempt, status: 'cancelled',
+        durationMs: Math.max(0, Date.parse(cancelledAt) - Date.parse(request.created_at)),
+        usage: null,
+      }], cancelledAt,
+    )
+  }
 }
 
 async function assertCurrentExecution(database: PoolClient, executionId: string) {

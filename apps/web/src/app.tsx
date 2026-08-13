@@ -41,18 +41,31 @@ type ResearchRecord = ResearchSummary & {
     id: string; status: string
     waitReason: { kind: string; target: string; startedAt: string } | null
     execution: { id: string; generation: number; status: string }
-    segments: Array<{ id: string; ordinal: number; createdAt: string }>
+    segments: Array<{
+      id: string; ordinal: number; parentSegmentId?: string | null; createdAt: string
+    }>
     events: Array<{
       sequence: number; type?: string; status?: string; createdAt: string
       previousExecutionId?: string; executionId?: string
+      contextTokens?: number; contextWindow?: number; reserveTokens?: number
+      keepRecentTokens?: number; durationMs?: number
+      tokensAfter?: number
+      estimated?: boolean
+      usage?: { input?: number; output?: number; totalTokens?: number }
       waitReason?: { kind: string; target: string; startedAt: string } | null
+    }>
+    compactionAttempts?: Array<{
+      compactionId: string; attempt: number; status: string; durationMs: number
+      usage: { input?: number; cacheRead?: number; cacheWrite?: number; output?: number; totalTokens?: number } | null
     }>
   }
   specialistAgents?: Array<{
     id?: string; domain: string; status?: string
     researchQuestion?: string; reason?: string
     execution?: { id: string; generation: number; status: string }
-    events?: Array<{ sequence: number; type?: string; name?: string; createdAt: string }>
+    segments?: NonNullable<ResearchRecord['mainAgent']>['segments']
+    events?: Array<NonNullable<ResearchRecord['mainAgent']>['events'][number] & { name?: string }>
+    compactionAttempts?: NonNullable<ResearchRecord['mainAgent']>['compactionAttempts']
     reportVersion?: { version: number; report: {
       gaps?: Array<{ capability?: string; reason?: string; impact?: string }>
       keyJudgments?: Array<{ statement?: string; direction?: string; confidence?: string }>
@@ -352,6 +365,8 @@ function SpecialistAgents({ agents = [] }: { agents?: ResearchRecord['specialist
       {agent.reason && <p>理由：{agent.reason}</p>}
       {agent.id && <p>Session {agent.id}</p>}
       {agent.execution && <p>Execution {agent.execution.id} · Generation {agent.execution.generation}</p>}
+      <ContextUsage agent={agent} />
+      <CompactionAttempts attempts={agent.compactionAttempts} />
       {agent.events?.some(({ type }) => type === 'tool_call') && <ol>{agent.events.filter(({ type }) => type === 'tool_call').map((event) => (
         <li key={event.sequence}>#{event.sequence} {event.name} · {formatTime(event.createdAt)}</li>
       ))}</ol>}
@@ -381,16 +396,68 @@ function AgentRuntime({ agent }: { agent?: ResearchRecord['mainAgent'] }) {
     <h2>{statusLabel(agent.status)}</h2>
     <p>Session {agent.id}</p>
     <p>Execution {agent.execution.id} · Generation {agent.execution.generation}</p>
+    <ContextUsage agent={agent} />
+    <CompactionAttempts attempts={agent.compactionAttempts} />
     {agent.waitReason && <p>等待：{agent.waitReason.target} · {formatTime(agent.waitReason.startedAt)}</p>}
-    <div>{agent.segments.map((segment) => <span key={segment.id}>Segment {segment.ordinal}</span>)}</div>
+    <div>{agent.segments.map((segment) => <span key={segment.id}>Segment {segment.ordinal}
+      {segment.parentSegmentId && <> · 源自 Segment {agent.segments.find(
+        ({ id }) => id === segment.parentSegmentId,
+      )?.ordinal ?? '?'}</>}
+    </span>)}</div>
     <ol>{agent.events.map((event) => <li key={event.sequence}>
       #{event.sequence} {event.type === 'runtime_context' ? 'Runtime Context'
-        : event.type === 'runtime_resume' ? 'Runtime Resume' : statusLabel(event.status ?? event.type ?? '')}
+        : event.type === 'runtime_resume' ? 'Runtime Resume'
+          : event.type === 'compaction' ? `Compaction ${statusLabel(event.status ?? '')}`
+            : statusLabel(event.status ?? event.type ?? '')}
       {' · '}{formatTime(event.createdAt)}
       {event.type === 'runtime_resume' && <> · 从 {event.previousExecutionId} 恢复到 {event.executionId}</>}
+      {event.type === 'compaction' && <>
+        {' · '}{event.contextTokens?.toLocaleString('zh-CN')} / {event.contextWindow?.toLocaleString('zh-CN')} Token
+        {' · '}保留 {event.reserveTokens?.toLocaleString('zh-CN')} · 近期 {event.keepRecentTokens?.toLocaleString('zh-CN')}
+        {' · '}{event.usage?.totalTokens?.toLocaleString('zh-CN')} Token
+        {typeof event.tokensAfter === 'number' && <> · 压缩后 {event.tokensAfter.toLocaleString('zh-CN')}</>}
+        {' · '}{typeof event.durationMs === 'number' ? `${(event.durationMs / 1000).toFixed(2)} 秒` : ''}
+      </>}
       {event.waitReason && <> · 等待 {event.waitReason.target}（始于 {formatTime(event.waitReason.startedAt)}）</>}
     </li>)}</ol>
   </section>
+}
+
+function ContextUsage({ agent }: {
+  agent?: {
+    segments?: NonNullable<ResearchRecord['mainAgent']>['segments']
+    events?: NonNullable<ResearchRecord['mainAgent']>['events']
+  }
+}) {
+  const raw = agent?.events?.filter(
+    ({ type }) => type === 'context_usage' || type === 'compaction',
+  ).at(-1)
+  const contextTokens = raw?.type === 'compaction' && typeof raw.tokensAfter === 'number'
+    ? raw.tokensAfter : raw?.contextTokens
+  if (!raw?.contextWindow || contextTokens === undefined || raw.reserveTokens === undefined) {
+    return null
+  }
+  const trigger = raw.contextWindow - raw.reserveTokens
+  const progress = trigger > 0 ? contextTokens / trigger : 1
+  const state = progress < .7 ? '绿色' : progress < .85 ? '黄色'
+    : progress < .95 ? '橙色' : '红色'
+  const currentSegment = agent?.segments?.at(-1)?.ordinal
+  return <p>
+    上下文 {raw.estimated ? '≈' : ''}{(contextTokens / raw.contextWindow * 100).toFixed(1)}% / {raw.contextWindow.toLocaleString('zh-CN')}
+    {' · '}距 Compaction {Math.max(0, trigger - contextTokens).toLocaleString('zh-CN')} Token
+    {' · '}{state}{currentSegment ? ` · Segment ${currentSegment}` : ''}
+  </p>
+}
+
+function CompactionAttempts({ attempts = [] }: {
+  attempts?: NonNullable<ResearchRecord['mainAgent']>['compactionAttempts']
+}) {
+  if (!attempts.length) return null
+  return <ol>{attempts.map((attempt) => <li key={`${attempt.compactionId}:${attempt.attempt}`}>
+    Compaction 尝试 {attempt.attempt} · {statusLabel(attempt.status)}
+    {' · '}{attempt.usage?.totalTokens?.toLocaleString('zh-CN') ?? 'usage 未返回'} Token
+    {' · '}{(attempt.durationMs / 1000).toFixed(2)} 秒
+  </li>)}</ol>
 }
 
 function ResearchReport({ record, onUpdate, onDelete, onResume, freshnessDays }: {

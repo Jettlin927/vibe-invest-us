@@ -27,6 +27,8 @@ const model = createPiModel({
     ? modelApiProtocol
     : undefined,
   modelName: process.env.MODEL_NAME,
+  contextWindow: process.env.MODEL_CONTEXT_WINDOW
+    ? Number(process.env.MODEL_CONTEXT_WINDOW) : undefined,
   baseUrl: process.env.MODEL_BASE_URL,
   apiKey: modelApiKey,
 })

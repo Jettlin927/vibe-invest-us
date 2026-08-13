@@ -419,3 +419,143 @@ test('Pi compaction 阈值只在 turn boundary 切换并保留到后续提交', 
   await adapter.submit(userMessage('后续提交'))
   assert.equal(seenContents[2]?.[0], 'compacted-summary')
 })
+
+test('Pi 在低于压缩阈值的安全 Turn 也报告当前上下文占用', async () => {
+  const fixture = createFixture([textMessage('完成')])
+  const usages: Array<{ contextTokens: number; contextWindow: number }> = []
+  let compactCalls = 0
+  const adapter = createPiAgentAdapter({
+    initialState: {
+      systemPrompt: 'system', model: fixture.model, messages: [], tools: [],
+    },
+    streamFn: fixture.streamFn,
+    compaction: {
+      settings: { enabled: true, reserveTokens: 1, keepRecentTokens: 1 },
+      onContextUsage: (usage) => { usages.push(usage) },
+      compact: async () => {
+        compactCalls += 1
+        return []
+      },
+    },
+  })
+  await adapter.submit(userMessage('短问题'))
+  assert.equal(usages.length, 1)
+  assert.equal(usages[0]?.contextWindow, fixture.model.contextWindow)
+  assert.ok((usages[0]?.contextTokens ?? 0) < fixture.model.contextWindow - 1)
+  assert.equal(compactCalls, 0)
+})
+
+test('Pi 上下文占用优先采用 Provider totalTokens', async () => {
+  const response = textMessage('完成')
+  response.usage = {
+    ...usage, input: 11, cacheRead: 12, cacheWrite: 13, output: 14, totalTokens: 99,
+  }
+  const fixture = createFixture([response])
+  const tokens: number[] = []
+  const adapter = createPiAgentAdapter({
+    initialState: { systemPrompt: 'system', model: fixture.model, messages: [], tools: [] },
+    streamFn: fixture.streamFn,
+    compaction: {
+      settings: { enabled: true, reserveTokens: 1, keepRecentTokens: 1 },
+      onContextUsage: ({ contextTokens }) => { tokens.push(contextTokens) },
+      compact: async () => [],
+    },
+  })
+  await adapter.submit(userMessage('问题'))
+  assert.deepEqual(tokens, [99])
+})
+
+test('Pi 在 Provider totalTokens 无效时回退包含 cacheWrite 的 usage 分项和', async () => {
+  const response = textMessage('完成')
+  response.usage = {
+    ...usage, input: 11, cacheRead: 12, cacheWrite: 13, output: 14, totalTokens: 0,
+  }
+  const fixture = createFixture([response])
+  const tokens: number[] = []
+  const adapter = createPiAgentAdapter({
+    initialState: { systemPrompt: 'system', model: fixture.model, messages: [], tools: [] },
+    streamFn: fixture.streamFn,
+    compaction: {
+      settings: { enabled: true, reserveTokens: 1, keepRecentTokens: 1 },
+      onContextUsage: ({ contextTokens }) => { tokens.push(contextTokens) },
+      compact: async () => [],
+    },
+  })
+  await adapter.submit(userMessage('问题'))
+  assert.deepEqual(tokens, [50])
+})
+
+test('Pi compaction 首次失败只重试一次且成功前不切换上下文', async () => {
+  const fixture = createFixture([
+    assistantMessage([toolCall('continue', 'call-retry')], 'toolUse'),
+    textMessage('完成'),
+  ])
+  let attempts = 0
+  const attemptNumbers: number[] = []
+  const seen: string[][] = []
+  const adapter = createPiAgentAdapter({
+    initialState: {
+      systemPrompt: 'system', model: fixture.model,
+      messages: [userMessage('旧问题'), textMessage('旧回答')],
+      tools: [textTool('continue', async () => ({
+        content: [{ type: 'text', text: 'continue' }], details: {},
+      }))],
+    },
+    streamFn: async (model, context, options) => {
+      seen.push(context.messages.map((message) => typeof message.content === 'string'
+        ? message.content : JSON.stringify(message.content)))
+      return fixture.streamFn(model, context, options)
+    },
+    compaction: {
+      settings: { enabled: true, reserveTokens: fixture.model.contextWindow, keepRecentTokens: 4 },
+      onAttempt: ({ attempt }) => { attemptNumbers.push(attempt) },
+      compact: async ({ retainedTail }) => {
+        attempts += 1
+        if (attempts === 1) throw new Error('summary_provider_failed')
+        return [userMessage('重试后的摘要'), ...retainedTail]
+      },
+    },
+  })
+  await adapter.submit(userMessage('原始内容'))
+  assert.deepEqual(attemptNumbers.slice(0, 2), [1, 2])
+  assert.ok(attempts >= 2)
+  assert.equal(seen[0]?.some((content) => content.includes('原始内容')), true)
+  assert.equal(seen[1]?.[0], '重试后的摘要')
+})
+
+test('Pi compaction 持久化失败时不重试摘要也不切换上下文', async () => {
+  const fixture = createFixture([
+    assistantMessage([toolCall('continue', 'call-commit')], 'toolUse'),
+  ])
+  let compactCalls = 0
+  let commitCalls = 0
+  const adapter = createPiAgentAdapter({
+    initialState: {
+      systemPrompt: 'system', model: fixture.model,
+      messages: [userMessage('旧问题'), textMessage('旧回答')],
+      tools: [textTool('continue', async () => ({
+        content: [{ type: 'text', text: 'continue' }], details: {},
+      }))],
+    },
+    streamFn: fixture.streamFn,
+    compaction: {
+      settings: { enabled: true, reserveTokens: fixture.model.contextWindow, keepRecentTokens: 4 },
+      compact: async ({ retainedTail }) => {
+        compactCalls += 1
+        return [userMessage('不应生效的摘要'), ...retainedTail]
+      },
+      commit: async () => {
+        commitCalls += 1
+        throw new Error('compaction_commit_failed')
+      },
+    },
+  })
+  await adapter.submit(userMessage('原始内容'))
+  await adapter.waitForIdle()
+  assert.equal(compactCalls, 1)
+  assert.equal(commitCalls, 1)
+  assert.match(adapter.snapshot().errorMessage ?? '', /compaction_commit_failed/)
+  assert.equal(adapter.snapshot().messages.some((message) => (
+    typeof message.content === 'string' && message.content.includes('不应生效的摘要')
+  )), false)
+})

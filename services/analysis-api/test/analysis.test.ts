@@ -1478,9 +1478,11 @@ test('用户手动恢复 stopped 研究会复用主 Session 并创建新 executi
           return
         }
         const resume = input.runtimeResume?.content as {
+          compactionSummary?: Record<string, unknown>
           reusableToolResults?: Array<{ toolName: string; factIds: string[] }>
           unresolved?: Array<{ kind: string; id: string; status: string }>
         }
+        assert.equal(resume.compactionSummary?.narrative, '保留旧 execution 的研究上下文', JSON.stringify(resume))
         assert.deepEqual(resume.reusableToolResults, [{
           toolName: 'fetch_financial_context', factIds: [toolFact.id],
           modelProjection: { facts: [toolFact] },
@@ -1533,6 +1535,21 @@ test('用户手动恢复 stopped 研究会复用主 Session 并创建新 executi
   await completeSourceBatch(
     `${originalExecutionId}:failed-batch`, 'failed', { error: 'source_timeout', facts: [] }, true,
   )
+  await database.agentEventRepository.commitCompaction({
+    id: `${originalExecutionId}:compaction:1`, executionId: originalExecutionId,
+    segmentId: `${originalExecutionId}:segment:2`,
+    operationId: `${originalExecutionId}:compaction:1:completed`,
+    event: { type: 'compaction', status: 'completed', tokensAfter: 2000 },
+    contextTokens: 120000, contextWindow: 128000, reserveTokens: 16384,
+    keepRecentTokens: 20000, tokensAfter: 2000,
+    summary: { narrative: '保留旧 execution 的研究上下文', isReportEvidence: false },
+    usage: { input: 100, output: 20, totalTokens: 120 },
+    attempts: [{
+      attempt: 1, status: 'completed', durationMs: 20,
+      usage: { input: 100, output: 20, totalTokens: 120 },
+    }],
+    createdAt: new Date().toISOString(),
+  })
   assert.equal((await app.inject({
     method: 'POST', url: `/api/analyses/${created.analysisId}/cancel`,
   })).statusCode, 202)

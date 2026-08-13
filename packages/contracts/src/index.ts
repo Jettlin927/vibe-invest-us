@@ -45,7 +45,7 @@ export const defaultRuntimeSettings = {
   toolConcurrency: 8,
   modelRequestTimeoutMinutes: 15,
   reportFreshnessDays: 7,
-  compactionReserveTokens: 20_000,
+  compactionReserveTokens: 16_384,
 } as const
 
 export type RuntimeSettings = {

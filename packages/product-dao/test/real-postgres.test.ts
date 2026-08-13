@@ -299,7 +299,7 @@ test('真实 PostgreSQL 持久化 Tool Projection 版本、模型请求与批次
   }
 })
 
-test('真实 PostgreSQL v19 接受技术面 Tool Projection 角色', {
+test('真实 PostgreSQL v21 接受技术面 Tool Projection 角色', {
   skip: !migrationUrl || !applicationUrl,
   concurrency: false,
 }, async () => {
@@ -325,7 +325,7 @@ test('真实 PostgreSQL v19 接受技术面 Tool Projection 角色', {
       createdAt: '2026-08-14T00:00:01.000Z',
     })
     assert.equal(projection.role, 'technical')
-    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 19 })
+    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 21 })
   } finally {
     const cleanup = createPool(migrationUrl!)
     await cleanup.query('DELETE FROM analyses WHERE id = $1', [analysisId])
@@ -605,6 +605,142 @@ test('真实 PostgreSQL 原子创建主 Session、execution generation、初始 
        VALUES ($1, $2, 2, 'running_model', $3, $3)`,
       [`budget-terminal-${crypto.randomUUID()}`, sessionId, createdAt],
     )
+  } finally {
+    await createAnalysisRepository(pool).removeResearch(analysisId)
+    await pool.end()
+  }
+})
+
+test('真实 PostgreSQL 原子保存 Compaction 事件、usage 与链接的新 segment', {
+  skip: !migrationUrl || !applicationUrl,
+  concurrency: false,
+}, async () => {
+  await migrate(migrationUrl!)
+  const pool = createPool(applicationUrl!)
+  const events = createAgentEventRepository(pool)
+  const analysisId = `compaction-${crypto.randomUUID()}`
+  const sessionId = `compaction-session-${crypto.randomUUID()}`
+  const executionId = `compaction-execution-${crypto.randomUUID()}`
+  const initialSegmentId = `compaction-segment-${crypto.randomUUID()}`
+  const nextSegmentId = `compaction-segment-${crypto.randomUUID()}`
+  try {
+    await events.createResearch({
+      analysisId, sessionId, executionId, segmentId: initialSegmentId,
+      symbol: `C${crypto.randomUUID().replaceAll('-', '').slice(0, 8)}`,
+      status: 'planning', analysisStatus: 'queued', operationId: 'compaction-context',
+      event: { type: 'runtime_context', status: 'planning' },
+      createdAt: '2026-08-14T01:00:00.000Z',
+    })
+    const input = {
+      id: `compaction-${crypto.randomUUID()}`, executionId, segmentId: nextSegmentId,
+      operationId: 'compaction-success:1',
+      event: {
+        type: 'compaction', status: 'completed', attempt: 1,
+        fromSegmentId: initialSegmentId, toSegmentId: nextSegmentId,
+        contextTokens: 120_000, contextWindow: 128_000,
+        reserveTokens: 16_384, keepRecentTokens: 20_000,
+      },
+      contextTokens: 120_000, contextWindow: 128_000,
+      reserveTokens: 16_384, keepRecentTokens: 20_000, tokensAfter: 18_000,
+      summary: {
+        goal: '形成综合报告', decisions: ['启动消息专项'], reportVersions: [],
+        specialistStatuses: [], factIds: ['fact:one'], unresolved: ['目标价输入缺失'],
+        personalContext: { position: 'held' },
+      },
+      usage: { input: 1000, output: 100, totalTokens: 1100 },
+      attempts: [{
+        attempt: 1, status: 'completed' as const, durationMs: 250,
+        usage: { input: 1000, output: 100, totalTokens: 1100 },
+      }],
+      createdAt: '2026-08-14T01:00:01.000Z',
+    }
+    const committed = await events.commitCompaction(input)
+    assert.equal(committed.created, true)
+    const replayed = await events.commitCompaction(input)
+    assert.equal(replayed.created, false)
+    await assert.rejects(events.commitCompaction({
+      ...input, contextTokens: input.contextTokens + 1,
+    }), /agent_operation_conflict/)
+    const lifecycle = await events.primaryLifecycle(analysisId)
+    assert.deepEqual(lifecycle?.segments.map(({ id, ordinal, parentSegmentId }) => ({
+      id, ordinal, parentSegmentId,
+    })), [
+      { id: initialSegmentId, ordinal: 1, parentSegmentId: null },
+      { id: nextSegmentId, ordinal: 2, parentSegmentId: initialSegmentId },
+    ])
+    assert.equal(lifecycle?.events.at(-1)?.type, 'compaction')
+    assert.deepEqual(lifecycle?.compactions.at(-1)?.summary, input.summary)
+    assert.equal(lifecycle?.compactionAttempts.at(-1)?.usage.totalTokens, 1100)
+    const failedInput = {
+      id: `failed-compaction-${crypto.randomUUID()}`, executionId,
+      operationId: 'compaction-failed:1',
+      event: { type: 'compaction', status: 'failed', attempts: 1 },
+      attempts: [{ attempt: 1, status: 'failed' as const, durationMs: 10, usage: null }],
+      createdAt: '2026-08-14T01:00:02.000Z',
+    }
+    await events.failCompaction(failedInput)
+    assert.equal((await events.failCompaction(failedInput)).created, false)
+    await assert.rejects(events.failCompaction({
+      ...failedInput, createdAt: '2026-08-14T01:00:03.000Z',
+    }), /agent_operation_conflict/)
+    const row = await pool.query<{
+      summary_json: Record<string, unknown>; usage_json: Record<string, unknown>
+    }>('SELECT summary_json, usage_json FROM agent_compactions WHERE id = $1', [input.id])
+    assert.deepEqual(row.rows[0]?.summary_json, input.summary)
+    assert.deepEqual(row.rows[0]?.usage_json, input.usage)
+  } finally {
+    await createAnalysisRepository(pool).removeResearch(analysisId)
+    await pool.end()
+  }
+})
+
+test('真实 PostgreSQL tree fence 原子封存进行中的 Compaction attempt 为 cancelled', {
+  skip: !migrationUrl || !applicationUrl,
+  concurrency: false,
+}, async () => {
+  await migrate(migrationUrl!)
+  const pool = createPool(applicationUrl!)
+  const events = createAgentEventRepository(pool)
+  const projections = createToolProjectionRepository(pool)
+  const analysisId = `compaction-cancel-${crypto.randomUUID()}`
+  const sessionId = `compaction-cancel-session-${crypto.randomUUID()}`
+  const executionId = `compaction-cancel-execution-${crypto.randomUUID()}`
+  try {
+    await events.createResearch({
+      analysisId, sessionId, executionId, segmentId: `segment-${crypto.randomUUID()}`,
+      symbol: `X${crypto.randomUUID().replaceAll('-', '').slice(0, 8)}`,
+      status: 'planning', analysisStatus: 'queued', operationId: 'runtime-context',
+      event: { type: 'runtime_context' }, createdAt: '2026-08-14T02:00:00.000Z',
+    })
+    const projection = await projections.ensureVersion({
+      executionId, role: 'main', stage: 'research', schemaHash: 'compaction-cancel',
+      projectedTools: [], visibleToolNames: [], reasons: { stage: 'research' },
+      createdAt: '2026-08-14T02:00:00.100Z',
+    })
+    const requestId = `execution:${executionId}:main:compaction:1:attempt:1`
+    await projections.recordModelRequest({
+      id: requestId, executionId, projectionId: projection.id, turnIndex: 1,
+      createdAt: '2026-08-14T02:00:01.000Z',
+    })
+    await events.fenceForStopping({
+      sessionId, executionId, fenceExecutionId: `fence-${crypto.randomUUID()}`,
+      operationId: 'compaction-cancel-stopping',
+      event: { type: 'status', status: 'stopping' },
+      createdAt: '2026-08-14T02:00:02.250Z',
+    })
+    const lifecycle = await events.primaryLifecycle(analysisId)
+    assert.deepEqual(lifecycle?.compactionAttempts.map((attempt) => ({
+      id: attempt.compactionId, attempt: attempt.attempt, status: attempt.status,
+      durationMs: attempt.durationMs, usage: attempt.usage,
+    })), [{
+      id: requestId.replace(/:attempt:1$/, ''), attempt: 1,
+      status: 'cancelled', durationMs: 1250, usage: null,
+    }])
+    await assert.rejects(events.recordCompactionAttempt({
+      id: requestId.replace(/:attempt:1$/, ''), executionId, attempt: 1,
+      status: 'cancelled', durationMs: 1250, usage: null,
+      createdAt: '2026-08-14T02:00:02.250Z',
+    }), /agent_execution_fenced/)
   } finally {
     await createAnalysisRepository(pool).removeResearch(analysisId)
     await pool.end()
@@ -1242,7 +1378,7 @@ test('真实 PostgreSQL migration 幂等且 application role 没有 DDL 权限',
   await migrate(migrationUrl!)
 
   const pool = createPool(applicationUrl!)
-  assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 19 })
+  assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 21 })
   const privileges = await pool.query<{ can_create: boolean; can_temp: boolean }>(
     `SELECT has_schema_privilege(current_user, 'public', 'CREATE') AS can_create,
             has_database_privilege(current_user, current_database(), 'TEMP') AS can_temp`,
@@ -1299,7 +1435,7 @@ test('真实 PostgreSQL migration receipt 为空时按 max=0 升级', {
     )
     await pool.query('DELETE FROM product_schema_migrations')
     await migrate(migrationUrl!)
-    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 19 })
+    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 21 })
     assert.deepEqual((await pool.query<{ sequence: number; provenance: string }>(
       `SELECT sequence, provenance FROM tool_event_migration_provenance WHERE session_id = $1`,
       [sessionId],
@@ -1329,7 +1465,7 @@ test('真实 PostgreSQL 拒绝未发布的 schema 13、14、15 候选状态', {
       )).rows, [{ version }])
       await pool.query(
         `INSERT INTO product_schema_migrations (version)
-         SELECT generate_series($1, 19) ON CONFLICT (version) DO NOTHING`,
+         SELECT generate_series($1, 20) ON CONFLICT (version) DO NOTHING`,
         [version + 1],
       )
     }
@@ -1366,23 +1502,23 @@ test('真实 PostgreSQL 拒绝未来 schema 且不修改数据库', {
   })
   try {
     await pool.query('DROP TABLE tool_event_migration_provenance')
-    await pool.query('INSERT INTO product_schema_migrations (version) VALUES (20)')
+    await pool.query('INSERT INTO product_schema_migrations (version) VALUES (22)')
     const before = await fingerprint()
 
     await assert.rejects(
       migrate(migrationUrl!),
-      /product_schema_future_version_unsupported:20/,
+      /product_schema_future_version_unsupported:22/,
     )
 
     assert.deepEqual(await fingerprint(), before)
   } finally {
-    await pool.query('DELETE FROM product_schema_migrations WHERE version = 20')
+    await pool.query('DELETE FROM product_schema_migrations WHERE version = 22')
     await migrate(migrationUrl!)
     await pool.end()
   }
 })
 
-test('真实 PostgreSQL v12 无 Tool Batch 的历史工具事件原样升级到 v19', {
+test('真实 PostgreSQL v12 无 Tool Batch 的历史工具事件原样升级到 v21', {
   skip: !migrationUrl,
   concurrency: false,
 }, async () => {
@@ -1426,7 +1562,7 @@ test('真实 PostgreSQL v12 无 Tool Batch 的历史工具事件原样升级到 
 
     await migrate(migrationUrl!)
 
-    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 19 })
+    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 21 })
     assert.deepEqual((await pool.query<{ sequence: number; provenance: string }>(
       `SELECT sequence, provenance FROM tool_event_migration_provenance
        WHERE session_id = $1 ORDER BY sequence`, [sessionId],

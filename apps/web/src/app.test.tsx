@@ -272,6 +272,61 @@ test('研究页展示主 Agent、execution、conversation segment、waitReason �
   assert.match(runtime.textContent ?? '', /等待 首次研究初始化/)
 })
 
+test('研究页展示 Compaction token usage 耗时与链接的新 Segment', async () => {
+  setupDom()
+  const record = {
+    id: 'compact-ui', symbol: 'NVDA', status: 'completed',
+    createdAt: '2026-08-14T01:00:00.000Z', report: null, facts: [], trace: [],
+    mainAgent: {
+      id: 'compact-session', status: 'completed', waitReason: null,
+      execution: { id: 'compact-execution', generation: 1, status: 'completed' },
+      segments: [
+        { id: 'segment-1', ordinal: 1, parentSegmentId: null, createdAt: '2026-08-14T01:00:00Z' },
+        { id: 'segment-2', ordinal: 2, parentSegmentId: 'segment-1', createdAt: '2026-08-14T01:01:00Z' },
+      ],
+      events: [{
+        sequence: 1, type: 'context_usage', createdAt: '2026-08-14T01:00:59Z',
+        contextTokens: 18000, contextWindow: 128000, reserveTokens: 16384,
+        keepRecentTokens: 20000, estimated: true,
+      }, {
+        sequence: 2, type: 'compaction', status: 'completed', createdAt: '2026-08-14T01:01:00Z',
+        contextTokens: 120000, contextWindow: 128000, reserveTokens: 16384,
+        keepRecentTokens: 20000, tokensAfter: 18000, estimated: true, durationMs: 1250,
+        usage: { input: 1000, output: 100, totalTokens: 1100 },
+      }],
+      compactionAttempts: [{
+        compactionId: 'compact-1', attempt: 1, status: 'failed', durationMs: 500,
+        usage: { input: 500, output: 20, totalTokens: 520 },
+      }, {
+        compactionId: 'compact-1', attempt: 2, status: 'completed', durationMs: 750,
+        usage: { input: 1000, output: 100, totalTokens: 1100 },
+      }],
+    },
+  }
+  globalThis.fetch = async (input) => {
+    const url = String(input)
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok' }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/settings') return Response.json({ ...settingsResponse(), model: { configured: true } })
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+    if (url === '/api/portfolio') return Response.json(portfolioResponse([]))
+    if (url === '/api/research') return Response.json({ records: [{ id: record.id, symbol: record.symbol, status: record.status, createdAt: record.createdAt }] })
+    if (url === '/api/research/compact-ui') return Response.json(record)
+    throw new Error(`unexpected_fetch:${url}`)
+  }
+  const view = render(React.createElement(App))
+  const user = userEvent.setup({ document: window.document })
+  await user.click(await view.findByRole('button', { name: '新建分析' }))
+  await user.click(await view.findByRole('button', { name: /打开 NVDA/ }))
+  const runtime = await view.findByRole('region', { name: '主 Agent Runtime' })
+  assert.match(runtime.textContent ?? '', /Segment 2.*源自 Segment 1/)
+  assert.match(runtime.textContent ?? '', /Compaction.*120,000.*128,000/)
+  assert.match(runtime.textContent ?? '', /保留 16,384.*近期 20,000/)
+  assert.match(runtime.textContent ?? '', /1,100 Token.*压缩后 18,000.*1\.25 秒/)
+  assert.match(runtime.textContent ?? '', /上下文 ≈14\.1%.*距 Compaction 93,616 Token.*绿色.*Segment 2/)
+  assert.match(runtime.textContent ?? '', /Compaction 尝试 1.*失败.*520 Token.*0\.50 秒/)
+  assert.match(runtime.textContent ?? '', /Compaction 尝试 2.*完成.*1,100 Token.*0\.75 秒/)
+})
+
 test('研究页只允许手动恢复 stopped 或 interrupted 记录', async () => {
   setupDom()
   Reflect.deleteProperty(globalThis, 'EventSource')
@@ -860,7 +915,7 @@ test('设置页展示当前、默认、修改时间与运行 execution 冻结值
   await view.findByText('当前 revision #2')
   await view.findByText(/上次修改：2026年8月13日 11:00/)
   await view.findByText(/运行 execution execution-1/)
-  await view.findByText(/主 Agent 20 轮.*墙钟 45 分钟.*研究\/模型\/工具并发 2\/4\/8.*Freshness 7 天.*Compaction 保留 20,000 Token/)
+  await view.findByText(/主 Agent 20 轮.*墙钟 45 分钟.*研究\/模型\/工具并发 2\/4\/8.*Freshness 7 天.*Compaction 保留 16,384 Token/)
   const rounds = view.getByRole('spinbutton', { name: '主 Agent 轮次' })
   assert.equal((rounds as HTMLInputElement).value, '100')
   assert.equal((rounds as HTMLInputElement).max, '500')

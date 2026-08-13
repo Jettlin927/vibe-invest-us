@@ -166,6 +166,23 @@ export function createAnalysisService(options: {
       return { projection: completed.projection
         ? { id: completed.projection.id, version: completed.projection.version } : undefined }
     },
+    async commitCompaction(input) {
+      const committed = await options.eventRepository.commitCompaction(input)
+      if (committed.event) {
+        for (const listener of listeners.get(committed.event.sessionId) ?? []) {
+          listener(committed.event)
+        }
+      }
+    },
+    async failCompaction(input) {
+      const committed = await options.eventRepository.failCompaction(input)
+      if (committed.event) for (const listener of listeners.get(committed.event.sessionId) ?? []) {
+        listener(committed.event)
+      }
+    },
+    async recordCompactionAttempt(input) {
+      await options.eventRepository.recordCompactionAttempt(input)
+    },
   }
 
   async function appendEvent(
@@ -500,6 +517,7 @@ export function createAnalysisService(options: {
           role: 'runtime_resume', generatedBy: 'product_runtime', isUserInput: false,
           content: {
             previousExecutionId: previous,
+            ...latestCompactionSummary(lifecycle),
             reusableToolResults: reusableResults(
               [replay], knownFactIds, modelContext.facts,
               domain === 'fundamental_valuation' ? 'fundamental' : domain,
@@ -514,6 +532,7 @@ export function createAnalysisService(options: {
         isUserInput: false as const,
         content: {
           previousExecutionId, executionId,
+          ...latestCompactionSummary(currentLifecycle),
           reusableToolResults, reusableSpecialistReports,
           unresolved: unresolvedResults(previousRuntimes),
         },
@@ -638,7 +657,7 @@ export function createAnalysisService(options: {
               }, specialistEvent.waitTarget,
             )
             else if (specialistEvent.type === 'trace'
-              && (specialistEvent.entry.type !== 'tool_result'
+              && (!['tool_result', 'compaction', 'context_usage'].includes(specialistEvent.entry.type)
                 || typeof specialistEvent.entry.operationId !== 'string')) {
               await appendTrace(specialistSessionId, specialistExecutionId, specialistEvent.entry)
             }
@@ -825,7 +844,8 @@ export function createAnalysisService(options: {
           lifecycleStatus = event.status
         }
         else if (event.type === 'trace') {
-          if (event.entry.type === 'tool_result' && typeof event.entry.operationId === 'string') continue
+          if (['tool_result', 'compaction', 'context_usage'].includes(event.entry.type)
+            && typeof event.entry.operationId === 'string') continue
           await appendTrace(sessionId, executionId, event.entry.operationId ? event.entry : {
             ...event.entry, operationId: nextModelOperationId(event.entry.type),
           })
@@ -1266,6 +1286,14 @@ function finalReportVersion(
     payloadHash,
     report: payload,
   }
+}
+
+function latestCompactionSummary(lifecycle: unknown) {
+  const compactions = (lifecycle as {
+    compactions?: Array<{ summary?: Record<string, unknown> }>
+  } | null | undefined)?.compactions
+  const summary = compactions?.at(-1)?.summary
+  return summary ? { compactionSummary: summary } : {}
 }
 
 function specialistResultProjection(report: Record<string, unknown>, fallbackSummary: string) {

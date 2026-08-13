@@ -166,12 +166,41 @@ type CreatePiAgentAdapterOptions = {
   commitToolProjection?: PiToolProjectionCommit
   compaction?: {
     settings: { enabled: boolean; reserveTokens: number; keepRecentTokens: number }
+    allowed?: () => boolean
+    onContextUsage?: (input: {
+      contextTokens: number; contextWindow: number
+      reserveTokens: number; keepRecentTokens: number; estimated: boolean
+    }, signal?: AbortSignal) => Promise<void> | void
     compact: (input: {
       messagesToSummarize: PiAgentAdapterMessage[]
       turnPrefixMessages: PiAgentAdapterMessage[]
       retainedTail: PiAgentAdapterMessage[]
       isSplitTurn: boolean
     }, signal?: AbortSignal) => Promise<PiAgentAdapterMessage[]>
+    shouldRetry?: (error: unknown) => boolean
+    commit?: (input: {
+      compactedMessages: PiAgentAdapterMessage[]
+      messagesToSummarize: PiAgentAdapterMessage[]
+      turnPrefixMessages: PiAgentAdapterMessage[]
+      retainedTail: PiAgentAdapterMessage[]
+      isSplitTurn: boolean
+      contextTokens: number
+      tokensAfter: number
+      contextWindow: number
+      reserveTokens: number
+      keepRecentTokens: number
+    }, signal?: AbortSignal) => Promise<void> | void
+    onAttempt?: (input: {
+      attempt: 1 | 2; contextTokens: number; contextWindow: number
+      reserveTokens: number; keepRecentTokens: number
+    }, signal?: AbortSignal) => Promise<void> | void
+    onAttemptFailure?: (input: {
+      attempt: 1 | 2; durationMs: number; error: unknown
+    }, signal?: AbortSignal) => Promise<void> | void
+    onFatalFailure?: (error: unknown, signal?: AbortSignal) => Promise<void> | void
+    onFailure?: (
+      error: AggregateError, signal?: AbortSignal,
+    ) => Promise<{ tools?: PiAgentAdapterTool[] } | void> | { tools?: PiAgentAdapterTool[] } | void
   }
 }
 
@@ -247,19 +276,80 @@ export function createPiAgentAdapter(options: CreatePiAgentAdapterOptions) {
       }
       const persistedProjection = await options.commitToolProjection?.(copyBoundaryState(nextState), signal)
       if (persistedProjection) nextState.tools = [...persistedProjection.tools]
-      if (options.compaction && shouldCompact(
-        estimateContextTokens(toPiMessages(nextState.messages)).tokens,
+      const contextTokens = estimateContextTokens(toPiMessages(nextState.messages)).tokens
+      const latestAssistant = [...nextState.messages].reverse().find(
+        (message) => message.role === 'assistant',
+      )
+      const reportedTotal = latestAssistant?.role === 'assistant'
+        ? latestAssistant.usage.totalTokens : 0
+      const providerTokens = Number.isFinite(reportedTotal) && reportedTotal > 0
+        ? reportedTotal
+        : latestAssistant?.role === 'assistant'
+          ? latestAssistant.usage.input + latestAssistant.usage.cacheRead
+            + latestAssistant.usage.cacheWrite + latestAssistant.usage.output
+          : 0
+      const measuredContextTokens = providerTokens > 0 ? providerTokens : contextTokens
+      const compactionAllowed = options.compaction?.allowed?.() ?? true
+      const compactionRequired = Boolean(options.compaction && compactionAllowed && shouldCompact(
+        measuredContextTokens,
         nextState.model.contextWindow,
         options.compaction.settings,
-      )) {
+      ))
+      if (options.compaction && compactionAllowed) await options.compaction.onContextUsage?.({
+        contextTokens: measuredContextTokens, contextWindow: nextState.model.contextWindow,
+        reserveTokens: options.compaction.settings.reserveTokens,
+        keepRecentTokens: options.compaction.settings.keepRecentTokens,
+        estimated: providerTokens <= 0,
+      }, signal)
+      if (options.compaction && compactionRequired) {
         const preparation = prepareCompaction(toCompactionEntries(nextState.messages), options.compaction.settings)
         if (preparation.ok && preparation.value) {
-          nextState.messages = await options.compaction.compact({
+          const compactInput = {
             messagesToSummarize: fromPiMessages(preparation.value.messagesToSummarize as Message[]),
             turnPrefixMessages: fromPiMessages(preparation.value.turnPrefixMessages as Message[]),
             retainedTail: fromPiMessages(preparation.value.retainedTail as Message[]),
             isSplitTurn: preparation.value.isSplitTurn,
-          }, signal)
+          }
+          let compacted: PiAgentAdapterMessage[] | undefined
+          let firstError: unknown
+          for (const attempt of [1, 2] as const) {
+            const attemptStartedAt = Date.now()
+            try {
+              await options.compaction.onAttempt?.({
+                attempt, contextTokens: measuredContextTokens,
+                contextWindow: nextState.model.contextWindow,
+                reserveTokens: options.compaction.settings.reserveTokens,
+                keepRecentTokens: options.compaction.settings.keepRecentTokens,
+              }, signal)
+              compacted = await options.compaction.compact(compactInput, signal)
+              break
+            } catch (error) {
+              await options.compaction.onAttemptFailure?.({
+                attempt, durationMs: Date.now() - attemptStartedAt, error,
+              }, signal)
+              if (!(options.compaction.shouldRetry?.(error) ?? true)) {
+                await options.compaction.onFatalFailure?.(error, signal)
+                throw error
+              }
+              firstError ??= error
+            }
+          }
+          if (!compacted) {
+            const failure = new AggregateError([firstError], 'compaction_failed_after_retry')
+            if (!options.compaction.onFailure) throw failure
+            const fallback = await options.compaction.onFailure(failure, signal)
+            if (fallback?.tools) nextState.tools = [...fallback.tools]
+          } else {
+            await options.compaction.commit?.({
+              ...compactInput, compactedMessages: compacted,
+              contextTokens: measuredContextTokens,
+              tokensAfter: estimateContextTokens(toPiMessages(compacted)).tokens,
+              contextWindow: nextState.model.contextWindow,
+              reserveTokens: options.compaction.settings.reserveTokens,
+              keepRecentTokens: options.compaction.settings.keepRecentTokens,
+            }, signal)
+            nextState.messages = compacted
+          }
         }
       }
       activeModel = nextState.model

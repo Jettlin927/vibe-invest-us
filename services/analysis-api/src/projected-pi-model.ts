@@ -2,7 +2,7 @@ import {
   createModels, createProvider, fauxProvider, contentText, validateToolCall,
   type Api, type FauxResponseStep, type Model, type Tool,
 } from '@earendil-works/pi-ai'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { openAICompletionsApi } from '@earendil-works/pi-ai/api/openai-completions.lazy'
 import { openAIResponsesApi } from '@earendil-works/pi-ai/api/openai-responses.lazy'
 import type { RuntimeSettings } from '@vibe-invest/contracts'
@@ -42,6 +42,14 @@ type Batch = {
 }
 
 const unavailableToolName = 'tool_not_available'
+
+class CompactionGenerationError extends Error {
+  readonly usage: unknown
+  constructor(cause: unknown, usage: unknown = null) {
+    super('compaction_generation_failed', { cause })
+    this.usage = usage
+  }
+}
 
 export function createProjectedPiModel(options: ModelOptions = {}) {
   const modelGate = createConcurrencyGate()
@@ -742,6 +750,23 @@ async function runProjectedAgent(config: {
   let lastAssistantHadCalls = false
   let modelEventIndex = 0
   let textDeltaIndex = 0
+  let compactionIndex = 0
+  let compactionDisabled = false
+  let compactionAttempt: 1 | 2 = 1
+  let compactionAttemptResults: Array<{ attempt: number; durationMs: number; usage: unknown }> = []
+  let pendingCompaction: {
+    id: string
+    segmentId: string
+    operationId: string
+    event: Record<string, unknown>
+    summary: Record<string, unknown>
+    usage: Record<string, unknown>
+    createdAt: string
+  } | undefined
+  let compactionMetrics = {
+    contextTokens: 0, contextWindow: config.provider.model.contextWindow,
+    reserveTokens: config.settings.compactionReserveTokens, keepRecentTokens: 20_000,
+  }
   let visibleTools = [...config.initialTools]
   const callStartedAt = new Map<string, string>()
   let adapter: ReturnType<typeof createPiAgentAdapter>
@@ -1006,6 +1031,197 @@ async function runProjectedAgent(config: {
       return { tools: projectedTools() }
     },
     commitToolProjection: async ({ tools }) => ({ tools }),
+    compaction: {
+      settings: {
+        enabled: true, reserveTokens: config.settings.compactionReserveTokens,
+        keepRecentTokens: 20_000,
+      },
+      allowed: () => !compactionDisabled && !completedReport && !finalText,
+      onContextUsage: async (metrics) => {
+        const usageEvent = {
+          type: 'context_usage', ...metrics,
+          operationId: `execution:${input.executionId}:${config.role}:turn:${turnIndex}:context-usage`,
+        } as Extract<ModelEvent, { type: 'trace' }>['entry']
+        await prepareProjection(visibleTools, usageEvent)
+        config.queue.push(trace(usageEvent))
+      },
+      shouldRetry: (error) => error instanceof CompactionGenerationError,
+      onAttempt: (metrics) => {
+        if (metrics.attempt === 1) {
+          compactionIndex += 1
+          compactionAttemptResults = []
+        }
+        compactionAttempt = metrics.attempt
+        compactionMetrics = metrics
+      },
+      onAttemptFailure: async ({ attempt, durationMs, error }) => {
+        const result = {
+          attempt, durationMs,
+          usage: error instanceof CompactionGenerationError ? error.usage : null,
+        }
+        compactionAttemptResults.push(result)
+        if (!input.toolRuntime?.recordCompactionAttempt) {
+          throw new Error('compaction_attempt_commit_required')
+        }
+        try {
+          await input.toolRuntime.recordCompactionAttempt({
+            id: `execution:${input.executionId}:${config.role}:compaction:${compactionIndex}`,
+            executionId: input.executionId, ...result,
+            status: config.executionSignal.aborted ? 'cancelled' : 'failed',
+            createdAt: new Date().toISOString(),
+          })
+        } catch (auditError) {
+          if (!(config.executionSignal.aborted && auditError instanceof Error
+            && auditError.message === 'agent_execution_fenced')) throw auditError
+        }
+      },
+      onFatalFailure: async () => {
+        if (!input.toolRuntime?.failCompaction) throw new Error('compaction_failure_commit_required')
+        const operationId = `execution:${input.executionId}:${config.role}:compaction:${compactionIndex}:fatal`
+        const event = {
+          type: 'compaction', status: 'failed', attempts: compactionAttemptResults.length,
+          contextTokens: compactionMetrics.contextTokens,
+          contextWindow: compactionMetrics.contextWindow,
+          reserveTokens: compactionMetrics.reserveTokens,
+          keepRecentTokens: compactionMetrics.keepRecentTokens,
+          attemptResults: compactionAttemptResults, operationId,
+        }
+        await input.toolRuntime.failCompaction({
+          id: `execution:${input.executionId}:${config.role}:compaction:${compactionIndex}`,
+          executionId: input.executionId, operationId, event,
+          attempts: compactionAttemptResults.map((attempt) => ({
+            ...attempt, status: 'failed' as const,
+          })), createdAt: new Date().toISOString(),
+        })
+        config.queue.push(trace(event as Extract<ModelEvent, { type: 'trace' }>['entry']))
+      },
+      compact: async (cut, signal) => {
+        if (!input.toolRuntime?.commitCompaction) throw new Error('compaction_commit_required')
+        const startedAt = new Date().toISOString()
+        const requestId = `execution:${input.executionId}:${config.role}:compaction:${compactionIndex}:attempt:${compactionAttempt}`
+        await input.toolRuntime.recordModelRequest({
+          requestId, executionId: input.executionId, projectionId: activeProjection.id,
+          turnIndex: Math.max(1, turnIndex), createdAt: startedAt,
+        })
+        const request = await beginBudgetedModelRequest(config, config.role !== 'main')
+        let compacted: { narrative: string; usage: Record<string, unknown> }
+        try {
+          compacted = config.options.compact
+            ? await config.options.compact({ ...cut, signal: request.signal })
+            : await compactWithProvider(config.provider, cut, request.signal)
+        } catch (error) {
+          const normalized = request.normalizeError(error)
+          if (request.signal.aborted || isPolicyFailure(normalized)) throw normalized
+          throw normalized instanceof CompactionGenerationError
+            ? normalized : new CompactionGenerationError(normalized)
+        } finally { request.finish() }
+        const summary = compactionSummaryContract(
+          config.role, config.userPrompt, input,
+          [...cut.messagesToSummarize, ...cut.turnPrefixMessages, ...cut.retainedTail],
+          compacted.narrative,
+        )
+        const segmentId = randomUUID()
+        const completedAt = new Date().toISOString()
+        const operationId = `execution:${input.executionId}:${config.role}:compaction:${compactionIndex}:completed`
+        const compactionId = `execution:${input.executionId}:${config.role}:compaction:${compactionIndex}`
+        const event = {
+          type: 'compaction', status: 'completed', attempt: compactionAttempt,
+          toSegmentId: segmentId, contextTokens: compactionMetrics.contextTokens,
+          contextWindow: compactionMetrics.contextWindow,
+          reserveTokens: compactionMetrics.reserveTokens,
+          keepRecentTokens: compactionMetrics.keepRecentTokens, usage: compacted.usage,
+          durationMs: Date.parse(completedAt) - Date.parse(startedAt),
+          attemptResults: compactionAttemptResults,
+        }
+        pendingCompaction = {
+          id: compactionId, segmentId, operationId, event, summary,
+          usage: compacted.usage, createdAt: completedAt,
+        }
+        return [userMessage(
+          `【系统生成的 Compaction Summary，不是报告证据】\n${JSON.stringify(summary)}`,
+        ), ...cut.retainedTail]
+      },
+      commit: async ({ tokensAfter }) => {
+        if (!pendingCompaction || !input.toolRuntime?.commitCompaction) {
+          throw new Error('compaction_commit_state_missing')
+        }
+        const pending = pendingCompaction
+        const persistedEvent = { ...pending.event, tokensAfter, estimated: true }
+        await input.toolRuntime.commitCompaction({
+          id: pending.id, executionId: input.executionId, segmentId: pending.segmentId,
+          operationId: pending.operationId, event: persistedEvent,
+          contextTokens: compactionMetrics.contextTokens,
+          contextWindow: compactionMetrics.contextWindow,
+          reserveTokens: compactionMetrics.reserveTokens,
+          keepRecentTokens: compactionMetrics.keepRecentTokens,
+          tokensAfter,
+          summary: pending.summary, usage: pending.usage, createdAt: pending.createdAt,
+          attempts: [
+            ...compactionAttemptResults.map((attempt) => ({
+              ...attempt, status: 'failed' as const,
+            })),
+            {
+              attempt: compactionAttempt, status: 'completed' as const,
+              durationMs: pending.event.durationMs as number, usage: pending.usage,
+            },
+          ],
+        })
+        config.queue.push(trace({
+          type: 'compaction', status: 'completed', segmentId: pending.segmentId,
+          contextTokens: compactionMetrics.contextTokens,
+          contextWindow: compactionMetrics.contextWindow,
+          reserveTokens: compactionMetrics.reserveTokens,
+          keepRecentTokens: compactionMetrics.keepRecentTokens,
+          tokensAfter,
+          usage: pending.usage,
+          durationMs: pending.event.durationMs as number,
+          attemptResults: compactionAttemptResults,
+          operationId: pending.operationId,
+        }))
+        pendingCompaction = undefined
+      },
+      onFailure: async () => {
+        compactionDisabled = true
+        const failed = {
+          type: 'compaction', status: 'failed', attempts: 2,
+          contextTokens: compactionMetrics.contextTokens,
+          contextWindow: compactionMetrics.contextWindow,
+          reserveTokens: compactionMetrics.reserveTokens,
+          keepRecentTokens: compactionMetrics.keepRecentTokens,
+          attemptResults: compactionAttemptResults,
+          operationId: `execution:${input.executionId}:${config.role}:compaction:${compactionIndex}:failed`,
+        } as Extract<ModelEvent, { type: 'trace' }>['entry']
+        const createdAt = new Date().toISOString()
+        if (compactionMetrics.contextTokens >= compactionMetrics.contextWindow) {
+          if (!input.toolRuntime?.failCompaction) throw new Error('compaction_failure_commit_required')
+          await input.toolRuntime.failCompaction({
+            id: `execution:${input.executionId}:${config.role}:compaction:${compactionIndex}`,
+            executionId: input.executionId, operationId: failed.operationId!,
+            event: failed as Record<string, unknown>,
+            attempts: compactionAttemptResults.map((attempt) => ({
+              ...attempt, status: 'failed' as const,
+            })), createdAt,
+          })
+          config.queue.push(trace(failed))
+          throw new Error('compaction_capacity_exhausted')
+        }
+        stage = 'finalization'
+        if (!input.toolRuntime?.failCompaction) throw new Error('compaction_failure_commit_required')
+        await input.toolRuntime.failCompaction({
+          id: `execution:${input.executionId}:${config.role}:compaction:${compactionIndex}`,
+          executionId: input.executionId, operationId: failed.operationId!,
+          event: failed as Record<string, unknown>,
+          attempts: compactionAttemptResults.map((attempt) => ({
+            ...attempt, status: 'failed' as const,
+          })), createdAt,
+        })
+        const tools = config.role === 'main' ? finalizationModelTools
+          : toolRegistry.project({ role: config.role, stage: 'finalization' })
+        await prepareProjection(tools, failed)
+        config.queue.push(trace(failed))
+        return { tools: projectedTools() }
+      },
+    },
   })
 
   adapter.subscribe(async (event) => {
@@ -1124,6 +1340,10 @@ type ExecutedTool = {
 }
 
 function createProviderRuntime(options: ModelOptions) {
+  if (options.contextWindow !== undefined
+    && (!Number.isInteger(options.contextWindow) || options.contextWindow <= 0)) {
+    throw new Error('model_context_window_invalid')
+  }
   const models = (options.modelsFactory ?? createModels)()
   let model: Model<Api>
   if (options.fauxResponses) {
@@ -1133,11 +1353,19 @@ function createProviderRuntime(options: ModelOptions) {
     model = faux.getModel()
   } else if (options.provider && options.apiProtocol && options.modelName && options.baseUrl && options.apiKey) {
     const api = options.apiProtocol === 'responses' ? 'openai-responses' : 'openai-completions'
+    const catalogModel = models.getModel(options.provider, options.modelName)
+    const contextWindow = options.contextWindow ?? catalogModel?.contextWindow
+    if (contextWindow === undefined) {
+      throw new Error('model_context_window_required')
+    }
+    if (!Number.isInteger(contextWindow) || contextWindow <= 0) {
+      throw new Error('model_context_window_invalid')
+    }
     const configured: Model<Api> = {
       id: options.modelName, name: options.modelName, api, provider: options.provider,
       baseUrl: options.baseUrl, reasoning: false, input: ['text'],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: 128_000, maxTokens: 16_000,
+      contextWindow, maxTokens: Math.min(16_000, contextWindow),
     }
     models.setProvider(createProvider({
       id: options.provider, name: options.provider, baseUrl: options.baseUrl,
@@ -1145,13 +1373,107 @@ function createProviderRuntime(options: ModelOptions) {
       models: [configured],
       api: api === 'openai-responses' ? openAIResponsesApi() : openAICompletionsApi(),
     }))
-    model = models.getModel(options.provider, options.modelName) ?? configured
+    model = catalogModel ? { ...catalogModel, contextWindow } : configured
   } else throw new Error('model_not_configured')
+  if (options.contextWindow !== undefined) model = { ...model, contextWindow: options.contextWindow }
   const streamFn: PiAgentAdapterStreamFn = (selected, context, streamOptions) => models.stream(
     selected as Model<Api>, context as never,
     { signal: streamOptions?.signal, apiKey: options.apiKey },
   ) as unknown as PiAgentAdapterStream
   return { model, streamFn }
+}
+
+async function compactWithProvider(
+  provider: ReturnType<typeof createProviderRuntime>,
+  cut: {
+    messagesToSummarize: PiAgentAdapterMessage[]
+    turnPrefixMessages: PiAgentAdapterMessage[]
+    retainedTail: PiAgentAdapterMessage[]
+    isSplitTurn: boolean
+  },
+  signal: AbortSignal,
+) {
+  const stream = await Promise.resolve(provider.streamFn(provider.model, {
+    systemPrompt: [
+      '你是研究上下文压缩器。只总结给定消息中的目标、已作决定和未决问题。',
+      '不得生成新事实、投资结论或报告证据；不得省略事实 ID、报告版本和专项状态。',
+      '输出简洁中文纯文本，不调用工具。',
+    ].join('\n'),
+    messages: [userMessage(JSON.stringify({
+      messagesToSummarize: cut.messagesToSummarize,
+      turnPrefixMessages: cut.turnPrefixMessages,
+      isSplitTurn: cut.isSplitTurn,
+    }))],
+    tools: [],
+  }, { signal }))
+  const finishable = finishableStream(stream, signal, () => {}, (error) => error)
+  for await (const _event of finishable) { /* consume the complete provider stream */ }
+  const message = await finishable.result()
+  const usage = message.role === 'assistant' ? message.usage : null
+  if (message.role !== 'assistant' || message.stopReason === 'error'
+    || message.content.some((item) => item.type === 'toolCall')) {
+    throw new CompactionGenerationError(
+      new Error('compaction_summary_invalid'), usage,
+    )
+  }
+  const narrative = contentText(message.content).trim()
+  if (!narrative) throw new CompactionGenerationError(
+    new Error('compaction_summary_empty'), message.usage,
+  )
+  return { narrative, usage: message.usage as unknown as Record<string, unknown> }
+}
+
+function compactionSummaryContract(
+  role: Role,
+  goal: string,
+  input: AnalyzeInput | AnalyzeNewsInput | AnalyzeFundamentalInput | AnalyzeTechnicalInput,
+  messages: PiAgentAdapterMessage[],
+  narrative: string,
+) {
+  const facts = new Set<string>()
+  for (const fact of input.knownFacts) facts.add(fact.id)
+  const reportVersions: Array<Record<string, unknown>> = []
+  const specialistStatuses: Array<Record<string, unknown>> = []
+  const unresolved: string[] = []
+  for (const message of messages) {
+    if (message.role !== 'toolResult') continue
+    const result = parseToolResultRecord(message)
+    for (const fact of Array.isArray(result.facts) ? result.facts : []) {
+      if (fact && typeof fact === 'object' && typeof (fact as { id?: unknown }).id === 'string') {
+        facts.add((fact as { id: string }).id)
+      }
+    }
+    if (typeof result.reportId === 'string' && typeof result.reportVersion === 'number') {
+      reportVersions.push({
+        reportId: result.reportId, version: result.reportVersion,
+        sessionId: result.sessionId, status: result.status,
+      })
+    }
+    if (typeof result.status === 'string' && typeof result.sessionId === 'string') {
+      specialistStatuses.push({
+        sessionId: result.sessionId, status: result.status, executionId: result.executionId,
+      })
+    }
+    if (typeof result.error === 'string') unresolved.push(result.error)
+    for (const gap of Array.isArray(result.gaps) ? result.gaps : []) {
+      if (gap && typeof gap === 'object') unresolved.push(JSON.stringify(gap))
+    }
+  }
+  return {
+    schemaVersion: 1, isReportEvidence: false, role, goal,
+    decisions: specialistStatuses.map((status) => ({
+      sessionId: status.sessionId, status: status.status,
+    })),
+    reportVersions, specialistStatuses,
+    factIds: [...facts], unresolved: [...new Set(unresolved)],
+    personalContext: 'runtimeContext' in input ? input.runtimeContext?.content.personalContext ?? null : null,
+    narrative,
+  }
+}
+
+function parseToolResultRecord(message: Extract<PiAgentAdapterMessage, { role: 'toolResult' }>) {
+  const text = contentText(message.content)
+  try { return asRecord(JSON.parse(text)) } catch { return {} }
 }
 
 async function beginBudgetedModelRequest(config: {

@@ -23,7 +23,13 @@ export function createTestProductDatabase() {
   const lifecycles = new Map<string, {
     execution: { id: string; generation: number; status: string; createdAt: string; updatedAt: string }
     waitReason: { kind: 'database'; target: string; startedAt: string }
-    segments: Array<{ id: string; ordinal: number; createdAt: string }>
+    segments: Array<{
+      id: string; ordinal: number; parentSegmentId?: string | null; createdAt: string
+    }>
+    compactions?: Array<{
+      id: string; fromSegmentId: string; toSegmentId: string
+      summary: Record<string, unknown>; usage: Record<string, unknown>; createdAt: string
+    }>
   }>()
   let nextSettingsRevisionId = 1
   const runtimeSettingsRevisions = [{
@@ -172,6 +178,63 @@ export function createTestProductDatabase() {
   }
 
   const agentEventRepository: AgentEventRepository = {
+    async commitCompaction(input) {
+      const session = [...agentSessions.values()].find((candidate) => (
+        candidate.executionId === input.executionId
+      ))
+      if (!session) throw new Error('agent_execution_fenced')
+      const lifecycle = lifecycles.get(session.id)
+      if (!lifecycle || lifecycle.execution.id !== input.executionId
+        || ['completed', 'partial', 'failed', 'stopped', 'interrupted', 'budget_exhausted']
+          .includes(lifecycle.execution.status)) throw new Error('agent_execution_fenced')
+      const events = agentEvents.get(session.id) ?? []
+      const replay = events.find(({ operationId }) => operationId === input.operationId)
+      if (replay) return { created: false, event: replay, segmentId: input.segmentId }
+      const current = lifecycle.segments.at(-1)
+      if (!current) throw new Error('conversation_segment_not_found')
+      const event = {
+        sessionId: session.id, sequence: session.latestSequence + 1,
+        operationId: input.operationId, payload: structuredClone(input.event),
+        createdAt: input.createdAt,
+      }
+      agentEvents.set(session.id, [...events, event])
+      agentSessions.set(session.id, {
+        ...session, latestSequence: event.sequence, updatedAt: input.createdAt,
+      })
+      lifecycles.set(session.id, {
+        ...lifecycle,
+        segments: [...lifecycle.segments, {
+          id: input.segmentId, ordinal: current.ordinal + 1,
+          parentSegmentId: current.id, createdAt: input.createdAt,
+        }],
+        compactions: [...(lifecycle.compactions ?? []), {
+          id: input.id, fromSegmentId: current.id, toSegmentId: input.segmentId,
+          summary: structuredClone(input.summary), usage: structuredClone(input.usage),
+          createdAt: input.createdAt,
+        }],
+      })
+      return { created: true, event, segmentId: input.segmentId }
+    },
+    async failCompaction(input) {
+      const session = [...agentSessions.values()].find((candidate) => (
+        candidate.executionId === input.executionId
+      ))
+      if (!session) throw new Error('agent_execution_fenced')
+      const events = agentEvents.get(session.id) ?? []
+      const replay = events.find(({ operationId }) => operationId === input.operationId)
+      if (replay) return { created: false, event: replay }
+      const event = {
+        sessionId: session.id, sequence: session.latestSequence + 1,
+        operationId: input.operationId, payload: structuredClone(input.event),
+        createdAt: input.createdAt,
+      }
+      agentEvents.set(session.id, [...events, event])
+      agentSessions.set(session.id, {
+        ...session, latestSequence: event.sequence, updatedAt: input.createdAt,
+      })
+      return { created: true, event }
+    },
+    async recordCompactionAttempt() {},
     async resumeResearch(input) {
       const record = analyses.get(input.analysisId)
       const session = [...agentSessions.values()].find((candidate) => (
@@ -203,6 +266,7 @@ export function createTestProductDatabase() {
           id: input.segmentId ?? `${session.id}:segment:${lifecycle.segments.length + 1}`,
           ordinal: lifecycle.segments.length + 1, createdAt: input.createdAt,
         }],
+        compactions: lifecycle.compactions ?? [],
       })
       analyses.set(input.analysisId, {
         ...record, status: 'queued', terminal: false, error: null, updatedAt: input.createdAt,
@@ -467,6 +531,7 @@ export function createTestProductDatabase() {
       return {
         ...session, status: lifecycle.execution.status, waitReason: lifecycle.waitReason,
         execution: lifecycle.execution, segments: lifecycle.segments,
+        compactions: lifecycle.compactions ?? [],
         events: (agentEvents.get(sessionId) ?? []).map((event) => ({
           sequence: event.sequence, createdAt: event.createdAt, ...event.payload,
         })),
@@ -480,6 +545,7 @@ export function createTestProductDatabase() {
       return {
         ...session, status: lifecycle.execution.status, waitReason: lifecycle.waitReason,
         execution: lifecycle.execution, segments: lifecycle.segments,
+        compactions: lifecycle.compactions ?? [],
         events: (agentEvents.get(session.id) ?? []).map((event) => ({
           sequence: event.sequence, createdAt: event.createdAt, ...event.payload,
         })),
@@ -706,7 +772,7 @@ export function createTestProductDatabase() {
 
   return {
     productDatabase: {
-      checkSchema: async () => ({ status: 'ok' as const, version: 19 }),
+      checkSchema: async () => ({ status: 'ok' as const, version: 21 }),
       close: async () => {},
     },
     portfolioRepository,

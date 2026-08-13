@@ -3,6 +3,7 @@ import type { RuntimeSettings } from '@vibe-invest/contracts'
 
 import type { ActiveBudget } from './runtime-policy.js'
 import { createProjectedPiModel } from './projected-pi-model.js'
+import type { PiAgentAdapterMessage } from './agent-runtime/pi-agent-adapter.js'
 
 type Fact = {
   id: string
@@ -62,6 +63,19 @@ type TraceEntry =
   | {
     type: 'runtime_turn_advanced'; toolRounds: number; activeElapsedMs: number
     stage: 'research' | 'finalization'; operationId: string
+  }
+  | {
+    type: 'compaction'; status: 'completed' | 'failed'; operationId: string
+    segmentId?: string; attempts?: number; contextTokens?: number; contextWindow?: number
+    reserveTokens?: number; keepRecentTokens?: number; tokensAfter?: number
+    estimated?: boolean
+    usage?: unknown; durationMs?: number
+    attemptResults?: Array<{ attempt: number; durationMs: number; usage: unknown }>
+  }
+  | {
+    type: 'context_usage'; operationId: string
+    contextTokens: number; contextWindow: number; reserveTokens: number
+    keepRecentTokens: number; estimated: boolean
   }
 
 export type ModelEvent =
@@ -245,6 +259,7 @@ export type RuntimeResume = {
   generatedBy: 'product_runtime'
   isUserInput: false
   content: Record<string, unknown> & {
+    compactionSummary?: Record<string, unknown>
     reusableToolResults?: Array<{
       toolName: string
       factIds: string[]
@@ -324,6 +339,35 @@ export type ToolRuntime = {
       causativeEvent?: { operationId: string; payload: Record<string, unknown> }
     }
   }): Promise<{ projection?: { id: string; version: number } }>
+  commitCompaction?(input: {
+    id: string
+    executionId: string
+    segmentId: string
+    operationId: string
+    event: Record<string, unknown>
+    contextTokens: number
+    contextWindow: number
+    reserveTokens: number
+    keepRecentTokens: number
+    tokensAfter: number
+    summary: Record<string, unknown>
+    usage: Record<string, unknown>
+    attempts: Array<{
+      attempt: number; status: 'completed' | 'failed' | 'cancelled'
+      durationMs: number; usage: unknown
+    }>
+    createdAt: string
+  }): Promise<void>
+  failCompaction?(input: {
+    id: string; executionId: string; operationId: string
+    event: Record<string, unknown>; attempts: Array<{
+      attempt: number; status: 'failed' | 'cancelled'; durationMs: number; usage: unknown
+    }>; createdAt: string
+  }): Promise<void>
+  recordCompactionAttempt?(input: {
+    id: string; executionId: string; attempt: number
+    status: 'failed' | 'cancelled'; durationMs: number; usage: unknown; createdAt: string
+  }): Promise<void>
 }
 
 export type ModelOptions = {
@@ -335,11 +379,22 @@ export type ModelOptions = {
   provider?: string
   apiProtocol?: 'chat-completions' | 'responses'
   modelName?: string
+  contextWindow?: number
   baseUrl?: string
   apiKey?: string
   runtimeMinuteMs?: number
   activeNow?: () => number
   activeTimeoutSignal?: (timeoutMs: number) => AbortSignal
+  compact?: (input: {
+    messagesToSummarize: PiAgentAdapterMessage[]
+    turnPrefixMessages: PiAgentAdapterMessage[]
+    retainedTail: PiAgentAdapterMessage[]
+    isSplitTurn: boolean
+    signal?: AbortSignal
+  }) => Promise<{
+    narrative: string
+    usage: Record<string, unknown>
+  }>
 }
 
 export function createPiModel(options: ModelOptions = {}) {

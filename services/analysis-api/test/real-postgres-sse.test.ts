@@ -77,7 +77,7 @@ function specialistResults(context: { messages: Array<{
   })
 }
 
-test('真实 v12 历史 Tool 事件升级到 v19 后经 DAO、HTTP 与 SSE 原样读取', {
+test('真实 v12 历史 Tool 事件升级到 v21 后经 DAO、HTTP 与 SSE 原样读取', {
   skip: !databaseUrl || !migrationDatabaseUrl,
   concurrency: false,
 }, async () => {
@@ -295,6 +295,7 @@ test('真实 OpenAI HTTP provider 经生产 Pi bridge 在 Turn 边界原子封�
   const model = createPiModel({
     provider: 'local-openai', apiProtocol: 'chat-completions', modelName: 'integration-model',
     baseUrl: `http://127.0.0.1:${providerAddress.port}`, apiKey: 'integration-key',
+    contextWindow: 128_000,
   })
   const app = buildApp({
     productDatabase: { checkSchema: () => checkSchema(pool), close: () => pool.end() },
@@ -891,6 +892,7 @@ test('首次研究经真实 PostgreSQL 与 HTTP SSE 展示 Runtime Context、工
   const model = createPiModel({
     provider: 'local-openai', apiProtocol: 'chat-completions', modelName: 'first-research-model',
     baseUrl: `http://127.0.0.1:${providerAddress.port}`, apiKey: 'integration-key',
+    contextWindow: 128_000,
   })
   const bars = Array.from({ length: 24 }, (_, index) => ({
     id: `fact:first-research:bar:${index}`, type: 'daily_bar',
@@ -1598,6 +1600,102 @@ test('生产 Pi 经 HTTP、SSE 与真实 PostgreSQL 留存工具及预算收口�
   }
 })
 
+test('真实 PostgreSQL 与 HTTP SSE 原子展示 Compaction usage 和链接 Segment', {
+  skip: !databaseUrl,
+  concurrency: false,
+}, async () => {
+  const pool = createPool(databaseUrl!)
+  const events = createAgentEventRepository(pool)
+  const settings = createRuntimeSettingsRepository(pool)
+  const previousSettings = await settings.current()
+  await settings.save({ compactionReserveTokens: 1_000_000 }, new Date().toISOString())
+  const symbol = `C${crypto.randomUUID().replaceAll('-', '').slice(0, 8)}`
+  const report = integratedReport({
+    title: 'Compaction 纵向验收', marketState: '未知', trend: '未知', drivers: [],
+    supportingEvidence: [], contraryEvidence: [], keyJudgments: [], scenarios: [],
+    invalidationConditions: [], valuation: null, personalImpact: null,
+    conditionalSuggestion: null, limitations: ['仅验证压缩闭环'],
+  })
+  let compactCalls = 0
+  const model = createPiModel({
+    fauxResponses: [
+      fauxAssistantMessage(fauxToolCall('fetch_financial_context', { symbol }), {
+        stopReason: 'toolUse',
+      }),
+      fauxAssistantMessage(fauxToolCall('submit_analysis_report', report), {
+        stopReason: 'toolUse',
+      }),
+    ],
+    compact: async () => {
+      compactCalls += 1
+      return {
+        narrative: '目标是形成综合报告；金融上下文已经读取；无未决工具调用。',
+        usage: { input: 800, output: 80, totalTokens: 880 },
+      }
+    },
+  })
+  const app = buildApp({
+    productDatabase: { checkSchema: () => checkSchema(pool), close: () => pool.end() },
+    portfolioRepository: createPortfolioRepository(pool),
+    analysisRepository: createAnalysisRepository(pool), agentEventRepository: events,
+    runtimeSettingsRepository: settings,
+    toolProjectionRepository: createToolProjectionRepository(pool),
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (requested) => ({ symbol: requested, gaps: [], facts: [] }),
+    model,
+  })
+  await app.listen({ host: '127.0.0.1', port: 0 })
+  const address = app.server.address()
+  assert.ok(address && typeof address === 'object')
+  const baseUrl = `http://127.0.0.1:${address.port}`
+  const created = await fetch(`${baseUrl}/api/analyses`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ symbol }),
+  }).then((response) => response.json()) as {
+    analysisId: string; sessionId: string
+  }
+  try {
+    await waitForAgentStatus(events, created.sessionId, 'partial')
+    assert.equal(compactCalls, 1)
+    const research = await fetch(`${baseUrl}/api/research/${created.analysisId}`)
+      .then((response) => response.json())
+    assert.deepEqual(research.mainAgent.segments.map((segment: {
+      ordinal: number; parentSegmentId: string | null
+    }) => ({ ordinal: segment.ordinal, parentSegmentId: segment.parentSegmentId })), [
+      { ordinal: 1, parentSegmentId: null },
+      { ordinal: 2, parentSegmentId: research.mainAgent.segments[0].id },
+    ])
+    const compactEvent = research.mainAgent.events.find(
+      (event: { type?: string }) => event.type === 'compaction',
+    )
+    assert.equal(compactEvent.status, 'completed')
+    assert.equal(compactEvent.reserveTokens, 1_000_000)
+    assert.equal(compactEvent.keepRecentTokens, 20_000)
+    assert.equal(typeof compactEvent.tokensAfter, 'number')
+    assert.equal(compactEvent.usage.totalTokens, 880)
+    const usageEvent = research.mainAgent.events.find(
+      (event: { type?: string }) => event.type === 'context_usage',
+    )
+    assert.equal(usageEvent.contextWindow, 128_000)
+    const replay = await fetch(`${baseUrl}/api/agent-sessions/${created.sessionId}/events`)
+      .then((response) => response.text())
+    assert.match(replay, /event: compaction/)
+    assert.match(replay, /"totalTokens":880/)
+    const row = await pool.query<{
+      summary_json: Record<string, unknown>; usage_json: Record<string, unknown>
+    }>(
+      `SELECT summary_json, usage_json FROM agent_compactions
+       WHERE session_id = $1`, [created.sessionId],
+    )
+    assert.equal(row.rows.length, 1)
+    assert.equal(row.rows[0]?.summary_json.isReportEvidence, false)
+    assert.equal(row.rows[0]?.usage_json.totalTokens, 880)
+  } finally {
+    await settings.save(previousSettings.values, new Date().toISOString())
+    await app.close()
+  }
+})
+
 test('Pi Runtime 使用持久 executionId 派生工具 operationId 且真实 PostgreSQL 重放幂等', {
   skip: !databaseUrl,
   concurrency: false,
@@ -2214,7 +2312,7 @@ async function waitForPersistedEvent(
   sessionId: string,
   text: string,
 ) {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
+  for (let attempt = 0; attempt < 300; attempt += 1) {
     if ((await repository.list(sessionId, 0)).some(({ payload }) => payload.text === text)) return
     await new Promise((resolve) => setTimeout(resolve, 5))
   }
@@ -2234,7 +2332,7 @@ async function waitForOperation(
 async function waitForAgentStatus(
   repository: ReturnType<typeof createAgentEventRepository>, sessionId: string, expected: string,
 ) {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
+  for (let attempt = 0; attempt < 1_000; attempt += 1) {
     if ((await repository.getSession(sessionId))?.status === expected) return
     await new Promise((resolve) => setTimeout(resolve, 5))
   }
@@ -2244,7 +2342,7 @@ async function waitForAgentStatus(
 async function waitForAnalysisStatus(
   app: ReturnType<typeof buildApp>, analysisId: string, expected: string,
 ) {
-  for (let attempt = 0; attempt < 300; attempt += 1) {
+  for (let attempt = 0; attempt < 1_000; attempt += 1) {
     const response = await app.inject({ method: 'GET', url: `/api/analyses/${analysisId}` })
     if (response.json().status === expected) return
     await new Promise((resolve) => setTimeout(resolve, 5))

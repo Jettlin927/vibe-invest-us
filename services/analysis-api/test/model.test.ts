@@ -51,6 +51,9 @@ function createTestToolRuntime(): ToolRuntime {
         id: `${input.executionId}:test-projection:${++version}`, version,
       } }
     },
+    async commitCompaction() {},
+    async failCompaction() {},
+    async recordCompactionAttempt() {},
   }
 }
 
@@ -2129,7 +2132,10 @@ test('基本面专项 Pi provider 超时保留统一冻结 policy 错误语义',
 })
 
 test('compaction/freshness 仅进入审计 seam 且不注入普通模型文本或改写报告', async () => {
-  const model = createPiModel({ fauxResponses: [
+  const model = createPiModel({
+    compact: async () => ({ narrative: '仅保留已有研究上下文。', usage: {
+      input: 10, output: 5, totalTokens: 15,
+    } }), fauxResponses: [
     fauxAssistantMessage(fauxText('早期推理 '.repeat(1_000))),
     fauxAssistantMessage(fauxToolCall('fetch_financial_context', {}), { stopReason: 'toolUse' }),
     fauxAssistantMessage(fauxToolCall('submit_analysis_report', validReport), { stopReason: 'toolUse' }),
@@ -2139,7 +2145,7 @@ test('compaction/freshness 仅进入审计 seam 且不注入普通模型文本�
     executionId: 'compaction-boundary',
     runtimeSettings: runtimeSettings({ compactionReserveTokens: 1_000_000 }),
     symbol: 'NVDA', systemPrompt: 'system', userPrompt: 'user', knownFacts: facts,
-    fetchFinancialContext: async () => ({ facts }),
+    fetchFinancialContext: async () => ({ facts }), toolRuntime: createTestToolRuntime(),
   })) events.push(event)
   const policy = events.find((event) => event.type === 'trace'
     && event.entry.type === 'runtime_policy')
@@ -2157,6 +2163,231 @@ test('compaction/freshness 仅进入审计 seam 且不注入普通模型文本�
   if (completed?.type === 'completed') {
     assert.deepEqual(completed.reportVersion?.report, validReport)
   }
+})
+
+test('Runtime 只在安全 Turn 边界持久化 Compaction 后才启动下一 Provider', async () => {
+  const order: string[] = []
+  const commits: Array<Record<string, unknown>> = []
+  const runtime = createTestToolRuntime()
+  runtime.commitCompaction = async (input) => {
+    order.push('compaction:commit')
+    commits.push(input)
+  }
+  const model = createPiModel({
+    fauxResponses: [
+      (context) => {
+        order.push('provider:1')
+        return fauxAssistantMessage(fauxToolCall('fetch_financial_context', {}), {
+          stopReason: 'toolUse',
+        })
+      },
+      (context) => {
+        order.push('provider:2')
+        assert.match(JSON.stringify(context.messages), /Compaction Summary/)
+        return fauxAssistantMessage(fauxToolCall('submit_analysis_report', validReport), {
+          stopReason: 'toolUse',
+        })
+      },
+    ],
+    compact: async () => {
+      order.push('compaction:model')
+      return { narrative: '保留既有目标、事实与未决问题。', usage: {
+        input: 100, output: 20, totalTokens: 120,
+      } }
+    },
+  })
+  const events = []
+  for await (const event of model.analyze({
+    executionId: 'compaction-success',
+    runtimeSettings: runtimeSettings({ compactionReserveTokens: 1_000_000 }),
+    symbol: 'NVDA', systemPrompt: 'system', userPrompt: '形成综合报告', knownFacts: facts,
+    fetchFinancialContext: async () => ({ facts }), toolRuntime: runtime,
+  })) events.push(event)
+  assert.deepEqual(order, [
+    'provider:1', 'compaction:model', 'compaction:commit', 'provider:2',
+  ])
+  assert.equal(commits.length, 1)
+  assert.equal(commits[0]?.reserveTokens, 1_000_000)
+  assert.equal(commits[0]?.keepRecentTokens, 20_000)
+  assert.equal((commits[0]?.summary as Record<string, unknown>).isReportEvidence, false)
+  assert.ok(events.some((event) => event.type === 'trace'
+    && event.entry.type === 'compaction' && event.entry.status === 'completed'))
+})
+
+test('Runtime Compaction 重试成功始终使用聚合 ID 且 attempt 不重复', async () => {
+  const recorded: Array<Record<string, unknown>> = []
+  const committed: Array<Record<string, unknown>> = []
+  const runtime = createTestToolRuntime()
+  runtime.recordCompactionAttempt = async (input) => { recorded.push(input) }
+  runtime.commitCompaction = async (input) => { committed.push(input) }
+  let compactCalls = 0
+  const model = createPiModel({
+    fauxResponses: [
+      fauxAssistantMessage(fauxToolCall('fetch_financial_context', {}), { stopReason: 'toolUse' }),
+      fauxAssistantMessage(fauxToolCall('submit_analysis_report', validReport), { stopReason: 'toolUse' }),
+    ],
+    compact: async () => {
+      compactCalls += 1
+      if (compactCalls === 1) throw new Error('first_summary_failed')
+      return { narrative: '重试摘要', usage: { input: 10, output: 2, totalTokens: 12 } }
+    },
+  })
+  for await (const _event of model.analyze({
+    executionId: 'compaction-retry-stable-id',
+    runtimeSettings: runtimeSettings({ compactionReserveTokens: 1_000_000 }),
+    symbol: 'NVDA', systemPrompt: 'system', userPrompt: '形成综合报告', knownFacts: facts,
+    fetchFinancialContext: async () => ({ facts }), toolRuntime: runtime,
+  })) { /* consume */ }
+  assert.equal(recorded.length, 1)
+  assert.equal(recorded[0]?.id, 'execution:compaction-retry-stable-id:main:compaction:1')
+  assert.equal(committed.length, 1)
+  assert.equal(committed[0]?.id, recorded[0]?.id)
+  assert.deepEqual((committed[0]?.attempts as Array<{ attempt: number }>).map(
+    ({ attempt }) => attempt,
+  ), [1, 2])
+})
+
+test('Runtime Compaction 两次失败后不建 segment 并提前切到报告收口工具', async () => {
+  let attempts = 0
+  let commits = 0
+  const secondTools: string[][] = []
+  const runtime = createTestToolRuntime()
+  runtime.commitCompaction = async () => { commits += 1 }
+  const model = createPiModel({
+    fauxResponses: [
+      fauxAssistantMessage(fauxToolCall('fetch_financial_context', {}), { stopReason: 'toolUse' }),
+      fauxAssistantMessage(fauxText('先整理收口依据。')),
+      (context) => {
+        secondTools.push(context.tools.map(({ name }) => name))
+        return fauxAssistantMessage(fauxToolCall('submit_analysis_report', validReport), {
+          stopReason: 'toolUse',
+        })
+      },
+    ],
+    compact: async () => {
+      attempts += 1
+      throw new Error('summary_provider_failed')
+    },
+  })
+  const events = []
+  for await (const event of model.analyze({
+    executionId: 'compaction-failure',
+    runtimeSettings: runtimeSettings({ compactionReserveTokens: 1_000_000 }),
+    symbol: 'NVDA', systemPrompt: 'system', userPrompt: '形成综合报告', knownFacts: facts,
+    fetchFinancialContext: async () => ({ facts }), toolRuntime: runtime,
+  })) events.push(event)
+  assert.equal(attempts, 2)
+  assert.equal(commits, 0)
+  assert.deepEqual(secondTools, [['submit_analysis_report']])
+  assert.ok(events.some((event) => event.type === 'trace'
+    && event.entry.type === 'compaction' && event.entry.status === 'failed'))
+  assert.ok(events.some((event) => event.type === 'completed'))
+})
+
+test('Runtime 使用当前模型 272k contextWindow 和 Provider usage 计算占用', async () => {
+  const model = createPiModel({
+    contextWindow: 272_000,
+    compact: async () => ({
+      narrative: '保留已有上下文。', usage: { input: 10, output: 5, totalTokens: 15 },
+    }),
+    fauxResponses: [
+      fauxAssistantMessage(fauxToolCall('fetch_financial_context', {}), { stopReason: 'toolUse' }),
+      fauxAssistantMessage(fauxToolCall('submit_analysis_report', validReport), { stopReason: 'toolUse' }),
+    ],
+  })
+  const events = []
+  for await (const event of model.analyze({
+    executionId: 'dynamic-context-window',
+    runtimeSettings: runtimeSettings({ compactionReserveTokens: 271_999 }),
+    symbol: 'NVDA', systemPrompt: 'system', userPrompt: '形成综合报告', knownFacts: facts,
+    fetchFinancialContext: async () => ({ facts }),
+  })) events.push(event)
+  const usage = events.find((event) => event.type === 'trace'
+    && event.entry.type === 'context_usage')
+  assert.equal(usage?.type, 'trace')
+  if (usage?.type === 'trace' && usage.entry.type === 'context_usage') {
+    assert.equal(usage.entry.contextWindow, 272_000)
+    assert.equal(usage.entry.estimated, false)
+    assert.ok(usage.entry.contextTokens > 0)
+  }
+})
+
+test('Runtime 对显式非法 contextWindow fail closed', async () => {
+  for (const contextWindow of [0, -1, Number.NaN]) {
+    const model = createPiModel({
+      contextWindow,
+      fauxResponses: [fauxAssistantMessage(fauxText('不应运行'))],
+    })
+    await assert.rejects(async () => {
+      for await (const _event of model.analyze({
+        executionId: `invalid-context-window:${String(contextWindow)}`,
+        runtimeSettings: runtimeSettings(), symbol: 'NVDA', systemPrompt: 'system',
+        userPrompt: '形成综合报告', knownFacts: facts,
+        fetchFinancialContext: async () => ({ facts }),
+      })) { /* consume */ }
+    }, /model_context_window_invalid/)
+  }
+})
+
+test('Runtime 在非重试 compaction 审计失败时持久化失败 attempt', async () => {
+  const failures: Array<Record<string, unknown>> = []
+  let compactCalls = 0
+  const runtime = createTestToolRuntime()
+  runtime.recordModelRequest = async (input) => {
+    if (input.requestId.includes(':compaction:')) throw new Error('compaction_request_audit_failed')
+  }
+  runtime.failCompaction = async (input) => { failures.push(input) }
+  const model = createPiModel({
+    contextWindow: 128_000,
+    fauxResponses: [
+      fauxAssistantMessage(fauxToolCall('fetch_financial_context', {}), { stopReason: 'toolUse' }),
+    ],
+    compact: async () => {
+      compactCalls += 1
+      return { narrative: '不应生成', usage: {} }
+    },
+  })
+  await assert.rejects(async () => {
+    for await (const _event of model.analyze({
+      executionId: 'compaction-non-retry-audit-failure',
+      runtimeSettings: runtimeSettings({ compactionReserveTokens: 128_000 }),
+      symbol: 'NVDA', systemPrompt: 'system', userPrompt: '形成综合报告', knownFacts: facts,
+      fetchFinancialContext: async () => ({ facts }), toolRuntime: runtime,
+    })) { /* consume */ }
+  }, /compaction_request_audit_failed/)
+  assert.equal(compactCalls, 0)
+  assert.equal(failures.length, 1)
+  assert.equal((failures[0]?.event as Record<string, unknown>).status, 'failed')
+  const attempts = failures[0]?.attempts as Array<Record<string, unknown>>
+  assert.equal(attempts.length, 1)
+  assert.equal(attempts[0]?.attempt, 1)
+  assert.equal(attempts[0]?.status, 'failed')
+  assert.equal(attempts[0]?.usage, null)
+  assert.equal(typeof attempts[0]?.durationMs, 'number')
+})
+
+test('Runtime 容量耗尽时先持久化两次失败 usage 再令 execution 失败', async () => {
+  const failed: Array<Record<string, unknown>> = []
+  const runtime = createTestToolRuntime()
+  runtime.failCompaction = async (input) => { failed.push(input) }
+  const model = createPiModel({
+    contextWindow: 1,
+    fauxResponses: [
+      fauxAssistantMessage(fauxToolCall('fetch_financial_context', {}), { stopReason: 'toolUse' }),
+    ],
+    compact: async () => { throw new Error('summary_provider_failed') },
+  })
+  await assert.rejects(async () => {
+    for await (const _event of model.analyze({
+      executionId: 'compaction-capacity-exhausted',
+      runtimeSettings: runtimeSettings({ compactionReserveTokens: 1 }),
+      symbol: 'NVDA', systemPrompt: 'system', userPrompt: '形成综合报告', knownFacts: facts,
+      fetchFinancialContext: async () => ({ facts }), toolRuntime: runtime,
+    })) { /* consume */ }
+  }, /compaction_capacity_exhausted/)
+  assert.equal(failed.length, 1)
+  assert.deepEqual((failed[0]?.attempts as Array<{ attempt: number }>).map(({ attempt }) => attempt), [1, 2])
+  assert.equal((failed[0]?.event as Record<string, unknown>).status, 'failed')
 })
 
 test('真实 Pi 用冻结 model concurrency 限制并行 provider 请求', async () => {
