@@ -218,7 +218,7 @@ test('新建分析页展示分析历史并能重新打开报告', async () => {
   assert.match(history.textContent ?? '', /AAPL 综合分析/)
   assert.match(history.textContent ?? '', /2026年8月11日/)
   await user.click(view.getByRole('button', { name: /打开 AAPL 综合分析/ }))
-  await view.findByRole('heading', { name: '研究记录' })
+  await view.findByRole('heading', { name: '研究记录' }, { timeout: 2_000 })
   await view.findByRole('heading', { name: 'AAPL 综合分析' })
 })
 
@@ -307,6 +307,64 @@ for (const terminal of ['stopped', 'budget_exhausted']) {
     await view.findByRole('heading', { name: '研究记录' })
   })
 }
+
+test('轮询经过 stopping 后在 stopped 终止并打开研究页', async () => {
+  setupDom()
+  Reflect.deleteProperty(globalThis, 'EventSource')
+  let polls = 0
+  globalThis.fetch = async (input, init) => {
+    const url = String(input)
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok', engine: 'postgresql', schemaVersion: 10 }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/settings') return Response.json(settingsResponse())
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+    if (url === '/api/portfolio') return Response.json(portfolioResponse([]))
+    if (url === '/api/research') return Response.json({ records: [] })
+    if (url === '/api/analyses' && init?.method === 'POST') return Response.json({ analysisId: 'poll-stop', sessionId: 'session-stop' }, { status: 202 })
+    if (url === '/api/analyses/poll-stop') {
+      polls += 1
+      return Response.json({ id: 'poll-stop', status: polls === 1 ? 'stopping' : 'stopped' })
+    }
+    if (url === '/api/research/poll-stop') return Response.json({ id: 'poll-stop', symbol: 'NVDA', status: 'stopped', facts: [], trace: [] })
+    throw new Error(`unexpected_fetch:${url}`)
+  }
+  const view = render(React.createElement(App))
+  const user = userEvent.setup({ document: window.document })
+  await user.click(await view.findByRole('button', { name: '新建分析' }))
+  await user.type(await view.findByLabelText('分析标的'), 'NVDA')
+  await user.click(view.getByRole('button', { name: '开始分析' }))
+  await view.findByRole('heading', { name: '研究记录' })
+  assert.ok(polls >= 2)
+})
+
+test('轮询遇到非终态 budget_exhausted 会继续等待 finalizing 与完成', async () => {
+  setupDom()
+  Reflect.deleteProperty(globalThis, 'EventSource')
+  let polls = 0
+  globalThis.fetch = async (input, init) => {
+    const url = String(input)
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok', engine: 'postgresql', schemaVersion: 10 }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/settings') return Response.json(settingsResponse())
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+    if (url === '/api/portfolio') return Response.json(portfolioResponse([]))
+    if (url === '/api/research') return Response.json({ records: [] })
+    if (url === '/api/analyses' && init?.method === 'POST') return Response.json({ analysisId: 'poll-budget-close', sessionId: 'session-budget-close' }, { status: 202 })
+    if (url === '/api/analyses/poll-budget-close') {
+      polls += 1
+      if (polls === 1) return Response.json({ status: 'budget_exhausted', terminal: false })
+      if (polls === 2) return Response.json({ status: 'finalizing', terminal: false })
+      return Response.json({ status: 'completed', terminal: true })
+    }
+    if (url === '/api/research/poll-budget-close') return Response.json({ id: 'poll-budget-close', symbol: 'NVDA', status: 'completed', facts: [], trace: [] })
+    throw new Error(`unexpected_fetch:${url}`)
+  }
+  const view = render(React.createElement(App))
+  const user = userEvent.setup({ document: window.document })
+  await user.click(await view.findByRole('button', { name: '新建分析' }))
+  await user.type(await view.findByLabelText('分析标的'), 'NVDA')
+  await user.click(view.getByRole('button', { name: '开始分析' }))
+  await view.findByRole('heading', { name: '研究记录' }, { timeout: 2_000 })
+  assert.ok(polls >= 3)
+})
 
 test('报告 freshness 按报告年龄提示且不因历史事实改写报告内容', async () => {
   setupDom()

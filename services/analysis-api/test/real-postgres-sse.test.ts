@@ -61,7 +61,6 @@ test('真实 PostgreSQL 与真实 HTTP SSE 断线后先 catch-up 再继续 live'
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ symbol: 'PGSSE' }),
   }).then((response) => response.json()) as { analysisId: string; sessionId: string }
-
   try {
     const persistedSession = await eventRepository.getSession(created.sessionId)
     const firstController = new AbortController()
@@ -154,6 +153,183 @@ test('真实 PostgreSQL 重启恢复在 API、Session ledger 与 SSE 中一致�
     assert.match(replay, /event: interrupted/)
     assert.doesNotMatch(replay, /event: running/)
   } finally {
+    await app.close()
+  }
+})
+
+test('真实 PostgreSQL 取消在 PG、HTTP 与 SSE reconnect 统一为 stopping → stopped', {
+  skip: !databaseUrl,
+  concurrency: false,
+}, async () => {
+  const pool = createPool(databaseUrl!)
+  const events = createAgentEventRepository(pool)
+  let modelStarted!: () => void
+  const started = new Promise<void>((resolve) => { modelStarted = resolve })
+  const app = buildApp({
+    productDatabase: { checkSchema: () => checkSchema(pool), close: () => pool.end() },
+    portfolioRepository: createPortfolioRepository(pool),
+    analysisRepository: createAnalysisRepository(pool),
+    agentEventRepository: events,
+    runtimeSettingsRepository: createRuntimeSettingsRepository(pool),
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, gaps: [], facts: [] }),
+    model: {
+      async *analyze(input): AsyncGenerator<ModelEvent> {
+        modelStarted()
+        await new Promise<void>((resolve) => {
+          input.signal?.addEventListener('abort', () => resolve(), { once: true })
+        })
+        yield { type: 'cancelled' }
+      },
+    },
+  })
+  await app.listen({ host: '127.0.0.1', port: 0 })
+  const address = app.server.address()
+  assert.ok(address && typeof address === 'object')
+  const baseUrl = `http://127.0.0.1:${address.port}`
+  const symbol = `C${crypto.randomUUID().replaceAll('-', '').slice(0, 8)}`
+  const created = await fetch(`${baseUrl}/api/analyses`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ symbol }),
+  }).then((response) => response.json()) as { analysisId: string; sessionId: string }
+  const originalExecutionId = (await events.getSession(created.sessionId))!.executionId
+  try {
+    await started
+    const before = await events.list(created.sessionId, 0)
+    const cursor = `${created.sessionId}:${before.at(-1)!.sequence}`
+    const cancelled = await fetch(`${baseUrl}/api/analyses/${created.analysisId}/cancel`, {
+      method: 'POST',
+    })
+    assert.equal(cancelled.status, 202)
+    await waitForAgentStatus(events, created.sessionId, 'stopped')
+
+    const status = await fetch(`${baseUrl}/api/analyses/${created.analysisId}`).then((response) => response.json())
+    const research = await fetch(`${baseUrl}/api/research/${created.analysisId}`).then((response) => response.json())
+    assert.equal(status.status, 'stopped')
+    assert.equal(research.status, 'stopped')
+    assert.equal(research.mainAgent.status, 'stopped')
+    assert.equal((await events.getSession(created.sessionId))?.status, 'stopped')
+    const execution = await pool.query<{ status: string; wait_reason_json: unknown }>(
+      `SELECT status, wait_reason_json FROM agent_executions
+       WHERE session_id = $1 ORDER BY generation DESC LIMIT 1`,
+      [created.sessionId],
+    )
+    assert.deepEqual(execution.rows[0], { status: 'stopped', wait_reason_json: null })
+
+    const replay = await fetch(`${baseUrl}/api/agent-sessions/${created.sessionId}/events`, {
+      headers: { 'last-event-id': cursor },
+    }).then((response) => response.text())
+    assert.match(replay, /event: stopping/)
+    assert.match(replay, /event: stopped/)
+    assert.doesNotMatch(replay, /event: cancelled/)
+
+    const beforeLateWrite = await events.list(created.sessionId, 0)
+    const fenced = await events.getSession(created.sessionId)
+    assert.notEqual(fenced?.executionId, originalExecutionId)
+    const generations = await pool.query<{ generation: number }>(
+      'SELECT generation FROM agent_executions WHERE session_id = $1 ORDER BY generation',
+      [created.sessionId],
+    )
+    assert.deepEqual(generations.rows.map(({ generation }) => generation), [1, 2])
+    await assert.rejects(events.append({
+      sessionId: created.sessionId, executionId: originalExecutionId,
+      operationId: `execution:${originalExecutionId}:late-tool-result`,
+      event: { type: 'tool_result', name: 'fetch_financial_context', result: { facts: [] } },
+      createdAt: new Date().toISOString(),
+    }), /agent_execution_fenced/)
+    await assert.rejects(events.append({
+      sessionId: created.sessionId, executionId: originalExecutionId,
+      operationId: `execution:${created.analysisId}:late-completed`,
+      event: { type: 'status', status: 'completed', terminal: true },
+      projection: { status: 'completed', executionStatus: 'completed', terminal: true },
+      createdAt: new Date().toISOString(),
+    }), /agent_execution_fenced/)
+    assert.equal((await events.list(created.sessionId, 0)).length, beforeLateWrite.length)
+    assert.equal((await events.getSession(created.sessionId))?.status, 'stopped')
+    assert.equal((await fetch(`${baseUrl}/api/analyses/${created.analysisId}`)
+      .then((response) => response.json())).status, 'stopped')
+  } finally {
+    await app.close()
+  }
+})
+
+test('生产 Pi 经 HTTP、SSE 与真实 PostgreSQL 留存工具及预算收口状态序列', {
+  skip: !databaseUrl,
+  concurrency: false,
+}, async () => {
+  const pool = createPool(databaseUrl!)
+  const events = createAgentEventRepository(pool)
+  const settings = createRuntimeSettingsRepository(pool)
+  const previousSettings = await settings.current()
+  await settings.save({ mainAgentToolRounds: 1 }, new Date().toISOString())
+  const symbol = `B${crypto.randomUUID().replaceAll('-', '').slice(0, 8)}`
+  const report = {
+    title: '预算收口序列', marketState: '未知', trend: '未知', drivers: [],
+    supportingEvidence: [], contraryEvidence: [], keyJudgments: [], scenarios: [],
+    invalidationConditions: [], valuation: null, personalImpact: null,
+    conditionalSuggestion: null, limitations: ['预算达到上限'],
+  }
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(
+      fauxToolCall('fetch_financial_context', { symbol }, { id: 'budget-context' }),
+      { stopReason: 'toolUse' },
+    ),
+    fauxAssistantMessage(
+      fauxToolCall('submit_analysis_report', report, { id: 'budget-report' }),
+      { stopReason: 'toolUse' },
+    ),
+  ] })
+  const app = buildApp({
+    productDatabase: { checkSchema: () => checkSchema(pool), close: () => pool.end() },
+    portfolioRepository: createPortfolioRepository(pool),
+    analysisRepository: createAnalysisRepository(pool),
+    agentEventRepository: events,
+    runtimeSettingsRepository: settings,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (requested) => ({ symbol: requested, gaps: [], facts: [] }),
+    model,
+  })
+  await app.listen({ host: '127.0.0.1', port: 0 })
+  const address = app.server.address()
+  assert.ok(address && typeof address === 'object')
+  const baseUrl = `http://127.0.0.1:${address.port}`
+  const created = await fetch(`${baseUrl}/api/analyses`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ symbol }),
+  }).then((response) => response.json()) as { analysisId: string; sessionId: string }
+  try {
+    await waitForAgentStatus(events, created.sessionId, 'partial')
+    const ledger = await events.list(created.sessionId, 0)
+    const statuses = ledger.flatMap(({ payload }) => (
+      payload.type === 'status' && typeof payload.status === 'string' ? [payload.status] : []
+    ))
+    assertSubsequence(statuses, [
+      'planning', 'running_model', 'running_tools',
+      'budget_exhausted', 'finalizing', 'running_tools', 'partial',
+    ])
+    const budget = ledger.find(({ payload }) => payload.status === 'budget_exhausted')
+    assert.equal(budget?.payload.terminal, false)
+    const finalizing = ledger.find(({ payload }) => payload.status === 'finalizing')
+    assert.equal(typeof (finalizing?.payload.waitReason as { startedAt?: unknown })?.startedAt, 'string')
+    const execution = await pool.query<{ status: string; terminal: boolean; wait_reason_json: unknown }>(
+      'SELECT status, terminal, wait_reason_json FROM agent_executions WHERE session_id = $1',
+      [created.sessionId],
+    )
+    assert.deepEqual(execution.rows[0], { status: 'partial', terminal: true, wait_reason_json: null })
+
+    const research = await fetch(`${baseUrl}/api/research/${created.analysisId}`)
+      .then((response) => response.json())
+    assert.equal(research.mainAgent.status, 'partial')
+    assertSubsequence(research.mainAgent.events.map((event: { status?: string }) => event.status), [
+      'running_model', 'running_tools', 'budget_exhausted', 'finalizing', 'partial',
+    ])
+    const replay = await fetch(`${baseUrl}/api/agent-sessions/${created.sessionId}/events`)
+      .then((response) => response.text())
+    for (const status of ['running_model', 'running_tools', 'budget_exhausted', 'finalizing', 'partial']) {
+      assert.match(replay, new RegExp(`event: ${status}`))
+    }
+  } finally {
+    await settings.save(previousSettings.values, new Date().toISOString())
     await app.close()
   }
 })
@@ -401,7 +577,7 @@ test('主 Agent 跨 Turn 复用与空 call id 在真实 PostgreSQL 各自完整�
         .map(({ operationId }) => operationId), [`${emptyPrefix}:call`, `${emptyPrefix}:result`])
       const beforeReplay = ledger.length
       const replayed = await events.append({
-        sessionId: createdSessionId,
+        sessionId: createdSessionId, executionId: session.executionId,
         operationId: `${emptyPrefix}:result`,
         event: ledger.find(({ operationId }) => operationId === `${emptyPrefix}:result`)!.payload,
         createdAt: new Date().toISOString(),
@@ -611,7 +787,8 @@ test('同一 execution 两次专项 invocation 在真实 PostgreSQL 各自封存
       assert.equal(context.messages.filter(({ role }) => role === 'toolResult').length, 2)
       const replay = sealed[0]!
       const replayed = await events.append({
-        sessionId: createdSessionId, operationId: replay.operationId,
+        sessionId: createdSessionId, executionId: (await events.getSession(createdSessionId))!.executionId,
+        operationId: replay.operationId,
         event: replay.payload, createdAt: new Date().toISOString(),
       })
       assert.equal(replayed.created, false)
@@ -671,6 +848,16 @@ async function waitForPersistedEvent(
   throw new Error('agent_event_not_persisted')
 }
 
+async function waitForAgentStatus(
+  repository: ReturnType<typeof createAgentEventRepository>, sessionId: string, expected: string,
+) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if ((await repository.getSession(sessionId))?.status === expected) return
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  throw new Error(`agent_status_not_reached:${expected}`)
+}
+
 async function waitForAnalysisStatus(
   app: ReturnType<typeof buildApp>, analysisId: string, expected: string,
 ) {
@@ -680,4 +867,10 @@ async function waitForAnalysisStatus(
     await new Promise((resolve) => setTimeout(resolve, 5))
   }
   throw new Error(`analysis_status_not_reached:${expected}`)
+}
+
+function assertSubsequence(actual: Array<string | undefined>, expected: string[]) {
+  let position = 0
+  for (const item of actual) if (item === expected[position]) position += 1
+  assert.equal(position, expected.length, `missing sequence ${expected.join(' → ')} in ${actual.join(' → ')}`)
 }

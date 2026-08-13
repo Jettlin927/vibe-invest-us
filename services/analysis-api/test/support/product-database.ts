@@ -130,7 +130,7 @@ export function createTestProductDatabase() {
     },
     async listResearch(symbol) {
       return [...analyses.values()].filter((record) => (
-        ['completed', 'partial', 'failed', 'cancelled', 'interrupted'].includes(record.status)
+        ['completed', 'partial', 'failed', 'stopped', 'interrupted', 'budget_exhausted'].includes(record.status)
         && (!symbol || record.symbol === symbol.toUpperCase())
       )).sort((left, right) => right.createdAt.localeCompare(left.createdAt))
     },
@@ -152,6 +152,34 @@ export function createTestProductDatabase() {
   }
 
   const agentEventRepository: AgentEventRepository = {
+    async fenceForStopping(input) {
+      const session = agentSessions.get(input.sessionId)
+      const lifecycle = lifecycles.get(input.sessionId)
+      if (!session || !lifecycle) throw new Error('agent_session_not_found')
+      if (session.executionId !== input.executionId) throw new Error('agent_execution_fenced')
+      const event = {
+        sessionId: input.sessionId, sequence: session.latestSequence + 1,
+        operationId: input.operationId, payload: input.event, createdAt: input.createdAt,
+      }
+      agentEvents.set(input.sessionId, [...(agentEvents.get(input.sessionId) ?? []), event])
+      agentSessions.set(input.sessionId, {
+        ...session, executionId: input.fenceExecutionId, status: 'stopping',
+        latestSequence: event.sequence, updatedAt: input.createdAt,
+      })
+      lifecycles.set(input.sessionId, {
+        ...lifecycle,
+        execution: {
+          id: input.fenceExecutionId, generation: lifecycle.execution.generation + 1,
+          status: 'stopping', createdAt: input.createdAt, updatedAt: input.createdAt,
+        },
+        waitReason: input.event.waitReason as never,
+      })
+      const record = analyses.get(session.analysisId)
+      if (record && session.isPrimary) analyses.set(session.analysisId, {
+        ...record, status: 'stopping', terminal: false, updatedAt: input.createdAt,
+      })
+      return event
+    },
     async createResearch(input) {
       const existing = [...analyses.values()]
         .find((record) => record.symbol === input.symbol && ['queued', 'running'].includes(record.status))
@@ -233,6 +261,7 @@ export function createTestProductDatabase() {
       if (existing) return { sequence: existing.sequence, created: false, event: existing }
       const session = agentSessions.get(input.sessionId)
       if (!session) throw new Error('agent_session_not_found')
+      if (session.executionId !== input.executionId) throw new Error('agent_execution_fenced')
       const event = {
         sessionId: input.sessionId, sequence: session.latestSequence + 1,
         operationId: input.operationId, payload: input.event, createdAt: input.createdAt,
@@ -263,6 +292,7 @@ export function createTestProductDatabase() {
         const record = analyses.get(analysisId)
         if (record && session.isPrimary) analyses.set(analysisId, {
           ...record, status: input.projection.status ?? record.status, updatedAt: input.createdAt,
+          ...(typeof input.event.terminal === 'boolean' ? { terminal: input.event.terminal } : {}),
           report: input.projection.report ?? record.report,
           reportCreatedAt: input.projection.report ? input.createdAt : record.reportCreatedAt,
           snapshot: input.projection.snapshot ?? record.snapshot,
@@ -375,7 +405,7 @@ export function createTestProductDatabase() {
 
   return {
     productDatabase: {
-      checkSchema: async () => ({ status: 'ok' as const, version: 10 }),
+      checkSchema: async () => ({ status: 'ok' as const, version: 12 }),
       close: async () => {},
     },
     portfolioRepository,

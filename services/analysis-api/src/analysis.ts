@@ -3,7 +3,8 @@ import type {
   AgentEvent, AgentEventRepository, AnalysisRepository, RuntimeSettingsRepository,
 } from '@vibe-invest/product-dao'
 import {
-  agentExecutionStatuses, defaultRuntimeSettings, waitReasonForStatus,
+  agentExecutionStatuses, defaultRuntimeSettings, isTerminalAgentExecutionStatus,
+  waitReasonForStatus,
   type AgentExecutionStatus, type RuntimeSettings,
 } from '@vibe-invest/contracts'
 
@@ -36,6 +37,7 @@ export function createAnalysisService(options: {
   const controllers = new Map<string, AbortController>()
   const listeners = new Map<string, Set<(entry: AgentEvent) => void>>()
   const tasks = new Set<Promise<void>>()
+  const analysisTasks = new Map<string, Promise<void>>()
   const toolGate = createConcurrencyGate()
   const modelGate = createConcurrencyGate()
   let running = 0
@@ -51,11 +53,13 @@ export function createAnalysisService(options: {
 
   async function appendEvent(
     sessionId: string,
+    executionId: string,
     operationId: string,
     payload: Record<string, unknown>,
     projection?: {
       status?: string; executionStatus?: import('@vibe-invest/contracts').AgentExecutionStatus
-      waitTarget?: string; report?: unknown; snapshot?: unknown; error?: string; facts?: Fact[]
+      waitTarget?: string; terminal?: boolean
+      report?: unknown; snapshot?: unknown; error?: string; facts?: Fact[]
     },
   ) {
     const createdAt = new Date().toISOString()
@@ -65,12 +69,12 @@ export function createAnalysisService(options: {
       : undefined
     const event = waitReason === undefined ? payload : { ...payload, waitReason }
     const result = await options.eventRepository.append({
-      sessionId, operationId, event, projection, createdAt,
+      sessionId, executionId, operationId, event, projection, createdAt,
     })
     if (result.created) for (const listener of listeners.get(sessionId) ?? []) listener(result.event)
     return result.event
   }
-  async function appendTrace(sessionId: string, payload: unknown) {
+  async function appendTrace(sessionId: string, executionId: string, payload: unknown) {
     if (!payload || typeof payload !== 'object') return
     const entry = payload as Record<string, unknown>
     if (entry.type === 'model_event'
@@ -79,21 +83,29 @@ export function createAnalysisService(options: {
     const facts = entry.type === 'tool_result'
       ? ((entry.result as { facts?: Fact[] } | undefined)?.facts ?? [])
       : []
-    await appendEvent(sessionId, entry.operationId, entry, facts.length ? { facts } : undefined)
+    await appendEvent(sessionId, executionId, entry.operationId, entry, facts.length ? { facts } : undefined)
   }
   async function setStatus(
     sessionId: string,
+    executionId: string,
     operationId: string,
     status: string,
-    extra: { report?: unknown; snapshot?: unknown; error?: string } = {},
+    extra: { report?: unknown; snapshot?: unknown; error?: string; terminal?: boolean } = {},
   ) {
-    const executionStatus = status === 'cancelled' ? 'stopped' : status
-    await appendEvent(sessionId, operationId, {
+    const executionStatus = status
+    await appendEvent(sessionId, executionId, operationId, {
       type: 'status', status: executionStatus, at: new Date().toISOString(),
+      terminal: extra.terminal ?? isTerminalAgentExecutionStatus(executionStatus, true),
       ...(extra.error ? { error: extra.error } : {}),
     }, {
-      status, ...extra,
-      ...(isExecutionStatus(executionStatus) ? { executionStatus } : {}),
+      status: executionStatus,
+      ...(extra.report !== undefined ? { report: extra.report } : {}),
+      ...(extra.snapshot !== undefined ? { snapshot: extra.snapshot } : {}),
+      ...(extra.error !== undefined ? { error: extra.error } : {}),
+      ...(isExecutionStatus(executionStatus) ? {
+        executionStatus,
+        terminal: extra.terminal ?? isTerminalAgentExecutionStatus(executionStatus, true),
+      } : {}),
     })
   }
   async function get(analysisId: string) {
@@ -147,9 +159,13 @@ export function createAnalysisService(options: {
       const settingsSnapshot = await options.settingsRepository.getExecutionSnapshot(executionId)
       if (!settingsSnapshot) {
         await setStatus(
-          session.id, `execution:${executionId}:settings-snapshot-missing`, 'interrupted',
+          session.id, executionId, `execution:${executionId}:settings-snapshot-missing`, 'interrupted',
           { error: 'execution_settings_snapshot_missing' },
         )
+        running -= 1
+        continue
+      }
+      if ((await repository.get(next))?.status !== 'running') {
         running -= 1
         continue
       }
@@ -157,7 +173,7 @@ export function createAnalysisService(options: {
         * (options.runtimeMinuteMs ?? 60_000)
       const remainingWallMs = wallBudgetMs - (Date.now() - Date.parse(session.createdAt))
       if (remainingWallMs <= 0) {
-        await setStatus(session.id, `execution:${executionId}:status-failed`, 'failed', {
+        await setStatus(session.id, executionId, `execution:${executionId}:budget-exhausted`, 'budget_exhausted', {
           error: 'execution_runtime_timeout',
         })
         running -= 1
@@ -166,6 +182,7 @@ export function createAnalysisService(options: {
       try {
         await appendEvent(
           session.id,
+          executionId,
           `execution:${executionId}:running`,
           { type: 'status', status: 'planning', at: now },
           { status: 'running', executionStatus: 'planning', waitTarget: '金融与组合上下文' },
@@ -173,7 +190,7 @@ export function createAnalysisService(options: {
       } catch {
         try {
           await setStatus(
-            session.id, `execution:${executionId}:running-failed`, 'interrupted',
+            session.id, executionId, `execution:${executionId}:running-failed`, 'interrupted',
             { error: 'analysis_running_trace_failed' },
           )
         } catch {
@@ -183,7 +200,8 @@ export function createAnalysisService(options: {
         continue
       }
       const task = run(next, session.id, executionId, settingsSnapshot.values, remainingWallMs)
-        .finally(() => { running -= 1; void schedule() })
+        .finally(() => { analysisTasks.delete(next); running -= 1; void schedule() })
+      analysisTasks.set(next, task)
       tasks.add(task)
       void task.then(() => tasks.delete(task), () => tasks.delete(task))
     }
@@ -192,10 +210,10 @@ export function createAnalysisService(options: {
     analysisId: string, sessionId: string, executionId: string,
     runtimeSettings: RuntimeSettings, remainingWallMs: number,
   ) {
-    const job = await get(analysisId)
-    if (!job) return
     const controller = new AbortController()
     controllers.set(analysisId, controller)
+    const job = await get(analysisId)
+    if (!job || job.status !== 'running') { controllers.delete(analysisId); return }
     const wallDeadline = AbortSignal.timeout(Math.max(1, Math.ceil(remainingWallMs)))
     const executionSignal = AbortSignal.any([controller.signal, wallDeadline])
     const activeBudget = createActiveBudget(
@@ -212,6 +230,7 @@ export function createAnalysisService(options: {
     }
     const operationId = (kind: string) => `execution:${executionId}:${kind}`
     let modelEventSequence = 0
+    let lifecycleStatus: AgentExecutionStatus = 'planning'
     let context: FinancialContext | undefined
     const nextModelOperationId = (kind: string) => (
       `execution:${executionId}:model:${++modelEventSequence}:${kind}`
@@ -263,7 +282,7 @@ export function createAnalysisService(options: {
         ...(portfolioPriceGap ? [{ capability: 'portfolio_prices', reason: 'source_unavailable' }] : []),
       ]
       const snapshot = { ...context, gaps, portfolioContext, createdAt: new Date().toISOString() }
-      await appendEvent(sessionId, operationId('financial-context'), {
+      await appendEvent(sessionId, executionId, operationId('financial-context'), {
         type: 'financial_context',
         gaps,
         capabilities: sourceDiagnostics(context),
@@ -272,7 +291,7 @@ export function createAnalysisService(options: {
       assertPolicy()
       const modelContext = createModelContext(snapshot)
       await appendEvent(
-        sessionId, operationId('running-model'),
+        sessionId, executionId, operationId('running-model'),
         { type: 'status', status: 'running_model' },
         { executionStatus: 'running_model' },
       )
@@ -294,21 +313,32 @@ export function createAnalysisService(options: {
       })) {
         resumeProcessing()
         assertPolicy()
-        if (event.type === 'trace') {
-          await appendTrace(sessionId, event.entry.operationId ? event.entry : {
+        if (event.type === 'lifecycle') {
+          await setStatus(sessionId, executionId, event.operationId, event.status, {
+            terminal: event.status === 'budget_exhausted' ? false : undefined,
+          })
+          lifecycleStatus = event.status
+        }
+        else if (event.type === 'trace') {
+          await appendTrace(sessionId, executionId, event.entry.operationId ? event.entry : {
             ...event.entry, operationId: nextModelOperationId(event.entry.type),
           })
         }
-        else if (event.type === 'text_delta') await appendTrace(sessionId, event.operationId ? event : {
+        else if (event.type === 'text_delta') await appendTrace(sessionId, executionId, event.operationId ? event : {
           ...event, operationId: nextModelOperationId('text-delta'),
         })
         else if (event.type === 'cancelled') {
           await setStatus(
-            sessionId, event.operationId ?? nextModelOperationId('cancelled'), 'cancelled',
+            sessionId, executionId, event.operationId ?? nextModelOperationId('stopped'), 'stopped',
           ); return
         }
         else if (event.type === 'completed') {
-          await appendTrace(sessionId, {
+          if (lifecycleStatus !== 'finalizing') await setStatus(
+            sessionId, executionId, event.operationId
+              ? `${event.operationId}:finalizing`
+              : nextModelOperationId('finalizing'), 'finalizing',
+          )
+          await appendTrace(sessionId, executionId, {
             operationId: event.operationId ?? nextModelOperationId('completed'),
             type: 'model_completed',
             usage: event.usage ?? null,
@@ -322,7 +352,7 @@ export function createAnalysisService(options: {
           }
           const report = enforceDataGaps(personalized, gaps)
           const status = report.limitations.length ? 'partial' : 'completed'
-          await setStatus(sessionId, operationId(`status-${status}`), status, { report })
+          await setStatus(sessionId, executionId, operationId(`status-${status}`), status, { report })
           return
         }
         assertPolicy()
@@ -330,12 +360,14 @@ export function createAnalysisService(options: {
       }
     } catch (error) {
       if (controller.signal.aborted) {
-        await setStatus(sessionId, operationId('status-cancelled'), 'cancelled')
+        return
       } else if (wallDeadline.aborted) {
-        await setStatus(sessionId, operationId('status-failed'), 'failed', {
+        await setStatus(sessionId, executionId, operationId('budget-exhausted'), 'budget_exhausted', {
           error: 'execution_runtime_timeout',
         })
       } else if (activeBudget.exhausted()) {
+        await setStatus(sessionId, executionId, operationId('budget-exhausted'), 'budget_exhausted', { terminal: false })
+        await setStatus(sessionId, executionId, operationId('finalizing'), 'finalizing')
         const limitedContext = context ?? {
           symbol: job.symbol, facts: [], gaps: [{ capability: 'research_active', reason: 'budget_exhausted' }],
           indicators: {},
@@ -352,23 +384,26 @@ export function createAnalysisService(options: {
             acquireModelSlot: (signal) => modelGate.acquire(signal),
             acquireToolSlot: (signal) => toolGate.acquire(signal),
           })) {
-            if (event.type === 'trace') await appendTrace(sessionId, event.entry.operationId ? event.entry : {
+            if (event.type === 'lifecycle') await setStatus(sessionId, executionId, event.operationId, event.status, {
+              terminal: event.status === 'budget_exhausted' ? false : undefined,
+            })
+            if (event.type === 'trace') await appendTrace(sessionId, executionId, event.entry.operationId ? event.entry : {
               ...event.entry, operationId: nextModelOperationId(event.entry.type),
             })
             if (event.type === 'completed') {
               const report = enforceDataGaps(event.report, limitedContext.gaps ?? [])
-              await setStatus(sessionId, operationId('status-partial'), 'partial', { report })
+              await setStatus(sessionId, executionId, operationId('status-partial'), 'partial', { report })
               return
             }
           }
           throw new Error('research_active_closure_required')
         } catch (closureError) {
-          await setStatus(sessionId, operationId('status-failed'), 'failed', {
+          await setStatus(sessionId, executionId, operationId('status-failed'), 'failed', {
             error: closureError instanceof Error ? closureError.message : String(closureError),
           })
         }
       } else {
-        await setStatus(sessionId, operationId('status-failed'), 'failed', {
+        await setStatus(sessionId, executionId, operationId('status-failed'), 'failed', {
           error: error instanceof Error ? error.message : String(error),
         })
       }
@@ -380,11 +415,22 @@ export function createAnalysisService(options: {
   async function cancel(analysisId: string) {
     const job = await get(analysisId)
     if (!job || !['queued', 'running'].includes(job.status)) return false
-    controllers.get(analysisId)?.abort()
-    if (job.status === 'queued') {
-      const session = await options.eventRepository.findPrimarySession(analysisId)
-      if (session) await setStatus(session.id, `session:${session.id}:queued-cancelled`, 'cancelled')
-    }
+    const session = await options.eventRepository.findPrimarySession(analysisId)
+    if (!session) return false
+    const fenceExecutionId = randomUUID()
+    const createdAt = new Date().toISOString()
+    const waitReason = waitReasonForStatus('stopping', '运行时停止确认', createdAt)
+    const event = await options.eventRepository.fenceForStopping({
+      sessionId: session.id, executionId: session.executionId, fenceExecutionId,
+      operationId: `session:${session.id}:stopping`,
+      event: { type: 'status', status: 'stopping', terminal: false, waitReason, at: createdAt },
+      createdAt,
+    })
+    for (const listener of listeners.get(session.id) ?? []) listener(event)
+    const controller = controllers.get(analysisId)
+    controller?.abort()
+    await analysisTasks.get(analysisId)
+    await setStatus(session.id, fenceExecutionId, `session:${session.id}:stopped`, 'stopped')
     return true
   }
   async function research(analysisId: string) {
@@ -437,16 +483,18 @@ export function createAnalysisService(options: {
         if (entry.sequence <= cursor) continue
         cursor = entry.sequence
         yield entry
-        if (entry.payload.type === 'status' && isTerminal(String(entry.payload.status))) return
+        if (entry.payload.type === 'status' && isTerminalEvent(entry.payload)) return
       }
       const current = await options.eventRepository.getSession(sessionId)
       if (!current) return
-      if (isTerminal(current.status)) {
-        for (const entry of await options.eventRepository.list(sessionId, cursor)) {
+      if (isTerminalAgentExecutionStatus(current.status, true)) {
+        const remaining = await options.eventRepository.list(sessionId, cursor)
+        for (const entry of remaining) {
           cursor = entry.sequence
           yield entry
         }
-        return
+        const latest = [...catchUp, ...remaining].at(-1)
+        if (latest?.payload.type === 'status' && isTerminalEvent(latest.payload)) return
       }
       while (!signal?.aborted) {
         if (!queue.some(({ sequence }) => sequence > cursor)) {
@@ -461,7 +509,7 @@ export function createAnalysisService(options: {
           if (entry.sequence <= cursor) continue
           cursor = entry.sequence
           yield entry
-          if (entry.payload.type === 'status' && isTerminal(String(entry.payload.status))) return
+          if (entry.payload.type === 'status' && isTerminalEvent(entry.payload)) return
         }
       }
     } finally {
@@ -490,6 +538,7 @@ function waitTarget(status: AgentExecutionStatus) {
   return ({
     planning: '研究规划', running_model: '主模型响应', running_tools: '工具结果',
     waiting_for_specialists: '专项分析', finalizing: '报告收口',
+    stopping: '停止当前执行',
   } as Partial<Record<AgentExecutionStatus, string>>)[status] ?? ''
 }
 
@@ -533,8 +582,10 @@ function sourceDiagnostics(context: FinancialContext) {
   return capabilities
 }
 
-function isTerminal(status: string) {
-  return ['completed', 'partial', 'failed', 'stopped', 'interrupted', 'budget_exhausted'].includes(status)
+function isTerminalEvent(payload: Record<string, unknown>) {
+  return isTerminalAgentExecutionStatus(
+    String(payload.status), typeof payload.terminal === 'boolean' ? payload.terminal : undefined,
+  )
 }
 
 function enforceDataGaps(report: AnalysisReport, gaps: unknown[]) {

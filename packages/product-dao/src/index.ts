@@ -1,11 +1,12 @@
 import { Pool, type PoolClient } from 'pg'
 import {
   agentExecutionStatuses, defaultRuntimeSettings, parseRuntimeSettingsUpdate,
+  terminalAgentExecutionStatuses,
   type AgentExecutionStatus,
   type ExecutionSettingsSnapshot, type RuntimeSettings, type RuntimeSettingsRevision,
 } from '@vibe-invest/contracts'
 
-export const schemaVersion = 10
+export const schemaVersion = 12
 
 const migrationSql = `
 CREATE TABLE IF NOT EXISTS product_schema_migrations (
@@ -62,6 +63,7 @@ CREATE TABLE IF NOT EXISTS analyses (
 );
 
 ALTER TABLE analyses ADD COLUMN IF NOT EXISTS report_created_at timestamptz;
+ALTER TABLE analyses ADD COLUMN IF NOT EXISTS active boolean NOT NULL DEFAULT false;
 
 CREATE TABLE IF NOT EXISTS atomic_facts (
   id text PRIMARY KEY,
@@ -125,15 +127,16 @@ CREATE TABLE IF NOT EXISTS agent_executions (
     'completed', 'partial', 'failed', 'stopping', 'stopped', 'interrupted', 'budget_exhausted'
   )),
   wait_reason_json jsonb,
+  terminal boolean NOT NULL DEFAULT false,
   created_at timestamptz NOT NULL,
   updated_at timestamptz NOT NULL,
   UNIQUE (session_id, generation)
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS agent_executions_one_active_per_session
-ON agent_executions (session_id) WHERE status IN (
-  'planning', 'running_model', 'running_tools', 'waiting_for_specialists', 'finalizing', 'stopping'
-);
+ALTER TABLE agent_executions ADD COLUMN IF NOT EXISTS terminal boolean NOT NULL DEFAULT false;
+UPDATE agent_executions SET terminal = status IN (
+  'completed', 'partial', 'failed', 'stopped', 'interrupted', 'budget_exhausted'
+) WHERE terminal = false;
 
 CREATE TABLE IF NOT EXISTS conversation_segments (
   id text PRIMARY KEY,
@@ -144,7 +147,7 @@ CREATE TABLE IF NOT EXISTS conversation_segments (
 );
 
 INSERT INTO agent_executions (
-  id, session_id, generation, status, wait_reason_json, created_at, updated_at
+  id, session_id, generation, status, wait_reason_json, terminal, created_at, updated_at
 )
 SELECT session.execution_id, session.id, 1,
   CASE session.status
@@ -162,9 +165,30 @@ SELECT session.execution_id, session.id, 1,
     WHEN 'running' THEN jsonb_build_object('kind', 'model', 'target', '主模型响应', 'startedAt', session.updated_at)
     ELSE NULL
   END,
+  session.status NOT IN ('queued', 'running'),
   session.created_at, session.updated_at
 FROM agent_sessions session
 ON CONFLICT (id) DO NOTHING;
+
+UPDATE agent_executions execution
+SET terminal = COALESCE(
+  (
+    SELECT (event.payload_json->>'terminal')::boolean
+    FROM agent_events event
+    WHERE event.session_id = execution.session_id
+      AND event.payload_json->>'status' = 'budget_exhausted'
+      AND event.payload_json ? 'terminal'
+    ORDER BY event.sequence DESC LIMIT 1
+  ), true
+)
+WHERE execution.status = 'budget_exhausted';
+
+UPDATE agent_sessions SET status = 'stopped' WHERE status = 'cancelled';
+UPDATE analyses SET status = 'stopped' WHERE status = 'cancelled';
+
+DROP INDEX IF EXISTS agent_executions_one_active_per_session;
+CREATE UNIQUE INDEX agent_executions_one_active_per_session
+ON agent_executions (session_id) WHERE terminal = false;
 
 INSERT INTO conversation_segments (id, session_id, ordinal, created_at)
 SELECT session.id || ':segment:1', session.id, 1, session.created_at
@@ -204,16 +228,21 @@ CREATE TABLE IF NOT EXISTS execution_settings_snapshots (
   frozen_at timestamptz NOT NULL
 );
 
+UPDATE analyses analysis SET active = EXISTS (
+  SELECT 1 FROM agent_sessions session
+  JOIN agent_executions execution ON execution.session_id = session.id
+  WHERE session.analysis_id = analysis.id AND session.is_primary AND execution.terminal = false
+);
 WITH duplicate_active AS (
   SELECT id, row_number() OVER (PARTITION BY symbol ORDER BY created_at, id) AS position
-  FROM analyses WHERE status IN ('queued', 'running')
+  FROM analyses WHERE active
 )
-UPDATE analyses SET status = 'interrupted', updated_at = now()
+UPDATE analyses SET status = 'interrupted', active = false, updated_at = now()
 FROM duplicate_active
 WHERE analyses.id = duplicate_active.id AND duplicate_active.position > 1;
 
-CREATE UNIQUE INDEX IF NOT EXISTS analyses_one_active_per_symbol
-ON analyses (symbol) WHERE status IN ('queued', 'running');
+DROP INDEX IF EXISTS analyses_one_active_per_symbol;
+CREATE UNIQUE INDEX analyses_one_active_per_symbol ON analyses (symbol) WHERE active;
 
 INSERT INTO product_schema_migrations (version)
 VALUES (1)
@@ -253,6 +282,14 @@ ON CONFLICT (version) DO NOTHING;
 
 INSERT INTO product_schema_migrations (version)
 VALUES (10)
+ON CONFLICT (version) DO NOTHING;
+
+INSERT INTO product_schema_migrations (version)
+VALUES (11)
+ON CONFLICT (version) DO NOTHING;
+
+INSERT INTO product_schema_migrations (version)
+VALUES (12)
 ON CONFLICT (version) DO NOTHING;
 
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM vibe_invest_app;
@@ -421,9 +458,7 @@ export function createRuntimeSettingsRepository(pool: Pool) {
                 snapshot.frozen_at::text AS created_at
          FROM execution_settings_snapshots snapshot
          JOIN agent_executions execution ON execution.id = snapshot.execution_id
-         WHERE execution.status IN (
-           'planning', 'running_model', 'running_tools', 'waiting_for_specialists', 'finalizing', 'stopping'
-         )
+         WHERE execution.terminal = false
          ORDER BY snapshot.frozen_at, snapshot.execution_id`,
       )
       return result.rows.map(mapSnapshot)
@@ -730,16 +765,18 @@ export type AnalysisRecord = {
   error: string | null
   starred: boolean
   note: string
+  terminal?: boolean
 }
 
 type AnalysisRow = {
   id: string; symbol: string; status: string; created_at: string; updated_at: string
   snapshot_json: unknown; report_json: unknown; report_created_at: string | null
   error: string | null; starred: boolean; note: string
+  terminal?: boolean | null
 }
 
 export function createAnalysisRepository(pool: Pool) {
-  const terminal = ['completed', 'partial', 'failed', 'cancelled', 'interrupted']
+  const terminal = terminalAgentExecutionStatuses
   return {
     async interruptRunning(updatedAt: string) {
       await pool.query(
@@ -796,17 +833,28 @@ export function createAnalysisRepository(pool: Pool) {
       )
     },
     async get(id: string) {
-      const result = await pool.query<AnalysisRow>('SELECT * FROM analyses WHERE id = $1', [id])
+      const result = await pool.query<AnalysisRow>(
+        `SELECT analysis.*,
+           CASE WHEN event.payload_json->>'terminal' IS NULL THEN NULL
+             ELSE (event.payload_json->>'terminal')::boolean END AS terminal
+         FROM analyses analysis
+         LEFT JOIN agent_sessions session
+           ON session.analysis_id = analysis.id AND session.is_primary
+         LEFT JOIN agent_events event
+           ON event.session_id = session.id AND event.sequence = session.latest_sequence
+         WHERE analysis.id = $1`, [id],
+      )
       return result.rows[0] ? mapAnalysisRow(result.rows[0]) : null
     },
     async createOrReturn(record: { id: string; symbol: string; status: string; createdAt: string; updatedAt: string }) {
+      const active = ['queued', 'running'].includes(record.status)
       const result = await pool.query<{ id: string; created: boolean }>(
-        `INSERT INTO analyses (id, symbol, status, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (symbol) WHERE status IN ('queued', 'running')
+        `INSERT INTO analyses (id, symbol, status, active, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (symbol) WHERE active
          DO UPDATE SET symbol = excluded.symbol
          RETURNING id, id = $1 AS created`,
-        [record.id, record.symbol, record.status, record.createdAt, record.updatedAt],
+        [record.id, record.symbol, record.status, active, record.createdAt, record.updatedAt],
       )
       return { analysisId: result.rows[0]!.id, created: result.rows[0]!.created }
     },
@@ -917,6 +965,64 @@ type AgentSessionRow = {
 
 export function createAgentEventRepository(pool: Pool) {
   return {
+    async fenceForStopping(input: {
+      sessionId: string; executionId: string; fenceExecutionId: string
+      operationId: string; event: Record<string, unknown>; createdAt: string
+    }) {
+      const client = await pool.connect()
+      try {
+        await client.query('BEGIN')
+        const session = await client.query<{
+          latest_sequence: number; analysis_id: string; is_primary: boolean; execution_id: string
+        }>(
+          `SELECT latest_sequence, analysis_id, is_primary, execution_id
+           FROM agent_sessions WHERE id = $1 FOR UPDATE`, [input.sessionId],
+        )
+        if (!session.rows[0]) throw new Error('agent_session_not_found')
+        if (session.rows[0].execution_id !== input.executionId) throw new Error('agent_execution_fenced')
+        const execution = await client.query<{ generation: number; terminal: boolean }>(
+          'SELECT generation, terminal FROM agent_executions WHERE id = $1 FOR UPDATE',
+          [input.executionId],
+        )
+        if (!execution.rows[0]) throw new Error('agent_execution_not_found')
+        if (execution.rows[0].terminal) throw new Error('agent_execution_terminal')
+        const sequence = session.rows[0].latest_sequence + 1
+        const waitReason = input.event.waitReason ?? null
+        await client.query(
+          'UPDATE agent_executions SET terminal = true, updated_at = $1 WHERE id = $2',
+          [input.createdAt, input.executionId],
+        )
+        await client.query(
+          `INSERT INTO agent_executions (
+             id, session_id, generation, status, wait_reason_json, terminal, created_at, updated_at
+           ) VALUES ($1, $2, $3, 'stopping', $4, false, $5, $5)`,
+          [input.fenceExecutionId, input.sessionId, execution.rows[0].generation + 1,
+            waitReason ? JSON.stringify(waitReason) : null, input.createdAt],
+        )
+        await client.query(
+          `INSERT INTO agent_events (session_id, sequence, operation_id, payload_json, created_at)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [input.sessionId, sequence, input.operationId, JSON.stringify(input.event), input.createdAt],
+        )
+        await client.query(
+          `UPDATE agent_sessions SET execution_id = $1, status = 'stopping', latest_sequence = $2,
+             updated_at = $3 WHERE id = $4`,
+          [input.fenceExecutionId, sequence, input.createdAt, input.sessionId],
+        )
+        if (session.rows[0].is_primary) await client.query(
+          `UPDATE analyses SET status = 'stopping', active = true, updated_at = $1 WHERE id = $2`,
+          [input.createdAt, session.rows[0].analysis_id],
+        )
+        await client.query('COMMIT')
+        return { sessionId: input.sessionId, sequence, operationId: input.operationId,
+          payload: input.event, createdAt: input.createdAt }
+      } catch (error) {
+        await client.query('ROLLBACK')
+        throw error
+      } finally {
+        client.release()
+      }
+    },
     async createResearch(input: {
       analysisId: string
       sessionId: string
@@ -933,9 +1039,9 @@ export function createAgentEventRepository(pool: Pool) {
       try {
         await client.query('BEGIN')
         const analysis = await client.query<{ id: string; created: boolean }>(
-          `INSERT INTO analyses (id, symbol, status, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, $4)
-           ON CONFLICT (symbol) WHERE status IN ('queued', 'running')
+          `INSERT INTO analyses (id, symbol, status, active, created_at, updated_at)
+           VALUES ($1, $2, $3, true, $4, $4)
+           ON CONFLICT (symbol) WHERE active
            DO UPDATE SET symbol = excluded.symbol
            RETURNING id, id = $1 AS created`,
           [input.analysisId, input.symbol, input.analysisStatus ?? input.status, input.createdAt],
@@ -960,8 +1066,8 @@ export function createAgentEventRepository(pool: Pool) {
         }
         await client.query(
           `INSERT INTO agent_executions (
-             id, session_id, generation, status, wait_reason_json, created_at, updated_at
-           ) VALUES ($1, $2, 1, 'planning', $3, $4, $4)`,
+             id, session_id, generation, status, wait_reason_json, terminal, created_at, updated_at
+           ) VALUES ($1, $2, 1, 'planning', $3, false, $4, $4)`,
           [input.executionId, input.sessionId, JSON.stringify(waitReason), input.createdAt],
         )
         await client.query(
@@ -1025,10 +1131,14 @@ export function createAgentEventRepository(pool: Pool) {
             : null
         await client.query(
           `INSERT INTO agent_executions (
-             id, session_id, generation, status, wait_reason_json, created_at, updated_at
-           ) VALUES ($1, $2, 1, $3, $4, $5, $5)`,
+             id, session_id, generation, status, wait_reason_json, terminal, created_at, updated_at
+           ) VALUES ($1, $2, 1, $3, $4, $5, $6, $6)`,
           [input.executionId, input.id, executionStatus,
-            waitReason ? JSON.stringify(waitReason) : null, input.createdAt],
+            waitReason ? JSON.stringify(waitReason) : null,
+            terminalAgentExecutionStatuses.includes(
+              executionStatus as typeof terminalAgentExecutionStatuses[number],
+            ),
+            input.createdAt],
         )
         await client.query(
           `INSERT INTO conversation_segments (id, session_id, ordinal, created_at)
@@ -1050,12 +1160,14 @@ export function createAgentEventRepository(pool: Pool) {
     },
     async append(input: {
       sessionId: string
+      executionId: string
       operationId: string
       event: Record<string, unknown>
       projection?: {
         status?: string
         executionStatus?: AgentExecutionStatus
         waitTarget?: string
+        terminal?: boolean
         report?: unknown
         snapshot?: unknown
         error?: string
@@ -1067,9 +1179,9 @@ export function createAgentEventRepository(pool: Pool) {
       try {
         await client.query('BEGIN')
         const session = await client.query<{
-          latest_sequence: number; analysis_id: string; is_primary: boolean
+          latest_sequence: number; analysis_id: string; is_primary: boolean; execution_id: string
         }>(
-          'SELECT latest_sequence, analysis_id, is_primary FROM agent_sessions WHERE id = $1 FOR UPDATE',
+          'SELECT latest_sequence, analysis_id, is_primary, execution_id FROM agent_sessions WHERE id = $1 FOR UPDATE',
           [input.sessionId],
         )
         if (!session.rows[0]) throw new Error('agent_session_not_found')
@@ -1087,6 +1199,17 @@ export function createAgentEventRepository(pool: Pool) {
           await client.query('COMMIT')
           return { sequence: existing.rows[0].sequence, created: false, event: mapAgentEventRow(event.rows[0]!) }
         }
+        if (session.rows[0].execution_id !== input.executionId) throw new Error('agent_execution_fenced')
+        const execution = await client.query<{ id: string; status: string; terminal: boolean }>(
+          `SELECT id, status, terminal FROM agent_executions WHERE id = $1 FOR UPDATE`,
+          [input.executionId],
+        )
+        if (!execution.rows[0]) throw new Error('agent_execution_not_found')
+        const current = execution.rows[0]
+        if (current.terminal) throw new Error('agent_execution_terminal')
+        if (current.status === 'stopping' && input.projection?.executionStatus !== 'stopped') {
+          throw new Error('agent_execution_stopping')
+        }
         const sequence = session.rows[0].latest_sequence + 1
         await client.query(
           `INSERT INTO agent_events (
@@ -1095,17 +1218,14 @@ export function createAgentEventRepository(pool: Pool) {
           [input.sessionId, sequence, input.operationId, JSON.stringify(input.event), input.createdAt],
         )
         if (input.projection?.executionStatus) {
-          const execution = await client.query<{ id: string }>(
-            `SELECT id FROM agent_executions WHERE session_id = $1
-             ORDER BY generation DESC LIMIT 1 FOR UPDATE`, [input.sessionId],
-          )
-          if (!execution.rows[0]) throw new Error('agent_execution_not_found')
           const waitReason = input.event.waitReason ?? null
+          const terminal = input.projection.terminal
+            ?? input.event.terminal === true
           await client.query(
-            `UPDATE agent_executions SET status = $1, wait_reason_json = $2, updated_at = $3
-             WHERE id = $4`,
+            `UPDATE agent_executions SET status = $1, wait_reason_json = $2,
+               terminal = $3, updated_at = $4 WHERE id = $5`,
             [input.projection.executionStatus, waitReason ? JSON.stringify(waitReason) : null,
-              input.createdAt, execution.rows[0].id],
+              terminal, input.createdAt, current.id],
           )
         }
         for (const fact of input.projection?.facts ?? []) {
@@ -1127,15 +1247,18 @@ export function createAgentEventRepository(pool: Pool) {
         )
         if (input.projection && session.rows[0].is_primary) {
           await client.query(
-            `UPDATE analyses SET status = COALESCE($1, status), updated_at = $2,
+          `UPDATE analyses SET status = COALESCE($1, status),
+               active = CASE WHEN $6::boolean IS NULL THEN active ELSE NOT $6 END,
+               updated_at = $2,
                report_json = COALESCE($3::jsonb, report_json),
                report_created_at = CASE WHEN $3::jsonb IS NULL THEN report_created_at ELSE $2 END,
                snapshot_json = COALESCE($4::jsonb, snapshot_json),
-               error = COALESCE($5, error) WHERE id = $6`,
+               error = COALESCE($5, error) WHERE id = $7`,
             [input.projection.status, input.createdAt,
               input.projection.report ? JSON.stringify(input.projection.report) : null,
               input.projection.snapshot ? JSON.stringify(input.projection.snapshot) : null,
-              input.projection.error ?? null, session.rows[0].analysis_id],
+              input.projection.error ?? null, input.projection.terminal ?? null,
+              session.rows[0].analysis_id],
           )
         }
         await client.query('COMMIT')
@@ -1160,17 +1283,14 @@ export function createAgentEventRepository(pool: Pool) {
           `SELECT session.id, session.analysis_id, session.is_primary, session.latest_sequence
            FROM agent_sessions session
            JOIN agent_executions execution ON execution.session_id = session.id
-           WHERE execution.status IN (
-             'planning', 'running_model', 'running_tools', 'waiting_for_specialists',
-             'finalizing', 'stopping'
-           )
+           WHERE execution.terminal = false
            ORDER BY session.id FOR UPDATE OF session, execution`,
         )
         const interrupted: AgentEvent[] = []
         for (const session of sessions.rows) {
           const sequence = session.latest_sequence + 1
           const operationId = `startup:interrupt:${session.id}:${sequence}`
-          const payload = { type: 'status', status: 'interrupted', at: createdAt }
+          const payload = { type: 'status', status: 'interrupted', terminal: true, at: createdAt }
           await client.query(
             `INSERT INTO agent_events (
                session_id, sequence, operation_id, payload_json, created_at
@@ -1184,16 +1304,13 @@ export function createAgentEventRepository(pool: Pool) {
           )
           await client.query(
             `UPDATE agent_executions
-             SET status = 'interrupted', wait_reason_json = NULL, updated_at = $1
-             WHERE session_id = $2 AND status IN (
-               'planning', 'running_model', 'running_tools', 'waiting_for_specialists',
-               'finalizing', 'stopping'
-             )`,
+             SET status = 'interrupted', wait_reason_json = NULL, terminal = true, updated_at = $1
+             WHERE session_id = $2 AND terminal = false`,
             [createdAt, session.id],
           )
           if (session.is_primary) {
             await client.query(
-              `UPDATE analyses SET status = 'interrupted', updated_at = $1 WHERE id = $2`,
+              `UPDATE analyses SET status = 'interrupted', active = false, updated_at = $1 WHERE id = $2`,
               [createdAt, session.analysis_id],
             )
           }
@@ -1243,39 +1360,60 @@ export function createAgentEventRepository(pool: Pool) {
       return result.rows.map(mapAgentSessionRow)
     },
     async primaryLifecycle(analysisId: string) {
-      const session = await this.findPrimarySession(analysisId)
-      if (!session) return null
-      const [execution, segments, events] = await Promise.all([
-        pool.query<{
-          id: string; generation: number; status: string; wait_reason_json: Record<string, unknown> | null
+      const client = await pool.connect()
+      try {
+        await client.query('BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
+        const sessionResult = await client.query<AgentSessionRow>(
+          `SELECT id, analysis_id, is_primary, execution_id, status, latest_sequence,
+             created_at::text, updated_at::text
+           FROM agent_sessions WHERE analysis_id = $1 AND is_primary`,
+          [analysisId],
+        )
+        const sessionRow = sessionResult.rows[0]
+        if (!sessionRow) { await client.query('COMMIT'); return null }
+        const session = mapAgentSessionRow(sessionRow)
+        const execution = await client.query<{
+          id: string; generation: number; status: string; terminal: boolean
+          wait_reason_json: Record<string, unknown> | null
           created_at: string; updated_at: string
         }>(
-          `SELECT id, generation, status, wait_reason_json, created_at::text, updated_at::text
+          `SELECT id, generation, status, terminal, wait_reason_json, created_at::text, updated_at::text
            FROM agent_executions WHERE session_id = $1 ORDER BY generation DESC LIMIT 1`,
           [session.id],
-        ),
-        pool.query<{ id: string; ordinal: number; created_at: string }>(
+        )
+        const segments = await client.query<{ id: string; ordinal: number; created_at: string }>(
           `SELECT id, ordinal, created_at::text FROM conversation_segments
            WHERE session_id = $1 ORDER BY ordinal`, [session.id],
-        ),
-        this.list(session.id, 0),
-      ])
-      const current = execution.rows[0]
-      if (!current) return null
-      return {
-        ...session, status: current.status, waitReason: current.wait_reason_json,
-        execution: {
-          id: current.id, generation: current.generation, status: current.status,
-          createdAt: new Date(current.created_at).toISOString(),
-          updatedAt: new Date(current.updated_at).toISOString(),
-        },
-        segments: segments.rows.map((segment) => ({
-          id: segment.id, ordinal: segment.ordinal,
-          createdAt: new Date(segment.created_at).toISOString(),
-        })),
-        events: events.map((event) => ({
-          sequence: event.sequence, createdAt: event.createdAt, ...event.payload,
-        })),
+        )
+        const eventRows = await client.query<AgentEventRow>(
+          `SELECT session_id, sequence, operation_id, payload_json, created_at::text
+           FROM agent_events WHERE session_id = $1 ORDER BY sequence`, [session.id],
+        )
+        const current = execution.rows[0]
+        if (!current) { await client.query('COMMIT'); return null }
+        const lifecycle = {
+          ...session, status: current.status, waitReason: current.wait_reason_json,
+          execution: {
+            id: current.id, generation: current.generation, status: current.status,
+            terminal: current.terminal,
+            createdAt: new Date(current.created_at).toISOString(),
+            updatedAt: new Date(current.updated_at).toISOString(),
+          },
+          segments: segments.rows.map((segment) => ({
+            id: segment.id, ordinal: segment.ordinal,
+            createdAt: new Date(segment.created_at).toISOString(),
+          })),
+          events: eventRows.rows.map(mapAgentEventRow).map((event) => ({
+            sequence: event.sequence, createdAt: event.createdAt, ...event.payload,
+          })),
+        }
+        await client.query('COMMIT')
+        return lifecycle
+      } catch (error) {
+        await client.query('ROLLBACK')
+        throw error
+      } finally {
+        client.release()
       }
     },
   }
@@ -1317,6 +1455,7 @@ function mapAnalysisRow(row: AnalysisRow): AnalysisRecord {
     snapshot: row.snapshot_json, report: row.report_json, error: row.error,
     reportCreatedAt: row.report_created_at ? new Date(row.report_created_at).toISOString() : null,
     starred: row.starred, note: row.note,
+    ...(row.terminal === null || row.terminal === undefined ? {} : { terminal: row.terminal }),
   }
 }
 

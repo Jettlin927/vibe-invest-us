@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import type { Pool } from 'pg'
 
 import { defaultRuntimeSettings } from '@vibe-invest/contracts'
 
@@ -141,11 +142,12 @@ test('真实 PostgreSQL 原子创建主 Session、execution generation、初始 
   const analysisId = `lifecycle-${crypto.randomUUID()}`
   const sessionId = `session-${crypto.randomUUID()}`
   const executionId = `execution-${crypto.randomUUID()}`
+  const symbol = `L${crypto.randomUUID().replaceAll('-', '').slice(0, 8)}`
   const createdAt = '2026-08-13T03:00:00.000Z'
   try {
     await events.createResearch({
       analysisId, sessionId, executionId, segmentId: `segment-${crypto.randomUUID()}`,
-      symbol: `L${crypto.randomUUID().replaceAll('-', '').slice(0, 8)}`,
+      symbol,
       status: 'planning', analysisStatus: 'queued', operationId: 'runtime-context',
       event: {
         type: 'runtime_context', status: 'planning', executionId, generation: 1,
@@ -168,7 +170,116 @@ test('真实 PostgreSQL 原子创建主 Session、execution generation、初始 
        VALUES ($1, $2, 2, 'running_model', $3, $3)`,
       [`active-${crypto.randomUUID()}`, sessionId, createdAt],
     ), /duplicate key value/)
+
+    await events.append({
+      sessionId, executionId, operationId: 'budget-transition',
+      event: { type: 'status', status: 'budget_exhausted', terminal: false },
+      projection: { status: 'budget_exhausted', executionStatus: 'budget_exhausted' },
+      createdAt: '2026-08-13T03:00:01.000Z',
+    })
+    await assert.rejects(pool.query(
+      `INSERT INTO agent_executions
+       (id, session_id, generation, status, created_at, updated_at)
+       VALUES ($1, $2, 2, 'running_model', $3, $3)`,
+      [`budget-active-${crypto.randomUUID()}`, sessionId, createdAt],
+    ), /duplicate key value/)
+    const duplicateWhileBudgetClosing = await events.createResearch({
+      analysisId: `duplicate-budget-${crypto.randomUUID()}`,
+      sessionId: `duplicate-budget-session-${crypto.randomUUID()}`,
+      executionId: `duplicate-budget-execution-${crypto.randomUUID()}`,
+      symbol,
+      status: 'planning', analysisStatus: 'queued', operationId: 'duplicate-budget-context',
+      event: { type: 'runtime_context', status: 'planning' },
+      createdAt: '2026-08-13T03:00:01.500Z',
+    })
+    assert.equal(duplicateWhileBudgetClosing.created, false)
+    assert.equal(duplicateWhileBudgetClosing.analysisId, analysisId)
+    await events.append({
+      sessionId, executionId, operationId: 'budget-terminal',
+      event: { type: 'status', status: 'budget_exhausted', terminal: true },
+      projection: { status: 'budget_exhausted', executionStatus: 'budget_exhausted' },
+      createdAt: '2026-08-13T03:00:02.000Z',
+    })
+    await pool.query(
+      `INSERT INTO agent_executions
+       (id, session_id, generation, status, created_at, updated_at)
+       VALUES ($1, $2, 2, 'running_model', $3, $3)`,
+      [`budget-terminal-${crypto.randomUUID()}`, sessionId, createdAt],
+    )
   } finally {
+    await createAnalysisRepository(pool).removeResearch(analysisId)
+    await pool.end()
+  }
+})
+
+test('真实 PostgreSQL primaryLifecycle 在并发状态写入期间只返回同一事务快照', {
+  skip: !migrationUrl || !applicationUrl,
+  concurrency: false,
+}, async () => {
+  await migrate(migrationUrl!)
+  const pool = createPool(applicationUrl!)
+  const writer = createAgentEventRepository(pool)
+  const analysisId = `snapshot-${crypto.randomUUID()}`
+  const sessionId = `snapshot-session-${crypto.randomUUID()}`
+  const createdAt = '2026-08-13T03:10:00.000Z'
+  let executionRead!: () => void
+  let continueRead!: () => void
+  const executionWasRead = new Promise<void>((resolve) => { executionRead = resolve })
+  const writeCompleted = new Promise<void>((resolve) => { continueRead = resolve })
+  const wrappedPool = Object.create(pool) as Pool
+  const poolQuery = pool.query.bind(pool)
+  wrappedPool.query = (async (...args: Parameters<typeof poolQuery>) => {
+    const sql = String(args[0])
+    if (sql.includes('FROM agent_events')) {
+      await executionWasRead
+      await writeCompleted
+    }
+    const result = await poolQuery(...args)
+    if (sql.includes('FROM agent_executions') && sql.includes('ORDER BY generation DESC')) {
+      executionRead()
+      await writeCompleted
+    }
+    return result
+  }) as typeof pool.query
+  wrappedPool.connect = (async () => {
+    const client = await pool.connect()
+    const query = client.query.bind(client)
+    client.query = (async (...args: Parameters<typeof query>) => {
+      const result = await query(...args)
+      const sql = String(args[0])
+      if (sql.includes('FROM agent_executions') && sql.includes('ORDER BY generation DESC')) {
+        executionRead()
+        await writeCompleted
+      }
+      return result
+    }) as typeof client.query
+    return client
+  }) as typeof pool.connect
+  const reader = createAgentEventRepository(wrappedPool)
+  try {
+    await writer.createResearch({
+      analysisId, sessionId, executionId: `snapshot-execution-${crypto.randomUUID()}`,
+      symbol: `S${crypto.randomUUID().replaceAll('-', '').slice(0, 8)}`,
+      status: 'planning', analysisStatus: 'queued', operationId: 'runtime-context',
+      event: { type: 'runtime_context', status: 'planning' }, createdAt,
+    })
+    const reading = reader.primaryLifecycle(analysisId)
+    await executionWasRead
+    await writer.append({
+      sessionId, executionId: (await writer.getSession(sessionId))!.executionId,
+      operationId: 'running-model',
+      event: { type: 'status', status: 'running_model' },
+      projection: { status: 'running_model', executionStatus: 'running_model' },
+      createdAt: '2026-08-13T03:10:01.000Z',
+    })
+    continueRead()
+    const lifecycle = await reading
+    const lastStatus = lifecycle?.events.filter((event) => event.type === 'status').at(-1)?.status
+      ?? lifecycle?.events.at(-1)?.status
+    assert.equal(lifecycle?.execution.status, 'planning')
+    assert.equal(lastStatus, 'planning')
+  } finally {
+    continueRead()
     await createAnalysisRepository(pool).removeResearch(analysisId)
     await pool.end()
   }
@@ -265,7 +376,7 @@ test('真实 PostgreSQL migration 幂等且 application role 没有 DDL 权限',
   await migrate(migrationUrl!)
 
   const pool = createPool(applicationUrl!)
-  assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 10 })
+  assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 12 })
   const privileges = await pool.query<{ can_create: boolean; can_temp: boolean }>(
     `SELECT has_schema_privilege(current_user, 'public', 'CREATE') AS can_create,
             has_database_privilege(current_user, current_database(), 'TEMP') AS can_temp`,
@@ -578,7 +689,7 @@ test('真实 PostgreSQL Agent Session 事件 sequence 严格递增且 operationI
     })
     const concurrent = await Promise.all(Array.from({ length: 40 }, (_, index) => (
       events.append({
-        sessionId,
+        sessionId, executionId: 'ledger-execution',
         operationId: `trace-${index}`,
         event: { type: 'trace', index },
         createdAt: now,
@@ -586,21 +697,21 @@ test('真实 PostgreSQL Agent Session 事件 sequence 严格递增且 operationI
     )))
     const first = await events.append({
       sessionId,
-      executionId: 'rollback-event-execution',
+      executionId: 'ledger-execution',
       operationId: 'complete-session',
       event: { type: 'status', status: 'completed', at: now },
       projection: { status: 'completed' },
       createdAt: now,
     })
     const replay = await events.append({
-      sessionId,
+      sessionId, executionId: 'ledger-execution',
       operationId: 'complete-session',
       event: { type: 'status', status: 'completed', at: now },
       projection: { status: 'completed' },
       createdAt: now,
     })
     const concurrentReplay = await Promise.all(Array.from({ length: 20 }, () => events.append({
-      sessionId,
+      sessionId, executionId: 'ledger-execution',
       operationId: 'one-concurrent-operation',
       event: { type: 'trace', value: 'only-once' },
       createdAt: now,
@@ -641,7 +752,7 @@ test('真实 PostgreSQL 事件与 Session 读取投影在投影失败时一起�
     const now = '2026-08-13T00:00:00.000Z'
     await events.createResearch({
       analysisId: sessionId,
-      sessionId,
+      sessionId, executionId: 'rollback-event-execution',
       executionId: 'rollback-event-execution',
       symbol: 'ROLLBACK-EVENT',
       status: 'queued',
@@ -651,7 +762,7 @@ test('真实 PostgreSQL 事件与 Session 读取投影在投影失败时一起�
     })
 
     await assert.rejects(events.append({
-      sessionId,
+      sessionId, executionId: 'rollback-event-execution',
       operationId: 'invalid-projection',
       event: { type: 'status', status: '', at: now },
       projection: { status: '', facts: [{ id: 'rolled-back-fact', type: 'quote', value: 100 }] },
@@ -701,7 +812,7 @@ test('真实 PostgreSQL 同一 analysis 可拥有多个独立 Agent Session 账�
         createdAt: now,
       })
       await events.append({
-        sessionId,
+        sessionId, executionId: `${sessionId}-execution`,
         operationId: `run:${sessionId}`,
         event: { type: 'status', status: 'running', at: now },
         projection: { status: 'running' },
@@ -774,6 +885,17 @@ test('真实 PostgreSQL 启动恢复在一个事务内中断全部活跃 Session
       ).then((result) => result.rows[0]),
     ])).map((value) => value?.status), ['interrupted', 'interrupted'])
     assert.equal((await analyses.get(analysisId))?.status, 'interrupted')
+    const replacement = await events.createResearch({
+      analysisId: 'interrupt-all-replacement',
+      sessionId: 'interrupt-all-replacement-session',
+      executionId: 'interrupt-all-replacement-execution',
+      symbol: 'INTERRUPT-ALL', status: 'planning', analysisStatus: 'queued',
+      operationId: 'interrupt-all-replacement-context',
+      event: { type: 'runtime_context', status: 'planning' },
+      createdAt: '2026-08-13T00:00:02.000Z',
+    })
+    assert.equal(replacement.created, true)
+    await analyses.removeResearch(replacement.analysisId)
   } finally {
     await analyses.removeResearch(analysisId)
     await pool.end()

@@ -393,6 +393,19 @@ test('8 分钟 Runtime 加 8 分钟 provider 共用 10 分钟 active budget 并�
   const completed = await waitForStatus(app as any, created.analysisId, 'completed')
   assert.equal(completed.report.title, report.title)
   assert.equal(requests, 2)
+  const research = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  const states = research.mainAgent.events
+    .filter((event: { type?: string }) => event.type === 'status')
+    .map((event: { status: string }) => event.status)
+  assert.ok(states.includes('running_model'))
+  assert.ok(states.includes('budget_exhausted'))
+  assert.ok(states.includes('finalizing'))
+  const finalizing = research.mainAgent.events.find(
+    (event: { status?: string }) => event.status === 'finalizing',
+  )
+  assert.equal(finalizing.waitReason.target, '报告收口')
   await app.close()
 })
 
@@ -527,9 +540,9 @@ test('execution wall 从创建时计时且排队超限后不启动任何外部�
   const first = (await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'WALL1' } })).json()
   const queued = (await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'WALL2' } })).json()
 
-  const firstExpired = await waitForStatus(app as any, first.analysisId, 'failed')
+  const firstExpired = await waitForStatus(app as any, first.analysisId, 'budget_exhausted')
   assert.equal(firstExpired.error, 'execution_runtime_timeout')
-  const expired = await waitForStatus(app as any, queued.analysisId, 'failed')
+  const expired = await waitForStatus(app as any, queued.analysisId, 'budget_exhausted')
   assert.equal(expired.error, 'execution_runtime_timeout')
   assert.equal(providerCalls, 1)
   assert.equal(toolCalls, 1)
@@ -647,16 +660,85 @@ test('running 轨迹写入失败会中断已领取任务并恢复后续调度', 
   await app.close()
 })
 
-test('取消运行任务会停止模型并保存取消轨迹', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'vibe-analysis-cancel-'))
-  const app = await makeApp(join(dir, 'storage'), fakeModel(1000), 1)
+test('取消运行任务会以 stopping → stopped 统一收敛模型与生命周期投影', async () => {
+  const database = createTestProductDatabase()
+  let modelStarted!: () => void
+  let releaseSettle!: () => void
+  const started = new Promise<void>((resolve) => { modelStarted = resolve })
+  const settle = new Promise<void>((resolve) => { releaseSettle = resolve })
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [] }),
+    model: {
+      async *analyze(input) {
+        modelStarted()
+        await new Promise<void>((resolve) => input.signal?.addEventListener('abort', () => resolve(), { once: true }))
+        await settle
+        yield { type: 'cancelled' as const }
+      },
+    },
+  })
+  await app.ready()
   const { analysisId } = (await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' } })).json()
-  await new Promise((resolve) => setTimeout(resolve, 10))
-  const cancelled = await app.inject({ method: 'POST', url: `/api/analyses/${analysisId}/cancel` })
+  await started
+  let cancelSettled = false
+  const cancelling = app.inject({ method: 'POST', url: `/api/analyses/${analysisId}/cancel` })
+    .finally(() => { cancelSettled = true })
+  await waitForStatus(app as any, analysisId, 'stopping')
+  assert.equal(cancelSettled, false)
+  releaseSettle()
+  const cancelled = await cancelling
   assert.equal(cancelled.statusCode, 202)
-  await waitForStatus(app, analysisId, 'cancelled')
+  await waitForStatus(app, analysisId, 'stopped')
   const research = await app.inject({ method: 'GET', url: `/api/research/${analysisId}` })
-  assert.ok(research.json().trace.some((entry: { status?: string }) => entry.status === 'stopped'))
+  assert.deepEqual(research.json().trace
+    .filter((entry: { status?: string }) => ['stopping', 'stopped'].includes(entry.status ?? ''))
+    .map((entry: { status: string }) => entry.status), ['stopping', 'stopped'])
+  assert.equal(research.json().status, 'stopped')
+  assert.equal(research.json().mainAgent.status, 'stopped')
+  await app.close()
+})
+
+test('取消已领取但尚未登记 controller 的任务会停止且不启动外部工作', async () => {
+  const database = createTestProductDatabase()
+  const originalSnapshot = database.runtimeSettingsRepository.getExecutionSnapshot
+  let snapshotRequested!: () => void
+  let releaseSnapshot!: () => void
+  const requested = new Promise<void>((resolve) => { snapshotRequested = resolve })
+  const release = new Promise<void>((resolve) => { releaseSnapshot = resolve })
+  database.runtimeSettingsRepository.getExecutionSnapshot = async (executionId) => {
+    snapshotRequested()
+    await release
+    return originalSnapshot(executionId)
+  }
+  let externalCalls = 0
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async () => {
+      externalCalls += 1
+      return { symbol: 'RACE', facts: [fact], gaps: [] }
+    },
+    model: { async *analyze() { externalCalls += 1; yield { type: 'completed' as const, report } } },
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'RACE' },
+  })).json()
+  await requested
+  const response = await app.inject({ method: 'POST', url: `/api/analyses/${created.analysisId}/cancel` })
+  assert.equal(response.statusCode, 202)
+  releaseSnapshot()
+  await waitForStatus(app as any, created.analysisId, 'stopped')
+  await new Promise((resolve) => setTimeout(resolve, 10))
+  assert.equal(externalCalls, 0)
+  const research = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  assert.deepEqual(research.trace
+    .filter((event: { status?: string }) => ['stopping', 'stopped'].includes(event.status ?? ''))
+    .map((event: { status: string }) => event.status), ['stopping', 'stopped'])
   await app.close()
 })
 
@@ -832,6 +914,56 @@ test('工具补查返回的事实进入研究证据集合', async () => {
   await waitForStatus(app as any, created.json().analysisId, 'completed')
   const research = await app.inject({ method: 'GET', url: `/api/research/${created.json().analysisId}` })
   assert.ok(research.json().facts.some((item: { id: string }) => item.id === extraFact.id))
+  await app.close()
+})
+
+test('Runtime 按模型请求、工具批次与报告收口持久化真实状态序列', async () => {
+  const database = createTestProductDatabase()
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [] }),
+    model: {
+      async *analyze() {
+        yield { type: 'lifecycle' as const, status: 'running_model' as const, operationId: 'model-request-1' }
+        yield { type: 'lifecycle' as const, status: 'running_tools' as const, operationId: 'tool-batch-1' }
+        yield { type: 'trace' as const, entry: {
+          type: 'tool_call' as const, name: 'fetch_financial_context', input: {}, operationId: 'tool-call-1',
+        } }
+        yield { type: 'trace' as const, entry: {
+          type: 'tool_result' as const, name: 'fetch_financial_context', result: { facts: [] },
+          isError: false, operationId: 'tool-result-1',
+        } }
+        yield { type: 'lifecycle' as const, status: 'running_model' as const, operationId: 'model-request-2' }
+        yield {
+          type: 'lifecycle' as const,
+          status: 'waiting_for_specialists' as const,
+          operationId: 'specialist-wait-1',
+        }
+        yield { type: 'lifecycle' as const, status: 'finalizing' as const, operationId: 'report-closure' }
+        yield { type: 'completed' as const, report }
+      },
+    },
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'SEQUENCE' },
+  })).json()
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  const research = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  assert.deepEqual(research.mainAgent.events
+    .filter((event: { type?: string }) => event.type === 'status')
+    .map((event: { status: string }) => event.status), [
+    'planning', 'running_model', 'running_model', 'running_tools',
+    'running_model', 'waiting_for_specialists', 'finalizing', 'completed',
+  ])
+  for (const event of research.mainAgent.events.filter(
+    (item: { status?: string }) => [
+      'running_model', 'running_tools', 'waiting_for_specialists', 'finalizing',
+    ].includes(item.status ?? ''),
+  )) assert.ok(event.waitReason?.startedAt)
   await app.close()
 })
 

@@ -61,6 +61,12 @@ type TraceEntry =
   | { type: 'cancelled'; operationId?: string }
 
 export type ModelEvent =
+  | {
+    type: 'lifecycle'
+    status: 'running_model' | 'running_tools' | 'waiting_for_specialists'
+      | 'finalizing' | 'budget_exhausted'
+    operationId: string
+  }
   | { type: 'text_delta'; text: string; operationId?: string }
   | { type: 'trace'; entry: TraceEntry }
   | { type: 'completed'; report: AnalysisReport; usage?: unknown; stopReason?: string; operationId?: string }
@@ -206,15 +212,30 @@ export function createPiModel(options: ModelOptions = {}) {
       let modelAttempts = 0
       let toolRounds = 0
       let closing = false
+      let budgetStateWritten = false
       let closingAttempts = 0
       while (true) {
         if (activeBudget.exhausted()) closing = true
         if (closing && closingAttempts >= 2) throw new Error('report_tool_required')
         if (closing) {
+          if (!budgetStateWritten) {
+            budgetStateWritten = true
+            yield {
+              type: 'lifecycle', status: 'budget_exhausted',
+              operationId: `execution:${input.executionId}:budget-exhausted`,
+            }
+          }
+          yield {
+            type: 'lifecycle', status: 'finalizing',
+            operationId: `execution:${input.executionId}:finalizing:${closingAttempts + 1}`,
+          }
           closingAttempts += 1
           context.tools = analysisModelTools.filter(({ name }) => name === 'submit_analysis_report')
         }
         const attemptId = `execution:${input.executionId}:model-attempt:${++modelAttempts}`
+        if (!closing) yield {
+          type: 'lifecycle', status: 'running_model', operationId: `${attemptId}:running-model`,
+        }
         let attemptEventSequence = 0
         const request = await beginModelRequest({
           input, options, runtimeSettings, executionSignal, activeBudget, modelGate,
@@ -319,6 +340,10 @@ export function createPiModel(options: ModelOptions = {}) {
             [...analysisModelTools], calls, `execution:${input.executionId}:tool`,
             `main-attempt:${modelAttempts}`,
           )
+          yield {
+            type: 'lifecycle', status: 'running_tools',
+            operationId: `${attemptId}:running-tools`,
+          }
           for (const { call, toolOperationId } of preparedCalls) {
             yield { type: 'trace', entry: {
               type: 'tool_call', name: call.name, input: call.arguments,
@@ -487,6 +512,10 @@ export function createPiModel(options: ModelOptions = {}) {
           }
           runtimeWork.stop()
           if (completedReport) {
+            yield {
+              type: 'lifecycle', status: 'finalizing',
+              operationId: `${completedOperationId}:finalizing`,
+            }
             yield {
               type: 'completed', report: completedReport,
               usage: message.usage, stopReason: message.stopReason,

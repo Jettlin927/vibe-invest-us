@@ -4,8 +4,10 @@ import test from 'node:test'
 import {
   agentExecutionStatuses,
   defaultRuntimeSettings,
+  isTerminalAgentExecutionStatus,
   isRuntimeSettingsResponse,
   parseRuntimeSettingsUpdate,
+  terminalAgentExecutionStatuses,
   waitReasonForStatus,
 } from '../src/index.js'
 
@@ -86,4 +88,17 @@ test('Agent execution 状态全集稳定且 waitReason 由 Runtime 确定生成'
     kind: 'model', target: '主模型响应', startedAt: '2026-08-13T03:00:00.000Z',
   })
   assert.equal(waitReasonForStatus('completed', 'ignored', '2026-08-13T03:00:00.000Z'), null)
+})
+
+test('Agent execution 终态由共享契约统一判定', () => {
+  assert.deepEqual(terminalAgentExecutionStatuses, [
+    'completed', 'partial', 'failed', 'stopped', 'interrupted', 'budget_exhausted',
+  ])
+  assert.equal(isTerminalAgentExecutionStatus('stopped'), true)
+  assert.equal(isTerminalAgentExecutionStatus('budget_exhausted'), true)
+  assert.equal(isTerminalAgentExecutionStatus('budget_exhausted', false), false)
+  assert.equal(isTerminalAgentExecutionStatus('budget_exhausted', true), true)
+  assert.equal(isTerminalAgentExecutionStatus('completed', false), false)
+  assert.equal(isTerminalAgentExecutionStatus('stopping'), false)
+  assert.equal(isTerminalAgentExecutionStatus('cancelled'), false)
 })

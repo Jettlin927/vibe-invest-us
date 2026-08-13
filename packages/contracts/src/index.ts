@@ -9,8 +9,17 @@ export const agentExecutionStatuses = [
   'interrupted', 'budget_exhausted',
 ] as const
 export type AgentExecutionStatus = typeof agentExecutionStatuses[number]
+export const terminalAgentExecutionStatuses = [
+  'completed', 'partial', 'failed', 'stopped', 'interrupted', 'budget_exhausted',
+] as const satisfies readonly AgentExecutionStatus[]
+export function isTerminalAgentExecutionStatus(
+  status: string, terminal?: boolean,
+): status is typeof terminalAgentExecutionStatuses[number] {
+  if (!terminalAgentExecutionStatuses.includes(status as typeof terminalAgentExecutionStatuses[number])) return false
+  return terminal !== false
+}
 export type WaitReason = {
-  kind: 'database' | 'model' | 'tools' | 'specialists' | 'finalizing'
+  kind: 'database' | 'model' | 'tools' | 'specialists' | 'finalizing' | 'runtime'
   target: string
   startedAt: string
 }
@@ -23,6 +32,7 @@ export function waitReasonForStatus(
 const statusKind = {
   planning: 'database', running_model: 'model', running_tools: 'tools',
   waiting_for_specialists: 'specialists', finalizing: 'finalizing',
+  stopping: 'runtime',
 } as const
 
 export const defaultRuntimeSettings = {

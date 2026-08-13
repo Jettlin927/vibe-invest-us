@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 
 import {
-  isRuntimeSettingsResponse, isSystemHealth, runtimeSettingLimits,
+  isRuntimeSettingsResponse, isSystemHealth, isTerminalAgentExecutionStatus, runtimeSettingLimits,
   type RuntimeSettings, type RuntimeSettingsResponse, type SystemHealth,
 } from '@vibe-invest/contracts'
 
@@ -106,7 +106,7 @@ export function App() {
   useEffect(() => {
     const agent = selectedResearch?.mainAgent
     if (page !== 'research' || !agent || !('EventSource' in globalThis)
-      || ['completed', 'partial', 'failed', 'stopped', 'interrupted', 'budget_exhausted'].includes(agent.status)) return
+      || isTerminalAgentExecutionStatus(agent.status)) return
     const source = new EventSource(`/api/agent-sessions/${agent.id}/events`, {
       withCredentials: false,
     })
@@ -184,7 +184,9 @@ export function App() {
       const entry = JSON.parse((event as MessageEvent).data) as Record<string, unknown>
       if (name !== 'text_delta') addStage(name)
       if (['planning', 'running_model', 'running_tools', 'waiting_for_specialists', 'finalizing', 'completed', 'partial', 'failed', 'stopping', 'stopped', 'interrupted', 'budget_exhausted'].includes(name)) setAnalysisStatus(name)
-      if (['completed', 'partial', 'failed', 'stopped', 'interrupted', 'budget_exhausted'].includes(name)) {
+      if (isTerminalAgentExecutionStatus(
+        name, typeof entry.terminal === 'boolean' ? entry.terminal : undefined,
+      )) {
         if (name === 'failed' && typeof entry.error === 'string') setError(friendlyError(entry.error))
         source.close()
         setActiveAnalysisId(null)
@@ -198,7 +200,7 @@ export function App() {
       const status = await fetch(`/api/analyses/${id}`).then((response) => response.json())
       setAnalysisStatus(status.status)
       addStage(status.status)
-      if (['completed', 'partial', 'failed', 'stopped', 'interrupted', 'budget_exhausted'].includes(status.status)) {
+      if (isTerminalAgentExecutionStatus(status.status, status.terminal)) {
         if (status.status === 'failed' && typeof status.error === 'string') setError(friendlyError(status.error))
         const researchResponse = await fetch(`/api/research/${id}`)
         if (researchResponse.ok) setSelectedResearch(await researchResponse.json())
@@ -617,11 +619,11 @@ function factHeadline(fact: Fact) {
   return String(value.title ?? value.name ?? value.status ?? '结构化事实')
 }
 function asRecord(value: unknown): Record<string, any> { return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, any> : {} }
-function pipelineIndex(status: string, stages: string[]) { if (['completed', 'partial'].includes(status)) return 6; if (status === 'failed' || status === 'cancelled' || status === 'interrupted') return Math.max(0, stages.includes('model_event') ? 4 : stages.includes('financial_context') ? 3 : 1); return stages.includes('model_completed') ? 5 : stages.includes('model_event') ? 4 : stages.includes('financial_context') ? 3 : status === 'running' ? 2 : status === 'queued' ? 1 : 0 }
+function pipelineIndex(status: string, stages: string[]) { if (['completed', 'partial'].includes(status)) return 6; if (['failed', 'stopped', 'interrupted', 'budget_exhausted'].includes(status)) return Math.max(0, stages.includes('model_event') ? 4 : stages.includes('financial_context') ? 3 : 1); return stages.includes('model_completed') ? 5 : stages.includes('model_event') ? 4 : stages.includes('financial_context') ? 3 : ['running', 'running_model', 'running_tools', 'waiting_for_specialists', 'finalizing'].includes(status) ? 2 : ['queued', 'planning'].includes(status) ? 1 : 0 }
 function pipelineLabel(stage: string) { return ({ queued: '创建分析任务', running: '准备市场与持仓材料', financial_context: '冻结金融上下文', model_event: 'AI 综合判断', model_completed: '校验结构化报告', completed: '保存研究记录' } as Record<string, string>)[stage] }
 function safeReference(value: string) { return value.startsWith('http://') || value.startsWith('https://') ? value : undefined }
 function factLabel(type: string) { return ({ quote: '当前价格', daily_bar: '历史行情', news: '相关新闻', indicators: '技术指标', valuation: '估值结果', dilutedEps: '每股收益', revenue: '营业收入', netIncome: '净利润', operatingCashFlow: '经营现金流' } as Record<string, string>)[type] ?? '结构化事实' }
-function statusLabel(status: string) { return ({ queued: '排队中', running: '分析中', completed: '已完成', partial: '部分完成', failed: '失败', cancelled: '已取消', interrupted: '服务中断' } as Record<string, string>)[status] ?? status }
+function statusLabel(status: string) { return ({ queued: '排队中', planning: '规划中', running: '分析中', running_model: '模型分析中', running_tools: '工具执行中', waiting_for_specialists: '等待专项分析', finalizing: '报告收口中', completed: '已完成', partial: '部分完成', failed: '失败', stopping: '正在停止', stopped: '已停止', interrupted: '服务中断', budget_exhausted: '预算已耗尽' } as Record<string, string>)[status] ?? status }
 function trendVerdict(trend?: string) { if (!trend) return '受限'; if (/偏强|看涨|上升/.test(trend)) return '谨慎偏多'; if (/偏弱|看跌|下降/.test(trend)) return '谨慎偏空'; return '中性观察' }
 function formatTime(value: string) { const date = new Date(value); return Number.isNaN(date.valueOf()) ? value : date.toLocaleString('zh-CN', { dateStyle: 'medium', timeStyle: 'short' }) }
 function formatMoney(value: number) { return Number.isFinite(value) ? new Intl.NumberFormat('zh-CN', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 }).format(value) : '—' }
