@@ -179,6 +179,7 @@ test('用户创建分析并打开研究记录后能看到报告依据', async ()
       trace: [
         { type: 'tool_call', name: 'search_news_by_keyword', toolCallId: 'news-call', startedAt: '2026-08-12T13:48:38.000Z' },
         { type: 'tool_result', name: 'search_news_by_keyword', toolCallId: 'news-call', startedAt: '2026-08-12T13:48:38.000Z', completedAt: '2026-08-12T13:48:38.125Z', completionOrder: 1 },
+        { type: 'tool_call', name: 'get_technical_indicators', toolCallId: 'cancelled-call', input: {}, startedAt: null, notStarted: true },
         { type: 'tool_result', name: 'get_technical_indicators', toolCallId: 'cancelled-call', startedAt: null, notStarted: true, completedAt: '2026-08-12T13:48:38.125Z', completionOrder: 2, isError: true },
         { type: 'status', status: 'completed' },
       ],
@@ -200,6 +201,7 @@ test('用户创建分析并打开研究记录后能看到报告依据', async ()
   await waitFor(() => assert.ok(view.getByText('偏强震荡')))
   await user.click(view.getByText('调用只读工具'))
   assert.ok(view.getAllByText(/开始/).some((item) => /2026/.test(item.textContent ?? '')))
+  await view.findByText('未开始')
   await user.click(view.getByText('工具返回事实'))
   await view.findByText('耗时 125 毫秒 · 完成序 #1')
   await view.findByText('未开始即取消')

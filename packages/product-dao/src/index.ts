@@ -319,12 +319,73 @@ ALTER TABLE tool_batch_calls ADD COLUMN IF NOT EXISTS completion_order integer;
 ALTER TABLE tool_batch_calls ADD COLUMN IF NOT EXISTS result_payload_json jsonb;
 UPDATE tool_batch_calls call SET
   completion_order = COALESCE(call.completion_order, call.position),
-  result_payload_json = COALESCE(call.result_payload_json, jsonb_build_object(
+  result_payload_json = CASE WHEN call.tool_name = 'tool_not_available' THEN jsonb_build_object(
+    'toolCallId', call.tool_call_id, 'toolName', call.tool_name,
+    'result', jsonb_build_object('error', 'tool_not_available', 'facts', '[]'::jsonb),
+    'isError', true
+  ) ELSE COALESCE(call.result_payload_json, jsonb_build_object(
     'toolName', call.tool_name,
     'result', jsonb_build_object('error', 'tool_execution_interrupted', 'facts', '[]'::jsonb),
     'isError', true
-  ))
+  )) || jsonb_build_object('toolCallId', call.tool_call_id, 'toolName', call.tool_name) END
 WHERE call.status <> 'running';
+DO $$
+DECLARE
+  target record;
+  candidate_count integer;
+  authoritative_call_id text;
+  authoritative_name text;
+BEGIN
+  FOR target IN
+    SELECT event.session_id, event.sequence, event.operation_id, event.payload_json
+    FROM agent_events event
+    WHERE event.payload_json->>'type' IN ('tool_call', 'tool_result')
+  LOOP
+    SELECT count(*), min(call.tool_call_id), min(call.tool_name)
+      INTO candidate_count, authoritative_call_id, authoritative_name
+    FROM agent_sessions session
+    JOIN agent_executions execution ON execution.session_id = session.id
+    JOIN tool_call_batches batch ON batch.execution_id = execution.id
+    JOIN tool_projection_versions projection ON projection.id = batch.projection_id
+    JOIN tool_batch_calls call ON call.batch_id = batch.id
+    WHERE session.id = target.session_id
+      AND target.operation_id IN (
+        'execution:' || batch.execution_id || ':'
+          || CASE projection.role WHEN 'main' THEN 'tool' WHEN 'fundamental' THEN 'specialist-tool' END
+          || ':' || call.tool_call_id || ':'
+          || CASE target.payload_json->>'type' WHEN 'tool_call' THEN 'call' ELSE 'result' END,
+        batch.id || ':cancelled-'
+          || CASE target.payload_json->>'type' WHEN 'tool_call' THEN 'call' ELSE 'result' END
+          || ':' || call.tool_call_id
+      )
+      AND (projection.visible_tool_names_json ? call.tool_name OR call.tool_name = 'tool_not_available');
+    IF candidate_count <> 1 THEN
+      RAISE EXCEPTION 'tool_event_call_association_failed:%:%', target.session_id, target.sequence;
+    END IF;
+    IF target.payload_json ? 'toolCallId'
+       AND target.payload_json->>'toolCallId' <> authoritative_call_id THEN
+      RAISE EXCEPTION 'tool_event_call_id_conflict:%:%', target.session_id, target.sequence;
+    END IF;
+    UPDATE agent_events SET payload_json = CASE
+      WHEN authoritative_name = 'tool_not_available'
+        AND target.payload_json->>'type' = 'tool_call' THEN
+          (target.payload_json - 'name' - 'input' - 'toolCallId') || jsonb_build_object(
+          'type', 'tool_call', 'name', authoritative_name, 'toolCallId', authoritative_call_id,
+          'input', '{}'::jsonb)
+      WHEN authoritative_name = 'tool_not_available' THEN
+        (target.payload_json - 'name' - 'result' - 'toolCallId') || jsonb_build_object(
+          'type', 'tool_result', 'name', authoritative_name, 'toolCallId', authoritative_call_id,
+          'result', jsonb_build_object('error', 'tool_not_available', 'facts', '[]'::jsonb),
+          'isError', true)
+      ELSE CASE target.payload_json->>'type'
+      WHEN 'tool_call' THEN target.payload_json || jsonb_build_object(
+        'toolCallId', authoritative_call_id, 'name', authoritative_name)
+      ELSE target.payload_json || jsonb_build_object(
+        'toolCallId', authoritative_call_id, 'name', authoritative_name)
+      END END
+    WHERE session_id = target.session_id AND sequence = target.sequence;
+  END LOOP;
+END $$;
 ALTER TABLE tool_batch_calls DROP CONSTRAINT IF EXISTS tool_batch_calls_completion_order_check;
 ALTER TABLE tool_batch_calls ADD CONSTRAINT tool_batch_calls_completion_order_check
   CHECK (completion_order IS NULL OR completion_order > 0);
@@ -2066,8 +2127,11 @@ async function cancelRunningToolBatches(
     `SELECT call.batch_id, call.tool_call_id, call.tool_name, call.position, call.started_at::text,
        COALESCE((SELECT max(completed.completion_order) FROM tool_batch_calls completed
          WHERE completed.batch_id = call.batch_id), 0)::integer AS max_completion_order
-     FROM tool_batch_calls call JOIN tool_call_batches batch ON batch.id = call.batch_id
+    FROM tool_batch_calls call
+    JOIN tool_call_batches batch ON batch.id = call.batch_id
+    JOIN tool_projection_versions projection ON projection.id = batch.projection_id
      WHERE batch.execution_id = $1 AND batch.status = 'running' AND call.status = 'running'
+       AND (projection.visible_tool_names_json ? call.tool_name OR call.tool_name = 'tool_not_available')
      ORDER BY call.batch_id, call.position FOR UPDATE OF call`, [executionId],
   )
   const orderByBatch = new Map<string, number>()
@@ -2087,6 +2151,21 @@ async function cancelRunningToolBatches(
       }), call.batch_id, call.tool_call_id],
     )
     const startedAt = call.started_at
+    if (startedAt === null) {
+      sequence += 1
+      const callOperationId = `${call.batch_id}:cancelled-call:${call.tool_call_id}`
+      const callPayload = {
+        type: 'tool_call', name: call.tool_name, toolCallId: call.tool_call_id,
+        input: {}, startedAt: null, notStarted: true, operationId: callOperationId,
+      }
+      const insertedCall = await database.query<AgentEventRow>(
+        `INSERT INTO agent_events (session_id, sequence, operation_id, payload_json, created_at)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING session_id, sequence, operation_id, payload_json, created_at::text`,
+        [sessionId, sequence, callOperationId, JSON.stringify(callPayload), completedAt],
+      )
+      events.push(mapAgentEventRow(insertedCall.rows[0]!))
+    }
     sequence += 1
     const operationId = `${call.batch_id}:cancelled-result:${call.tool_call_id}`
     const payload = {
