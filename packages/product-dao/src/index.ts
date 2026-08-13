@@ -1592,6 +1592,14 @@ export function createAgentEventRepository(pool: Pool) {
       const client = await pool.connect()
       try {
         await client.query('BEGIN')
+        const sessionIdentity = await client.query<{ analysis_id: string }>(
+          'SELECT analysis_id FROM agent_sessions WHERE id = $1', [input.sessionId],
+        )
+        if (!sessionIdentity.rows[0]) throw new Error('agent_session_not_found')
+        await client.query(
+          'SELECT id FROM analyses WHERE id = $1 FOR UPDATE',
+          [sessionIdentity.rows[0].analysis_id],
+        )
         const session = await client.query<{
           latest_sequence: number; analysis_id: string; is_primary: boolean; execution_id: string
         }>(
