@@ -891,6 +891,50 @@ test('真实 PostgreSQL 拒绝未发布的 schema 13、14、15 候选状态', {
   }
 })
 
+test('真实 PostgreSQL 拒绝未来 schema 且不修改数据库', {
+  skip: !migrationUrl,
+  concurrency: false,
+}, async () => {
+  await migrate(migrationUrl!)
+  const pool = createPool(migrationUrl!)
+  const fingerprint = async () => ({
+    receipts: (await pool.query<{ version: number }>(
+      'SELECT version FROM product_schema_migrations ORDER BY version',
+    )).rows,
+    provenanceTable: (await pool.query<{ table_name: string | null }>(
+      `SELECT to_regclass('public.tool_event_migration_provenance')::text AS table_name`,
+    )).rows,
+    batchCallColumns: (await pool.query<{ column_name: string; is_nullable: string }>(
+      `SELECT column_name, is_nullable FROM information_schema.columns
+       WHERE table_schema = 'public' AND table_name = 'tool_batch_calls'
+       ORDER BY ordinal_position`,
+    )).rows,
+    batchCallConstraints: (await pool.query<{ definition: string }>(
+      `SELECT pg_get_constraintdef(oid) AS definition FROM pg_constraint
+       WHERE conrelid = 'public.tool_batch_calls'::regclass ORDER BY conname`,
+    )).rows,
+    appCanSelectPositions: (await pool.query<{ allowed: boolean }>(
+      `SELECT has_table_privilege('vibe_invest_app', 'positions', 'SELECT') AS allowed`,
+    )).rows,
+  })
+  try {
+    await pool.query('DROP TABLE tool_event_migration_provenance')
+    await pool.query('INSERT INTO product_schema_migrations (version) VALUES (17)')
+    const before = await fingerprint()
+
+    await assert.rejects(
+      migrate(migrationUrl!),
+      /product_schema_future_version_unsupported:17/,
+    )
+
+    assert.deepEqual(await fingerprint(), before)
+  } finally {
+    await pool.query('DELETE FROM product_schema_migrations WHERE version = 17')
+    await migrate(migrationUrl!)
+    await pool.end()
+  }
+})
+
 test('真实 PostgreSQL v12 无 Tool Batch 的历史工具事件原样升级到 v16', {
   skip: !migrationUrl,
   concurrency: false,

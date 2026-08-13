@@ -466,6 +466,9 @@ export async function migrate(connectionString: string) {
       if (maxVersion >= 13 && maxVersion <= 15) {
         throw new Error(`product_schema_intermediate_candidate_unsupported:${maxVersion}`)
       }
+      if (maxVersion > schemaVersion) {
+        throw new Error(`product_schema_future_version_unsupported:${maxVersion}`)
+      }
     }
     if (maxVersion <= 12 && existingTables.rows[0]?.events_exist) {
       await client.query(
