@@ -2,6 +2,7 @@ import re
 from datetime import datetime, timedelta
 from hashlib import sha256
 from typing import Any, Iterable, List, Optional
+from urllib.parse import urlsplit
 
 from app.indicators import calculate_indicators
 from app.models import (
@@ -96,9 +97,10 @@ def build_financial_context(
     )
 
 
-def search_news_facts(keyword: str, now: datetime, news_sources: Iterable[Any]):
+def search_news_facts(keyword: str, now: datetime, news_sources: Iterable[Any],
+                      include_eligibility: bool = False, qualified_urls=None):
     normalized_keyword = " ".join(keyword.strip().split())
-    statuses, collected = [], []
+    statuses, collected, source_items = [], [], []
     for source in news_sources:
         try:
             items = source.fetch(normalized_keyword)
@@ -106,8 +108,10 @@ def search_news_facts(keyword: str, now: datetime, news_sources: Iterable[Any]):
                 source=source.name, status="ok" if items else "empty", item_count=len(items or []),
             ))
             collected.extend(items or [])
+            source_items.append((source.name, items or [], None))
         except Exception as error:
             statuses.append(SourceStatus(source=source.name, status="failed", error=_safe_error(error), item_count=0))
+            source_items.append((source.name, [], "unavailable"))
     facts, seen = [], set()
     for candidate in sorted(collected, key=lambda item: item.published_at, reverse=True):
         item = candidate if isinstance(candidate, NewsItem) else NewsItem(**candidate)
@@ -122,7 +126,33 @@ def search_news_facts(keyword: str, now: datetime, news_sources: Iterable[Any]):
             source=item.source, sourceReference=item.url,
             evidenceLevel="title_only",
         ))
-    return facts[:30], statuses
+    if not include_eligibility:
+        return facts[:30], statuses
+    if len(source_items) != 3:
+        eligibility = {"eligible": False, "normalizedQuery": normalized_keyword, "reasons": [
+            {"source": name, "reason": error or ("empty" if not items else "title_only")}
+            for name, items, error in source_items
+        ]}
+        return facts[:30], statuses, eligibility
+    query_terms = {term.lower() for term in normalized_keyword.split() if len(term) > 1}
+    qualified_urls = set(qualified_urls or [])
+    reasons = []
+    for name, items, error in source_items:
+        if error:
+            reason = error
+        elif not items:
+            reason = "empty"
+        elif any(getattr(item, "url", None) in qualified_urls for item in items):
+            reason = "qualified"
+        else:
+            relevant = any(query_terms & set((item.title + " " + item.summary).lower().split()) for item in items)
+            reason = "title_only" if relevant else "irrelevant"
+        reasons.append({"source": name, "reason": reason})
+    eligibility = {
+        "eligible": all(item["reason"] in {"unavailable", "empty", "irrelevant", "title_only"} for item in reasons),
+        "normalizedQuery": normalized_keyword, "reasons": reasons,
+    }
+    return facts[:30], statuses, eligibility
 
 
 def read_news_document_fact(candidate: AtomicFact, now: datetime, reader, max_bytes: int = 65536):
@@ -167,6 +197,25 @@ def company_event_facts(symbol: str, now: datetime, news_sources: Iterable[Any])
         },
     }) for fact in news_facts]
     return facts, statuses
+
+
+def web_search_lead_facts(query: str, now: datetime, searcher):
+    normalized_query = " ".join(query.strip().split())
+    if not normalized_query or len(normalized_query) > 500:
+        raise ValueError("web_search_query_invalid")
+    facts = []
+    for item in searcher(normalized_query)[:10]:
+        parsed = urlsplit(item["url"])
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+            continue
+        facts.append(AtomicFact(
+            id=f"fact:web-search-lead:{sha256(normalized_query.lower().encode()).hexdigest()[:12]}:{sha256(item['url'].encode()).hexdigest()[:16]}",
+            type="web_search_lead",
+            value={"query": normalized_query, "title": item["title"], "summary": item["summary"], "url": item["url"]},
+            observedAt=now.isoformat(), fetchedAt=now.isoformat(), source="bing-web-search",
+            sourceReference=item["url"], evidenceLevel="lead",
+        ))
+    return facts
 
 
 def technical_indicator_facts(symbol: str, start_date: str, end_date: str, now: datetime, history_sources: Iterable[Any]):

@@ -29,6 +29,7 @@ type AppDependencies = {
   fetchFinancialContext?: (symbol: string, signal: AbortSignal) => Promise<FinancialContext>
   searchNews?: (keyword: string, signal: AbortSignal) => Promise<FactQueryResult>
   searchNewsCandidates?: (query: string, signal: AbortSignal) => Promise<FactQueryResult>
+  searchWebEvidence?: (query: string, signal: AbortSignal) => Promise<FactQueryResult>
   readNewsDocument?: (
     candidate: import('./financial-data-client.js').FinancialFact, signal: AbortSignal,
   ) => Promise<FactQueryResult>
@@ -63,6 +64,7 @@ export function buildApp(dependencies: AppDependencies) {
           ?? (async () => { throw new Error('model_not_configured') }),
         searchNews: dependencies.searchNews,
         searchNewsCandidates: dependencies.searchNewsCandidates,
+        searchWebEvidence: dependencies.searchWebEvidence,
         readNewsDocument: dependencies.readNewsDocument,
         listCompanyEvents: dependencies.listCompanyEvents,
         fetchTechnicalIndicators: dependencies.fetchTechnicalIndicators,

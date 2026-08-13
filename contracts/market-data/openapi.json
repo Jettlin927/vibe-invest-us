@@ -139,6 +139,45 @@
         }
       }
     },
+    "/v1/web-search": {
+      "post": {
+        "summary": "Web Search",
+        "operationId": "searchWebEvidence",
+        "parameters": [
+          {
+            "name": "query",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Query"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FactQueryResult"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/company-events": {
       "post": {
         "summary": "Company Events",
@@ -438,6 +477,15 @@
             "type": "array",
             "title": "Sources",
             "default": []
+          },
+          "eligibility": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Eligibility"
           }
         },
         "type": "object",
@@ -651,6 +699,15 @@
             "type": "array",
             "title": "Sources",
             "default": []
+          },
+          "eligibility": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Eligibility"
           },
           "excerpt": {
             "type": "string",

@@ -46,6 +46,7 @@ const app = buildApp({
   fetchFinancialContext: (symbol, signal) => financialData.context(symbol, signal),
   searchNews: (keyword, signal) => financialData.searchNews(keyword, signal),
   searchNewsCandidates: (query, signal) => financialData.searchNews(query, signal),
+  searchWebEvidence: (query, signal) => financialData.searchWeb(query, signal),
   readNewsDocument: (candidate, signal) => financialData.readNewsDocument(candidate, signal),
   listCompanyEvents: (symbol, signal) => financialData.companyEvents(symbol, signal),
   fetchTechnicalIndicators: (symbol, startDate, endDate, signal) => (

@@ -73,6 +73,23 @@ test('标题级新闻只能作为线索不能支撑消息面关键判断', () =>
   }])
 })
 
+test('Web Search lead 必须读取正文核实后才能支撑消息面判断', () => {
+  const result = validateReportCandidate({
+    kind: 'specialist', domain: 'news', availability: 'available', status: 'completed',
+    gaps: [], limitations: [], keyJudgments: [{
+      type: 'news', statement: '搜索线索显示事件偏正面', direction: 'bullish', confidence: 'low',
+      supportingEvidence: ['fact:web-lead'], contraryEvidence: [],
+      contraryEvidenceStatus: 'not_searched', invalidationConditions: ['正文与摘要不符'],
+    }],
+  }, { role: 'news', knownFacts: [{
+    id: 'fact:web-lead', type: 'web_search_lead', evidenceLevel: 'lead',
+  }] })
+  assert.equal(result.ok, false)
+  if (result.ok) return
+  assert.equal(result.errors[0]?.rule, 'evidence_qualification')
+  assert.deepEqual(result.errors[0]?.allowedEvidenceTypes, ['verified_news', 'official_company_event'])
+})
+
 test('专项报告拒绝个人行动建议和跨领域裁决', () => {
   const result = validateReportCandidate({
     kind: 'specialist', availability: 'partial', status: 'partial', gaps: [], limitations: [],

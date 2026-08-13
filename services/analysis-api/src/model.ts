@@ -12,6 +12,7 @@ type Fact = {
   fetchedAt: string
   source: string
   sourceReference: string
+  evidenceLevel?: string
 }
 
 export type AnalysisReport = {
@@ -52,6 +53,14 @@ type TraceEntry =
     version: number
     visibleToolNames: string[]
     operationId: string
+  }
+  | {
+    type: 'web_search_eligibility'; query: string; eligible: boolean
+    reasons: Array<{ source: string; reason: string }>; operationId: string
+  }
+  | {
+    type: 'runtime_turn_advanced'; toolRounds: number; activeElapsedMs: number
+    stage: 'research' | 'finalization'; operationId: string
   }
 
 export type ModelEvent =
@@ -123,6 +132,9 @@ export type AnalyzeNewsInput = {
   searchNewsCandidates: (
     query: string, signal: AbortSignal,
   ) => Promise<{ facts: Fact[]; [key: string]: unknown }>
+  searchWebEvidence?: (
+    query: string, signal: AbortSignal,
+  ) => Promise<{ facts: Fact[]; [key: string]: unknown }>
   readNewsDocument: (
     candidate: Fact, signal: AbortSignal,
   ) => Promise<{ facts: Fact[]; [key: string]: unknown }>
@@ -156,6 +168,7 @@ export type ToolRuntime = {
     stage: 'research' | 'finalization'
     tools: Tool[]
     createdAt: string
+    causativeEvent?: { operationId: string; payload: Record<string, unknown> }
   }): Promise<{ id: string; version: number }>
   recordModelRequest(input: {
     requestId: string
@@ -210,7 +223,15 @@ export type ToolRuntime = {
       operationId: string
     }>
     completedAt: string
-  }): Promise<void>
+    advance?: {
+      role: 'main' | 'fundamental' | 'news'
+      stage: 'research' | 'finalization'
+      tools: Tool[]
+      toolRounds: number
+      activeElapsedMs: number
+      causativeEvent?: { operationId: string; payload: Record<string, unknown> }
+    }
+  }): Promise<{ projection?: { id: string; version: number } }>
 }
 
 export type ModelOptions = {

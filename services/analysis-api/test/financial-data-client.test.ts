@@ -82,9 +82,11 @@ test('TS 客户端查询关键词新闻和日期范围技术指标', async () =>
   const client = createFinancialDataClient(`http://127.0.0.1:${address.port}`)
 
   assert.equal((await client.searchNews('NAND pricing')).facts[0]?.id, resultFact.id)
+  assert.equal((await client.searchWeb('NVDA event')).facts[0]?.id, resultFact.id)
   assert.equal((await client.technicalIndicators('SNDK', '2026-01-01', '2026-08-12')).facts[0]?.id, resultFact.id)
   assert.match(requests[0] ?? '', /keyword=NAND(?:\+|%20)pricing/)
-  assert.match(requests[1] ?? '', /symbol=SNDK.*start_date=2026-01-01.*end_date=2026-08-12/)
+  assert.match(requests[1] ?? '', /web-search.*query=NVDA(?:\+|%20)event/)
+  assert.match(requests[2] ?? '', /symbol=SNDK.*start_date=2026-01-01.*end_date=2026-08-12/)
   await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
 })
 

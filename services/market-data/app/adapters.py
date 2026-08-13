@@ -162,6 +162,27 @@ class TimedSource:
         self.timeout = timeout
 
 
+def search_web(query: str, timeout: float = 10):
+    if not query or len(query) > 500:
+        raise ValueError("web_search_query_invalid")
+    target = f"https://www.bing.com/search?{urlencode({'q': query, 'format': 'rss'})}"
+    with urlopen(Request(target, headers={"User-Agent": USER_AGENT}), timeout=timeout) as response:
+        payload = response.read(262145)
+        if len(payload) > 262144:
+            raise ValueError("web_search_response_too_large")
+    root = ElementTree.fromstring(payload)
+    results = []
+    for item in root.findall("./channel/item")[:10]:
+        title, link = item.findtext("title"), item.findtext("link")
+        parsed = urlsplit(link) if link else None
+        if title and parsed and parsed.scheme.lower() in {"http", "https"} and parsed.hostname:
+            results.append({
+                "title": title, "url": link,
+                "summary": item.findtext("description") or title,
+            })
+    return results
+
+
 class AlpacaSource(TimedSource):
     name = "alpaca"
 

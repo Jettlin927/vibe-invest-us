@@ -143,7 +143,7 @@ test('真实 PostgreSQL 在模型槽等待取消时不留下 phantom model reque
     async beginModelRequest() { throw new Error('legacy_begin_model_request_not_allowed') },
     async beginToolBatch(input) { await projections.beginToolBatch(input) },
     async startToolCall(input) { await projections.startToolCall(input) },
-    async completeToolBatch() {},
+    async completeToolBatch() { return {} },
   }
   try {
     await events.createResearch({
@@ -939,6 +939,97 @@ test('主 Agent 经真实 PostgreSQL、HTTP 与 SSE 启动并展示独立消息�
   } finally {
     await app.close()
   }
+})
+
+test('Web Search 只在三源资格事件后投影并经正文核实生成专项版本', {
+  skip: !databaseUrl,
+  concurrency: false,
+}, async () => {
+  const pool = createPool(databaseUrl!)
+  const events = createAgentEventRepository(pool)
+  const lead = {
+    id: 'fact:web:e2e:lead', type: 'web_search_lead', evidenceLevel: 'lead',
+    value: { title: 'NVDA event detail', summary: 'search snippet', url: 'https://example.com/web-event' },
+    observedAt: '2026-08-13T12:00:00Z', fetchedAt: '2026-08-13T12:01:00Z',
+    source: 'bing-web-search', sourceReference: 'https://example.com/web-event',
+  }
+  const verified = {
+    ...lead, id: 'fact:web:e2e:verified', type: 'news_document', evidenceLevel: 'verified_news',
+    value: { candidateFactId: lead.id, summary: 'verified event detail', contentHash: 'b'.repeat(64),
+      url: lead.sourceReference, metadata: { contentType: 'text/html', excerptBytes: 21, truncated: false } },
+  }
+  const specialistReport = {
+    kind: 'specialist' as const, domain: 'news', availability: 'available' as const,
+    status: 'completed' as const, gaps: [], limitations: [], keyJudgments: [{
+      type: 'news', statement: '补充搜索核实了产品事件', direction: 'bullish', confidence: 'medium',
+      supportingEvidence: [verified.id], contraryEvidence: [], contraryEvidenceStatus: 'none_found',
+      invalidationConditions: ['事件取消'],
+    }],
+  }
+  const mainModel = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall('run_news_analysis', {
+      launch: true, researchQuestion: '核实近期产品事件', reason: '常规新闻材料不足',
+    }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('submit_analysis_report', integratedReport({
+      title: 'Web Search 降级闭环', marketState: '材料有限', trend: '震荡', drivers: [],
+      supportingEvidence: [], contraryEvidence: [], keyJudgments: [], scenarios: [],
+      invalidationConditions: [], valuation: null, personalImpact: null,
+      conditionalSuggestion: null, limitations: [],
+    })), { stopReason: 'toolUse' }),
+  ] })
+  const newsModel = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall('search_web_evidence', { query: 'NVDA event' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('search_news_candidates', { query: 'NVDA event' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('search_web_evidence', { query: 'NVDA event' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('read_news_document', { factId: lead.id }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('submit_specialist_report', specialistReport), { stopReason: 'toolUse' }),
+  ] })
+  const model = { ...mainModel, analyzeNews: newsModel.analyzeNews }
+  let webSearchCalls = 0
+  const app = buildApp({
+    productDatabase: { checkSchema: () => checkSchema(pool), close: () => pool.end() },
+    portfolioRepository: createPortfolioRepository(pool), analysisRepository: createAnalysisRepository(pool),
+    agentEventRepository: events, runtimeSettingsRepository: createRuntimeSettingsRepository(pool),
+    toolProjectionRepository: createToolProjectionRepository(pool),
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, gaps: [], facts: [] }),
+    searchNewsCandidates: async () => ({ facts: [], eligibility: {
+      eligible: true, normalizedQuery: 'NVDA event', reasons: [
+        { source: 'yahoo', reason: 'empty' }, { source: 'google-news', reason: 'title_only' },
+        { source: 'alpaca', reason: 'unavailable' },
+      ],
+    } }),
+    searchWebEvidence: async () => { webSearchCalls += 1; return { facts: [lead] } },
+    readNewsDocument: async (candidate) => { assert.equal(candidate.id, lead.id); return { facts: [verified] } },
+    listCompanyEvents: async () => ({ facts: [] }), model,
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: `W${crypto.randomUUID().slice(0, 8)}` },
+  })).json() as { analysisId: string; sessionId: string }
+  try {
+    await waitForAnalysisStatus(app, created.analysisId, 'completed')
+    const research = (await app.inject({ method: 'GET', url: `/api/research/${created.analysisId}` })).json()
+    const news = research.specialistAgents[0]
+    const serialized = JSON.stringify(news.events)
+    assert.equal(webSearchCalls, 1)
+    assert.match(serialized, /web_search_eligibility/)
+    assert.match(serialized, /search_web_evidence/)
+    assert.match(serialized, /tool_not_available/)
+    assert.match(serialized, /fact:web:e2e:lead/)
+    assert.match(serialized, /fact:web:e2e:verified/)
+    const eligibilitySequence = news.events.find((event: any) => event.type === 'web_search_eligibility').sequence
+    const candidateResultSequence = news.events.find((event: any) => (
+      event.type === 'tool_result' && event.name === 'search_news_candidates'
+    )).sequence
+    assert.ok(eligibilitySequence > candidateResultSequence)
+    const replay = await app.inject({ method: 'GET', url: `/api/agent-sessions/${news.id}/events` })
+    assert.match(replay.body, /event: web_search_eligibility/)
+    const versions = (await app.inject({
+      method: 'GET', url: `/api/research/${created.analysisId}/report-versions`,
+    })).json().items
+    assert.equal(versions[0].report.keyJudgments[0].supportingEvidence[0], verified.id)
+  } finally { await app.close() }
 })
 
 test('生产 Pi 经 HTTP、SSE 与真实 PostgreSQL 留存工具及预算收口状态序列', {

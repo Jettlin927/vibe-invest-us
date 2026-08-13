@@ -5,10 +5,10 @@ from typing import Literal, List, Optional
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-from app.adapters import read_limited_document
+from app.adapters import read_limited_document, search_web
 from app.context import (
     build_financial_context, company_event_facts, read_news_document_fact,
-    search_news_facts, technical_indicator_facts,
+    search_news_facts, technical_indicator_facts, web_search_lead_facts,
 )
 from app.models import AtomicFact, FactQueryResult, FinancialContext, NewsDocumentResult, QuoteBatch, QuoteSnapshot, SourceStatus
 from app.source_config import build_sources, load_source_config
@@ -43,10 +43,11 @@ def financial_context(symbol: str) -> FinancialContext:
 
 @app.post("/v1/news-search", operation_id="searchNews", response_model=FactQueryResult)
 def news_search(keyword: str) -> FactQueryResult:
-    facts, sources = search_news_facts(
+    facts, sources, eligibility = search_news_facts(
         keyword, datetime.now(timezone.utc), build_sources(source_config, "news"),
+        include_eligibility=True,
     )
-    return FactQueryResult(facts=facts, sources=sources)
+    return FactQueryResult(facts=facts, sources=sources, eligibility=eligibility)
 
 
 class NewsDocumentRequest(BaseModel):
@@ -56,7 +57,9 @@ class NewsDocumentRequest(BaseModel):
 @app.post("/v1/news-document", operation_id="readNewsDocument", response_model=NewsDocumentResult)
 def news_document(request: NewsDocumentRequest) -> NewsDocumentResult:
     candidate = request.candidate
-    if candidate.type != "news" or candidate.evidenceLevel != "title_only":
+    valid_candidate = (candidate.type == "news" and candidate.evidenceLevel == "title_only") \
+        or (candidate.type == "web_search_lead" and candidate.evidenceLevel == "lead")
+    if not valid_candidate:
         raise ValueError("news_candidate_invalid")
 
     def reader(url: str, max_bytes: int):
@@ -70,6 +73,16 @@ def news_document(request: NewsDocumentRequest) -> NewsDocumentResult:
     )
     return NewsDocumentResult(facts=[fact], excerpt=text[:2048], sources=[SourceStatus(
         source=candidate.source, status="ok", item_count=1,
+    )])
+
+
+@app.post("/v1/web-search", operation_id="searchWebEvidence", response_model=FactQueryResult)
+def web_search(query: str) -> FactQueryResult:
+    facts = web_search_lead_facts(
+        query, datetime.now(timezone.utc), lambda normalized: search_web(normalized, timeout=10),
+    )
+    return FactQueryResult(facts=facts, sources=[SourceStatus(
+        source="bing-web-search", status="ok" if facts else "empty", item_count=len(facts),
     )])
 
 

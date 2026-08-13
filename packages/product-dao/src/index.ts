@@ -1833,6 +1833,7 @@ export function createToolProjectionRepository(pool: Pool) {
       executionId: string; role: ToolProjectionRole; stage: ToolProjectionStage; schemaHash: string
       projectedTools: unknown[]; visibleToolNames: string[]
       reasons: Record<string, unknown>; createdAt: string
+      causativeEvent?: { operationId: string; payload: Record<string, unknown> }
     }) {
       const client = await pool.connect()
       try {
@@ -1846,6 +1847,39 @@ export function createToolProjectionRepository(pool: Pool) {
           [input.executionId, input.role],
         )
         if (running.rowCount) throw new Error('tool_batch_not_terminal')
+        let causativeAgentEvent: AgentEvent | undefined
+        if (input.causativeEvent) {
+          const session = await client.query<{ id: string; latest_sequence: number }>(
+            `SELECT session.id, session.latest_sequence FROM agent_executions execution
+             JOIN agent_sessions session ON session.id = execution.session_id
+             WHERE execution.id = $1 FOR UPDATE OF session`, [input.executionId],
+          )
+          if (!session.rows[0]) throw new Error('agent_session_not_found')
+          const existingEvent = await client.query<AgentEventRow>(
+            `SELECT session_id, sequence, operation_id, payload_json, created_at::text
+             FROM agent_events WHERE session_id = $1 AND operation_id = $2`,
+            [session.rows[0].id, input.causativeEvent.operationId],
+          )
+          if (existingEvent.rows[0]) {
+            if (!jsonValuesEqual(existingEvent.rows[0].payload_json, input.causativeEvent.payload)) {
+              throw new Error('tool_projection_causative_event_conflict')
+            }
+          } else {
+            const sequence = session.rows[0].latest_sequence + 1
+            const insertedEvent = await client.query<AgentEventRow>(
+              `INSERT INTO agent_events (session_id, sequence, operation_id, payload_json, created_at)
+               VALUES ($1, $2, $3, $4, $5)
+               RETURNING session_id, sequence, operation_id, payload_json, created_at::text`,
+              [session.rows[0].id, sequence, input.causativeEvent.operationId,
+                JSON.stringify(input.causativeEvent.payload), input.createdAt],
+            )
+            await client.query(
+              'UPDATE agent_sessions SET latest_sequence = $1, updated_at = $2 WHERE id = $3',
+              [sequence, input.createdAt, session.rows[0].id],
+            )
+            causativeAgentEvent = mapAgentEventRow(insertedEvent.rows[0]!)
+          }
+        }
         const existing = await client.query<ToolProjectionRow>(
           `SELECT id, execution_id, version, role, stage, schema_hash, projected_tools_json, visible_tool_names_json,
              reasons_json, created_at::text FROM tool_projection_versions
@@ -1860,7 +1894,7 @@ export function createToolProjectionRepository(pool: Pool) {
             throw new Error('tool_projection_conflict')
           }
           await client.query('COMMIT')
-          return mapToolProjection(existing.rows[0])
+          return { ...mapToolProjection(existing.rows[0]), event: causativeAgentEvent }
         }
         const version = await client.query<{ next: number }>(
           `SELECT COALESCE(max(version), 0) + 1 AS next
@@ -1880,7 +1914,7 @@ export function createToolProjectionRepository(pool: Pool) {
             JSON.stringify(input.reasons), input.createdAt],
         )
         await client.query('COMMIT')
-        return mapToolProjection(inserted.rows[0]!)
+        return { ...mapToolProjection(inserted.rows[0]!), event: causativeAgentEvent }
       } catch (error) {
         await client.query('ROLLBACK'); throw error
       } finally { client.release() }
@@ -2052,6 +2086,12 @@ export function createToolProjectionRepository(pool: Pool) {
         eventPayload: Record<string, unknown>
       }>
       completedAt: string
+      advance?: {
+        role: ToolProjectionRole; stage: ToolProjectionStage; schemaHash: string
+        projectedTools: unknown[]; visibleToolNames: string[]; reasons: Record<string, unknown>
+        toolRounds: number; activeElapsedMs: number
+        causativeEvent?: { operationId: string; payload: Record<string, unknown> }
+      }
     }) {
       const client = await pool.connect()
       try {
@@ -2133,8 +2173,44 @@ export function createToolProjectionRepository(pool: Pool) {
             }
             existingEvents.push(mapAgentEventRow(row))
           }
+          if (input.advance) {
+            const turnPayload = {
+              type: 'runtime_turn_advanced', toolRounds: input.advance.toolRounds,
+              activeElapsedMs: input.advance.activeElapsedMs, stage: input.advance.stage,
+            }
+            const advanceEvents = [
+              { operationId: `${input.id}:turn-advanced`, payload: turnPayload },
+              ...(input.advance.causativeEvent ? [input.advance.causativeEvent] : []),
+            ]
+            for (const expectedEvent of advanceEvents) {
+              const event = await client.query<AgentEventRow>(
+                `SELECT session_id, sequence, operation_id, payload_json, created_at::text
+                 FROM agent_events WHERE session_id = $1 AND operation_id = $2`,
+                [session.rows[0].session_id, expectedEvent.operationId],
+              )
+              if (!event.rows[0] || !jsonValuesEqual(event.rows[0].payload_json, expectedEvent.payload)) {
+                throw new Error('tool_batch_completion_conflict')
+              }
+              existingEvents.push(mapAgentEventRow(event.rows[0]))
+            }
+          }
+          const projection = input.advance ? await client.query<ToolProjectionRow>(
+            `SELECT id, execution_id, version, role, stage, schema_hash, projected_tools_json,
+               visible_tool_names_json, reasons_json, created_at::text FROM tool_projection_versions
+             WHERE execution_id = $1 AND role = $2 AND stage = $3 AND schema_hash = $4
+               AND visible_tool_names_json = $5::jsonb`,
+            [input.executionId, input.advance.role, input.advance.stage, input.advance.schemaHash,
+              JSON.stringify(input.advance.visibleToolNames)],
+          ) : undefined
+          if (input.advance && (!projection?.rows[0]
+            || !jsonValuesEqual(projection.rows[0].projected_tools_json, input.advance.projectedTools)
+            || !jsonValuesEqual(projection.rows[0].reasons_json, input.advance.reasons))) {
+            throw new Error('tool_batch_completion_conflict')
+          }
+          existingEvents.sort((left, right) => left.sequence - right.sequence)
           await client.query('COMMIT')
-          return existingEvents
+          return { events: existingEvents, projection: projection?.rows[0]
+            ? mapToolProjection(projection.rows[0]) : undefined }
         }
         for (const result of orderedResults) {
           const existingCall = expected.rows.find((row) => row.tool_call_id === result.toolCallId)!
@@ -2201,12 +2277,70 @@ export function createToolProjectionRepository(pool: Pool) {
             }
           }
         }
+        let advancedProjection: ReturnType<typeof mapToolProjection> | undefined
+        if (input.advance) {
+          sequence += 1
+          const turnEvent = await client.query<AgentEventRow>(
+            `INSERT INTO agent_events (session_id, sequence, operation_id, payload_json, created_at)
+             VALUES ($1, $2, $3, $4, $5)
+             RETURNING session_id, sequence, operation_id, payload_json, created_at::text`,
+            [session.rows[0].session_id, sequence, `${input.id}:turn-advanced`, JSON.stringify({
+              type: 'runtime_turn_advanced', toolRounds: input.advance.toolRounds,
+              activeElapsedMs: input.advance.activeElapsedMs, stage: input.advance.stage,
+            }), input.completedAt],
+          )
+          createdEvents.push(mapAgentEventRow(turnEvent.rows[0]!))
+          if (input.advance.causativeEvent) {
+            sequence += 1
+            const decision = await client.query<AgentEventRow>(
+              `INSERT INTO agent_events (session_id, sequence, operation_id, payload_json, created_at)
+               VALUES ($1, $2, $3, $4, $5)
+               RETURNING session_id, sequence, operation_id, payload_json, created_at::text`,
+              [session.rows[0].session_id, sequence, input.advance.causativeEvent.operationId,
+                JSON.stringify(input.advance.causativeEvent.payload), input.completedAt],
+            )
+            createdEvents.push(mapAgentEventRow(decision.rows[0]!))
+          }
+          const existingProjection = await client.query<ToolProjectionRow>(
+            `SELECT id, execution_id, version, role, stage, schema_hash, projected_tools_json,
+               visible_tool_names_json, reasons_json, created_at::text FROM tool_projection_versions
+             WHERE execution_id = $1 AND role = $2 AND stage = $3 AND schema_hash = $4
+               AND visible_tool_names_json = $5::jsonb`,
+            [input.executionId, input.advance.role, input.advance.stage, input.advance.schemaHash,
+              JSON.stringify(input.advance.visibleToolNames)],
+          )
+          if (existingProjection.rows[0]) {
+            if (!jsonValuesEqual(existingProjection.rows[0].projected_tools_json, input.advance.projectedTools)
+              || !jsonValuesEqual(existingProjection.rows[0].reasons_json, input.advance.reasons)) {
+              throw new Error('tool_projection_conflict')
+            }
+            advancedProjection = mapToolProjection(existingProjection.rows[0])
+          } else {
+            const version = Number((await client.query<{ next: number }>(
+              `SELECT COALESCE(max(version), 0) + 1 AS next
+               FROM tool_projection_versions WHERE execution_id = $1`, [input.executionId],
+            )).rows[0]!.next)
+            const insertedProjection = await client.query<ToolProjectionRow>(
+              `INSERT INTO tool_projection_versions (
+                 id, execution_id, version, role, stage, schema_hash, projected_tools_json,
+                 visible_tool_names_json, reasons_json, created_at
+               ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+               RETURNING id, execution_id, version, role, stage, schema_hash, projected_tools_json,
+                 visible_tool_names_json, reasons_json, created_at::text`,
+              [`${input.executionId}:tool-projection:${version}`, input.executionId, version,
+                input.advance.role, input.advance.stage, input.advance.schemaHash,
+                JSON.stringify(input.advance.projectedTools), JSON.stringify(input.advance.visibleToolNames),
+                JSON.stringify(input.advance.reasons), input.completedAt],
+            )
+            advancedProjection = mapToolProjection(insertedProjection.rows[0]!)
+          }
+        }
         await client.query(
           `UPDATE agent_sessions SET latest_sequence = $1, updated_at = $2 WHERE id = $3`,
           [sequence, input.completedAt, session.rows[0].session_id],
         )
         await client.query('COMMIT')
-        return createdEvents
+        return { events: createdEvents, projection: advancedProjection }
       } catch (error) { await client.query('ROLLBACK'); throw error } finally { client.release() }
     },
     async replay(executionId: string) {

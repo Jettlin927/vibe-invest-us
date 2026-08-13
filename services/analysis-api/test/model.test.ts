@@ -45,7 +45,12 @@ function createTestToolRuntime(): ToolRuntime {
     },
     async beginToolBatch() {},
     async startToolCall() {},
-    async completeToolBatch() {},
+    async completeToolBatch(input) {
+      if (!input.advance) return {}
+      return { projection: {
+        id: `${input.executionId}:test-projection:${++version}`, version,
+      } }
+    },
   }
 }
 
@@ -265,6 +270,166 @@ test('消息面 Agent 只使用领域工具并提交可追溯专项报告', asyn
   if (completed?.type === 'completed') assert.deepEqual(completed.reportVersion?.report, report)
   assert.match(JSON.stringify(events), /fact:news:candidate/)
   assert.match(JSON.stringify(events), /fact:news:document/)
+})
+
+test('Web Search 仅在三个既定来源不合格后的下一轮可见且恢复后撤销', async () => {
+  const visible: string[][] = []
+  const model = createPiModel({ fauxResponses: [
+    (context) => {
+      visible.push(context.tools.map(({ name }) => name))
+      return fauxAssistantMessage(fauxToolCall('search_web_evidence', { query: 'NVDA event' }), { stopReason: 'toolUse' })
+    },
+    (context) => {
+      visible.push(context.tools.map(({ name }) => name))
+      return fauxAssistantMessage(fauxToolCall('search_news_candidates', { query: 'NVDA event' }), { stopReason: 'toolUse' })
+    },
+    (context) => {
+      visible.push(context.tools.map(({ name }) => name))
+      return fauxAssistantMessage(fauxToolCall('search_web_evidence', { query: 'NVDA event' }), { stopReason: 'toolUse' })
+    },
+    (context) => {
+      visible.push(context.tools.map(({ name }) => name))
+      return fauxAssistantMessage(fauxToolCall('search_news_candidates', { query: 'NVDA event' }), { stopReason: 'toolUse' })
+    },
+    (context) => {
+      visible.push(context.tools.map(({ name }) => name))
+      return fauxAssistantMessage(fauxToolCall('submit_specialist_report', {
+        kind: 'specialist', domain: 'news', availability: 'partial', status: 'partial',
+        gaps: [], limitations: [], keyJudgments: [],
+      }), { stopReason: 'toolUse' })
+    },
+  ] })
+  const eligibility = { eligible: true, normalizedQuery: 'NVDA event', reasons: [
+    { source: 'yahoo', reason: 'empty' },
+    { source: 'google-news', reason: 'title_only' },
+    { source: 'alpaca', reason: 'unavailable' },
+  ] }
+  let searches = 0
+  const events = []
+  for await (const event of model.analyzeNews!({
+    executionId: 'web-fallback', runtimeSettings: { ...runtimeSettings(), specialistAgentToolRounds: 5 },
+    symbol: 'NVDA', systemPrompt: 'news', researchQuestion: 'question', knownFacts: [],
+    searchNewsCandidates: async (_query) => searches++ === 0
+      ? { facts: [], eligibility }
+      : { facts: [{ ...facts[0]!, id: 'fact:recovered', type: 'news', evidenceLevel: 'verified_news' }],
+          eligibility: { ...eligibility, eligible: false, reasons: [
+            { source: 'yahoo', reason: 'empty' },
+            { source: 'google-news', reason: 'qualified' },
+            { source: 'alpaca', reason: 'unavailable' },
+          ] } },
+    searchWebEvidence: async () => ({ facts: [{ ...facts[0]!, id: 'fact:web-lead', evidenceLevel: 'lead' }] }),
+    readNewsDocument: async () => ({ facts: [] }), listCompanyEvents: async () => ({ facts: [] }),
+    toolRuntime: createTestToolRuntime(),
+  })) events.push(event)
+
+  assert.equal(visible[0]?.includes('search_web_evidence'), false)
+  assert.match(JSON.stringify(events), /tool_not_available/)
+  assert.equal(visible[2]?.includes('search_web_evidence'), true)
+  assert.equal(visible[4]?.includes('search_web_evidence'), false)
+})
+
+test('常规新闻候选经正文核实后撤销后续 Web Search 投影', async () => {
+  const candidate = { ...facts[0]!, id: 'fact:regular-lead', type: 'news', evidenceLevel: 'title_only' }
+  const verified = { ...candidate, id: 'fact:regular-verified', type: 'news_document', evidenceLevel: 'verified_news' }
+  const visible: string[][] = []
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall('search_news_candidates', { query: 'NVDA event' }), { stopReason: 'toolUse' }),
+    (context) => {
+      visible.push(context.tools.map(({ name }) => name))
+      return fauxAssistantMessage(fauxToolCall('read_news_document', { factId: candidate.id }), { stopReason: 'toolUse' })
+    },
+    (context) => {
+      visible.push(context.tools.map(({ name }) => name))
+      return fauxAssistantMessage(fauxToolCall('submit_specialist_report', {
+        kind: 'specialist', domain: 'news', availability: 'partial', status: 'partial',
+        gaps: [], limitations: [], keyJudgments: [],
+      }), { stopReason: 'toolUse' })
+    },
+  ] })
+  for await (const _event of model.analyzeNews!({
+    executionId: 'web-revoked-by-document', runtimeSettings: runtimeSettings(), symbol: 'NVDA',
+    systemPrompt: 'news', researchQuestion: 'question', knownFacts: [],
+    searchNewsCandidates: async () => ({ facts: [candidate], eligibility: {
+      eligible: true, normalizedQuery: 'NVDA event', reasons: [
+        { source: 'yahoo', reason: 'title_only' }, { source: 'google-news', reason: 'empty' },
+        { source: 'alpaca', reason: 'unavailable' },
+      ],
+    } }),
+    searchWebEvidence: async () => ({ facts: [] }), readNewsDocument: async () => ({ facts: [verified] }),
+    listCompanyEvents: async () => ({ facts: [] }), toolRuntime: createTestToolRuntime(),
+  })) { /* consume */ }
+  assert.equal(visible[0]?.includes('search_web_evidence'), true)
+  assert.equal(visible[1]?.includes('search_web_evidence'), false)
+})
+
+test('Runtime 按三个配置来源失败原因独立判定且拒绝 qualified 伪资格', async () => {
+  const visible: string[][] = []
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall('search_news_candidates', { query: 'NVDA' }), { stopReason: 'toolUse' }),
+    (context) => {
+      visible.push(context.tools.map(({ name }) => name))
+      return fauxAssistantMessage(fauxToolCall('search_news_candidates', { query: 'NVDA' }), { stopReason: 'toolUse' })
+    },
+    (context) => {
+      visible.push(context.tools.map(({ name }) => name))
+      return fauxAssistantMessage(fauxToolCall('submit_specialist_report', {
+        kind: 'specialist', domain: 'news', availability: 'partial', status: 'partial',
+        gaps: [], limitations: [], keyJudgments: [],
+      }), { stopReason: 'toolUse' })
+    },
+  ] })
+  let call = 0
+  for await (const _event of model.analyzeNews!({
+    executionId: 'configured-news-sources', runtimeSettings: runtimeSettings(), symbol: 'NVDA',
+    systemPrompt: 'news', researchQuestion: 'question', knownFacts: [],
+    searchNewsCandidates: async () => call++ === 0 ? { facts: [], eligibility: {
+      eligible: false, normalizedQuery: 'NVDA', reasons: [
+        { source: 'source-c', reason: 'empty' }, { source: 'source-a', reason: 'irrelevant' },
+        { source: 'source-b', reason: 'title_only' },
+      ],
+    } } : { facts: [], eligibility: {
+      eligible: true, normalizedQuery: 'NVDA', reasons: [
+        { source: 'source-c', reason: 'empty' }, { source: 'source-a', reason: 'qualified' },
+        { source: 'source-b', reason: 'title_only' },
+      ],
+    } },
+    searchWebEvidence: async () => ({ facts: [] }), readNewsDocument: async () => ({ facts: [] }),
+    listCompanyEvents: async () => ({ facts: [] }), toolRuntime: createTestToolRuntime(),
+  })) { /* consume */ }
+  assert.equal(visible[0]?.includes('search_web_evidence'), true)
+  assert.equal(visible[1]?.includes('search_web_evidence'), false)
+})
+
+test('Web Search 资格事件与下一版投影只在当前工具批次完成后原子提交', async () => {
+  const toolRuntime = createTestToolRuntime()
+  let batchRunning = false
+  const originalCompleteToolBatch = toolRuntime.completeToolBatch
+  toolRuntime.beginToolBatch = async () => { batchRunning = true }
+  toolRuntime.completeToolBatch = async (input) => {
+    assert.equal(batchRunning, true)
+    const completed = await originalCompleteToolBatch(input)
+    batchRunning = false
+    return completed
+  }
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall('search_news_candidates', { query: 'NVDA event' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('submit_specialist_report', {
+      kind: 'specialist', domain: 'news', availability: 'partial', status: 'partial',
+      gaps: [], limitations: [], keyJudgments: [],
+    }), { stopReason: 'toolUse' }),
+  ] })
+  for await (const _event of model.analyzeNews!({
+    executionId: 'web-eligibility-after-batch', runtimeSettings: runtimeSettings(), symbol: 'NVDA',
+    systemPrompt: 'news', researchQuestion: 'question', knownFacts: [],
+    searchNewsCandidates: async () => ({ facts: [], eligibility: {
+      normalizedQuery: 'NVDA event', reasons: [
+        { source: 'one', reason: 'empty' }, { source: 'two', reason: 'irrelevant' },
+        { source: 'three', reason: 'title_only' },
+      ],
+    } }),
+    searchWebEvidence: async () => ({ facts: [] }), readNewsDocument: async () => ({ facts: [] }),
+    listCompanyEvents: async () => ({ facts: [] }), toolRuntime,
+  })) { /* consume */ }
 })
 
 test('宽松报告允许证据和情景数组为空', async () => {
@@ -671,7 +836,11 @@ for (const [position, calls, expectedExecutions] of [
     let executions = 0
     const committedResults: Array<{ toolCallId: string }> = []
     const toolRuntime = createTestToolRuntime()
-    toolRuntime.completeToolBatch = async (input) => { committedResults.push(...input.results) }
+  const originalComplete = toolRuntime.completeToolBatch
+  toolRuntime.completeToolBatch = async (input) => {
+    committedResults.push(...input.results)
+    return originalComplete(input)
+  }
     const finalContexts: Context[] = []
     const model = createPiModel({ fauxResponses: [
       (context) => {
@@ -1609,6 +1778,30 @@ test('研究 active 在 provider 后耗尽时不再调用研究工具并由主 A
   assert.ok(events.some((event) => event.type === 'completed'))
 })
 
+test('纯文本 Turn 耗尽研究预算后持久化收口投影且不再暴露研究工具', async () => {
+  let now = 0
+  const visible: string[][] = []
+  const budget = createActiveBudget(10, () => now, () => new AbortController().signal)
+  const model = createPiModel({ fauxResponses: [
+    (context) => {
+      visible.push(context.tools.map(({ name }) => name))
+      now = 11
+      return fauxAssistantMessage(fauxText('先整理现有材料'))
+    },
+    (context) => {
+      visible.push(context.tools.map(({ name }) => name))
+      return fauxAssistantMessage(fauxToolCall('submit_analysis_report', validReport), { stopReason: 'toolUse' })
+    },
+  ] })
+  for await (const _event of model.analyze({
+    executionId: 'text-turn-budget-closing', runtimeSettings: runtimeSettings(), activeBudget: budget,
+    symbol: 'NVDA', systemPrompt: 'system', userPrompt: 'user', knownFacts: facts,
+    fetchFinancialContext: async () => ({ facts }), toolRuntime: createTestToolRuntime(),
+  })) { /* consume */ }
+  assert.ok(visible[0]?.includes('fetch_financial_context'))
+  assert.deepEqual(visible[1], ['submit_analysis_report'])
+})
+
 test('真实 Pi 使用冻结 timeout、并发且只审计 freshness/compaction 设置', async () => {
   const logs: Array<Record<string, unknown>> = []
   const settings = runtimeSettings({
@@ -1815,7 +2008,11 @@ test('工具 start 审计失败时 fail closed 且不执行 handler 或完成批
   let completedBatches = 0
   const toolRuntime = createTestToolRuntime()
   toolRuntime.startToolCall = async () => { throw new Error('tool_start_audit_failed') }
-  toolRuntime.completeToolBatch = async () => { completedBatches += 1 }
+  const originalComplete = toolRuntime.completeToolBatch
+  toolRuntime.completeToolBatch = async (input) => {
+    completedBatches += 1
+    return originalComplete(input)
+  }
   const model = createPiModel({ fauxResponses: [
     fauxAssistantMessage(fauxToolCall('fetch_financial_context', {}), { stopReason: 'toolUse' }),
   ] })

@@ -11,6 +11,7 @@ export const registeredToolHandlers: Record<string, RegisteredToolHandler> = {
   search_news_by_keyword: async (params, context) => required(context, 'searchNews')(params),
   get_technical_indicators: async (params, context) => required(context, 'fetchTechnicalIndicators')(params),
   search_news_candidates: async (params, context) => required(context, 'searchNewsCandidates')(params),
+  search_web_evidence: async (params, context) => required(context, 'searchWebEvidence')(params),
   read_news_document: async (params, context) => required(context, 'readNewsDocument')(params),
   list_company_events: async (params, context) => required(context, 'listCompanyEvents')(params),
   submit_specialist_report: async (params, context) => required(context, 'submitSpecialistReport')(params),

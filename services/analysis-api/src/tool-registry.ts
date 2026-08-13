@@ -8,6 +8,7 @@ import { listCompanyEventsDefinition } from './tool-definitions/list-company-eve
 import { readNewsDocumentDefinition } from './tool-definitions/read-news-document.js'
 import { runNewsAnalysisDefinition } from './tool-definitions/run-news-analysis.js'
 import { searchNewsCandidatesDefinition } from './tool-definitions/search-news-candidates.js'
+import { searchWebEvidenceDefinition } from './tool-definitions/search-web-evidence.js'
 import { searchNewsByKeywordDefinition } from './tool-definitions/search-news-by-keyword.js'
 import { submitSpecialistReportDefinition } from './tool-definitions/submit-specialist-report.js'
 import { submitAnalysisReportDefinition } from './tool-definitions/submit-analysis-report.js'
@@ -27,6 +28,7 @@ export const registeredToolDefinitions = [
   searchNewsByKeywordDefinition,
   getTechnicalIndicatorsDefinition,
   searchNewsCandidatesDefinition,
+  searchWebEvidenceDefinition,
   readNewsDocumentDefinition,
   listCompanyEventsDefinition,
   submitSpecialistReportDefinition,

@@ -24,6 +24,7 @@ export type FactQueryResult = {
   facts: FinancialFact[]
   sources?: unknown[]
   excerpt?: string
+  eligibility?: unknown
 }
 
 export function createFinancialDataClient(baseUrl: string) {
@@ -53,6 +54,9 @@ export function createFinancialDataClient(baseUrl: string) {
     },
     async searchNews(keyword: string, signal?: AbortSignal): Promise<FactQueryResult> {
       return factQuery(`/v1/news-search?keyword=${encodeURIComponent(keyword)}`, signal)
+    },
+    async searchWeb(query: string, signal?: AbortSignal): Promise<FactQueryResult> {
+      return factQuery(`/v1/web-search?query=${encodeURIComponent(query)}`, signal)
     },
     async readNewsDocument(candidate: FinancialFact, signal?: AbortSignal): Promise<FactQueryResult> {
       const response = await fetch(new URL('/v1/news-document', baseUrl), {
@@ -103,11 +107,14 @@ export function createFinancialDataClient(baseUrl: string) {
       signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(30_000)]) : AbortSignal.timeout(30_000),
     })
     if (!response.ok) throw new Error(`financial_data_fact_query_http_${response.status}`)
-    const value = await response.json() as { facts?: unknown; sources?: unknown[] }
+    const value = await response.json() as { facts?: unknown; sources?: unknown[]; eligibility?: unknown }
     if (!Array.isArray(value.facts) || !value.facts.every(isFinancialFact)) {
       throw new Error('financial_data_fact_query_contract_invalid')
     }
-    return { facts: value.facts, sources: Array.isArray(value.sources) ? value.sources : [] }
+    return {
+      facts: value.facts, sources: Array.isArray(value.sources) ? value.sources : [],
+      ...('eligibility' in value ? { eligibility: value.eligibility } : {}),
+    }
   }
 }
 

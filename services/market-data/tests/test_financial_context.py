@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 
 from app.context import (
     build_financial_context, company_event_facts, read_news_document_fact, search_news_facts,
-    technical_indicator_facts,
+    technical_indicator_facts, web_search_lead_facts,
 )
 from app.models import DailyBar, NewsItem, Quote
 
@@ -131,6 +131,69 @@ def test_keyword_news_query_returns_traceable_facts_without_symbol_filter():
     assert facts[0].sourceReference == item.url
     assert facts[0].evidenceLevel == "title_only"
     assert sources[0].status == "ok"
+
+
+def test_three_news_sources_must_all_fail_qualification_before_web_search_eligibility():
+    irrelevant = NewsItem(title="Unrelated macro update", source="Yahoo", published_at=NOW,
+                          fetched_at=NOW, url="https://example.com/macro", summary="Rates", symbols=[])
+    title_only = NewsItem(title="NVDA event", source="Google", published_at=NOW,
+                          fetched_at=NOW, url="https://example.com/nvda", summary="Event", symbols=[])
+    facts, sources, eligibility = search_news_facts(
+        "  NVDA   event ", NOW, [
+            Source("yahoo", [irrelevant]), Source("google-news", [title_only]),
+            Source("alpaca", error=RuntimeError("down")),
+        ], include_eligibility=True,
+    )
+    assert eligibility == {
+        "eligible": True, "normalizedQuery": "NVDA event", "reasons": [
+            {"source": "yahoo", "reason": "irrelevant"},
+            {"source": "google-news", "reason": "title_only"},
+            {"source": "alpaca", "reason": "unavailable"},
+        ],
+    }
+    assert "NVDA event" in [fact.value["title"] for fact in facts]
+    assert len(sources) == 3
+
+
+def test_any_qualified_regular_news_revokes_web_search_eligibility():
+    qualified = NewsItem(title="NVDA event details", source="IR", published_at=NOW,
+                         fetched_at=NOW, url="https://example.com/ir", summary="NVDA event details", symbols=[])
+    facts, _sources, eligibility = search_news_facts(
+        "NVDA event", NOW, [Source("yahoo", []), Source("google-news", [qualified]), Source("alpaca", [])],
+        include_eligibility=True, qualified_urls={qualified.url},
+    )
+    assert len(facts) == 1
+    assert eligibility["eligible"] is False
+    assert eligibility["reasons"][1] == {"source": "google-news", "reason": "qualified"}
+
+
+def test_web_search_results_are_leads_until_document_read_verifies_them():
+    leads = web_search_lead_facts("NVDA event", NOW, lambda query: [{
+        "title": "NVDA event details", "summary": "Search snippet",
+        "url": "https://example.com/event",
+    }])
+    assert len(leads) == 1
+    assert leads[0].type == "web_search_lead"
+    assert leads[0].evidenceLevel == "lead"
+    verified = read_news_document_fact(leads[0], NOW, lambda url, max_bytes: (
+        b"<p>Verified event details</p>", "text/html", False, url,
+    ))
+    assert verified.evidenceLevel == "verified_news"
+    assert verified.value["candidateFactId"] == leads[0].id
+
+
+def test_web_search_leads_reject_non_http_results_and_oversized_query():
+    leads = web_search_lead_facts("NVDA", NOW, lambda query: [
+        {"title": "unsafe", "summary": "unsafe", "url": "file:///etc/passwd"},
+        {"title": "safe", "summary": "safe", "url": "https://example.com/news"},
+    ])
+    assert [fact.value["title"] for fact in leads] == ["safe"]
+    try:
+        web_search_lead_facts("x" * 501, NOW, lambda query: [])
+    except ValueError as error:
+        assert str(error) == "web_search_query_invalid"
+    else:
+        raise AssertionError("oversized_query_accepted")
 
 
 def test_news_document_read_preserves_bounded_excerpt_summary_hash_and_metadata():

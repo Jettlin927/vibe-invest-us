@@ -297,6 +297,11 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
       const queue = createAsyncQueue<ModelEvent>()
       const knownFacts = new Map(input.knownFacts.map((fact) => [fact.id, fact]))
       const candidateFactIds = new Set<string>()
+      const regularCandidateFactIds = new Set<string>()
+      let webSearchEligible = false
+      let webSearchQuery = ''
+      let webSearchDecisionIndex = 0
+      let pendingWebSearchDecision: Extract<ModelEvent, { type: 'trace' }>['entry'] | undefined
       const validationState = { failures: 0, exhausted: false }
       let policyFailure: Error | undefined
       queue.push(trace({
@@ -332,12 +337,45 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
         provider, queue, initialTools: newsSpecialistTools,
         systemPrompt: input.systemPrompt, userPrompt: input.researchQuestion,
         shouldRejectNextTurn: () => validationState.exhausted,
+        nextResearchTools: () => webSearchEligible
+          ? [...newsSpecialistTools, toolRegistry.definition('search_web_evidence')!.model]
+          : newsSpecialistTools,
+        beforeNextProjection: () => {
+          const decision = pendingWebSearchDecision
+          pendingWebSearchDecision = undefined
+          return decision
+        },
         execute: async (name, params, signal, onStart) => {
           if (name === unavailableToolName) { await onStart(); return failed('tool_not_available') }
           if (name === 'search_news_candidates') {
             const query = stringParam(params, 'query')
             const result = await runTool(name, onStart, signal, (toolSignal) => (
               input.searchNewsCandidates(query, toolSignal)
+            ))
+            const facts = asRecord(result.result).facts
+            if (Array.isArray(facts)) for (const fact of facts as Fact[]) {
+              candidateFactIds.add(fact.id); regularCandidateFactIds.add(fact.id)
+            }
+            const eligibility = asRecord(asRecord(result.result).eligibility)
+            const reasons = Array.isArray(eligibility.reasons)
+              ? eligibility.reasons as Array<{ source: string; reason: string }> : []
+            webSearchEligible = validWebSearchReasons(reasons)
+            webSearchQuery = asString(eligibility.normalizedQuery) || query
+            pendingWebSearchDecision = {
+              type: 'web_search_eligibility', query: webSearchQuery,
+              eligible: webSearchEligible, reasons,
+              operationId: `execution:${input.executionId}:web-search-eligibility:${++webSearchDecisionIndex}`,
+            }
+            return result
+          }
+          if (name === 'search_web_evidence') {
+            const query = stringParam(params, 'query')
+            if (!webSearchEligible || normalizeQuery(query) !== normalizeQuery(webSearchQuery)
+              || !input.searchWebEvidence) {
+              await onStart(); return failed('tool_not_available')
+            }
+            const result = await runTool(name, onStart, signal, (toolSignal) => (
+              input.searchWebEvidence!(query, toolSignal)
             ))
             const facts = asRecord(result.result).facts
             if (Array.isArray(facts)) for (const fact of facts as Fact[]) candidateFactIds.add(fact.id)
@@ -352,6 +390,16 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
             const result = await runTool(name, onStart, signal, (toolSignal) => (
               input.readNewsDocument(candidate, toolSignal)
             ))
+            const verifiedFacts = asRecord(result.result).facts
+            if (regularCandidateFactIds.has(factId) && Array.isArray(verifiedFacts)
+              && (verifiedFacts as Fact[]).some((fact) => fact.evidenceLevel === 'verified_news')) {
+              webSearchEligible = false
+              pendingWebSearchDecision = {
+                type: 'web_search_eligibility', query: webSearchQuery,
+                eligible: false, reasons: [{ source: candidate.source, reason: 'qualified' }],
+                operationId: `execution:${input.executionId}:web-search-eligibility:${++webSearchDecisionIndex}`,
+              }
+            }
             return result.isError ? result : {
               ...result,
               result: {
@@ -416,6 +464,8 @@ async function runProjectedAgent(config: {
   initialTools: Tool[]; systemPrompt: string; userPrompt: string
   invocationId?: string
   shouldRejectNextTurn?: () => boolean
+  nextResearchTools?: () => Tool[]
+  beforeNextProjection?: () => Extract<ModelEvent, { type: 'trace' }>['entry'] | undefined
   execute: (
     name: string, params: unknown, signal: AbortSignal, onStart: () => Promise<void>,
   ) => Promise<ExecutedTool>
@@ -432,6 +482,7 @@ async function runProjectedAgent(config: {
     tools: config.initialTools, createdAt: new Date().toISOString(),
   })
   let currentBatch: Batch | undefined
+  let batchCompletion: Promise<void> | undefined
   let completedReport: AnalysisReport | undefined
   let completedReportVersion: ExecutedTool['reportVersion']
   let finalText = ''
@@ -547,46 +598,73 @@ async function runProjectedAgent(config: {
     }))
   }
 
-  const prepareProjection = async (tools: Tool[]) => {
+  const prepareProjection = async (
+    tools: Tool[], causativeEvent?: Extract<ModelEvent, { type: 'trace' }>['entry'],
+  ) => {
     visibleTools = [...tools]
     activeProjection = await input.toolRuntime!.ensureProjection({
       executionId: input.executionId, role: config.role, stage,
       tools: visibleTools, createdAt: new Date().toISOString(),
+      ...(causativeEvent ? { causativeEvent: {
+        operationId: causativeEvent.operationId!, payload: causativeEvent as Record<string, unknown>,
+      } } : {}),
     })
     return projectedTools()
   }
 
-  const completeCurrentBatch = async () => {
+  const completeCurrentBatch = async (advance?: {
+    tools: Tool[]; causativeEvent?: Extract<ModelEvent, { type: 'trace' }>['entry']
+  }) => {
+    if (batchCompletion) return batchCompletion
     if (!currentBatch) return
     const batch = currentBatch
-    if (batch.results.size !== batch.calls.length) {
-      const now = new Date().toISOString()
-      for (const call of batch.calls) if (!batch.results.has(call.toolCallId)) {
-        batch.results.set(call.toolCallId, {
-          ...call, status: config.executionSignal.aborted ? 'cancelled' : 'failed',
-          startedAt: callStartedAt.get(call.toolCallId) ?? null, completedAt: now,
-          completionOrder: ++completionOrder,
-          notStarted: !callStartedAt.has(call.toolCallId),
-          result: { error: 'tool_execution_interrupted', facts: [] }, isError: true,
-          operationId: toolOperationId(config.role, input.executionId, call.toolCallId, 'result'),
-        })
+    const completion = (async () => {
+      if (batch.results.size !== batch.calls.length) {
+        const now = new Date().toISOString()
+        for (const call of batch.calls) if (!batch.results.has(call.toolCallId)) {
+          batch.results.set(call.toolCallId, {
+            ...call, status: config.executionSignal.aborted ? 'cancelled' : 'failed',
+            startedAt: callStartedAt.get(call.toolCallId) ?? null, completedAt: now,
+            completionOrder: ++completionOrder,
+            notStarted: !callStartedAt.has(call.toolCallId),
+            result: { error: 'tool_execution_interrupted', facts: [] }, isError: true,
+            operationId: toolOperationId(config.role, input.executionId, call.toolCallId, 'result'),
+          })
+        }
       }
+      const completed = await input.toolRuntime!.completeToolBatch({
+        id: batch.id, executionId: input.executionId,
+        results: [...batch.results.values()], completedAt: new Date().toISOString(),
+        ...(advance ? { advance: {
+          role: config.role, stage, tools: advance.tools, toolRounds,
+          activeElapsedMs: config.activeBudget.elapsedMs(),
+          ...(advance.causativeEvent ? { causativeEvent: {
+            operationId: advance.causativeEvent.operationId!,
+            payload: advance.causativeEvent as Record<string, unknown>,
+          } } : {}),
+        } } : {}),
+      })
+      for (const result of [...batch.results.values()].sort((left, right) => (
+        left.completionOrder - right.completionOrder
+      ))) config.queue.push(trace({
+        type: 'tool_result', name: result.toolName, toolCallId: result.toolCallId,
+        result: result.result,
+        isError: result.isError, startedAt: result.startedAt,
+        completedAt: result.completedAt, completionOrder: result.completionOrder,
+        ...(result.notStarted ? { notStarted: true } : {}),
+        operationId: result.operationId,
+      }))
+      if (advance) {
+        if (!completed.projection) throw new Error('tool_projection_commit_required')
+        visibleTools = [...advance.tools]
+        activeProjection = completed.projection
+      }
+      if (currentBatch === batch) currentBatch = undefined
+    })()
+    batchCompletion = completion
+    try { await completion } finally {
+      if (batchCompletion === completion) batchCompletion = undefined
     }
-    await input.toolRuntime!.completeToolBatch({
-      id: batch.id, executionId: input.executionId,
-      results: [...batch.results.values()], completedAt: new Date().toISOString(),
-    })
-    for (const result of [...batch.results.values()].sort((left, right) => (
-      left.completionOrder - right.completionOrder
-    ))) config.queue.push(trace({
-      type: 'tool_result', name: result.toolName, toolCallId: result.toolCallId,
-      result: result.result,
-      isError: result.isError, startedAt: result.startedAt,
-      completedAt: result.completedAt, completionOrder: result.completionOrder,
-      ...(result.notStarted ? { notStarted: true } : {}),
-      operationId: result.operationId,
-    }))
-    currentBatch = undefined
   }
 
   adapter = createPiAgentAdapter({
@@ -636,7 +714,11 @@ async function runProjectedAgent(config: {
       : Boolean(completedReport),
     prepareNextTurn: async () => {
       if (completedReport || finalText) return undefined
-      if (config.shouldRejectNextTurn?.()) throw new Error('report_validation_repair_exhausted')
+      const hasToolBatch = Boolean(currentBatch)
+      if (config.shouldRejectNextTurn?.()) {
+        await completeCurrentBatch()
+        throw new Error('report_validation_repair_exhausted')
+      }
       if (lastAssistantHadCalls) toolRounds += 1
       const limit = config.role === 'main'
         ? config.settings.mainAgentToolRounds : config.settings.specialistAgentToolRounds
@@ -649,16 +731,31 @@ async function runProjectedAgent(config: {
           })
         }
         finalizationAttempts += 1
-        if (finalizationAttempts > 2) throw new Error(
-          config.role === 'main' ? 'report_tool_required' : 'specialist_finalization_required',
-        )
+        if (finalizationAttempts > 2) {
+          await completeCurrentBatch()
+          throw new Error(
+            config.role === 'main' ? 'report_tool_required' : 'specialist_finalization_required',
+          )
+        }
       }
+      const causativeEvent = config.beforeNextProjection?.()
       const next = config.role === 'main'
         ? stage === 'finalization' ? finalizationModelTools : analysisModelTools
         : stage === 'finalization'
           ? config.role === 'news' ? toolRegistry.project({ role: 'news', stage: 'finalization' }) : []
-          : config.role === 'news' ? newsSpecialistTools : projectedSpecialistTools(input as AnalyzeInput)
-      return { tools: await prepareProjection(next) }
+          : config.role === 'news'
+            ? config.nextResearchTools?.() ?? newsSpecialistTools
+            : projectedSpecialistTools(input as AnalyzeInput)
+      if (hasToolBatch) await completeCurrentBatch({ tools: next, causativeEvent })
+      else {
+        const turnAdvance = {
+          type: 'runtime_turn_advanced', toolRounds,
+          activeElapsedMs: config.activeBudget.elapsedMs(), stage,
+          operationId: `execution:${input.executionId}:${config.role}:model-attempt:${turnIndex}:turn-advanced`,
+        } as Extract<ModelEvent, { type: 'trace' }>['entry']
+        await prepareProjection(next, turnAdvance)
+      }
+      return { tools: projectedTools() }
     },
     commitToolProjection: async ({ tools }) => ({ tools }),
   })
@@ -738,10 +835,7 @@ async function runProjectedAgent(config: {
         operationId: toolOperationId(config.role, input.executionId, event.toolCallId, 'result'),
       })
     }
-    if (event.type === 'turn_end' && currentBatch) {
-      if (toolAuditFailure) throw toolAuditFailure
-      await completeCurrentBatch()
-    }
+    if (event.type === 'turn_end' && currentBatch && toolAuditFailure) throw toolAuditFailure
   })
 
   const submitted = adapter.submit(userMessage(config.userPrompt))
@@ -760,6 +854,7 @@ async function runProjectedAgent(config: {
     throw requestPolicyFailure
   }
   await adapter.waitForIdle()
+  await completeCurrentBatch()
   const snapshot = adapter.snapshot()
   adapter.dispose()
   if (requestPolicyFailure) throw requestPolicyFailure
@@ -1054,6 +1149,13 @@ function retainedToolResult(result: Record<string, unknown>) {
 function stringParam(value: unknown, key: string) {
   const entry = value && typeof value === 'object' ? (value as Record<string, unknown>)[key] : undefined
   return typeof entry === 'string' ? entry : ''
+}
+function normalizeQuery(value: string) { return value.trim().replace(/\s+/g, ' ').toLowerCase() }
+function validWebSearchReasons(reasons: Array<{ source: string; reason: string }>) {
+  const allowed = ['unavailable', 'empty', 'irrelevant', 'title_only']
+  return reasons.length === 3
+    && new Set(reasons.map(({ source }) => source)).size === 3
+    && reasons.every(({ source, reason }) => Boolean(source) && allowed.includes(reason))
 }
 function projectedSpecialistTools(input: AnalyzeInput) {
   return financialSpecialistTools.filter(({ name }) => (

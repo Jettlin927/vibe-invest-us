@@ -476,8 +476,21 @@ export function createTestProductDatabase() {
         ...input, id: `${input.executionId}:tool-projection:${versions.length + 1}`,
         version: versions.length + 1,
       }
+      let event
+      if (input.causativeEvent) {
+        const session = [...agentSessions.values()].find(({ executionId }) => executionId === input.executionId)!
+        const existing = agentEvents.get(session.id)?.find(
+          ({ operationId }) => operationId === input.causativeEvent!.operationId,
+        )
+        event = await agentEventRepository.append({
+          sessionId: session.id, executionId: input.executionId,
+          operationId: input.causativeEvent.operationId, event: input.causativeEvent.payload,
+          createdAt: input.createdAt,
+        })
+        if (existing) event = undefined
+      }
       toolProjections.set(input.executionId, [...versions, projection])
-      return structuredClone(projection)
+      return { ...structuredClone(projection), event }
     },
     async recordModelRequest(input) {
       if (!modelRequests.some(({ id }) => id === input.id)) modelRequests.push(structuredClone(input))
@@ -540,7 +553,34 @@ export function createTestProductDatabase() {
           analysisFacts.set(session.analysisId, ids)
         }
       }
-      return created
+      let projection
+      if (input.advance) {
+        const versions = toolProjections.get(input.executionId) ?? []
+        projection = {
+          executionId: input.executionId, role: input.advance.role, stage: input.advance.stage,
+          schemaHash: input.advance.schemaHash,
+          projectedTools: structuredClone(input.advance.projectedTools),
+          visibleToolNames: structuredClone(input.advance.visibleToolNames), reasons: {
+            toolRounds: input.advance.toolRounds, activeElapsedMs: input.advance.activeElapsedMs,
+          }, createdAt: input.completedAt,
+          id: `${input.executionId}:tool-projection:${versions.length + 1}`, version: versions.length + 1,
+        }
+        toolProjections.set(input.executionId, [...versions, projection])
+        const turnEvent = await agentEventRepository.append({
+          sessionId: session.id, executionId: input.executionId,
+          operationId: `${input.id}:turn-advanced`, event: {
+            type: 'runtime_turn_advanced', toolRounds: input.advance.toolRounds,
+            activeElapsedMs: input.advance.activeElapsedMs, stage: input.advance.stage,
+          }, createdAt: input.completedAt,
+        })
+        created.push(turnEvent)
+        if (input.advance.causativeEvent) created.push(await agentEventRepository.append({
+          sessionId: session.id, executionId: input.executionId,
+          operationId: input.advance.causativeEvent.operationId,
+          event: input.advance.causativeEvent.payload, createdAt: input.completedAt,
+        }))
+      }
+      return { events: created, projection }
     },
     async replay(executionId) {
       const projections = toolProjections.get(executionId) ?? []

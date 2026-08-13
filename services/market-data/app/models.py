@@ -85,6 +85,7 @@ class AtomicFact(BaseModel):
 class FactQueryResult(BaseModel):
     facts: List[AtomicFact]
     sources: List[SourceStatus] = []
+    eligibility: Optional[Any] = None
 
 
 class NewsDocumentResult(FactQueryResult):

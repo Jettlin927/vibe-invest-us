@@ -29,6 +29,7 @@ export function createAnalysisService(options: {
   fetchFinancialContext: (symbol: string, signal: AbortSignal) => Promise<FinancialContext>
   searchNews?: (keyword: string, signal: AbortSignal) => Promise<FactQueryResult>
   searchNewsCandidates?: (query: string, signal: AbortSignal) => Promise<FactQueryResult>
+  searchWebEvidence?: (query: string, signal: AbortSignal) => Promise<FactQueryResult>
   readNewsDocument?: (candidate: Fact, signal: AbortSignal) => Promise<FactQueryResult>
   listCompanyEvents?: (symbol: string, signal: AbortSignal) => Promise<FactQueryResult>
   fetchTechnicalIndicators?: (
@@ -67,8 +68,12 @@ export function createAnalysisService(options: {
         executionId: input.executionId, role: input.role, stage: input.stage,
         schemaHash, projectedTools: input.tools, visibleToolNames,
         reasons: { role: input.role, stage: input.stage },
+        causativeEvent: input.causativeEvent,
         createdAt: input.createdAt,
       })
+      if (projection.event) {
+        for (const listener of listeners.get(projection.event.sessionId) ?? []) listener(projection.event)
+      }
       return { id: projection.id, version: projection.version }
     },
     async recordModelRequest(input) {
@@ -93,7 +98,8 @@ export function createAnalysisService(options: {
       for (const listener of listeners.get(event.sessionId) ?? []) listener(event)
     },
     async completeToolBatch(input) {
-      const events = await options.toolProjectionRepository.completeToolBatch({
+      const visibleToolNames = input.advance?.tools.map(({ name }) => name)
+      const completed = await options.toolProjectionRepository.completeToolBatch({
         id: input.id, executionId: input.executionId, completedAt: input.completedAt,
         results: input.results.map((result) => ({
           toolCallId: result.toolCallId, status: result.status,
@@ -112,10 +118,20 @@ export function createAnalysisService(options: {
             operationId: result.operationId,
           },
         })),
+        ...(input.advance ? { advance: {
+          role: input.advance.role, stage: input.advance.stage,
+          schemaHash: createHash('sha256').update(JSON.stringify(input.advance.tools)).digest('hex'),
+          projectedTools: input.advance.tools, visibleToolNames: visibleToolNames!,
+          reasons: { role: input.advance.role, stage: input.advance.stage },
+          toolRounds: input.advance.toolRounds, activeElapsedMs: input.advance.activeElapsedMs,
+          causativeEvent: input.advance.causativeEvent,
+        } } : {}),
       })
-      for (const event of events) {
+      for (const event of completed.events) {
         for (const listener of listeners.get(event.sessionId) ?? []) listener(event)
       }
+      return { projection: completed.projection
+        ? { id: completed.projection.id, version: completed.projection.version } : undefined }
     },
   }
 
@@ -430,6 +446,7 @@ export function createAnalysisService(options: {
             systemPrompt: '你是独立消息面 Agent。只使用新闻候选、新闻文档和公司事件工具；每项判断引用合格事实 ID，禁止个人买卖或仓位建议。',
             researchQuestion: request.researchQuestion, knownFacts: modelContext.facts,
             searchNewsCandidates: options.searchNewsCandidates,
+            searchWebEvidence: options.searchWebEvidence,
             readNewsDocument: options.readNewsDocument,
             listCompanyEvents: options.listCompanyEvents,
             signal: controller.signal, executionDeadlineSignal: wallDeadline, activeBudget,
