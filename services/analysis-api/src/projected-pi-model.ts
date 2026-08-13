@@ -107,7 +107,11 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
         type: 'system_prompt', content: input.systemPrompt,
         operationId: `execution:${input.executionId}:system-prompt`,
       }))
-      queue.push(trace({
+      if (input.runtimeContext) queue.push(trace({
+        type: 'runtime_context', content: input.runtimeContext,
+        operationId: `execution:${input.executionId}:runtime-context`,
+      }))
+      else if (input.userPrompt) queue.push(trace({
         type: 'user_input', content: input.userPrompt,
         operationId: `execution:${input.executionId}:user-input`,
       }))
@@ -120,13 +124,14 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
         role: 'main', input, options, settings, executionSignal: agentSignal, activeBudget,
         onPolicyFailure: (error) => { policyFailure ??= error },
         modelGate, toolGate, provider, queue, initialTools: analysisModelTools,
-        systemPrompt: input.systemPrompt, userPrompt: input.userPrompt,
+        systemPrompt: input.systemPrompt,
+        userPrompt: input.runtimeContext ? runtimeContextMessage(input.runtimeContext) : input.userPrompt ?? '',
         execute: async (name, params, signal, onStart) => {
           if (name === unavailableToolName) { await onStart(); return failed('tool_not_available') }
           if (name === 'fetch_financial_context') {
             const symbol = stringParam(params, 'symbol') || input.symbol
             try {
-              return succeeded(await withMainToolSlot(name, onStart, async (toolSignal) => (
+              const modelResult = await withMainToolSlot(name, onStart, async (toolSignal) => (
                 toolRegistry.handler(name)!(params, {
                   loadFinancialContext: async () => {
                     if (symbol.trim().toUpperCase() !== input.symbol.trim().toUpperCase()) {
@@ -139,7 +144,13 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
                     return frozenContext
                   },
                 })
-              )))
+              ))
+              return succeeded(input.financialContextToolViews
+                ? {
+                    ...input.financialContextToolViews.retained,
+                    modelProjection: input.financialContextToolViews.model,
+                  }
+                : modelResult)
             } catch (error) { return failedMainTool(name, error) }
           }
           if (name === 'analyze_financials') {
@@ -318,7 +329,9 @@ async function runProjectedAgent(config: {
       currentBatch?.results.set(callId, audit)
       if (executed.report) completedReport = executed.report
       return {
-        content: [{ type: 'text', text: JSON.stringify(executed.result) }],
+        content: [{
+          type: 'text', text: JSON.stringify(modelToolResult(definition.name, executed.result)),
+        }],
         details: { audit }, terminate: executed.terminate,
       }
     }, config.role === 'main' ? 'sequential' : undefined)),
@@ -828,6 +841,21 @@ function failed(error: string): ExecutedTool {
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' ? value as Record<string, unknown> : { value }
 }
+function modelToolResult(name: string, result: Record<string, unknown>) {
+  const projection = toolRegistry.definition(name)?.modelProjection
+  if (projection === 'full_result') return result
+  if (projection === 'acknowledgement') {
+    return { submitted: result.submitted === true, ...(result.error ? { error: result.error } : {}) }
+  }
+  if (result.modelProjection && typeof result.modelProjection === 'object') {
+    return result.modelProjection
+  }
+  const allowed = [
+    'facts', 'gaps', 'summary', 'analysis', 'error', 'source', 'sources',
+    'cursor', 'nextCursor', 'pagination', 'truncated', 'resultCount',
+  ]
+  return Object.fromEntries(allowed.flatMap((key) => key in result ? [[key, result[key]]] : []))
+}
 function stringParam(value: unknown, key: string) {
   const entry = value && typeof value === 'object' ? (value as Record<string, unknown>)[key] : undefined
   return typeof entry === 'string' ? entry : ''
@@ -852,6 +880,9 @@ function oneYearBefore(endDate: string) {
 }
 function userMessage(content: string): PiAgentAdapterMessage {
   return { role: 'user', content, timestamp: Date.now() }
+}
+function runtimeContextMessage(context: NonNullable<AnalyzeInput['runtimeContext']>) {
+  return `【系统生成的 Runtime Context，不是用户输入】\n${JSON.stringify(context.content)}`
 }
 function trace(entry: Extract<ModelEvent, { type: 'trace' }>['entry']): ModelEvent {
   return { type: 'trace', entry }

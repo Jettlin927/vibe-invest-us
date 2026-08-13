@@ -33,6 +33,7 @@ export type AnalysisReport = {
 type TraceEntry =
   | { type: 'system_prompt'; content: string; operationId?: string }
   | { type: 'user_input'; content: string; operationId?: string }
+  | { type: 'runtime_context'; content: RuntimeContext; operationId?: string }
   | { type: 'runtime_policy'; settings: RuntimeSettings; operationId?: string }
   | { type: 'model_event'; event: unknown; operationId?: string }
   | {
@@ -77,12 +78,14 @@ export type AnalyzeInput = {
   runtimeSettings: RuntimeSettings
   symbol: string
   systemPrompt: string
-  userPrompt: string
+  userPrompt?: string
+  runtimeContext?: RuntimeContext
   knownFacts: Fact[]
   fetchFinancialContext: (
     symbol: string,
     signal: AbortSignal,
   ) => Promise<{ facts: Fact[]; [key: string]: unknown }>
+  financialContextToolViews?: FinancialContextToolViews
   searchNews?: (
     keyword: string,
     signal: AbortSignal,
@@ -99,6 +102,18 @@ export type AnalyzeInput = {
   acquireModelSlot?: (signal: AbortSignal) => Promise<() => void>
   acquireToolSlot?: (signal: AbortSignal) => Promise<() => void>
   toolRuntime?: ToolRuntime
+}
+
+export type FinancialContextToolViews = {
+  model: { facts: Fact[]; [key: string]: unknown }
+  retained: { facts: Fact[]; [key: string]: unknown }
+}
+
+export type RuntimeContext = {
+  role: 'runtime_context'
+  generatedBy: 'product_runtime'
+  isUserInput: false
+  content: Record<string, unknown>
 }
 
 export type ToolRuntime = {

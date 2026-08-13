@@ -57,6 +57,7 @@ export function createToolRegistry(
       .filter((definition) => definition.allowedRoles.includes(role)
         && definition.allowedStages.includes(stage))
       .map((definition) => definition.model),
+    definition: (name: string) => validated.find((definition) => definition.model.name === name),
     handler: (name: string) => handlers[name],
   })
 }

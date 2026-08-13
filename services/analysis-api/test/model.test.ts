@@ -168,6 +168,38 @@ test('Pi Model 通过只读工具流式生成结构化报告和完整轨迹', as
   assert.equal(JSON.stringify(logs).includes('217.5'), false)
 })
 
+test('完整工具结果保留在审计事件而模型只收到 Registry 声明的受控投影', async () => {
+  let providerToolResult = ''
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(
+      fauxToolCall('fetch_financial_context', { symbol: 'NVDA' }, { id: 'bounded-context' }),
+      { stopReason: 'toolUse' },
+    ),
+    (context) => {
+      providerToolResult = context.messages.flatMap((message) => (
+        message.role === 'toolResult' ? message.content : []
+      )).flatMap((item) => item.type === 'text' ? [item.text] : []).join('\n')
+      return fauxAssistantMessage(
+        fauxToolCall('submit_analysis_report', validReport), { stopReason: 'toolUse' },
+      )
+    },
+  ] })
+  const events = []
+  for await (const event of model.analyze({
+    runtimeSettings: runtimeSettings(), executionId: 'bounded-projection',
+    symbol: 'NVDA', systemPrompt: 'system', userPrompt: 'user', knownFacts: facts,
+    fetchFinancialContext: async () => ({
+      facts, gaps: [], privateDiagnostic: '只允许保留在 PostgreSQL 审计视图',
+    }),
+  })) events.push(event)
+
+  assert.match(providerToolResult, /fact:nvda:price:2026-08-12/)
+  assert.doesNotMatch(providerToolResult, /privateDiagnostic|只允许保留在 PostgreSQL 审计视图/)
+  const retained = events.find((event) => event.type === 'trace'
+    && event.entry.type === 'tool_result' && event.entry.name === 'fetch_financial_context')
+  assert.match(JSON.stringify(retained), /privateDiagnostic|只允许保留在 PostgreSQL 审计视图/)
+})
+
 test('Pi Model 拒绝不存在的报告依据并允许模型修正后重交', async () => {
   const badReport = { ...validReport, supportingEvidence: ['fact:not-found'] }
   const model = createPiModel({ fauxResponses: [

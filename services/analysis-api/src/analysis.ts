@@ -12,6 +12,7 @@ import {
 import type { AnalyzeInput, AnalysisReport, ModelEvent, ToolRuntime } from './model.js'
 import type { FactQueryResult, FinancialContext, FinancialFact } from './financial-data-client.js'
 import { acquireActiveSlot, createActiveBudget, createConcurrencyGate } from './runtime-policy.js'
+import { analysisModelTools } from './tools.js'
 
 type Fact = FinancialFact
 type Model = { analyze(input: AnalyzeInput): AsyncIterable<ModelEvent> }
@@ -358,6 +359,7 @@ export function createAnalysisService(options: {
       }, { snapshot, facts: context.facts })
       assertPolicy()
       const modelContext = createModelContext(snapshot)
+      const runtimeContext = createInitialRuntimeContext(modelContext, portfolioContext)
       await appendEvent(
         sessionId, executionId, operationId('running-model'),
         { type: 'status', status: 'running_model' },
@@ -369,9 +371,11 @@ export function createAnalysisService(options: {
         runtimeSettings,
         symbol: job.symbol,
         systemPrompt: ANALYSIS_SYSTEM_PROMPT,
-        userPrompt: `分析 ${job.symbol}。个人语境：${JSON.stringify(portfolioContext)}`,
+        runtimeContext,
         knownFacts: modelContext.facts,
-        fetchFinancialContext: async () => modelContext, signal: controller.signal,
+        fetchFinancialContext: async () => modelContext,
+        financialContextToolViews: { model: modelContext, retained: snapshot },
+        signal: controller.signal,
         executionDeadlineSignal: wallDeadline,
         activeBudget,
         acquireModelSlot: (signal) => modelGate.acquire(signal),
@@ -697,7 +701,7 @@ function createModelContext(snapshot: FinancialContext & Record<string, unknown>
     && fact.type !== 'news'
     && (!isFinancialFact(fact) || financialFactIds.has(fact.id))
   ))
-  const sampledHistory = [...dailyBars.slice(-10)]
+  const sampledHistory = [...dailyBars.slice(-20)]
   return {
     symbol: snapshot.symbol,
     facts: [...relevantFacts, ...news, ...sampledHistory],
@@ -712,6 +716,48 @@ function createModelContext(snapshot: FinancialContext & Record<string, unknown>
       note: '日线仅为冻结快照的上下文裁剪样本，不代表数据源总历史长度。',
     },
     createdAt: snapshot.createdAt,
+  }
+}
+
+function createInitialRuntimeContext(
+  modelContext: ReturnType<typeof createModelContext>, personalContext: unknown,
+): NonNullable<AnalyzeInput['runtimeContext']> {
+  const quote = modelContext.facts.find((fact) => fact.type === 'quote')
+  const dailyBars = modelContext.facts.filter((fact) => fact.type === 'daily_bar')
+  const unavailable = new Map((modelContext.gaps as Array<Record<string, unknown>>).flatMap((gap) => (
+    typeof gap.capability === 'string' ? [[gap.capability, gap.reason ?? 'unavailable'] as const] : []
+  )))
+  const capability = (name: string, available: boolean) => unavailable.has(name)
+    ? { status: 'unavailable', reason: unavailable.get(name) }
+    : { status: available ? 'available' : 'unavailable' }
+  const financials = modelContext.financials as { quarters?: Array<Record<string, unknown>> } | null
+  const evidenceFacts = modelContext.facts.filter((fact) => fact.type !== 'daily_bar')
+  return {
+    role: 'runtime_context', generatedBy: 'product_runtime', isUserInput: false,
+    content: {
+      symbol: modelContext.symbol,
+      analysisPeriod: '未来一至四周',
+      marketSummary: { currentPrice: typeof quote?.value === 'number' ? quote.value : null },
+      recentDailyBars: dailyBars,
+      evidenceFacts,
+      latestFinancialPeriod: financials?.quarters?.[0]
+        ? periodName(financials.quarters[0]) ?? null : null,
+      capabilityStatus: {
+        quote: capability('quote', Boolean(quote)),
+        history: capability('history', dailyBars.length > 0),
+        fundamentals: capability('fundamentals', Boolean(modelContext.financials)),
+        news: capability('news', modelContext.facts.some((fact) => fact.type === 'news')),
+        valuation: capability('valuation', modelContext.valuation !== null && modelContext.valuation !== undefined),
+      },
+      personalContext,
+      availableTools: analysisModelTools.map(({ name, description }) => ({ name, purpose: description })),
+      specialistCapabilities: [
+        { domain: 'news', responsibility: '核实消息、公司事件及相反证据' },
+        { domain: 'fundamental_valuation', responsibility: '解释财务表现、估值输入与数据缺口' },
+        { domain: 'technical', responsibility: '解释多周期量价与确定性技术指标' },
+      ],
+      finalReportGoal: '基于合格事实提交候选结构化综合报告；缺失资料形成明确限制，不补造结论。',
+    },
   }
 }
 

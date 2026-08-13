@@ -704,6 +704,104 @@ test('真实 PostgreSQL 取消在 PG、HTTP 与 SSE reconnect 统一为 stopping
   }
 })
 
+test('首次研究经真实 PostgreSQL 与 HTTP SSE 展示 Runtime Context、工具和候选报告', {
+  skip: !databaseUrl,
+  concurrency: false,
+}, async () => {
+  const providerRequests: Array<Record<string, unknown>> = []
+  const provider = createServer(async (request, response) => {
+    const body = await readJsonBody(request)
+    providerRequests.push(body)
+    const toolResults = (body.messages as Array<{ role?: string }> | undefined)
+      ?.filter(({ role }) => role === 'tool') ?? []
+    response.writeHead(200, { 'content-type': 'text/event-stream' })
+    if (toolResults.length === 0) {
+      writeOpenAiToolCalls(response, [{
+        id: 'first-research-context', name: 'fetch_financial_context', arguments: '{}',
+      }])
+    } else {
+      writeOpenAiToolCalls(response, [{
+        id: 'first-research-report', name: 'submit_analysis_report', arguments: JSON.stringify({
+          title: '首次研究候选报告', marketState: '数据充足', trend: '震荡', drivers: [],
+          supportingEvidence: [], contraryEvidence: [], keyJudgments: [], scenarios: [],
+          invalidationConditions: [], valuation: null, personalImpact: null,
+          conditionalSuggestion: null, limitations: [],
+        }),
+      }])
+    }
+  })
+  await listenHttp(provider)
+  const providerAddress = provider.address()
+  assert.ok(providerAddress && typeof providerAddress === 'object')
+
+  const pool = createPool(databaseUrl!)
+  const events = createAgentEventRepository(pool)
+  const model = createPiModel({
+    provider: 'local-openai', apiProtocol: 'chat-completions', modelName: 'first-research-model',
+    baseUrl: `http://127.0.0.1:${providerAddress.port}`, apiKey: 'integration-key',
+  })
+  const bars = Array.from({ length: 24 }, (_, index) => ({
+    id: `fact:first-research:bar:${index}`, type: 'daily_bar',
+    value: { date: `day-${index}`, close: 100 + index }, observedAt: `day-${index}`,
+    fetchedAt: '2026-08-13T00:00:00Z', source: 'test', sourceReference: 'test://bar',
+  }))
+  const app = buildApp({
+    productDatabase: { checkSchema: () => checkSchema(pool), close: () => pool.end() },
+    portfolioRepository: createPortfolioRepository(pool),
+    analysisRepository: createAnalysisRepository(pool), agentEventRepository: events,
+    runtimeSettingsRepository: createRuntimeSettingsRepository(pool),
+    toolProjectionRepository: createToolProjectionRepository(pool),
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({
+      symbol, gaps: [], facts: bars, indicators: {},
+      privateDiagnostic: '只允许保留在 PostgreSQL 审计视图',
+    }),
+    model,
+  })
+  await app.listen({ host: '127.0.0.1', port: 0 })
+  const address = app.server.address()
+  assert.ok(address && typeof address === 'object')
+  const baseUrl = `http://127.0.0.1:${address.port}`
+  const symbol = `F${crypto.randomUUID().replaceAll('-', '').slice(0, 8)}`
+  const created = await fetch(`${baseUrl}/api/analyses`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ symbol }),
+  }).then((response) => response.json()) as { analysisId: string; sessionId: string }
+  try {
+    const sseResponse = await fetch(`${baseUrl}/api/agent-sessions/${created.sessionId}/events`)
+    const sse = await readThrough(sseResponse, 'event: completed')
+    await waitForAgentStatus(events, created.sessionId, 'completed')
+
+    assert.equal(providerRequests.length, 2)
+    const firstRequest = JSON.stringify(providerRequests[0])
+    const secondRequest = JSON.stringify(providerRequests[1])
+    assert.match(firstRequest, /系统生成的 Runtime Context，不是用户输入/)
+    assert.match(firstRequest, new RegExp(symbol.toUpperCase()))
+    assert.doesNotMatch(firstRequest, /mainAgentToolRounds|researchActiveMinutes|elapsed|budget/i)
+    assert.match(secondRequest, /fact:first-research:bar:23/)
+    assert.doesNotMatch(secondRequest, /privateDiagnostic|只允许保留在 PostgreSQL 审计视图/)
+
+    const ledger = await events.list(created.sessionId, 0)
+    assert.ok(ledger.some(({ payload }) => payload.type === 'runtime_context'))
+    assert.ok(ledger.some(({ payload }) => payload.type === 'model_event'))
+    assert.ok(ledger.some(({ payload }) => payload.type === 'tool_call'
+      && payload.name === 'fetch_financial_context'))
+    assert.ok(ledger.some(({ payload }) => payload.type === 'tool_call'
+      && payload.name === 'submit_analysis_report'))
+    const retained = ledger.find(({ payload }) => payload.type === 'tool_result'
+      && payload.name === 'fetch_financial_context')
+    assert.match(JSON.stringify(retained), /privateDiagnostic|只允许保留在 PostgreSQL 审计视图/)
+    for (const eventName of ['runtime_context', 'model_event', 'tool_call', 'tool_result', 'completed']) {
+      assert.match(sse, new RegExp(`event: ${eventName}`))
+    }
+    const research = await fetch(`${baseUrl}/api/research/${created.analysisId}`)
+      .then((response) => response.json())
+    assert.equal(research.report.title, '首次研究候选报告')
+  } finally {
+    await app.close()
+    await closeHttp(provider)
+  }
+})
+
 test('生产 Pi 经 HTTP、SSE 与真实 PostgreSQL 留存工具及预算收口状态序列', {
   skip: !databaseUrl,
   concurrency: false,

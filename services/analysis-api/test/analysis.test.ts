@@ -1028,7 +1028,94 @@ test('分析轨迹永久保存系统指令、用户语境、模型用量和最�
   await app.close()
 })
 
-test('完整历史写入冻结快照但只向模型提供最近十条日线', async () => {
+test('首次研究把系统生成的 Runtime Context 追加到上下文末尾且不伪装为用户问题', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'vibe-first-research-runtime-context-'))
+  let modelInput: Record<string, unknown> | undefined
+  const app = buildApp({
+    storageKey: join(dir, 'storage'),
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [], indicators: {} }),
+    model: {
+      async *analyze(input: any) {
+        modelInput = input
+        yield { type: 'completed' as const, report }
+      },
+    },
+  })
+  await app.ready()
+
+  const created = await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' } })
+  await waitForStatus(app as any, created.json().analysisId, 'completed')
+  const research = (await app.inject({
+    method: 'GET', url: `/api/research/${created.json().analysisId}`,
+  })).json()
+
+  assert.match(String(modelInput?.systemPrompt), /^你是个人美股研究助手/)
+  assert.equal(modelInput?.userPrompt, undefined)
+  assert.deepEqual(modelInput?.runtimeContext && {
+    role: (modelInput.runtimeContext as any).role,
+    generatedBy: (modelInput.runtimeContext as any).generatedBy,
+    isUserInput: (modelInput.runtimeContext as any).isUserInput,
+    symbol: (modelInput.runtimeContext as any).content.symbol,
+  }, {
+    role: 'runtime_context', generatedBy: 'product_runtime', isUserInput: false, symbol: 'NVDA',
+  })
+  assert.ok(research.trace.some((entry: { type: string }) => entry.type === 'runtime_context'))
+  assert.equal(research.trace.some((entry: { type: string }) => entry.type === 'user_input'), false)
+  await app.close()
+})
+
+test('首次研究起始资料完整描述能力、工具与报告目标且不注入预算', async () => {
+  const bars = Array.from({ length: 24 }, (_, index) => ({
+    ...fact, id: `fact:context-bar:${index}`, type: 'daily_bar',
+    value: { date: `2026-07-${String(index + 1).padStart(2, '0')}`, close: 190 + index },
+    observedAt: `2026-07-${String(index + 1).padStart(2, '0')}`,
+  }))
+  let runtimeContext: any
+  const app = buildApp({
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({
+      symbol, facts: [fact, ...bars], gaps: [{ capability: 'news', reason: 'source_unavailable' }],
+      quote: { value: 217.5, adopted_source: 'sina', sources: [{ source: 'sina', status: 'ok' }] },
+      history: { items: bars, adopted_source: 'alpaca', sources: [{ source: 'alpaca', status: 'ok' }] },
+      fundamentals: { value: { quarters: [{ period: 'CY2026Q2' }], annuals: [], derived_metrics: [] } },
+      valuation: null,
+    }),
+    model: {
+      async *analyze(input: any) {
+        runtimeContext = input.runtimeContext?.content
+        yield { type: 'completed' as const, report }
+      },
+    },
+  })
+  await app.ready()
+  const created = await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' } })
+  await waitForStatus(app as any, created.json().analysisId, 'partial')
+
+  assert.equal(runtimeContext.symbol, 'NVDA')
+  assert.equal(runtimeContext.analysisPeriod, '未来一至四周')
+  assert.equal(runtimeContext.marketSummary.currentPrice, 217.5)
+  assert.equal(runtimeContext.recentDailyBars.length, 20)
+  assert.equal(runtimeContext.latestFinancialPeriod, 'CY2026Q2')
+  assert.equal(runtimeContext.capabilityStatus.quote.status, 'available')
+  assert.equal(runtimeContext.capabilityStatus.history.status, 'available')
+  assert.equal(runtimeContext.capabilityStatus.news.status, 'unavailable')
+  assert.equal(runtimeContext.capabilityStatus.valuation.status, 'unavailable')
+  assert.deepEqual(runtimeContext.availableTools.map(({ name }: { name: string }) => name), [
+    'fetch_financial_context', 'analyze_financials', 'submit_analysis_report',
+  ])
+  assert.deepEqual(runtimeContext.specialistCapabilities, [
+    { domain: 'news', responsibility: '核实消息、公司事件及相反证据' },
+    { domain: 'fundamental_valuation', responsibility: '解释财务表现、估值输入与数据缺口' },
+    { domain: 'technical', responsibility: '解释多周期量价与确定性技术指标' },
+  ])
+  assert.match(runtimeContext.finalReportGoal, /候选结构化综合报告/)
+  assert.ok(runtimeContext.personalContext)
+  assert.doesNotMatch(JSON.stringify(runtimeContext), /mainAgentToolRounds|researchActiveMinutes|elapsed|budget/i)
+  await app.close()
+})
+
+test('完整历史写入冻结快照且首次研究起始资料提供最近二十条日线', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'vibe-analysis-model-context-'))
   const bars = Array.from({ length: 180 }, (_, index) => ({
     ...fact, id: `fact:bar:${index}`, type: 'daily_bar',
@@ -1052,7 +1139,7 @@ test('完整历史写入冻结快照但只向模型提供最近十条日线', as
   await waitForStatus(app as any, created.json().analysisId, 'completed')
   const research = (await app.inject({ method: 'GET', url: `/api/research/${created.json().analysisId}` })).json()
   assert.equal(research.snapshot.facts.filter((item: { type: string }) => item.type === 'daily_bar').length, 180)
-  assert.equal(modelFactCount, 10)
+  assert.equal(modelFactCount, 20)
   await app.close()
 })
 
