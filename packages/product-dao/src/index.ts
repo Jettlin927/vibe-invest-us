@@ -330,7 +330,10 @@ INSERT INTO tool_event_migration_provenance (session_id, sequence, provenance)
 SELECT event.session_id, event.sequence, 'pre_registry_v12'
 FROM agent_events event
 CROSS JOIN vibe_invest_migration_provenance provenance
-WHERE provenance.max_version <= 12
+WHERE (provenance.max_version <= 12 OR (
+    provenance.had_v13 AND provenance.through_v13_complete
+    AND event.created_at < provenance.v13_applied_at
+  ))
   AND event.payload_json->>'type' IN ('tool_call', 'tool_result')
 ON CONFLICT (session_id, sequence) DO NOTHING;
 UPDATE tool_batch_calls call SET
@@ -417,8 +420,7 @@ ALTER TABLE tool_batch_calls ADD CONSTRAINT tool_batch_calls_completion_check CH
   (status = 'running' AND completed_at IS NULL AND completion_order IS NULL
     AND result_payload_json IS NULL)
   OR
-  (status <> 'running' AND (started_at IS NOT NULL OR status = 'cancelled')
-    AND completed_at IS NOT NULL
+  (status <> 'running' AND completed_at IS NOT NULL
     AND completion_order IS NOT NULL AND result_payload_json IS NOT NULL)
 );
 
@@ -537,16 +539,19 @@ export async function migrate(connectionString: string) {
     )
     let provenance: {
       max_version: number
+      through_v13_complete: boolean
       had_v13: boolean; v13_applied_at: string | null
       had_v14: boolean; v14_applied_at: string | null
     } = {
       max_version: 0,
+      through_v13_complete: false,
       had_v13: false, v13_applied_at: null, had_v14: false, v14_applied_at: null,
     }
     if (migrationTable.rows[0]?.exists) {
       const existing = await client.query<typeof provenance>(
         `SELECT
            COALESCE(max(version), 0)::integer AS max_version,
+           count(*) FILTER (WHERE version BETWEEN 1 AND 13) = 13 AS through_v13_complete,
            EXISTS (SELECT 1 FROM product_schema_migrations WHERE version = 13) AS had_v13,
            (SELECT applied_at::text FROM product_schema_migrations WHERE version = 13) AS v13_applied_at,
            EXISTS (SELECT 1 FROM product_schema_migrations WHERE version = 14) AS had_v14,
@@ -554,19 +559,24 @@ export async function migrate(connectionString: string) {
          FROM product_schema_migrations`,
       )
       provenance = existing.rows[0]!
+      if (provenance.had_v14 && (!provenance.had_v13 || !provenance.through_v13_complete)) {
+        throw new Error('product_schema_migration_receipt_gap:v14_without_complete_v13')
+      }
     }
     await client.query(
       `CREATE TEMP TABLE vibe_invest_migration_provenance (
          max_version integer NOT NULL,
+         through_v13_complete boolean NOT NULL,
          had_v13 boolean NOT NULL, v13_applied_at timestamptz,
          had_v14 boolean NOT NULL, v14_applied_at timestamptz
        ) ON COMMIT DROP`,
     )
     await client.query(
       `INSERT INTO vibe_invest_migration_provenance
-         (max_version, had_v13, v13_applied_at, had_v14, v14_applied_at)
-       VALUES ($1, $2, $3, $4, $5)`,
-      [provenance.max_version, provenance.had_v13, provenance.v13_applied_at,
+         (max_version, through_v13_complete, had_v13, v13_applied_at, had_v14, v14_applied_at)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [provenance.max_version, provenance.through_v13_complete,
+        provenance.had_v13, provenance.v13_applied_at,
         provenance.had_v14, provenance.v14_applied_at],
     )
     await client.query(migrationSql)
