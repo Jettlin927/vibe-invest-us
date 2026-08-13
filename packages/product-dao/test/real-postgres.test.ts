@@ -874,7 +874,72 @@ test('真实 PostgreSQL 停止主 Session 时原子 fence 整棵专项树', {
       operationId: 'late-specialist-result', event: { type: 'status', status: 'partial' },
       createdAt: '2026-08-14T01:00:03.000Z',
     }), /agent_execution_fenced/)
+    await assert.rejects(events.createSpecialistSession({
+      id: `${analysisId}:late-technical`, analysisId, domain: 'technical',
+      executionId: `${analysisId}:late-technical:execution`, status: 'planning',
+      operationId: 'late-technical-created',
+      event: { type: 'specialist_context', domain: 'technical' },
+      createdAt: '2026-08-14T01:00:03.000Z',
+    }), /analysis_not_active/)
+    assert.deepEqual(await events.createSpecialistSession({
+      id: `${analysisId}:news-replay`, analysisId, domain: 'news',
+      executionId: specialistExecutionId, status: 'running_tools', operationId: 'news-created',
+      event: { type: 'specialist_context', domain: 'news' },
+      createdAt: '2026-08-14T01:00:00.000Z',
+    }), { sessionId: specialistSessionId, executionId: specialistExecutionId, created: false })
+    assert.equal((await events.listSessions(analysisId)).length, 2)
   } finally {
+    await analyses.removeResearch(analysisId)
+    await pool.end()
+  }
+})
+
+test('真实 PostgreSQL 树级 fence 与并发专项创建按 analysis 行锁串行化', {
+  skip: !migrationUrl || !applicationUrl,
+  concurrency: false,
+}, async () => {
+  await migrate(migrationUrl!)
+  const pool = createPool(applicationUrl!)
+  const events = createAgentEventRepository(pool)
+  const analyses = createAnalysisRepository(pool)
+  const blocker = await pool.connect()
+  const suffix = crypto.randomUUID()
+  const analysisId = `tree-fence-race-${suffix}`
+  const sessionId = `${analysisId}:main`
+  const executionId = `${sessionId}:execution`
+  try {
+    await events.createResearch({
+      analysisId, sessionId, executionId, symbol: `R${suffix.slice(0, 8)}`,
+      status: 'running', operationId: 'main-created',
+      event: { type: 'status', status: 'running' }, createdAt: '2026-08-14T02:00:00.000Z',
+    })
+    await blocker.query('BEGIN')
+    await blocker.query('SELECT id FROM analyses WHERE id = $1 FOR UPDATE', [analysisId])
+    let fenceSettled = false
+    const fencing = events.fenceForStopping({
+      sessionId, executionId, fenceExecutionId: `${executionId}:stopping`,
+      operationId: 'tree-race-stopping', event: { type: 'status', status: 'stopping' },
+      createdAt: '2026-08-14T02:00:01.000Z',
+    }).finally(() => { fenceSettled = true })
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    assert.equal(fenceSettled, false)
+    let createSettled = false
+    const creating = events.createSpecialistSession({
+      id: `${analysisId}:news`, analysisId, domain: 'news',
+      executionId: `${analysisId}:news:execution`, status: 'planning',
+      operationId: 'racing-news-created',
+      event: { type: 'specialist_context', domain: 'news' },
+      createdAt: '2026-08-14T02:00:01.000Z',
+    }).finally(() => { createSettled = true })
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    assert.equal(createSettled, false)
+    await blocker.query('COMMIT')
+    await fencing
+    await assert.rejects(creating, /analysis_not_active/)
+    assert.deepEqual((await events.listSessions(analysisId)).map(({ id }) => id), [sessionId])
+  } finally {
+    await blocker.query('ROLLBACK').catch(() => undefined)
+    blocker.release()
     await analyses.removeResearch(analysisId)
     await pool.end()
   }

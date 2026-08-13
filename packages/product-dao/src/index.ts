@@ -1175,6 +1175,14 @@ export function createAgentEventRepository(pool: Pool) {
       const client = await pool.connect()
       try {
         await client.query('BEGIN')
+        const sessionIdentity = await client.query<{ analysis_id: string }>(
+          'SELECT analysis_id FROM agent_sessions WHERE id = $1', [input.sessionId],
+        )
+        if (!sessionIdentity.rows[0]) throw new Error('agent_session_not_found')
+        await client.query(
+          'SELECT id FROM analyses WHERE id = $1 FOR UPDATE',
+          [sessionIdentity.rows[0].analysis_id],
+        )
         const session = await client.query<{
           latest_sequence: number; analysis_id: string; is_primary: boolean; execution_id: string
         }>(
@@ -1428,10 +1436,34 @@ export function createAgentEventRepository(pool: Pool) {
       const client = await pool.connect()
       try {
         await client.query('BEGIN')
-        const analysis = await client.query(
-          'SELECT id FROM analyses WHERE id = $1 FOR KEY SHARE', [input.analysisId],
+        const analysis = await client.query<{ active: boolean; status: string }>(
+          'SELECT active, status FROM analyses WHERE id = $1 FOR UPDATE', [input.analysisId],
         )
         if (!analysis.rowCount) throw new Error('analysis_not_found')
+        const replay = await client.query<AgentEventRow & { session_id: string }>(
+          `SELECT e.session_id, e.sequence, e.operation_id, e.payload_json, e.created_at::text
+           FROM agent_events e JOIN agent_sessions s ON s.id = e.session_id
+           WHERE s.analysis_id = $1 AND s.domain = $2 AND e.operation_id = $3`,
+          [input.analysisId, input.domain, input.operationId],
+        )
+        if (replay.rows[0]) {
+          const replayExecution = await client.query<{ session_id: string }>(
+            'SELECT session_id FROM agent_executions WHERE id = $1', [input.executionId],
+          )
+          if (replayExecution.rows[0]?.session_id !== replay.rows[0].session_id
+            || !jsonValuesEqual(replay.rows[0].payload_json, input.event)
+            || !sameInstant(replay.rows[0].created_at, input.createdAt)) {
+            throw new Error('agent_operation_conflict')
+          }
+          await client.query('COMMIT')
+          return {
+            sessionId: replay.rows[0].session_id, executionId: input.executionId, created: false,
+          }
+        }
+        if (!analysis.rows[0]!.active || ['stopping', 'completed', 'partial', 'failed', 'stopped',
+          'interrupted', 'budget_exhausted'].includes(analysis.rows[0]!.status)) {
+          throw new Error('analysis_not_active')
+        }
         const inserted = await client.query<{ id: string }>(
           `INSERT INTO agent_sessions (
              id, analysis_id, is_primary, domain, execution_id, status,
