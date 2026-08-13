@@ -81,6 +81,28 @@ export function createToolRegistry(
       .map((definition) => definition.model),
     definition: (name: string) => validated.find((definition) => definition.model.name === name),
     handler: (name: string) => handlers[name],
+    projectResult(name: string, result: Record<string, unknown>) {
+      const projection = validated.find((definition) => definition.model.name === name)?.modelProjection
+      if (projection === 'full_result') return result
+      if (projection === 'acknowledgement') {
+        return { submitted: result.submitted === true, ...(result.error ? { error: result.error } : {}) }
+      }
+      if (result.modelProjection && typeof result.modelProjection === 'object') {
+        return result.modelProjection as Record<string, unknown>
+      }
+      const allowed = [
+        'facts', 'gaps', 'summary', 'analysis', 'error', 'source', 'sources',
+        'launched', 'status', 'sessionId', 'executionId', 'reportId', 'reportVersion',
+        'keyFactIds', 'contraryFactIds',
+        'cursor', 'nextCursor', 'pagination', 'truncated', 'resultCount',
+        'returnedCount', 'totalCount', 'items', 'overview',
+        'symbol', 'authorizedComparables', 'comparables',
+        'currentMultiples', 'historicalRanges', 'methods',
+        'actualStart', 'actualEnd', 'totalBarCount', 'sampling', 'structures',
+        'indicators', 'volatility', 'drawdown', 'volumePrice', 'keyLevels', 'conflicts',
+      ]
+      return Object.fromEntries(allowed.flatMap((key) => key in result ? [[key, result[key]]] : []))
+    },
   })
 }
 

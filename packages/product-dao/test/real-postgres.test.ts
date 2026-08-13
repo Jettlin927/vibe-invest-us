@@ -611,6 +611,65 @@ test('真实 PostgreSQL 原子创建主 Session、execution generation、初始 
   }
 })
 
+test('真实 PostgreSQL 手动恢复复用主 Session 并原子创建新 generation 与 segment', {
+  skip: !migrationUrl || !applicationUrl,
+  concurrency: false,
+}, async () => {
+  await migrate(migrationUrl!)
+  const pool = createPool(applicationUrl!)
+  const events = createAgentEventRepository(pool)
+  const settings = createRuntimeSettingsRepository(pool)
+  const analysisId = `resume-${crypto.randomUUID()}`
+  const sessionId = `resume-session-${crypto.randomUUID()}`
+  const oldExecutionId = `resume-old-${crypto.randomUUID()}`
+  const newExecutionId = `resume-new-${crypto.randomUUID()}`
+  const createdAt = '2026-08-13T03:30:00.000Z'
+  try {
+    await events.createResearch({
+      analysisId, sessionId, executionId: oldExecutionId,
+      symbol: `R${crypto.randomUUID().replaceAll('-', '').slice(0, 8)}`,
+      status: 'planning', analysisStatus: 'queued', operationId: 'resume-initial',
+      event: { type: 'runtime_context', executionId: oldExecutionId, generation: 1 }, createdAt,
+    })
+    await events.append({
+      sessionId, executionId: oldExecutionId, operationId: 'resume-interrupted',
+      event: { type: 'status', status: 'interrupted', terminal: true },
+      projection: { status: 'interrupted', executionStatus: 'interrupted', terminal: true },
+      createdAt: '2026-08-13T03:30:01.000Z',
+    })
+    const resumed = await events.resumeResearch({
+      analysisId, executionId: newExecutionId, segmentId: `resume-segment-${crypto.randomUUID()}`,
+      operationId: 'resume-manual', event: {
+        type: 'runtime_resume', status: 'planning', resumed: true,
+        previousExecutionId: oldExecutionId, executionId: newExecutionId, generation: 2,
+      }, createdAt: '2026-08-13T03:30:02.000Z',
+    })
+    assert.equal(resumed.sessionId, sessionId)
+    assert.equal(resumed.executionId, newExecutionId)
+    assert.equal(resumed.generation, 2)
+    assert.equal(resumed.created, true)
+    const lifecycle = await events.primaryLifecycle(analysisId)
+    assert.equal(lifecycle?.id, sessionId)
+    assert.equal(lifecycle?.execution.id, newExecutionId)
+    assert.equal(lifecycle?.execution.generation, 2)
+    assert.deepEqual(lifecycle?.segments.map(({ ordinal }) => ordinal), [1, 2])
+    assert.deepEqual(lifecycle?.events.at(-1), {
+      sequence: 3, createdAt: '2026-08-13T03:30:02.000Z',
+      type: 'runtime_resume', status: 'planning', resumed: true,
+      previousExecutionId: oldExecutionId, executionId: newExecutionId, generation: 2,
+    })
+    assert.equal((await settings.getExecutionSnapshot(newExecutionId))?.executionId, newExecutionId)
+    await assert.rejects(events.resumeResearch({
+      analysisId, executionId: `resume-conflict-${crypto.randomUUID()}`,
+      operationId: 'resume-again', event: { type: 'runtime_context', resumed: true },
+      createdAt: '2026-08-13T03:30:03.000Z',
+    }), /analysis_not_resumable/)
+  } finally {
+    await createAnalysisRepository(pool).removeResearch(analysisId)
+    await pool.end()
+  }
+})
+
 test('真实 PostgreSQL primaryLifecycle 在并发状态写入期间只返回同一事务快照', {
   skip: !migrationUrl || !applicationUrl,
   concurrency: false,

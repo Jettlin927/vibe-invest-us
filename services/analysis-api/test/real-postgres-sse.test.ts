@@ -577,6 +577,7 @@ test('真实 PostgreSQL 重启恢复在 API、Session ledger 与 SSE 中一致�
     event: { type: 'status', status: 'running', at: beforeRestart },
     createdAt: beforeRestart,
   })
+  let modelCalls = 0
   const app = buildApp({
     productDatabase: { checkSchema: () => checkSchema(pool), close: () => pool.end() },
     portfolioRepository: createPortfolioRepository(pool),
@@ -586,7 +587,15 @@ test('真实 PostgreSQL 重启恢复在 API、Session ledger 与 SSE 中一致�
     toolProjectionRepository: createToolProjectionRepository(pool),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({ symbol, gaps: [], facts: [] }),
-    model: { async *analyze(): AsyncGenerator<ModelEvent> { return } },
+    model: { async *analyze(): AsyncGenerator<ModelEvent> {
+      modelCalls += 1
+      yield { type: 'completed', report: {
+        title: '恢复后的报告', marketState: '中性', trend: '中性', drivers: [],
+        supportingEvidence: [], contraryEvidence: [], scenarios: [],
+        invalidationConditions: [], valuation: null, personalImpact: null,
+        conditionalSuggestion: null, limitations: ['恢复验证'], keyJudgments: [],
+      } }
+    } },
   })
   await app.listen({ host: '127.0.0.1', port: 0 })
   const address = app.server.address()
@@ -606,6 +615,31 @@ test('真实 PostgreSQL 重启恢复在 API、Session ledger 与 SSE 中一致�
     assert.match(replay, new RegExp(`id: ${sessionId}:2`))
     assert.match(replay, /event: interrupted/)
     assert.doesNotMatch(replay, /event: running/)
+    assert.equal(modelCalls, 0)
+
+    const resumed = await fetch(`${baseUrl}/api/analyses/${analysisId}/resume`, {
+      method: 'POST',
+    })
+    assert.equal(resumed.status, 202, await resumed.clone().text())
+    const resumedBody = await resumed.json() as { sessionId: string; executionId: string; generation: number }
+    assert.equal(resumedBody.sessionId, sessionId)
+    assert.equal(resumedBody.generation, 2)
+    await waitForAgentStatus(events, sessionId, 'partial')
+    assert.equal(modelCalls, 1)
+    const lifecycle = await events.primaryLifecycle(analysisId)
+    assert.equal(lifecycle?.execution.id, resumedBody.executionId)
+    assert.equal(lifecycle?.execution.generation, 2)
+    assert.ok(lifecycle?.events.some((event) => (
+      event.type === 'runtime_resume'
+      && event.previousExecutionId === 'before-restart'
+      && event.executionId === resumedBody.executionId
+    )))
+    await assert.rejects(events.append({
+      sessionId, executionId: 'before-restart', operationId: 'late-after-resume',
+      event: { type: 'status', status: 'completed', terminal: true },
+      projection: { status: 'completed', executionStatus: 'completed', terminal: true },
+      createdAt: new Date().toISOString(),
+    }), /agent_execution_fenced/)
   } finally {
     await app.close()
   }

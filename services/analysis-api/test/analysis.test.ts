@@ -8,6 +8,7 @@ import { fauxAssistantMessage, fauxToolCall } from '@earendil-works/pi-ai'
 
 import { createPiModel, type ModelEvent } from '../src/model.js'
 import { buildApp as buildProductionApp } from '../src/app.js'
+import { analysisModelTools, newsSpecialistTools } from '../src/tools.js'
 import { createTestProductDatabase } from './support/product-database.js'
 
 const testDatabases = new Map<string, ReturnType<typeof createTestProductDatabase>>()
@@ -1441,6 +1442,322 @@ test('取消已领取但尚未登记 controller 的任务会停止且不启动�
   assert.deepEqual(research.trace
     .filter((event: { status?: string }) => ['stopping', 'stopped'].includes(event.status ?? ''))
     .map((event: { status: string }) => event.status), ['stopping', 'stopped'])
+  await app.close()
+})
+
+test('用户手动恢复 stopped 研究会复用主 Session 并创建新 execution generation', async () => {
+  const database = createTestProductDatabase()
+  const toolFact = {
+    ...fact, id: 'fact:RESUME:tool:current', observedAt: new Date().toISOString(),
+    fetchedAt: new Date().toISOString(),
+  }
+  const expiredFact = {
+    ...fact, id: 'fact:RESUME:tool:expired', observedAt: '2020-01-01T00:00:00.000Z',
+    fetchedAt: new Date().toISOString(),
+  }
+  let attempts = 0
+  let contextFetches = 0
+  let firstStarted!: () => void
+  const started = new Promise<void>((resolve) => { firstStarted = resolve })
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => {
+      contextFetches += 1
+      return { symbol, facts: [fact], gaps: [] }
+    },
+    model: {
+      async *analyze(input) {
+        attempts += 1
+        if (attempts === 1) {
+          firstStarted()
+          await new Promise<void>((resolve) => input.signal?.addEventListener('abort', resolve, {
+            once: true,
+          }))
+          yield { type: 'cancelled' as const }
+          return
+        }
+        const resume = input.runtimeResume?.content as {
+          reusableToolResults?: Array<{ toolName: string; factIds: string[] }>
+          unresolved?: Array<{ kind: string; id: string; status: string }>
+        }
+        assert.deepEqual(resume.reusableToolResults, [{
+          toolName: 'fetch_financial_context', factIds: [toolFact.id],
+          modelProjection: { facts: [toolFact] },
+        }])
+        assert.deepEqual(resume.unresolved, [{
+          kind: 'tool_call', id: `${originalExecutionId}:failed-batch:call`, status: 'failed',
+        }])
+        yield { type: 'completed' as const, report }
+      },
+    },
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'RESUME' },
+  })).json()
+  await started
+  const originalExecutionId = created.executionId
+  const projection = await database.toolProjectionRepository.ensureVersion({
+    executionId: originalExecutionId, role: 'main', stage: 'research',
+    schemaHash: 'resume-source', projectedTools: [
+      analysisModelTools.find(({ name }) => name === 'fetch_financial_context')!,
+    ],
+    visibleToolNames: ['fetch_financial_context'], reasons: {},
+    createdAt: new Date().toISOString(),
+  })
+  const completeSourceBatch = async (
+    id: string, status: 'completed' | 'failed', result: unknown, isError: boolean,
+  ) => {
+    const toolCallId = `${id}:call`
+    const createdAt = new Date().toISOString()
+    await database.toolProjectionRepository.beginToolBatch({
+      id, executionId: originalExecutionId, projectionId: projection.id, turnIndex: 1,
+      calls: [{ toolCallId, toolName: 'fetch_financial_context', position: 1 }], createdAt,
+    })
+    await database.toolProjectionRepository.completeToolBatch({
+      id, executionId: originalExecutionId, completedAt: createdAt,
+      results: [{
+        toolCallId, status, startedAt: createdAt, completedAt: createdAt, completionOrder: 1,
+        resultPayload: { toolName: 'fetch_financial_context', result, isError },
+        operationId: `${id}:result`, eventPayload: {
+          type: 'tool_result', name: 'fetch_financial_context', toolCallId,
+          result, isError, completedAt: createdAt, completionOrder: 1,
+        },
+      }],
+    })
+  }
+  await completeSourceBatch(
+    `${originalExecutionId}:success-batch`, 'completed', { facts: [toolFact, expiredFact] }, false,
+  )
+  await completeSourceBatch(
+    `${originalExecutionId}:failed-batch`, 'failed', { error: 'source_timeout', facts: [] }, true,
+  )
+  assert.equal((await app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/cancel`,
+  })).statusCode, 202)
+  await waitForStatus(app as any, created.analysisId, 'stopped')
+  const stopped = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  const stoppedExecutionId = stopped.mainAgent.execution.id
+  assert.equal(stopped.mainAgent.id, created.sessionId)
+  assert.equal(stopped.mainAgent.execution.generation, 2)
+
+  const response = await app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/resume`,
+  })
+  assert.equal(response.statusCode, 202)
+  const resumed = response.json()
+  assert.equal(resumed.sessionId, created.sessionId)
+  assert.equal(resumed.generation, 3)
+  assert.notEqual(resumed.executionId, stoppedExecutionId)
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  const completed = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  assert.equal(completed.mainAgent.id, created.sessionId)
+  assert.equal(completed.mainAgent.execution.id, resumed.executionId)
+  assert.equal(completed.mainAgent.execution.generation, 3)
+  assert.ok(completed.trace.some((event: Record<string, unknown>) => (
+    event.resumed === true
+      && event.previousExecutionId === stoppedExecutionId
+      && event.executionId === resumed.executionId
+  )))
+  assert.equal(contextFetches, 1)
+  await assert.rejects(database.agentEventRepository.append({
+    sessionId: created.sessionId, executionId: originalExecutionId,
+    operationId: `execution:${originalExecutionId}:late-completed-after-resume`,
+    event: { type: 'status', status: 'completed', terminal: true },
+    projection: { status: 'completed', executionStatus: 'completed', terminal: true },
+    createdAt: new Date().toISOString(),
+  }), /agent_execution_fenced/)
+  await app.close()
+})
+
+test('恢复研究直接复用已完成专项 V1 而不创建新专项 execution', async () => {
+  const database = createTestProductDatabase()
+  let mainAttempts = 0
+  let newsRuns = 0
+  let firstSpecialistDone!: () => void
+  const specialistDone = new Promise<void>((resolve) => { firstSpecialistDone = resolve })
+  const specialistReport = {
+    kind: 'specialist' as const, domain: 'news', availability: 'available' as const,
+    status: 'completed' as const, gaps: [], limitations: [], keyJudgments: [],
+  }
+  let originalSpecialist: Record<string, unknown> | undefined
+  const model = {
+    async *analyze(input: any) {
+      mainAttempts += 1
+      const result = await input.runNewsSpecialist({
+        launch: true, researchQuestion: '是否有重大消息？', reason: '需要消息面报告',
+      })
+      if (mainAttempts === 1) {
+        originalSpecialist = result
+        firstSpecialistDone()
+        await new Promise<void>((resolve) => input.signal.addEventListener('abort', resolve, {
+          once: true,
+        }))
+        yield { type: 'cancelled' as const }
+        return
+      }
+      assert.equal(result.sessionId, originalSpecialist?.sessionId)
+      assert.equal(result.executionId, originalSpecialist?.executionId)
+      assert.equal(result.reportId, originalSpecialist?.reportId)
+      assert.equal(result.reportVersion, 1)
+      yield { type: 'completed' as const, report }
+    },
+    async *analyzeNews() {
+      newsRuns += 1
+      yield { type: 'completed' as const, report: { ...report, title: '消息面专项' },
+        reportVersion: { kind: 'specialist' as const, report: specialistReport } }
+    },
+  }
+  const emptyFacts = async () => ({ facts: [] })
+  const app = buildProductionApp({
+    ...database, model,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [] }),
+    searchNewsCandidates: emptyFacts, readNewsDocument: emptyFacts, listCompanyEvents: emptyFacts,
+  } as any)
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'REUSEV1' },
+  })).json()
+  await specialistDone
+  assert.equal((await app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/cancel`,
+  })).statusCode, 202)
+  await waitForStatus(app as any, created.analysisId, 'stopped')
+  assert.equal((await app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/resume`,
+  })).statusCode, 202)
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  const research = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  const news = research.specialistAgents.find((agent: any) => agent.domain === 'news')
+  assert.equal(news.execution.generation, 1)
+  assert.equal(news.reportVersion.version, 1)
+  assert.equal(newsRuns, 1)
+  await app.close()
+})
+
+test('恢复未完成专项时创建新 generation 并注入旧专项成功结果与未决项', async () => {
+  const database = createTestProductDatabase()
+  const newsFact = {
+    ...fact, id: 'fact:RECOVERNEWS:verified', type: 'news', evidenceLevel: 'verified_news',
+    fetchedAt: new Date().toISOString(),
+  }
+  let mainRuns = 0
+  let newsRuns = 0
+  let specialistStarted!: () => void
+  const started = new Promise<void>((resolve) => { specialistStarted = resolve })
+  let firstSpecialistExecution = ''
+  const specialistReport = {
+    kind: 'specialist' as const, domain: 'news', availability: 'available' as const,
+    status: 'completed' as const, gaps: [], limitations: [], keyJudgments: [],
+  }
+  const model = {
+    async *analyze(input: any) {
+      mainRuns += 1
+      const outcome = await input.runNewsSpecialist({
+        launch: true, researchQuestion: '恢复消息专项', reason: '验证专项重建',
+      })
+      if (mainRuns === 1) {
+        const aborted = new Promise<void>((resolve) => input.signal.addEventListener('abort', resolve, {
+          once: true,
+        }))
+        specialistStarted()
+        await aborted
+        yield { type: 'cancelled' as const }
+        return
+      }
+      assert.equal(outcome.reportVersion, 1)
+      yield { type: 'completed' as const, report }
+    },
+    async *analyzeNews(input: any) {
+      newsRuns += 1
+      if (newsRuns === 1) {
+        firstSpecialistExecution = input.executionId
+        const projection = await input.toolRuntime.ensureProjection({
+          executionId: input.executionId, role: 'news', stage: 'research',
+          tools: [newsSpecialistTools.find(({ name }) => name === 'search_news_candidates')!],
+          createdAt: new Date().toISOString(),
+        })
+        const completedAt = new Date().toISOString()
+        await input.toolRuntime.beginToolBatch({
+          id: `${input.executionId}:completed-batch`, executionId: input.executionId,
+          projectionId: projection.id, turnIndex: 1,
+          calls: [{ toolCallId: 'news-success', toolName: 'search_news_candidates', position: 1 }],
+          createdAt: completedAt,
+        })
+        await input.toolRuntime.completeToolBatch({
+          id: `${input.executionId}:completed-batch`, executionId: input.executionId,
+          results: [{
+            toolCallId: 'news-success', toolName: 'search_news_candidates', status: 'completed',
+            startedAt: completedAt, completedAt, completionOrder: 1,
+            result: { facts: [newsFact] }, isError: false, operationId: 'news-success-result',
+          }], completedAt,
+        })
+        await input.toolRuntime.beginToolBatch({
+          id: `${input.executionId}:failed-batch`, executionId: input.executionId,
+          projectionId: projection.id, turnIndex: 2,
+          calls: [{ toolCallId: 'news-failed', toolName: 'search_news_candidates', position: 1 }],
+          createdAt: completedAt,
+        })
+        await input.toolRuntime.completeToolBatch({
+          id: `${input.executionId}:failed-batch`, executionId: input.executionId,
+          results: [{
+            toolCallId: 'news-failed', toolName: 'search_news_candidates', status: 'failed',
+            startedAt: completedAt, completedAt, completionOrder: 1,
+            result: { error: 'source_timeout', facts: [] }, isError: true,
+            operationId: 'news-failed-result',
+          }], completedAt,
+        })
+        yield { type: 'cancelled' as const }
+        return
+      }
+      assert.notEqual(input.executionId, firstSpecialistExecution)
+      assert.deepEqual(input.runtimeResume?.content.reusableToolResults, [{
+        toolName: 'search_news_candidates', factIds: [newsFact.id],
+        modelProjection: { facts: [newsFact] },
+      }])
+      assert.deepEqual(input.runtimeResume?.content.unresolved, [{
+        kind: 'tool_call', id: 'news-failed', status: 'failed',
+      }])
+      yield { type: 'completed' as const, report: { ...report, title: '恢复消息专项' },
+        reportVersion: { kind: 'specialist' as const, report: specialistReport } }
+    },
+  }
+  const emptyFacts = async () => ({ facts: [] })
+  const app = buildProductionApp({
+    ...database, model,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [] }),
+    searchNewsCandidates: emptyFacts, readNewsDocument: emptyFacts, listCompanyEvents: emptyFacts,
+  } as any)
+  await app.ready()
+  const createdResponse = await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'RCVNEWS' },
+  })
+  assert.equal(createdResponse.statusCode, 202)
+  const created = createdResponse.json()
+  await started
+  assert.equal((await app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/cancel`,
+  })).statusCode, 202)
+  await waitForStatus(app as any, created.analysisId, 'stopped')
+  assert.equal((await app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/resume`,
+  })).statusCode, 202)
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  const research = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  const news = research.specialistAgents.find((agent: any) => agent.domain === 'news')
+  assert.equal(news.execution.generation, 2)
+  assert.equal(newsRuns, 2)
   await app.close()
 })
 

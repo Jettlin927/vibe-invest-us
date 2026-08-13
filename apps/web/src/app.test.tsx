@@ -272,6 +272,47 @@ test('研究页展示主 Agent、execution、conversation segment、waitReason �
   assert.match(runtime.textContent ?? '', /等待 首次研究初始化/)
 })
 
+test('研究页只允许手动恢复 stopped 或 interrupted 记录', async () => {
+  setupDom()
+  Reflect.deleteProperty(globalThis, 'EventSource')
+  let resumed = false
+  let status = 'stopped'
+  const record = () => ({
+    id: 'resume-1', symbol: 'NVDA', status, report: null, facts: [], trace: [],
+    mainAgent: {
+      id: 'resume-session', status,
+      waitReason: null,
+      execution: { id: resumed ? 'resume-new' : 'resume-old', generation: resumed ? 2 : 1, status },
+      segments: [{ id: 'resume-segment', ordinal: 1, createdAt: '2026-08-13T03:00:00Z' }],
+      events: [],
+    },
+  })
+  globalThis.fetch = async (input, init) => {
+    const url = String(input)
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok' }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/settings') return Response.json({ ...settingsResponse(), model: { configured: true } })
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+    if (url === '/api/portfolio') return Response.json(portfolioResponse([]))
+    if (url === '/api/research') return Response.json({ records: [{ id: 'resume-1', symbol: 'NVDA', status }] })
+    if (url === '/api/research/resume-1') return Response.json(record())
+    if (url === '/api/analyses/resume-1/resume' && init?.method === 'POST') {
+      resumed = true
+      status = 'completed'
+      return Response.json({ sessionId: 'resume-session', executionId: 'resume-new', generation: 2 }, { status: 202 })
+    }
+    if (url === '/api/analyses/resume-1') return Response.json({ status, terminal: status === 'completed' })
+    throw new Error(`unexpected_fetch:${url}`)
+  }
+  const view = render(React.createElement(App))
+  const user = userEvent.setup({ document: window.document })
+  await user.click(await view.findByRole('button', { name: '新建分析' }))
+  await user.click(await view.findByRole('button', { name: /打开 NVDA/ }))
+  const resume = await view.findByRole('button', { name: '恢复研究' })
+  await user.click(resume)
+  await waitFor(() => assert.equal(resumed, true))
+  await waitFor(() => assert.equal(view.queryByRole('button', { name: '恢复研究' }), null))
+})
+
 test('研究页固定展示未启动的消息面专项及理由', async () => {
   setupDom()
   const record = {

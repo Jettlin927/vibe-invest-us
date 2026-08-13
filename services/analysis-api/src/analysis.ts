@@ -19,7 +19,10 @@ import type {
 import {
   acquireActiveSlot, createActiveBudget, createConcurrencyGate, raceWithAbort,
 } from './runtime-policy.js'
-import { analysisModelTools } from './tools.js'
+import {
+  analysisModelTools, financialSpecialistTools, newsSpecialistTools, technicalSpecialistTools,
+} from './tools.js'
+import { toolRegistry } from './tool-registry.js'
 
 type Fact = FinancialFact
 type SpecialistDomain = 'news' | 'fundamental_valuation' | 'technical'
@@ -301,7 +304,7 @@ export function createAnalysisService(options: {
       }
       const wallBudgetMs = settingsSnapshot.values.executionWallClockMinutes
         * (options.runtimeMinuteMs ?? 60_000)
-      const remainingWallMs = wallBudgetMs - (Date.now() - Date.parse(session.createdAt))
+      const remainingWallMs = wallBudgetMs - (Date.now() - Date.parse(settingsSnapshot.createdAt))
       if (remainingWallMs <= 0) {
         await setStatus(session.id, executionId, `execution:${executionId}:budget-exhausted`, 'budget_exhausted', {
           error: 'execution_runtime_timeout',
@@ -378,24 +381,38 @@ export function createAnalysisService(options: {
       `execution:${executionId}:model:${++modelEventSequence}:${kind}`
     )
     try {
-      pauseProcessing()
-      const contextOwner = await acquireActiveSlot({
-        acquire: () => toolGate.acquire(executionSignal), activeBudget, signal: executionSignal,
-      })
-      try {
-        context = await raceWithAbort(
-          () => options.fetchFinancialContext(job.symbol, contextOwner.signal), contextOwner.signal,
-        )
-      } finally {
-        contextOwner.finish()
+      const currentLifecycle = await options.eventRepository.primaryLifecycle(analysisId)
+      const resumeEvent = currentLifecycle?.events.findLast((event) => {
+        const payload = event as Record<string, unknown>
+        return payload.type === 'runtime_resume' && payload.executionId === executionId
+      }) as (Record<string, unknown> | undefined)
+      const restoredResearch = resumeEvent ? await repository.research(analysisId) : undefined
+      const restoredSnapshot = resumeEvent && job.snapshot && typeof job.snapshot === 'object'
+        ? {
+            ...job.snapshot as FinancialContext & { portfolioContext?: unknown },
+            facts: (restoredResearch?.facts ?? []) as Fact[],
+          } : undefined
+      if (restoredSnapshot) context = restoredSnapshot
+      else {
+        pauseProcessing()
+        const contextOwner = await acquireActiveSlot({
+          acquire: () => toolGate.acquire(executionSignal), activeBudget, signal: executionSignal,
+        })
+        try {
+          context = await raceWithAbort(
+            () => options.fetchFinancialContext(job.symbol, contextOwner.signal), contextOwner.signal,
+          )
+        } finally {
+          contextOwner.finish()
+        }
+        resumeProcessing()
       }
-      resumeProcessing()
       assertPolicy()
       if (!context) throw new Error('financial_context_unavailable')
       const quoteFact = context.facts.find((fact) => fact.type === 'quote' && typeof fact.value === 'number')
       let portfolioPrices: Record<string, number> = {}
       let portfolioPriceGap = false
-      if (options.fetchMarketPrices && options.listPortfolioSymbols) {
+      if (!restoredSnapshot && options.fetchMarketPrices && options.listPortfolioSymbols) {
         try {
           pauseProcessing()
           const pricesOwner = await acquireActiveSlot({
@@ -420,10 +437,9 @@ export function createAnalysisService(options: {
         }
       }
       if (quoteFact) portfolioPrices[job.symbol] = quoteFact.value as number
-      const portfolioContext = await options.getPortfolioContext?.(
-        job.symbol,
-        portfolioPrices,
-      ) ?? { position: null, portfolio: null }
+      const portfolioContext = restoredSnapshot?.portfolioContext
+        ?? await options.getPortfolioContext?.(job.symbol, portfolioPrices)
+        ?? { position: null, portfolio: null }
       const gaps = [
         ...(context.gaps ?? []),
         ...(portfolioPriceGap ? [{ capability: 'portfolio_prices', reason: 'source_unavailable' }] : []),
@@ -440,6 +456,68 @@ export function createAnalysisService(options: {
       assertPolicy()
       const modelContext = createModelContext(snapshot)
       const runtimeContext = createInitialRuntimeContext(modelContext, portfolioContext)
+      const previousExecutionId = typeof resumeEvent?.previousExecutionId === 'string'
+        ? resumeEvent.previousExecutionId : undefined
+      const sourceExecutionIds = Array.isArray(resumeEvent?.sourceExecutionIds)
+        ? resumeEvent.sourceExecutionIds.filter((id): id is string => typeof id === 'string') : []
+      const previousRuntimes = await Promise.all(sourceExecutionIds.map(
+        (sourceExecutionId) => options.toolProjectionRepository.replay(sourceExecutionId),
+      ))
+      const knownFactIds = new Set(modelContext.facts.map((fact) => fact.id))
+      const reusableToolResults = reusableResults(
+        previousRuntimes, knownFactIds, modelContext.facts,
+        'main', analysisModelTools.map(({ name }) => name),
+      )
+      const specialistSessions = (await options.eventRepository.listSessions(analysisId))
+        .filter(({ isPrimary }) => !isPrimary)
+      const reportVersions = await options.eventRepository.listReportVersions(analysisId)
+      const reusableSpecialistReports = specialistSessions.flatMap((specialist) => {
+        const version = reportVersions.filter(({ sessionId: id }) => id === specialist.id).at(-1)
+        if (!version) return []
+        const report = version.report as Record<string, unknown>
+        return [{
+          domain: typeof report.domain === 'string' ? report.domain : 'unknown',
+          sessionId: specialist.id, reportId: version.id, version: version.version,
+          status: report.status === 'partial' ? 'partial' : 'completed',
+        }]
+      })
+      const specialistRecovery = new Map<SpecialistDomain, NonNullable<AnalyzeInput['runtimeResume']>>()
+      for (const specialist of specialistSessions) {
+        if (reusableSpecialistReports.some(({ sessionId: id }) => id === specialist.id)) continue
+        const lifecycle = await options.eventRepository.sessionLifecycle(specialist.id)
+        const domainEvent = lifecycle?.events.find((event) => {
+          const payload = event as Record<string, unknown>
+          return ['news', 'fundamental_valuation', 'technical'].includes(String(payload.domain))
+        }) as Record<string, unknown> | undefined
+        const previousEvent = lifecycle?.events.findLast((event) => (
+          typeof (event as Record<string, unknown>).previousExecutionId === 'string'
+        )) as Record<string, unknown> | undefined
+        const domain = domainEvent?.domain as SpecialistDomain | undefined
+        const previous = previousEvent?.previousExecutionId ?? lifecycle?.execution.id
+        if (!domain || typeof previous !== 'string') continue
+        const replay = await options.toolProjectionRepository.replay(previous)
+        specialistRecovery.set(domain, {
+          role: 'runtime_resume', generatedBy: 'product_runtime', isUserInput: false,
+          content: {
+            previousExecutionId: previous,
+            reusableToolResults: reusableResults(
+              [replay], knownFactIds, modelContext.facts,
+              domain === 'fundamental_valuation' ? 'fundamental' : domain,
+              specialistToolNames(domain),
+            ),
+            unresolved: unresolvedResults([replay]),
+          },
+        })
+      }
+      const runtimeResume = previousExecutionId ? {
+        role: 'runtime_resume' as const, generatedBy: 'product_runtime' as const,
+        isUserInput: false as const,
+        content: {
+          previousExecutionId, executionId,
+          reusableToolResults, reusableSpecialistReports,
+          unresolved: unresolvedResults(previousRuntimes),
+        },
+      } : undefined
       const newsRuntimeAvailable = Boolean(options.model.analyzeNews && options.searchNewsCandidates
         && options.readNewsDocument && options.listCompanyEvents)
       const fundamentalRuntimeAvailable = Boolean(options.model.analyzeFundamental
@@ -455,6 +533,16 @@ export function createAnalysisService(options: {
       const prepareSpecialist = async (request: {
         domain: SpecialistDomain; researchQuestion: string; reason: string
       }) => {
+        if (runtimeResume) {
+          const reusable = reusableSpecialistReports.find(({ domain }) => domain === request.domain)
+          if (reusable) {
+            const existing = specialistSessions.find(({ id }) => id === reusable.sessionId)!
+            return {
+              domain: request.domain, sessionId: existing.id,
+              executionId: existing.executionId, created: false,
+            }
+          }
+        }
         const requestedSessionId = randomUUID()
         const requestedExecutionId = randomUUID()
         const createdAt = new Date().toISOString()
@@ -632,7 +720,8 @@ export function createAnalysisService(options: {
           ) => options.model.analyzeNews!({
             executionId: specialistExecutionId, runtimeSettings, symbol: job.symbol,
             systemPrompt: '你是独立消息面 Agent。只使用新闻候选、新闻文档和公司事件工具；每项判断引用合格事实 ID，禁止个人买卖或仓位建议。',
-            researchQuestion: request.researchQuestion, knownFacts: modelContext.facts,
+            researchQuestion: request.researchQuestion,
+            runtimeResume: specialistRecovery.get('news'), knownFacts: modelContext.facts,
             searchNewsCandidates: options.searchNewsCandidates!,
             searchWebEvidence: options.searchWebEvidence,
             readNewsDocument: options.readNewsDocument!,
@@ -659,7 +748,9 @@ export function createAnalysisService(options: {
           ) => options.model.analyzeFundamental!({
             executionId: specialistExecutionId, runtimeSettings, symbol: job.symbol,
             systemPrompt: '你是独立基本面 Agent。只使用财务概览、指标序列、Filing 和官方公司事件；每项判断引用正式或确定性财务事实，禁止个人买卖或仓位建议。',
-            researchQuestion: request.researchQuestion, knownFacts: modelContext.facts,
+            researchQuestion: request.researchQuestion,
+            runtimeResume: specialistRecovery.get('fundamental_valuation'),
+            knownFacts: modelContext.facts,
             getFinancialOverview: options.getFinancialOverview!,
             getFinancialMetricSeries: options.getFinancialMetricSeries!,
             getValuationEvidence: options.getValuationEvidence!,
@@ -685,7 +776,8 @@ export function createAnalysisService(options: {
           ) => options.model.analyzeTechnical!({
             executionId: specialistExecutionId, runtimeSettings, symbol: job.symbol,
             systemPrompt: '你是独立技术面 Agent。只使用宿主确定性技术证据和受控价格窗口；不得把模型上下文裁剪长度称为数据源总历史长度，不自行计算新指标；每项判断保留反方证据与失效条件，禁止个人买卖或仓位建议。',
-            researchQuestion: request.researchQuestion, knownFacts: modelContext.facts,
+            researchQuestion: request.researchQuestion,
+            runtimeResume: specialistRecovery.get('technical'), knownFacts: modelContext.facts,
             getTechnicalEvidence: options.getTechnicalEvidence!,
             getPriceWindow: options.getPriceWindow!,
             signal: controller.signal, executionDeadlineSignal: specialistWallDeadline,
@@ -707,6 +799,7 @@ export function createAnalysisService(options: {
         symbol: job.symbol,
         systemPrompt: ANALYSIS_SYSTEM_PROMPT,
         runtimeContext,
+        runtimeResume,
         knownFacts: modelContext.facts,
         refreshKnownFacts,
         onSpecialistOutcome: rememberSpecialistOutcome,
@@ -863,7 +956,10 @@ export function createAnalysisService(options: {
     const event = await options.eventRepository.fenceForStopping({
       sessionId: session.id, executionId: session.executionId, fenceExecutionId,
       operationId: `session:${session.id}:stopping`,
-      event: { type: 'status', status: 'stopping', terminal: false, waitReason, at: createdAt },
+      event: {
+        type: 'status', status: 'stopping', terminal: false,
+        previousExecutionId: session.executionId, waitReason, at: createdAt,
+      },
       createdAt,
     })
     for (const cancelled of event.cancelledToolEvents ?? []) {
@@ -881,6 +977,37 @@ export function createAnalysisService(options: {
       )
     }
     return true
+  }
+  async function resume(analysisId: string) {
+    await initialized
+    const job = await repository.get(analysisId)
+    if (!job || !['stopped', 'interrupted'].includes(job.status)) return null
+    const lifecycle = await options.eventRepository.primaryLifecycle(analysisId)
+    if (!lifecycle || !['stopped', 'interrupted'].includes(lifecycle.execution.status)) return null
+    const executionId = randomUUID()
+    const createdAt = new Date().toISOString()
+    const generation = lifecycle.execution.generation + 1
+    const stoppedSource = lifecycle.events.findLast((event) => {
+      const payload = event as Record<string, unknown>
+      return payload.status === 'stopping' && typeof payload.previousExecutionId === 'string'
+    }) as (Record<string, unknown> | undefined)
+    const sourceExecutionIds = job.status === 'stopped'
+      && typeof stoppedSource?.previousExecutionId === 'string'
+      ? [stoppedSource.previousExecutionId] : [lifecycle.execution.id]
+    const result = await options.eventRepository.resumeResearch({
+      analysisId, executionId, segmentId: randomUUID(),
+      operationId: `execution:${executionId}:resumed`,
+      event: {
+        type: 'runtime_resume', status: 'planning', resumed: true,
+        previousExecutionId: lifecycle.execution.id, executionId, generation,
+        sourceExecutionIds,
+        waitReason: { kind: 'database', target: '恢复研究上下文', startedAt: createdAt },
+        at: createdAt,
+      },
+      createdAt,
+    })
+    queueMicrotask(() => void schedule())
+    return result
   }
   async function research(analysisId: string) {
     await initialized
@@ -1032,7 +1159,10 @@ export function createAnalysisService(options: {
     toolGate.setLimit(values.toolConcurrency)
     queueMicrotask(() => void schedule())
   }
-  return { create, get, cancel, research, listResearch, updateResearch, removeResearch, streamEvents, close, updateRuntimePolicy }
+  return {
+    create, get, cancel, resume, research, listResearch, updateResearch, removeResearch,
+    streamEvents, close, updateRuntimePolicy,
+  }
 }
 
 function isExecutionStatus(value: string): value is import('@vibe-invest/contracts').AgentExecutionStatus {
@@ -1181,6 +1311,76 @@ function createModelContext(snapshot: FinancialContext & Record<string, unknown>
     },
     createdAt: snapshot.createdAt,
   }
+}
+
+type ToolReplay = Awaited<ReturnType<ToolProjectionRepository['replay']>>
+
+function reusableResults(
+  runtimes: ToolReplay[], knownFactIds: Set<string>, facts: Fact[],
+  role: 'main' | 'fundamental' | 'news' | 'technical', currentToolNames: string[],
+) {
+  const factsById = new Map(facts.map((fact) => [fact.id, fact]))
+  return runtimes.flatMap((runtime) => runtime.toolBatches.flatMap((batch) => {
+    const projection = runtime.projections.find(({ version }) => version === batch.projectionVersion)
+    return batch.results.flatMap((result) => {
+      const payload = result.resultPayload as {
+        toolName?: unknown; result?: { facts?: Array<{ id?: unknown }> }; isError?: unknown
+      } | null
+      const toolName = typeof payload?.toolName === 'string' ? payload.toolName : ''
+      const definition = toolName ? toolRegistry.definition(toolName) : undefined
+      if (result.status !== 'completed' || payload?.isError !== false || !definition
+        || !definition.allowedRoles.includes(role) || !currentToolNames.includes(toolName)
+        || !projection?.visibleToolNames.includes(toolName)
+        || !projection.projectedTools.some((projected) => (
+          JSON.stringify(projected) === JSON.stringify(definition.model)
+        ))) return []
+      const factIds = Array.isArray(payload.result?.facts) ? payload.result.facts.flatMap((item) => {
+        if (typeof item.id !== 'string' || !knownFactIds.has(item.id)) return []
+        const fact = factsById.get(item.id)
+        return fact && validReusableFact(fact) ? [item.id] : []
+      }) : []
+      if (!factIds.length) return []
+      const factSet = new Set(factIds)
+      return [{
+        toolName, factIds,
+        modelProjection: toolRegistry.projectResult(toolName, {
+          ...payload.result,
+          facts: facts.filter(({ id }) => factSet.has(id)),
+        }),
+      }]
+    })
+  }))
+}
+
+function validReusableFact(fact: Fact) {
+  if (!fact.id || !fact.type || !fact.source || !fact.sourceReference) return false
+  if (!Number.isFinite(Date.parse(fact.observedAt)) || !Number.isFinite(Date.parse(fact.fetchedAt))) {
+    return false
+  }
+  const level = fact.evidenceLevel
+    ?? (['quote', 'daily_bar'].includes(fact.type) ? 'market_observation' : undefined)
+  if (fact.type === 'quote') {
+    return Date.now() - Date.parse(fact.observedAt) <= 24 * 60 * 60 * 1000
+  }
+  return typeof level === 'string'
+}
+
+function unresolvedResults(runtimes: ToolReplay[]) {
+  return runtimes.flatMap((runtime) => runtime.toolBatches.flatMap((batch) => (
+    batch.results.length ? batch.results.flatMap((result) => (
+      result.status === 'completed' ? [] : [{
+        kind: 'tool_call', id: result.toolCallId, status: result.status,
+      }]
+    )) : [{ kind: 'tool_batch', id: batch.id, status: batch.status }]
+  )))
+}
+
+function specialistToolNames(domain: SpecialistDomain) {
+  if (domain === 'news') return [
+    ...newsSpecialistTools.map(({ name }) => name), 'search_web_evidence',
+  ]
+  if (domain === 'fundamental_valuation') return financialSpecialistTools.map(({ name }) => name)
+  return technicalSpecialistTools.map(({ name }) => name)
 }
 
 function createInitialRuntimeContext(

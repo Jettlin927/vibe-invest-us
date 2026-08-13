@@ -321,6 +321,18 @@ export function buildApp(dependencies: AppDependencies) {
     if (!await analysis?.cancel(request.params.id)) return reply.status(409).send({ error: 'analysis_not_cancellable' })
     return reply.status(202).send({ status: 'cancelling' })
   })
+  app.post<{ Params: { id: string } }>('/api/analyses/:id/resume', async (request, reply) => {
+    try {
+      const resumed = await analysis?.resume(request.params.id)
+      if (!resumed) return reply.status(409).send({ error: 'analysis_not_resumable' })
+      return reply.status(202).send(resumed)
+    } catch (error) {
+      if (error instanceof Error && error.message === 'analysis_not_resumable') {
+        return reply.status(409).send({ error: error.message })
+      }
+      throw error
+    }
+  })
   app.get<{ Params: { id: string } }>('/api/research/:id', async (request, reply) => {
     const result = await analysis?.research(request.params.id)
     return result ?? reply.status(404).send({ error: 'research_not_found' })

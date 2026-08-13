@@ -172,6 +172,48 @@ export function createTestProductDatabase() {
   }
 
   const agentEventRepository: AgentEventRepository = {
+    async resumeResearch(input) {
+      const record = analyses.get(input.analysisId)
+      const session = [...agentSessions.values()].find((candidate) => (
+        candidate.analysisId === input.analysisId && candidate.isPrimary
+      ))
+      if (!record || !session) throw new Error('analysis_not_found')
+      const lifecycle = lifecycles.get(session.id)!
+      if (!['stopped', 'interrupted'].includes(record.status)
+        || !['stopped', 'interrupted'].includes(lifecycle.execution.status)) {
+        throw new Error('analysis_not_resumable')
+      }
+      const generation = lifecycle.execution.generation + 1
+      const sequence = session.latestSequence + 1
+      agentEvents.set(session.id, [...(agentEvents.get(session.id) ?? []), {
+        sessionId: session.id, sequence, operationId: input.operationId,
+        payload: input.event, createdAt: input.createdAt,
+      }])
+      agentSessions.set(session.id, {
+        ...session, executionId: input.executionId, status: 'planning',
+        latestSequence: sequence, updatedAt: input.createdAt,
+      })
+      lifecycles.set(session.id, {
+        execution: {
+          id: input.executionId, generation, status: 'planning',
+          createdAt: input.createdAt, updatedAt: input.createdAt,
+        },
+        waitReason: { kind: 'database', target: '恢复研究上下文', startedAt: input.createdAt },
+        segments: [...lifecycle.segments, {
+          id: input.segmentId ?? `${session.id}:segment:${lifecycle.segments.length + 1}`,
+          ordinal: lifecycle.segments.length + 1, createdAt: input.createdAt,
+        }],
+      })
+      analyses.set(input.analysisId, {
+        ...record, status: 'queued', terminal: false, error: null, updatedAt: input.createdAt,
+      })
+      const current = runtimeSettingsRevisions.at(-1)!
+      executionSettingsSnapshots.set(input.executionId, {
+        executionId: input.executionId, id: current.id,
+        values: { ...current.values }, createdAt: input.createdAt,
+      })
+      return { sessionId: session.id, executionId: input.executionId, generation, created: true }
+    },
     async fenceForStopping(input) {
       const session = agentSessions.get(input.sessionId)
       const lifecycle = lifecycles.get(input.sessionId)
@@ -186,9 +228,12 @@ export function createTestProductDatabase() {
           ? input.fenceExecutionId : `${input.fenceExecutionId}:session:${candidate.id}`
         const operationId = candidate.id === input.sessionId
           ? input.operationId : `${input.operationId}:session:${candidate.id}`
+        const payload = candidate.id === input.sessionId ? input.event : {
+          ...input.event, previousExecutionId: candidate.executionId,
+        }
         const event = {
           sessionId: candidate.id, sequence: candidate.latestSequence + 1,
-          operationId, payload: input.event, createdAt: input.createdAt,
+          operationId, payload, createdAt: input.createdAt,
         }
         agentEvents.set(candidate.id, [...(agentEvents.get(candidate.id) ?? []), event])
         agentSessions.set(candidate.id, {
@@ -447,7 +492,10 @@ export function createTestProductDatabase() {
         if (!lifecycle || !['planning', 'running_model', 'running_tools', 'waiting_for_specialists', 'finalizing', 'stopping'].includes(lifecycle.execution.status)) continue
         const sequence = session.latestSequence + 1
         const operationId = `startup:interrupt:${id}:${sequence}`
-        const payload = { type: 'status', status: 'interrupted', at: createdAt }
+        const payload = {
+          type: 'status', status: 'interrupted', previousExecutionId: session.executionId,
+          at: createdAt,
+        }
         const event = { sessionId: id, sequence, operationId, payload, createdAt }
         agentEvents.set(id, [...(agentEvents.get(id) ?? []), event])
         agentSessions.set(id, {
@@ -643,7 +691,10 @@ export function createTestProductDatabase() {
           createdAt: request.createdAt,
         })),
         toolBatches: [...toolBatches.values()].filter((batch) => batch.executionId === executionId)
-          .map((batch) => structuredClone(batch)),
+          .map((batch) => ({
+            ...structuredClone(batch),
+            projectionVersion: projections.find(({ id }) => id === batch.projectionId)?.version ?? 0,
+          })),
       }
     },
     async replayForSession(sessionId, executionId) {

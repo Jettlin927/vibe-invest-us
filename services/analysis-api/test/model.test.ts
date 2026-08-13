@@ -504,6 +504,43 @@ test('消息面正文只能读取当前专项候选工具返回的 Fact', async 
   assert.equal(reads, 1)
 })
 
+test('恢复消息专项可直接读取已校验的历史候选而无需重复搜索', async () => {
+  const candidate = {
+    ...facts[0]!, id: 'fact:resumed-news', type: 'news', evidenceLevel: 'title_only',
+  }
+  let searches = 0
+  let reads = 0
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall('read_news_document', {
+      factId: candidate.id,
+    }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('submit_specialist_report', {
+      kind: 'specialist', domain: 'news', availability: 'partial', status: 'partial',
+      gaps: [], limitations: ['恢复候选验证'], keyJudgments: [],
+    }), { stopReason: 'toolUse' }),
+  ] })
+  const events = []
+  for await (const event of model.analyzeNews!({
+    executionId: 'news-resume-candidate', runtimeSettings: runtimeSettings(), symbol: 'NVDA',
+    systemPrompt: 'news', researchQuestion: 'question', knownFacts: [candidate],
+    runtimeResume: {
+      role: 'runtime_resume', generatedBy: 'product_runtime', isUserInput: false,
+      content: { reusableToolResults: [{
+        toolName: 'search_news_candidates', factIds: [candidate.id],
+        modelProjection: { facts: [candidate] },
+      }] },
+    },
+    searchNewsCandidates: async () => { searches += 1; return { facts: [] } },
+    readNewsDocument: async (input) => {
+      reads += 1; assert.equal(input.id, candidate.id); return { facts: [] }
+    },
+    listCompanyEvents: async () => ({ facts: [] }), toolRuntime: createTestToolRuntime(),
+  })) events.push(event)
+  assert.equal(searches, 0)
+  assert.equal(reads, 1)
+  assert.doesNotMatch(JSON.stringify(events), /news_candidate_not_found/)
+})
+
 test('消息面 Agent 只使用领域工具并提交可追溯专项报告', async () => {
   const candidate = {
     ...facts[0]!, id: 'fact:news:candidate', type: 'news',

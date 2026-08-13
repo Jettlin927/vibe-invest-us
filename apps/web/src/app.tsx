@@ -44,6 +44,7 @@ type ResearchRecord = ResearchSummary & {
     segments: Array<{ id: string; ordinal: number; createdAt: string }>
     events: Array<{
       sequence: number; type?: string; status?: string; createdAt: string
+      previousExecutionId?: string; executionId?: string
       waitReason?: { kind: string; target: string; startedAt: string } | null
     }>
   }
@@ -190,7 +191,7 @@ export function App() {
   }
   function streamAnalysis(sessionId: string, analysisId: string) {
     const source = new EventSource(`/api/agent-sessions/${sessionId}/events`)
-    const eventNames = ['runtime_context', 'planning', 'running_model', 'running_tools', 'waiting_for_specialists', 'finalizing', 'financial_context', 'model_event', 'text_delta', 'model_completed', 'completed', 'partial', 'failed', 'stopping', 'stopped', 'interrupted', 'budget_exhausted']
+    const eventNames = ['runtime_context', 'runtime_resume', 'planning', 'running_model', 'running_tools', 'waiting_for_specialists', 'finalizing', 'financial_context', 'model_event', 'text_delta', 'model_completed', 'completed', 'partial', 'failed', 'stopping', 'stopped', 'interrupted', 'budget_exhausted']
     for (const name of eventNames) source.addEventListener(name, (event) => {
       const entry = JSON.parse((event as MessageEvent).data) as Record<string, unknown>
       if (name !== 'text_delta') addStage(name)
@@ -231,6 +232,19 @@ export function App() {
   async function cancelAnalysis() {
     if (activeAnalysisId) await fetch(`/api/analyses/${activeAnalysisId}/cancel`, { method: 'POST' })
   }
+  async function resumeResearch() {
+    if (!selectedResearch) return
+    setError('')
+    const response = await fetch(`/api/analyses/${selectedResearch.id}/resume`, { method: 'POST' })
+    const resumed = await response.json() as { sessionId?: string }
+    if (!response.ok || !resumed.sessionId) { setError('研究恢复失败'); return }
+    setActiveAnalysisId(selectedResearch.id)
+    setAnalysisStatus('planning')
+    if ('EventSource' in globalThis) streamAnalysis(resumed.sessionId, selectedResearch.id)
+    else await pollAnalysis(selectedResearch.id)
+    await openResearch(selectedResearch.id)
+    await loadResearch()
+  }
   async function updateResearch(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
     if (!selectedResearch) return
@@ -260,7 +274,7 @@ export function App() {
       {error && <p role="alert" className="error-banner">{error}</p>}
       {page === 'overview' && <Overview records={records} selected={selectedResearch} positions={positions} health={health} modelConfigured={modelConfigured} onNavigate={navigate} onOpen={async (id) => { await openResearch(id); navigate('research') }} />}
       {page === 'analysis' && <AnalysisPage symbol={analysisSymbol} setSymbol={setAnalysisSymbol} status={analysisStatus} stages={analysisStages} active={Boolean(activeAnalysisId)} onStart={startAnalysis} onCancel={cancelAnalysis} health={health} modelConfigured={modelConfigured} records={records} onOpen={async (id) => { await openResearch(id); navigate('research') }} />}
-      {page === 'research' && <ResearchPage records={records} record={selectedResearch} onOpen={openResearch} onUpdate={updateResearch} onDelete={removeResearch} freshnessDays={runtimeSettings?.current.values.reportFreshnessDays ?? null} />}
+      {page === 'research' && <ResearchPage records={records} record={selectedResearch} onOpen={openResearch} onUpdate={updateResearch} onDelete={removeResearch} onResume={resumeResearch} freshnessDays={runtimeSettings?.current.values.reportFreshnessDays ?? null} />}
       {page === 'portfolio' && <PortfolioPage portfolio={portfolio} history={portfolioHistory} onSave={savePosition} onSaveCash={saveCash} onReduce={reducePosition} onDelete={removePosition} />}
       {page === 'settings' && <SettingsPage health={health} modelConfigured={modelConfigured} settings={runtimeSettings} onReload={loadSettings} />}
     </main>
@@ -308,16 +322,17 @@ function AnalysisPage({ symbol, setSymbol, status, stages, active, onStart, onCa
   </>
 }
 
-function ResearchPage({ records, record, onOpen, onUpdate, onDelete, freshnessDays }: {
+function ResearchPage({ records, record, onOpen, onUpdate, onDelete, onResume, freshnessDays }: {
   records: ResearchSummary[]; record: ResearchRecord | null; onOpen: (id: string) => Promise<void>
   onUpdate: (event: React.FormEvent<HTMLFormElement>) => Promise<void>; onDelete: () => Promise<void>
+  onResume: () => Promise<void>
   freshnessDays: number | null
 }) {
   return <>
     <PageHeader eyebrow="RESEARCH ARCHIVE" title="研究记录" description="每份报告都绑定当时的数据快照、来源和分析轨迹，结论变化也有迹可循。" />
     <div className="research-layout">
       <aside className="research-index"><p className="micro">全部记录 · {records.length}</p>{records.map((item) => <button className={record?.id === item.id ? 'active' : ''} key={item.id} onClick={() => void onOpen(item.id)}><strong>{item.symbol}</strong><span>{item.report?.title ?? statusLabel(item.status)}</span><small>{item.starred ? `已标记 · ${statusLabel(item.status)}` : statusLabel(item.status)}</small></button>)}</aside>
-      <ResearchReport record={record} onUpdate={onUpdate} onDelete={onDelete} freshnessDays={freshnessDays} />
+      <ResearchReport record={record} onUpdate={onUpdate} onDelete={onDelete} onResume={onResume} freshnessDays={freshnessDays} />
       <div><AgentRuntime agent={record?.mainAgent} /><SpecialistAgents agents={record?.specialistAgents} /><TraceSummary trace={record?.trace ?? []} /></div>
     </div>
   </>
@@ -369,15 +384,18 @@ function AgentRuntime({ agent }: { agent?: ResearchRecord['mainAgent'] }) {
     {agent.waitReason && <p>等待：{agent.waitReason.target} · {formatTime(agent.waitReason.startedAt)}</p>}
     <div>{agent.segments.map((segment) => <span key={segment.id}>Segment {segment.ordinal}</span>)}</div>
     <ol>{agent.events.map((event) => <li key={event.sequence}>
-      #{event.sequence} {event.type === 'runtime_context' ? 'Runtime Context' : statusLabel(event.status ?? event.type ?? '')}
+      #{event.sequence} {event.type === 'runtime_context' ? 'Runtime Context'
+        : event.type === 'runtime_resume' ? 'Runtime Resume' : statusLabel(event.status ?? event.type ?? '')}
       {' · '}{formatTime(event.createdAt)}
+      {event.type === 'runtime_resume' && <> · 从 {event.previousExecutionId} 恢复到 {event.executionId}</>}
       {event.waitReason && <> · 等待 {event.waitReason.target}（始于 {formatTime(event.waitReason.startedAt)}）</>}
     </li>)}</ol>
   </section>
 }
 
-function ResearchReport({ record, onUpdate, onDelete, freshnessDays }: {
+function ResearchReport({ record, onUpdate, onDelete, onResume, freshnessDays }: {
   record: ResearchRecord | null; onUpdate: (event: React.FormEvent<HTMLFormElement>) => Promise<void>; onDelete: () => Promise<void>
+  onResume: () => Promise<void>
   freshnessDays: number | null
 }) {
   if (!record) return <article className="research-report empty">选择一条研究记录开始阅读。</article>
@@ -400,7 +418,7 @@ function ResearchReport({ record, onUpdate, onDelete, freshnessDays }: {
     {(report?.personalImpact || report?.conditionalSuggestion) && <ReportBlock number="06" title="与你的持仓"><p>{report.personalImpact}</p>{report.conditionalSuggestion && <p className="suggestion">条件式方向：{report.conditionalSuggestion}</p>}</ReportBlock>}
     <details className="evidence-drawer"><summary>查看全部支持与相反证据</summary><div className="evidence-columns"><section><h3>支持证据</h3><Evidence facts={facts} ids={report?.supportingEvidence ?? []} /></section><section><h3>相反证据</h3><Evidence facts={facts} ids={report?.contraryEvidence ?? []} /></section></div></details>
     {!!report?.limitations?.length && <section className="limitations"><p className="micro">数据与分析限制</p><BulletList values={report.limitations} /></section>}
-    <form className="research-meta" onSubmit={(event) => void onUpdate(event)}><label><input type="checkbox" name="starred" defaultChecked={record.starred} /> 标记这份研究</label><label>个人备注<textarea name="note" defaultValue={record.note ?? ''} /></label><div><button type="submit">保存备注</button><button type="button" className="quiet danger" onClick={() => void onDelete()}>删除记录</button></div></form>
+    <form className="research-meta" onSubmit={(event) => void onUpdate(event)}><label><input type="checkbox" name="starred" defaultChecked={record.starred} /> 标记这份研究</label><label>个人备注<textarea name="note" defaultValue={record.note ?? ''} /></label><div><button type="submit">保存备注</button>{['stopped', 'interrupted'].includes(record.status) && <button type="button" className="quiet" onClick={() => void onResume()}>恢复研究</button>}<button type="button" className="quiet danger" onClick={() => void onDelete()}>删除记录</button></div></form>
   </article>
 }
 

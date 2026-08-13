@@ -166,7 +166,10 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
         initialTools: input.finalizationOnly ? finalizationModelTools : analysisModelTools,
         initialStage: input.finalizationOnly ? 'finalization' : 'research',
         systemPrompt: input.systemPrompt,
-        userPrompt: input.runtimeContext ? runtimeContextMessage(input.runtimeContext) : input.userPrompt ?? '',
+        userPrompt: input.runtimeContext
+          ? [runtimeContextMessage(input.runtimeContext), input.runtimeResume
+            ? runtimeResumeMessage(input.runtimeResume) : ''].filter(Boolean).join('\n')
+          : input.userPrompt ?? '',
         shouldRejectNextTurn: () => reportValidationState.exhausted,
         prepareSpecialistBatch: input.prepareSpecialistBatch ? async (calls, batchId) => {
           const domainByTool = {
@@ -376,6 +379,14 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
       const knownFacts = new Map(input.knownFacts.map((fact) => [fact.id, fact]))
       const candidateFactIds = new Set<string>()
       const regularCandidateFactIds = new Set<string>()
+      for (const reusable of input.runtimeResume?.content.reusableToolResults ?? []) {
+        if (!['search_news_candidates', 'search_web_evidence'].includes(reusable.toolName)) continue
+        for (const factId of reusable.factIds) {
+          if (!knownFacts.has(factId)) continue
+          candidateFactIds.add(factId)
+          if (reusable.toolName === 'search_news_candidates') regularCandidateFactIds.add(factId)
+        }
+      }
       let webSearchEligible = false
       let webSearchQuery = ''
       let webSearchDecisionIndex = 0
@@ -414,7 +425,7 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
         role: 'news', input, options, settings, executionSignal: agentSignal, activeBudget,
         onPolicyFailure: (error) => { policyFailure ??= error }, modelGate, toolGate,
         provider, queue, initialTools: newsSpecialistTools,
-        systemPrompt: input.systemPrompt, userPrompt: input.researchQuestion,
+        systemPrompt: input.systemPrompt, userPrompt: specialistUserPrompt(input),
         shouldRejectNextTurn: () => validationState.exhausted,
         nextResearchTools: () => webSearchEligible
           ? [...newsSpecialistTools, toolRegistry.definition('search_web_evidence')!.model]
@@ -642,7 +653,7 @@ async function* runStructuredSpecialist(config: {
     role: config.role, input, options, settings, executionSignal: agentSignal, activeBudget,
     onPolicyFailure: (error) => { policyFailure ??= error }, modelGate, toolGate,
     provider, queue, initialTools: config.initialTools,
-    systemPrompt: input.systemPrompt, userPrompt: input.researchQuestion,
+    systemPrompt: input.systemPrompt, userPrompt: specialistUserPrompt(input),
     shouldRejectNextTurn: () => validationState.exhausted,
     execute: async (name, params, signal, onStart) => {
       if (name === unavailableToolName) { await onStart(); return failed('tool_not_available') }
@@ -1314,26 +1325,7 @@ function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' ? value as Record<string, unknown> : { value }
 }
 function modelToolResult(name: string, result: Record<string, unknown>) {
-  const projection = toolRegistry.definition(name)?.modelProjection
-  if (projection === 'full_result') return result
-  if (projection === 'acknowledgement') {
-    return { submitted: result.submitted === true, ...(result.error ? { error: result.error } : {}) }
-  }
-  if (result.modelProjection && typeof result.modelProjection === 'object') {
-    return result.modelProjection
-  }
-  const allowed = [
-    'facts', 'gaps', 'summary', 'analysis', 'error', 'source', 'sources',
-    'launched', 'status', 'sessionId', 'executionId', 'reportId', 'reportVersion',
-    'keyFactIds', 'contraryFactIds',
-    'cursor', 'nextCursor', 'pagination', 'truncated', 'resultCount',
-    'returnedCount', 'totalCount', 'items', 'overview',
-    'symbol', 'authorizedComparables', 'comparables',
-    'currentMultiples', 'historicalRanges', 'methods',
-    'actualStart', 'actualEnd', 'totalBarCount', 'sampling', 'structures',
-    'indicators', 'volatility', 'drawdown', 'volumePrice', 'keyLevels', 'conflicts',
-  ]
-  return Object.fromEntries(allowed.flatMap((key) => key in result ? [[key, result[key]]] : []))
+  return toolRegistry.projectResult(name, result)
 }
 function retainedToolResult(result: Record<string, unknown>) {
   if (!('modelProjection' in result)) return result
@@ -1365,6 +1357,13 @@ function userMessage(content: string): PiAgentAdapterMessage {
 }
 function runtimeContextMessage(context: NonNullable<AnalyzeInput['runtimeContext']>) {
   return `【系统生成的 Runtime Context，不是用户输入】\n${JSON.stringify(context.content)}`
+}
+function runtimeResumeMessage(context: NonNullable<AnalyzeInput['runtimeResume']>) {
+  return `【系统生成的 Runtime Resume，不是用户输入】\n${JSON.stringify(context.content)}`
+}
+function specialistUserPrompt(input: AnalyzeNewsInput | AnalyzeFundamentalInput | AnalyzeTechnicalInput) {
+  return [input.researchQuestion, input.runtimeResume
+    ? runtimeResumeMessage(input.runtimeResume) : ''].filter(Boolean).join('\n')
 }
 function trace(entry: Extract<ModelEvent, { type: 'trace' }>['entry']): ModelEvent {
   return { type: 'trace', entry }

@@ -35,6 +35,7 @@ type TraceEntry =
   | { type: 'system_prompt'; content: string; operationId?: string }
   | { type: 'user_input'; content: string; operationId?: string }
   | { type: 'runtime_context'; content: RuntimeContext; operationId?: string }
+  | { type: 'runtime_resume'; content: RuntimeResume; operationId?: string }
   | { type: 'runtime_policy'; settings: RuntimeSettings; operationId?: string }
   | { type: 'model_event'; event: unknown; operationId?: string }
   | {
@@ -93,6 +94,7 @@ export type AnalyzeInput = {
   systemPrompt: string
   userPrompt?: string
   runtimeContext?: RuntimeContext
+  runtimeResume?: RuntimeResume
   knownFacts: Fact[]
   refreshKnownFacts?: () => Promise<Fact[]>
   finalizationOnly?: boolean
@@ -150,6 +152,7 @@ export type AnalyzeNewsInput = {
   symbol: string
   systemPrompt: string
   researchQuestion: string
+  runtimeResume?: RuntimeResume
   knownFacts: Fact[]
   searchNewsCandidates: (
     query: string, signal: AbortSignal,
@@ -177,6 +180,7 @@ export type AnalyzeFundamentalInput = {
   symbol: string
   systemPrompt: string
   researchQuestion: string
+  runtimeResume?: RuntimeResume
   knownFacts: Fact[]
   getFinancialOverview: (
     symbol: string, signal: AbortSignal,
@@ -207,6 +211,7 @@ export type AnalyzeTechnicalInput = {
   symbol: string
   systemPrompt: string
   researchQuestion: string
+  runtimeResume?: RuntimeResume
   knownFacts: Fact[]
   getTechnicalEvidence: (
     symbol: string, signal: AbortSignal,
@@ -233,6 +238,19 @@ export type RuntimeContext = {
   generatedBy: 'product_runtime'
   isUserInput: false
   content: Record<string, unknown>
+}
+
+export type RuntimeResume = {
+  role: 'runtime_resume'
+  generatedBy: 'product_runtime'
+  isUserInput: false
+  content: Record<string, unknown> & {
+    reusableToolResults?: Array<{
+      toolName: string
+      factIds: string[]
+      modelProjection: Record<string, unknown>
+    }>
+  }
 }
 
 export type ToolRuntime = {

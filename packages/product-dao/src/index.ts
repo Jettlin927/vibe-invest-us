@@ -1268,10 +1268,13 @@ export function createAgentEventRepository(pool: Pool) {
             [fenceExecutionId, currentSession.id, execution.rows[0].generation + 1,
               waitReason ? JSON.stringify(waitReason) : null, input.createdAt],
           )
+          const eventPayload = currentSession.id === input.sessionId ? input.event : {
+            ...input.event, previousExecutionId: currentSession.execution_id,
+          }
           await client.query(
             `INSERT INTO agent_events (session_id, sequence, operation_id, payload_json, created_at)
              VALUES ($1, $2, $3, $4, $5)`,
-            [currentSession.id, sequence, operationId, JSON.stringify(input.event), input.createdAt],
+            [currentSession.id, sequence, operationId, JSON.stringify(eventPayload), input.createdAt],
           )
           await client.query(
             `UPDATE agent_sessions SET execution_id = $1, status = 'stopping', latest_sequence = $2,
@@ -1279,7 +1282,7 @@ export function createAgentEventRepository(pool: Pool) {
             [fenceExecutionId, sequence, input.createdAt, currentSession.id],
           )
           fencedSessions.push({
-            sessionId: currentSession.id, sequence, operationId, payload: input.event,
+            sessionId: currentSession.id, sequence, operationId, payload: eventPayload,
             createdAt: input.createdAt, executionId: fenceExecutionId,
           })
         }
@@ -1367,6 +1370,102 @@ export function createAgentEventRepository(pool: Pool) {
       } finally {
         client.release()
       }
+    },
+    async resumeResearch(input: {
+      analysisId: string; executionId: string; segmentId?: string
+      operationId: string; event: Record<string, unknown>; createdAt: string
+    }) {
+      const client = await pool.connect()
+      try {
+        await client.query('BEGIN')
+        const analysis = await client.query<{ status: string }>(
+          'SELECT status FROM analyses WHERE id = $1 FOR UPDATE', [input.analysisId],
+        )
+        if (!analysis.rows[0]) throw new Error('analysis_not_found')
+        const session = await client.query<{
+          id: string; execution_id: string; latest_sequence: number
+        }>(
+          `SELECT id, execution_id, latest_sequence FROM agent_sessions
+           WHERE analysis_id = $1 AND is_primary FOR UPDATE`, [input.analysisId],
+        )
+        if (!session.rows[0]) throw new Error('agent_session_not_found')
+        const current = await client.query<{
+          id: string; generation: number; status: string; terminal: boolean
+        }>(
+          `SELECT id, generation, status, terminal FROM agent_executions
+           WHERE id = $1 FOR UPDATE`, [session.rows[0].execution_id],
+        )
+        if (!current.rows[0]) throw new Error('agent_execution_not_found')
+        const replay = await client.query<AgentEventRow>(
+          `SELECT session_id, sequence, operation_id, payload_json, created_at::text
+           FROM agent_events WHERE session_id = $1 AND operation_id = $2`,
+          [session.rows[0].id, input.operationId],
+        )
+        if (replay.rows[0]) {
+          const execution = await client.query<{ session_id: string; generation: number }>(
+            'SELECT session_id, generation FROM agent_executions WHERE id = $1', [input.executionId],
+          )
+          if (execution.rows[0]?.session_id !== session.rows[0].id
+            || !jsonValuesEqual(replay.rows[0].payload_json, input.event)
+            || !sameInstant(replay.rows[0].created_at, input.createdAt)) {
+            throw new Error('agent_operation_conflict')
+          }
+          await client.query('COMMIT')
+          return {
+            sessionId: session.rows[0].id, executionId: input.executionId,
+            generation: execution.rows[0].generation, created: false,
+          }
+        }
+        if (!current.rows[0].terminal
+          || !['stopped', 'interrupted'].includes(current.rows[0].status)
+          || !['stopped', 'interrupted'].includes(analysis.rows[0].status)) {
+          throw new Error('analysis_not_resumable')
+        }
+        const generation = current.rows[0].generation + 1
+        const sequence = session.rows[0].latest_sequence + 1
+        const segment = await client.query<{ next_ordinal: number }>(
+          `SELECT COALESCE(max(ordinal), 0)::integer + 1 AS next_ordinal
+           FROM conversation_segments WHERE session_id = $1`, [session.rows[0].id],
+        )
+        const ordinal = segment.rows[0]!.next_ordinal
+        const waitReason = { kind: 'database', target: '恢复研究上下文', startedAt: input.createdAt }
+        await client.query(
+          `INSERT INTO agent_executions (
+             id, session_id, generation, status, wait_reason_json, terminal, created_at, updated_at
+           ) VALUES ($1, $2, $3, 'planning', $4, false, $5, $5)`,
+          [input.executionId, session.rows[0].id, generation,
+            JSON.stringify(waitReason), input.createdAt],
+        )
+        await client.query(
+          `INSERT INTO conversation_segments (id, session_id, ordinal, created_at)
+           VALUES ($1, $2, $3, $4)`,
+          [input.segmentId ?? `${session.rows[0].id}:segment:${ordinal}`,
+            session.rows[0].id, ordinal, input.createdAt],
+        )
+        await client.query(
+          `INSERT INTO agent_events (session_id, sequence, operation_id, payload_json, created_at)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [session.rows[0].id, sequence, input.operationId,
+            JSON.stringify(input.event), input.createdAt],
+        )
+        await freezeExecutionSettings(client, input.executionId, input.createdAt)
+        await client.query(
+          `UPDATE agent_sessions SET execution_id = $1, status = 'planning', latest_sequence = $2,
+             updated_at = $3 WHERE id = $4`,
+          [input.executionId, sequence, input.createdAt, session.rows[0].id],
+        )
+        await client.query(
+          `UPDATE analyses SET status = 'queued', active = true, error = NULL, updated_at = $1
+           WHERE id = $2`, [input.createdAt, input.analysisId],
+        )
+        await client.query('COMMIT')
+        return {
+          sessionId: session.rows[0].id, executionId: input.executionId, generation, created: true,
+        }
+      } catch (error) {
+        await client.query('ROLLBACK')
+        throw error
+      } finally { client.release() }
     },
     async createSession(input: {
       id: string
@@ -1764,7 +1863,10 @@ export function createAgentEventRepository(pool: Pool) {
           )
           const sequence = cancelled.latestSequence + 1
           const operationId = `startup:interrupt:${session.id}:${sequence}`
-          const payload = { type: 'status', status: 'interrupted', terminal: true, at: createdAt }
+          const payload = {
+            type: 'status', status: 'interrupted', terminal: true,
+            previousExecutionId: session.execution_id, at: createdAt,
+          }
           await client.query(
             `INSERT INTO agent_events (
                session_id, sequence, operation_id, payload_json, created_at
