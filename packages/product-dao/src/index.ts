@@ -6,7 +6,7 @@ import {
   type ExecutionSettingsSnapshot, type RuntimeSettings, type RuntimeSettingsRevision,
 } from '@vibe-invest/contracts'
 
-export const schemaVersion = 14
+export const schemaVersion = 15
 
 const migrationSql = `
 CREATE TABLE IF NOT EXISTS product_schema_migrations (
@@ -317,11 +317,28 @@ ALTER TABLE tool_projection_versions ADD CONSTRAINT tool_projection_versions_sta
 ALTER TABLE tool_batch_calls ADD COLUMN IF NOT EXISTS started_at timestamptz;
 ALTER TABLE tool_batch_calls ADD COLUMN IF NOT EXISTS completion_order integer;
 ALTER TABLE tool_batch_calls ADD COLUMN IF NOT EXISTS result_payload_json jsonb;
+UPDATE tool_batch_calls call SET
+  started_at = COALESCE(call.started_at, call.completed_at),
+  completion_order = COALESCE(call.completion_order, call.position),
+  result_payload_json = COALESCE(call.result_payload_json, jsonb_build_object(
+    'toolName', call.tool_name,
+    'result', jsonb_build_object('error', 'tool_execution_interrupted', 'facts', '[]'::jsonb),
+    'isError', true
+  ))
+WHERE call.status <> 'running';
 ALTER TABLE tool_batch_calls DROP CONSTRAINT IF EXISTS tool_batch_calls_completion_order_check;
 ALTER TABLE tool_batch_calls ADD CONSTRAINT tool_batch_calls_completion_order_check
   CHECK (completion_order IS NULL OR completion_order > 0);
 CREATE UNIQUE INDEX IF NOT EXISTS tool_batch_calls_completion_order_unique
   ON tool_batch_calls (batch_id, completion_order) WHERE completion_order IS NOT NULL;
+ALTER TABLE tool_batch_calls DROP CONSTRAINT IF EXISTS tool_batch_calls_completion_check;
+ALTER TABLE tool_batch_calls ADD CONSTRAINT tool_batch_calls_completion_check CHECK (
+  (status = 'running' AND completed_at IS NULL AND completion_order IS NULL
+    AND result_payload_json IS NULL)
+  OR
+  (status <> 'running' AND started_at IS NOT NULL AND completed_at IS NOT NULL
+    AND completion_order IS NOT NULL AND result_payload_json IS NOT NULL)
+);
 
 UPDATE analyses analysis SET active = EXISTS (
   SELECT 1 FROM agent_sessions session
@@ -393,6 +410,10 @@ ON CONFLICT (version) DO NOTHING;
 
 INSERT INTO product_schema_migrations (version)
 VALUES (14)
+ON CONFLICT (version) DO NOTHING;
+
+INSERT INTO product_schema_migrations (version)
+VALUES (15)
 ON CONFLICT (version) DO NOTHING;
 
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM vibe_invest_app;
@@ -1086,20 +1107,40 @@ export function createAgentEventRepository(pool: Pool) {
            FROM agent_sessions WHERE id = $1 FOR UPDATE`, [input.sessionId],
         )
         if (!session.rows[0]) throw new Error('agent_session_not_found')
-        if (session.rows[0].execution_id !== input.executionId) throw new Error('agent_execution_fenced')
+        if (session.rows[0].execution_id !== input.executionId) {
+          const existing = await client.query<AgentEventRow>(
+            `SELECT session_id, sequence, operation_id, payload_json, created_at::text
+             FROM agent_events WHERE session_id = $1 AND operation_id = $2`,
+            [input.sessionId, input.operationId],
+          )
+          const row = existing.rows[0]
+          if (!row || session.rows[0].execution_id !== input.fenceExecutionId
+            || !jsonValuesEqual(row.payload_json, input.event)
+            || !sameInstant(row.created_at, input.createdAt)) throw new Error('agent_execution_fenced')
+          const cancelled = await client.query<AgentEventRow>(
+            `SELECT session_id, sequence, operation_id, payload_json, created_at::text
+             FROM agent_events WHERE session_id = $1 AND created_at = $2
+               AND operation_id LIKE '%:cancelled-%' ORDER BY sequence`,
+            [input.sessionId, input.createdAt],
+          )
+          await client.query('COMMIT')
+          return { ...mapAgentEventRow(row), cancelledToolEvents: cancelled.rows.map(mapAgentEventRow) }
+        }
         const execution = await client.query<{ generation: number; terminal: boolean }>(
           'SELECT generation, terminal FROM agent_executions WHERE id = $1 FOR UPDATE',
           [input.executionId],
         )
         if (!execution.rows[0]) throw new Error('agent_execution_not_found')
         if (execution.rows[0].terminal) throw new Error('agent_execution_terminal')
-        const sequence = session.rows[0].latest_sequence + 1
+        const cancelled = await cancelRunningToolBatches(
+          client, input.sessionId, input.executionId, session.rows[0].latest_sequence, input.createdAt,
+        )
+        const sequence = cancelled.latestSequence + 1
         const waitReason = input.event.waitReason ?? null
         await client.query(
           'UPDATE agent_executions SET terminal = true, updated_at = $1 WHERE id = $2',
           [input.createdAt, input.executionId],
         )
-        await cancelRunningToolBatches(client, input.executionId, input.createdAt)
         await client.query(
           `INSERT INTO agent_executions (
              id, session_id, generation, status, wait_reason_json, terminal, created_at, updated_at
@@ -1123,7 +1164,7 @@ export function createAgentEventRepository(pool: Pool) {
         )
         await client.query('COMMIT')
         return { sessionId: input.sessionId, sequence, operationId: input.operationId,
-          payload: input.event, createdAt: input.createdAt }
+          payload: input.event, createdAt: input.createdAt, cancelledToolEvents: cancelled.events }
       } catch (error) {
         await client.query('ROLLBACK')
         throw error
@@ -1318,7 +1359,16 @@ export function createAgentEventRepository(pool: Pool) {
         if (current.status === 'stopping' && input.projection?.executionStatus !== 'stopped') {
           throw new Error('agent_execution_stopping')
         }
-        const sequence = session.rows[0].latest_sequence + 1
+        let cancelledToolEvents: AgentEvent[] = []
+        let sequence = session.rows[0].latest_sequence + 1
+        if (input.projection?.executionStatus
+          && (input.projection.terminal ?? input.event.terminal === true)) {
+          const cancelled = await cancelRunningToolBatches(
+            client, input.sessionId, current.id, session.rows[0].latest_sequence, input.createdAt,
+          )
+          cancelledToolEvents = cancelled.events
+          sequence = cancelled.latestSequence + 1
+        }
         await client.query(
           `INSERT INTO agent_events (
              session_id, sequence, operation_id, payload_json, created_at
@@ -1335,9 +1385,6 @@ export function createAgentEventRepository(pool: Pool) {
             [input.projection.executionStatus, waitReason ? JSON.stringify(waitReason) : null,
               terminal, input.createdAt, current.id],
           )
-          if (terminal) {
-            await cancelRunningToolBatches(client, current.id, input.createdAt)
-          }
         }
         for (const fact of input.projection?.facts ?? []) {
           await client.query(
@@ -1373,7 +1420,7 @@ export function createAgentEventRepository(pool: Pool) {
           )
         }
         await client.query('COMMIT')
-        return { sequence, created: true, event: {
+        return { sequence, created: true, cancelledToolEvents, event: {
           sessionId: input.sessionId, sequence, operationId: input.operationId,
           payload: input.event, createdAt: input.createdAt,
         } }
@@ -1398,9 +1445,12 @@ export function createAgentEventRepository(pool: Pool) {
            WHERE execution.terminal = false
            ORDER BY session.id FOR UPDATE OF session, execution`,
         )
-        const interrupted: AgentEvent[] = []
+        const interrupted: Array<AgentEvent & { cancelledToolEvents: AgentEvent[] }> = []
         for (const session of sessions.rows) {
-          const sequence = session.latest_sequence + 1
+          const cancelled = await cancelRunningToolBatches(
+            client, session.id, session.execution_id, session.latest_sequence, createdAt,
+          )
+          const sequence = cancelled.latestSequence + 1
           const operationId = `startup:interrupt:${session.id}:${sequence}`
           const payload = { type: 'status', status: 'interrupted', terminal: true, at: createdAt }
           await client.query(
@@ -1420,7 +1470,6 @@ export function createAgentEventRepository(pool: Pool) {
              WHERE session_id = $2 AND terminal = false`,
             [createdAt, session.id],
           )
-          await cancelRunningToolBatches(client, session.execution_id, createdAt)
           if (session.is_primary) {
             await client.query(
               `UPDATE analyses SET status = 'interrupted', active = false, updated_at = $1 WHERE id = $2`,
@@ -1429,6 +1478,7 @@ export function createAgentEventRepository(pool: Pool) {
           }
           interrupted.push({
             sessionId: session.id, sequence, operationId, payload, createdAt,
+            cancelledToolEvents: cancelled.events,
           })
         }
         await client.query('COMMIT')
@@ -1672,11 +1722,21 @@ export function createToolProjectionRepository(pool: Pool) {
            ) VALUES ($1, $2, $3, $4, 'running', $5)`,
           [input.id, input.executionId, input.projectionId, input.turnIndex, input.createdAt],
         )
-        for (const call of input.calls) await client.query(
+        const projected = await client.query<{ visible_tool_names_json: string[] }>(
+          `SELECT visible_tool_names_json FROM tool_projection_versions
+           WHERE id = $1 AND execution_id = $2`, [input.projectionId, input.executionId],
+        )
+        const visibleNames = new Set(projected.rows[0]?.visible_tool_names_json ?? [])
+        for (const call of input.calls) {
+          if (call.toolName !== 'tool_not_available' && !visibleNames.has(call.toolName)) {
+            throw new Error('tool_not_available')
+          }
+          await client.query(
           `INSERT INTO tool_batch_calls (batch_id, tool_call_id, tool_name, position)
            VALUES ($1, $2, $3, $4)`,
           [input.id, call.toolCallId, call.toolName, call.position],
-        )
+          )
+        }
         let sequence = session.rows[0].latest_sequence
         for (const call of input.calls) {
           if (!call.operationId || !call.eventPayload) continue
@@ -1693,6 +1753,71 @@ export function createToolProjectionRepository(pool: Pool) {
           [sequence, input.createdAt, session.rows[0].id],
         )
         await client.query('COMMIT')
+      } catch (error) { await client.query('ROLLBACK'); throw error } finally { client.release() }
+    },
+    async startToolCall(input: {
+      batchId: string; executionId: string; toolCallId: string; startedAt: string
+      operationId: string; eventPayload: Record<string, unknown>
+    }) {
+      const client = await pool.connect()
+      try {
+        await client.query('BEGIN')
+        const session = await client.query<{
+          id: string; latest_sequence: number; current_execution_id: string; terminal: boolean
+        }>(
+          `SELECT session.id, session.latest_sequence, session.execution_id AS current_execution_id,
+             execution.terminal FROM agent_executions execution
+           JOIN agent_sessions session ON session.id = execution.session_id
+           WHERE execution.id = $1
+           FOR UPDATE OF session, execution`, [input.executionId],
+        )
+        if (!session.rows[0]) throw new Error('agent_session_not_found')
+        const call = await client.query<{ started_at: string | null; batch_status: string }>(
+          `SELECT call.started_at::text, batch.status AS batch_status FROM tool_batch_calls call
+           JOIN tool_call_batches batch ON batch.id = call.batch_id
+           WHERE call.batch_id = $1 AND call.tool_call_id = $2
+             AND batch.execution_id = $3
+           FOR UPDATE OF call`, [input.batchId, input.toolCallId, input.executionId],
+        )
+        if (!call.rows[0]) throw new Error('tool_call_not_found')
+        const existing = await client.query<AgentEventRow>(
+          `SELECT session_id, sequence, operation_id, payload_json, created_at::text
+           FROM agent_events WHERE session_id = $1 AND operation_id = $2`,
+          [session.rows[0].id, input.operationId],
+        )
+        if (call.rows[0].started_at || existing.rows[0]) {
+          const row = existing.rows[0]
+          if (!sameInstant(call.rows[0].started_at, input.startedAt) || !row
+            || !sameInstant(row.created_at, input.startedAt)
+            || !jsonValuesEqual(row.payload_json, input.eventPayload)) {
+            throw new Error('tool_call_start_conflict')
+          }
+          await client.query('COMMIT')
+          return mapAgentEventRow(row)
+        }
+        if (session.rows[0].current_execution_id !== input.executionId
+          || session.rows[0].terminal || call.rows[0].batch_status !== 'running') {
+          throw new Error('agent_execution_fenced')
+        }
+        await client.query(
+          `UPDATE tool_batch_calls SET started_at = $1
+           WHERE batch_id = $2 AND tool_call_id = $3 AND status = 'running'`,
+          [input.startedAt, input.batchId, input.toolCallId],
+        )
+        const sequence = session.rows[0].latest_sequence + 1
+        const inserted = await client.query<AgentEventRow>(
+          `INSERT INTO agent_events (session_id, sequence, operation_id, payload_json, created_at)
+           VALUES ($1, $2, $3, $4, $5)
+           RETURNING session_id, sequence, operation_id, payload_json, created_at::text`,
+          [session.rows[0].id, sequence, input.operationId,
+            JSON.stringify(input.eventPayload), input.startedAt],
+        )
+        await client.query(
+          `UPDATE agent_sessions SET latest_sequence = $1, updated_at = $2 WHERE id = $3`,
+          [sequence, input.startedAt, session.rows[0].id],
+        )
+        await client.query('COMMIT')
+        return mapAgentEventRow(inserted.rows[0]!)
       } catch (error) { await client.query('ROLLBACK'); throw error } finally { client.release() }
     },
     async completeToolBatch(input: {
@@ -1784,11 +1909,15 @@ export function createToolProjectionRepository(pool: Pool) {
           return existingEvents
         }
         for (const result of orderedResults) {
+          const existingCall = expected.rows.find((row) => row.tool_call_id === result.toolCallId)!
+          if (!existingCall.started_at || !sameInstant(existingCall.started_at, result.startedAt)) {
+            throw new Error('tool_batch_started_at_conflict')
+          }
           const updated = await client.query(
-          `UPDATE tool_batch_calls SET status = $1, started_at = $2, completed_at = $3,
-             completion_order = $4, result_payload_json = $5
-           WHERE batch_id = $6 AND tool_call_id = $7 AND status = 'running'`,
-          [result.status, result.startedAt, result.completedAt, result.completionOrder,
+          `UPDATE tool_batch_calls SET status = $1, completed_at = $2,
+             completion_order = $3, result_payload_json = $4
+           WHERE batch_id = $5 AND tool_call_id = $6 AND status = 'running'`,
+          [result.status, result.completedAt, result.completionOrder,
             JSON.stringify(result.resultPayload), input.id, result.toolCallId],
           )
           if (!updated.rowCount) throw new Error('tool_call_not_running')
@@ -1915,22 +2044,25 @@ export function createToolProjectionRepository(pool: Pool) {
 export type ToolProjectionRepository = ReturnType<typeof createToolProjectionRepository>
 
 async function cancelRunningToolBatches(
-  database: PoolClient, executionId: string, completedAt: string,
+  database: PoolClient, sessionId: string, executionId: string,
+  latestSequence: number, completedAt: string,
 ) {
   const calls = await database.query<{
-    batch_id: string; tool_call_id: string; tool_name: string; position: number
+    batch_id: string; tool_call_id: string; tool_name: string; position: number; started_at: string | null
   }>(
-    `SELECT call.batch_id, call.tool_call_id, call.tool_name, call.position
+    `SELECT call.batch_id, call.tool_call_id, call.tool_name, call.position, call.started_at::text
      FROM tool_batch_calls call JOIN tool_call_batches batch ON batch.id = call.batch_id
      WHERE batch.execution_id = $1 AND batch.status = 'running' AND call.status = 'running'
      ORDER BY call.batch_id, call.position FOR UPDATE OF call`, [executionId],
   )
   const orderByBatch = new Map<string, number>()
+  const events: AgentEvent[] = []
+  let sequence = latestSequence
   for (const call of calls.rows) {
     const completionOrder = (orderByBatch.get(call.batch_id) ?? 0) + 1
     orderByBatch.set(call.batch_id, completionOrder)
     await database.query(
-      `UPDATE tool_batch_calls SET status = 'cancelled', started_at = $1, completed_at = $1,
+      `UPDATE tool_batch_calls SET status = 'cancelled', started_at = COALESCE(started_at, $1), completed_at = $1,
          completion_order = $2, result_payload_json = $3
        WHERE batch_id = $4 AND tool_call_id = $5 AND status = 'running'`,
       [completedAt, completionOrder, JSON.stringify({
@@ -1938,12 +2070,43 @@ async function cancelRunningToolBatches(
         result: { error: 'tool_execution_interrupted', facts: [] }, isError: true,
       }), call.batch_id, call.tool_call_id],
     )
+    const startedAt = call.started_at ?? completedAt
+    if (!call.started_at) {
+      sequence += 1
+      const callOperationId = `${call.batch_id}:cancelled-call:${call.tool_call_id}`
+      const callPayload = {
+        type: 'tool_call', name: call.tool_name, toolCallId: call.tool_call_id,
+        input: {}, startedAt, operationId: callOperationId,
+      }
+      const insertedCall = await database.query<AgentEventRow>(
+        `INSERT INTO agent_events (session_id, sequence, operation_id, payload_json, created_at)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING session_id, sequence, operation_id, payload_json, created_at::text`,
+        [sessionId, sequence, callOperationId, JSON.stringify(callPayload), startedAt],
+      )
+      events.push(mapAgentEventRow(insertedCall.rows[0]!))
+    }
+    sequence += 1
+    const operationId = `${call.batch_id}:cancelled-result:${call.tool_call_id}`
+    const payload = {
+      type: 'tool_result', name: call.tool_name,
+      result: { error: 'tool_execution_interrupted', facts: [] }, isError: true,
+      toolCallId: call.tool_call_id, startedAt, completedAt, completionOrder, operationId,
+    }
+    const inserted = await database.query<AgentEventRow>(
+      `INSERT INTO agent_events (session_id, sequence, operation_id, payload_json, created_at)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING session_id, sequence, operation_id, payload_json, created_at::text`,
+      [sessionId, sequence, operationId, JSON.stringify(payload), completedAt],
+    )
+    events.push(mapAgentEventRow(inserted.rows[0]!))
   }
   await database.query(
     `UPDATE tool_call_batches SET status = 'cancelled', completed_at = $1
      WHERE execution_id = $2 AND status = 'running'`,
     [completedAt, executionId],
   )
+  return { latestSequence: sequence, events }
 }
 
 async function assertCurrentExecution(database: PoolClient, executionId: string) {

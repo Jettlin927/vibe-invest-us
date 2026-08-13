@@ -343,37 +343,6 @@ test('下一 Turn 改变工具但缺少持久化 Projection hook 时 fail closed
   assert.deepEqual(adapter.snapshot().tools.map(({ name }) => name), ['old_tool'])
 })
 
-test('生产 Projection bridge 在每次真实 provider 请求前持久化当前工具', async () => {
-  const recorded: Array<{ turnIndex: number; tools: Array<{ name: string }> }> = []
-  const next = textTool('next_tool', async () => ({
-    content: [{ type: 'text', text: 'next' }], details: {},
-  }))
-  const fixture = createFixture([
-    assistantMessage([toolCall('old_tool', 'old-call')], 'toolUse'),
-    textMessage('完成'),
-  ])
-  const adapter = createPiAgentAdapter({
-    initialState: {
-      systemPrompt: 'system', model: fixture.model,
-      tools: [textTool('old_tool', async () => ({ content: [], details: {} }))],
-    },
-    streamFn: fixture.streamFn,
-    beforeModelRequest: async ({ tools }) => {
-      recorded.push({ turnIndex: recorded.length + 1, tools })
-      return { tools }
-    },
-    prepareNextTurn: async () => ({ tools: [next] }),
-    commitToolProjection: async ({ tools }) => ({ tools }),
-  })
-  await adapter.submit(userMessage('开始'))
-  assert.deepEqual(recorded.map(({ turnIndex, tools }) => ({
-    turnIndex, toolNames: tools.map(({ name }) => name),
-  })), [
-    { turnIndex: 1, toolNames: ['old_tool'] },
-    { turnIndex: 2, toolNames: ['next_tool'] },
-  ])
-})
-
 test('turn_end 审计提交完成前绝不启动下一次真实 provider 请求', async () => {
   const fixture = createFixture([
     assistantMessage([toolCall('read', 'call-read')], 'toolUse'),
@@ -403,23 +372,6 @@ test('turn_end 审计提交完成前绝不启动下一次真实 provider 请求'
   assert.deepEqual(order, [
     'provider:1', 'atomic-commit:start', 'atomic-commit:end', 'provider:2',
   ])
-})
-
-test('模型请求 Projection 持久化失败时 fail closed 且 provider 未被调用', async () => {
-  const fixture = createFixture([textMessage('不应可见')])
-  let providerRequests = 0
-  const adapter = createPiAgentAdapter({
-    initialState: { systemPrompt: 'system', model: fixture.model },
-    beforeModelRequest: async () => { throw new Error('projection_persist_failed') },
-    streamFn: async (model, context, options) => {
-      providerRequests += 1
-      return fixture.streamFn(model, context, options)
-    },
-  })
-  await adapter.submit(userMessage('开始'))
-  await adapter.waitForIdle()
-  assert.equal(providerRequests, 0)
-  assert.match(adapter.snapshot().errorMessage ?? '', /projection_persist_failed/)
 })
 
 test('Pi compaction 阈值只在 turn boundary 切换并保留到后续提交', async () => {

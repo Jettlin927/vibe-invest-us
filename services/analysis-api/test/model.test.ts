@@ -43,6 +43,7 @@ function createTestToolRuntime(): ToolRuntime {
       return { id: `${input.requestId}:test-projection`, version: ++version }
     },
     async beginToolBatch() {},
+    async startToolCall() {},
     async completeToolBatch() {},
   }
 }
@@ -514,9 +515,13 @@ test('主 Agent 非法参数只拒绝当前 call 且同批合法工具仍执行'
   assert.equal(executions, 1)
   const invalidResult = events.find((event) => event.type === 'trace'
     && legacyOperationId(event.entry.operationId) === 'execution:invalid-main:tool:invalid-arguments:result')
-  assert.deepEqual(invalidResult, { type: 'trace', entry: {
+  assert.deepEqual(invalidResult && { ...invalidResult, entry: {
+    ...invalidResult.entry, startedAt: typeof invalidResult.entry.startedAt,
+    completedAt: typeof invalidResult.entry.completedAt,
+  } }, { type: 'trace', entry: {
     type: 'tool_result', name: 'fetch_financial_context',
     result: { error: 'invalid_tool_arguments', facts: [] }, isError: true,
+    startedAt: 'string', completedAt: 'string', completionOrder: 1,
     operationId: 'execution:invalid-main:tool:invalid-arguments:main-attempt:1:position:1:result',
   } })
   assert.doesNotMatch(JSON.stringify(events), /Validation failed|Received arguments/)
@@ -1072,10 +1077,10 @@ test('专项 Agent 在工具并发槽等待期 abort 仍为同批全部调用补
     && (event.entry.type === 'tool_call' || event.entry.type === 'tool_result')
     && event.entry.operationId.includes('specialist-tool'))
     .map((event) => event.type === 'trace' ? legacyOperationId(event.entry.operationId) : '')
-  assert.deepEqual(specialistAudit.slice(0, 2), [
+  assert.deepEqual(new Set(specialistAudit.slice(0, 2)), new Set([
     'execution:gate-wait:specialist-tool:waiting-first:call',
     'execution:gate-wait:specialist-tool:waiting-second:call',
-  ])
+  ]))
   assert.deepEqual(new Set(specialistAudit.slice(2)), new Set([
     'execution:gate-wait:specialist-tool:waiting-first:result',
     'execution:gate-wait:specialist-tool:waiting-second:result',
@@ -1401,6 +1406,9 @@ for (const failure of ['stream', 'iterator', 'next'] as const) {
     })
     let acquired = 0
     let released = 0
+    let recorded = 0
+    const toolRuntime = createTestToolRuntime()
+    toolRuntime.recordModelRequest = async () => { recorded += 1 }
     const run = async (executionId: string) => {
       for await (const _event of model.analyze({
         executionId, runtimeSettings: runtimeSettings(), symbol: 'NVDA',
@@ -1410,9 +1418,11 @@ for (const failure of ['stream', 'iterator', 'next'] as const) {
           acquired += 1
           return () => { released += 1 }
         },
+        toolRuntime,
       })) { /* consume */ }
     }
     await assert.rejects(run(`${failure}-first`), new RegExp(`${failure}_construction_failed`))
+    assert.equal(recorded, 1)
     await run(`${failure}-second`)
     assert.equal(acquired, 2)
     assert.equal(released, 2)
@@ -1447,6 +1457,9 @@ for (const failure of ['active', 'log'] as const) {
     })
     let acquired = 0
     let released = 0
+    let recorded = 0
+    const toolRuntime = createTestToolRuntime()
+    toolRuntime.recordModelRequest = async () => { recorded += 1 }
     const run = async (executionId: string) => {
       for await (const _event of model.analyze({
         executionId, runtimeSettings: runtimeSettings(), activeBudget: budget,
@@ -1456,14 +1469,95 @@ for (const failure of ['active', 'log'] as const) {
           acquired += 1
           return () => { released += 1 }
         },
+        toolRuntime,
       })) { /* consume */ }
     }
     await assert.rejects(run(`${failure}-first`), new RegExp(`${failure}_start_failed`))
+    assert.equal(recorded, 0)
     await run(`${failure}-second`)
     assert.equal(acquired, 2)
     assert.equal(released, 2)
   })
 }
+
+test('模型槽等待取消不记录 phantom request 且不调用 provider', async () => {
+  const controller = new AbortController()
+  let providerCalls = 0
+  let recorded = 0
+  const models = createModels()
+  models.stream = (() => {
+    providerCalls += 1
+    throw new Error('provider_must_not_run')
+  }) as typeof models.stream
+  const toolRuntime = createTestToolRuntime()
+  toolRuntime.recordModelRequest = async () => { recorded += 1 }
+  const model = createPiModel({
+    modelsFactory: () => models,
+    fauxResponses: [fauxAssistantMessage(fauxText('不应运行'))],
+  })
+  const consume = async () => {
+    for await (const _event of model.analyze({
+      executionId: 'slot-wait-cancelled', runtimeSettings: runtimeSettings(),
+      symbol: 'NVDA', systemPrompt: 'system', userPrompt: 'user', knownFacts: facts,
+      fetchFinancialContext: async () => ({ facts }), toolRuntime,
+      signal: controller.signal,
+      acquireModelSlot: (signal) => new Promise<() => void>((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+      }),
+    })) { /* consume */ }
+  }
+  const running = consume()
+  setTimeout(() => controller.abort(), 10)
+  await running
+  assert.equal(recorded, 0)
+  assert.equal(providerCalls, 0)
+})
+
+test('模型 request 审计失败时 provider 不运行且精确释放 owner', async () => {
+  let providerCalls = 0
+  let released = 0
+  const models = createModels()
+  models.stream = (() => {
+    providerCalls += 1
+    throw new Error('provider_must_not_run')
+  }) as typeof models.stream
+  const toolRuntime = createTestToolRuntime()
+  toolRuntime.recordModelRequest = async () => { throw new Error('request_audit_failed') }
+  const model = createPiModel({
+    modelsFactory: () => models,
+    fauxResponses: [fauxAssistantMessage(fauxText('不应运行'))],
+  })
+  await assert.rejects(async () => {
+    for await (const _event of model.analyze({
+      executionId: 'request-audit-failed', runtimeSettings: runtimeSettings(),
+      symbol: 'NVDA', systemPrompt: 'system', userPrompt: 'user', knownFacts: facts,
+      fetchFinancialContext: async () => ({ facts }), toolRuntime,
+      acquireModelSlot: async () => () => { released += 1 },
+    })) { /* consume */ }
+  }, /request_audit_failed/)
+  assert.equal(providerCalls, 0)
+  assert.equal(released, 1)
+})
+
+test('工具 start 审计失败时 fail closed 且不执行 handler 或完成批次', async () => {
+  let handlerCalls = 0
+  let completedBatches = 0
+  const toolRuntime = createTestToolRuntime()
+  toolRuntime.startToolCall = async () => { throw new Error('tool_start_audit_failed') }
+  toolRuntime.completeToolBatch = async () => { completedBatches += 1 }
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall('fetch_financial_context', {}), { stopReason: 'toolUse' }),
+  ] })
+  await assert.rejects(async () => {
+    for await (const _event of model.analyze({
+      executionId: 'tool-start-audit-failed', runtimeSettings: runtimeSettings(),
+      symbol: 'NVDA', systemPrompt: 'system', userPrompt: 'user', knownFacts: facts,
+      fetchFinancialContext: async () => { handlerCalls += 1; return { facts } }, toolRuntime,
+    })) { /* consume */ }
+  }, /tool_start_audit_failed/)
+  assert.equal(handlerCalls, 0)
+  assert.equal(completedBatches, 0)
+})
 
 test('主模型消费者提前 return 会精确释放 model slot 与 active budget', async () => {
   let now = 0

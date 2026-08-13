@@ -35,8 +35,11 @@ type TraceEntry =
   | { type: 'user_input'; content: string; operationId?: string }
   | { type: 'runtime_policy'; settings: RuntimeSettings; operationId?: string }
   | { type: 'model_event'; event: unknown; operationId?: string }
-  | { type: 'tool_call'; name: string; input: unknown; operationId: string }
-  | { type: 'tool_result'; name: string; result: unknown; isError: boolean; operationId: string }
+  | { type: 'tool_call'; name: string; input: unknown; startedAt: string; operationId: string }
+  | {
+    type: 'tool_result'; name: string; result: unknown; isError: boolean
+    startedAt: string; completedAt: string; completionOrder: number; operationId: string
+  }
   | { type: 'cancelled'; operationId?: string }
   | {
     type: 'tool_projection'
@@ -131,6 +134,14 @@ export type ToolRuntime = {
       eventPayload?: Record<string, unknown>
     }>
     createdAt: string
+  }): Promise<void>
+  startToolCall(input: {
+    batchId: string
+    executionId: string
+    toolCallId: string
+    startedAt: string
+    operationId: string
+    eventPayload: Record<string, unknown>
   }): Promise<void>
   completeToolBatch(input: {
     id: string

@@ -154,7 +154,6 @@ type CreatePiAgentAdapterOptions = {
     tools?: PiAgentAdapterTool[]
   }
   streamFn: PiAgentAdapterStreamFn
-  beforeModelRequest?: PiToolProjectionCommit
   beforeToolCall?: (context: PiBeforeToolCallContext, signal?: AbortSignal) =>
     Promise<PiBeforeToolCallResult | undefined>
   afterToolCall?: (context: PiAfterToolCallContext, signal?: AbortSignal) =>
@@ -220,18 +219,12 @@ export function createPiAgentAdapter(options: CreatePiAgentAdapterOptions) {
         messages: fromPiMessages(context.messages as Message[]),
         tools: (context.tools ?? []) as PiAgentAdapterTool[],
       }
-      const persisted = await options.beforeModelRequest?.(
-        copyBoundaryState(boundaryState), streamOptions?.signal,
-      )
-      const providerContext = persisted
-        ? { ...boundaryState, tools: [...persisted.tools] }
-        : boundaryState
       return options.streamFn(
-        providerContext.model,
+        boundaryState.model,
         {
-          systemPrompt: providerContext.systemPrompt,
-          messages: providerContext.messages,
-          tools: providerContext.tools,
+          systemPrompt: boundaryState.systemPrompt,
+          messages: boundaryState.messages,
+          tools: boundaryState.tools,
         },
         { signal: streamOptions?.signal, apiKey: streamOptions?.apiKey },
       ) as unknown as AssistantMessageEventStream

@@ -80,12 +80,10 @@ export function createAnalysisService(options: {
     },
     async beginToolBatch(input) {
       await options.toolProjectionRepository.beginToolBatch(input)
-      const operations = new Set(input.calls.map((call) => call.operationId).filter(Boolean))
-      if (!operations.size) return
-      const created = await options.eventRepository.listByExecution(input.executionId, 0)
-      for (const event of created) if (operations.has(event.operationId)) {
-        for (const listener of listeners.get(event.sessionId) ?? []) listener(event)
-      }
+    },
+    async startToolCall(input) {
+      const event = await options.toolProjectionRepository.startToolCall(input)
+      for (const listener of listeners.get(event.sessionId) ?? []) listener(event)
     },
     async completeToolBatch(input) {
       const events = await options.toolProjectionRepository.completeToolBatch({
@@ -100,7 +98,9 @@ export function createAnalysisService(options: {
           operationId: result.operationId,
           eventPayload: {
             type: 'tool_result', name: result.toolName, result: result.result,
-            isError: result.isError, operationId: result.operationId,
+            isError: result.isError, startedAt: result.startedAt,
+            completedAt: result.completedAt, completionOrder: result.completionOrder,
+            operationId: result.operationId,
           },
         })),
       })
@@ -130,7 +130,12 @@ export function createAnalysisService(options: {
     const result = await options.eventRepository.append({
       sessionId, executionId, operationId, event, projection, createdAt,
     })
-    if (result.created) for (const listener of listeners.get(sessionId) ?? []) listener(result.event)
+    if (result.created) {
+      for (const cancelled of result.cancelledToolEvents ?? []) {
+        for (const listener of listeners.get(sessionId) ?? []) listener(cancelled)
+      }
+      for (const listener of listeners.get(sessionId) ?? []) listener(result.event)
+    }
     return result.event
   }
   async function appendTrace(sessionId: string, executionId: string, payload: unknown) {
@@ -493,6 +498,9 @@ export function createAnalysisService(options: {
       event: { type: 'status', status: 'stopping', terminal: false, waitReason, at: createdAt },
       createdAt,
     })
+    for (const cancelled of event.cancelledToolEvents ?? []) {
+      for (const listener of listeners.get(session.id) ?? []) listener(cancelled)
+    }
     for (const listener of listeners.get(session.id) ?? []) listener(event)
     const controller = controllers.get(analysisId)
     controller?.abort()

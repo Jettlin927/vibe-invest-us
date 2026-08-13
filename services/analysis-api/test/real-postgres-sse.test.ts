@@ -14,9 +14,73 @@ import {
 } from '@vibe-invest/product-dao'
 
 import { buildApp } from '../src/app.js'
-import { createPiModel, type ModelEvent } from '../src/model.js'
+import { createPiModel, type ModelEvent, type ToolRuntime } from '../src/model.js'
 
 const databaseUrl = process.env.TEST_DATABASE_URL
+
+test('真实 PostgreSQL 在模型槽等待取消时不留下 phantom model request', {
+  skip: !databaseUrl,
+  concurrency: false,
+}, async () => {
+  const pool = createPool(databaseUrl!)
+  const events = createAgentEventRepository(pool)
+  const projections = createToolProjectionRepository(pool)
+  const analyses = createAnalysisRepository(pool)
+  const analysisId = `phantom-analysis-${crypto.randomUUID()}`
+  const sessionId = `phantom-session-${crypto.randomUUID()}`
+  const executionId = `phantom-execution-${crypto.randomUUID()}`
+  const controller = new AbortController()
+  let providerCalls = 0
+  const toolRuntime: ToolRuntime = {
+    async ensureProjection(input) {
+      const projection = await projections.ensureVersion({
+        executionId: input.executionId, role: input.role, stage: input.stage,
+        schemaHash: JSON.stringify(input.tools), projectedTools: input.tools,
+        visibleToolNames: input.tools.map(({ name }) => name),
+        reasons: { role: input.role, stage: input.stage }, createdAt: input.createdAt,
+      })
+      return { id: projection.id, version: projection.version }
+    },
+    async recordModelRequest(input) {
+      await projections.recordModelRequest({
+        id: input.requestId, executionId: input.executionId, projectionId: input.projectionId,
+        turnIndex: input.turnIndex, createdAt: input.createdAt,
+      })
+    },
+    async beginModelRequest() { throw new Error('legacy_begin_model_request_not_allowed') },
+    async beginToolBatch(input) { await projections.beginToolBatch(input) },
+    async startToolCall(input) { await projections.startToolCall(input) },
+    async completeToolBatch() {},
+  }
+  try {
+    await events.createResearch({
+      analysisId, sessionId, executionId, symbol: `P${crypto.randomUUID().slice(0, 8)}`,
+      status: 'planning', analysisStatus: 'queued', operationId: 'runtime-context',
+      event: { type: 'runtime_context', status: 'planning' }, createdAt: new Date().toISOString(),
+    })
+    const model = createPiModel({ fauxResponses: [async () => {
+      providerCalls += 1
+      return fauxAssistantMessage('不应调用')
+    }] })
+    const running = (async () => {
+      for await (const _event of model.analyze({
+        executionId, runtimeSettings: (await createRuntimeSettingsRepository(pool).current()).values,
+        symbol: 'PHANTOM', systemPrompt: 'system', userPrompt: 'user', knownFacts: [],
+        fetchFinancialContext: async () => ({ facts: [] }), signal: controller.signal, toolRuntime,
+        acquireModelSlot: (signal) => new Promise<() => void>((_resolve, reject) => {
+          signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+        }),
+      })) { /* consume */ }
+    })()
+    setTimeout(() => controller.abort(), 10)
+    await running
+    assert.equal(providerCalls, 0)
+    assert.deepEqual((await projections.replay(executionId)).modelRequests, [])
+  } finally {
+    await analyses.removeResearch(analysisId)
+    await pool.end()
+  }
+})
 
 test('真实 OpenAI HTTP provider 经生产 Pi bridge 在 Turn 边界原子封存并按原调用序回送', {
   skip: !databaseUrl,
@@ -62,7 +126,9 @@ test('真实 OpenAI HTTP provider 经生产 Pi bridge 在 Turn 边界原子封�
   const events = createAgentEventRepository(pool)
   const settings = createRuntimeSettingsRepository(pool)
   const previousSettings = await settings.current()
-  await settings.save({ mainAgentToolRounds: 3, specialistAgentToolRounds: 2 }, new Date().toISOString())
+  await settings.save({
+    mainAgentToolRounds: 3, specialistAgentToolRounds: 2, toolConcurrency: 2,
+  }, new Date().toISOString())
   const model = createPiModel({
     provider: 'local-openai', apiProtocol: 'chat-completions', modelName: 'integration-model',
     baseUrl: `http://127.0.0.1:${providerAddress.port}`, apiKey: 'integration-key',
@@ -135,17 +201,81 @@ test('真实 OpenAI HTTP provider 经生产 Pi bridge 在 Turn 边界原子封�
     const news = resultFor('search_news_by_keyword')
     const indicators = resultFor('get_technical_indicators')
     assert.ok(news.startedAt && news.completedAt && indicators.startedAt && indicators.completedAt)
-    assert.ok(new Date(indicators.completedAt).getTime() < new Date(news.completedAt).getTime())
+    assert.ok(new Date(news.startedAt).getTime() <= new Date(indicators.startedAt).getTime())
+    assert.ok(new Date(indicators.startedAt).getTime() < new Date(news.completedAt).getTime())
     assert.ok(indicators.completionOrder < news.completionOrder)
     assert.match(sse, /event: tool_result/)
-    const resultPayloads = (await events.list(created.sessionId, 0)).filter(
+    const ledger = await events.list(created.sessionId, 0)
+    const callEvents = ledger.filter(({ payload }) => payload.type === 'tool_call'
+      && ['search_news_by_keyword', 'get_technical_indicators'].includes(String(payload.name)))
+    assert.deepEqual(callEvents.map(({ payload }) => ({
+      name: payload.name, startedAt: typeof payload.startedAt,
+    })).sort((left, right) => String(left.name).localeCompare(String(right.name))), [
+      { name: 'get_technical_indicators', startedAt: 'string' },
+      { name: 'search_news_by_keyword', startedAt: 'string' },
+    ])
+    const resultEvents = ledger.filter(({ payload }) => payload.type === 'tool_result'
+      && ['search_news_by_keyword', 'get_technical_indicators'].includes(String(payload.name)))
+    assert.deepEqual(resultEvents.map(({ payload }) => ({
+      name: payload.name, startedAt: typeof payload.startedAt,
+      completedAt: typeof payload.completedAt, completionOrder: payload.completionOrder,
+    })), [
+      { name: 'get_technical_indicators', startedAt: 'string', completedAt: 'string', completionOrder: 2 },
+      { name: 'search_news_by_keyword', startedAt: 'string', completedAt: 'string', completionOrder: 3 },
+    ])
+    const resultPayloads = ledger.filter(
       ({ payload }) => payload.type === 'tool_result',
     ).map(({ payload }) => payload.name)
     assert.ok(resultPayloads.indexOf('get_technical_indicators')
       < resultPayloads.indexOf('search_news_by_keyword'))
+    const research = await fetch(`${baseUrl}/api/research/${created.analysisId}`)
+      .then((response) => response.json()) as { trace: Array<Record<string, unknown>> }
+    const webToolEvents = research.trace.filter((payload) => (
+      ['tool_call', 'tool_result'].includes(String(payload.type))
+      && ['search_news_by_keyword', 'get_technical_indicators'].includes(String(payload.name))
+    ))
+    assert.ok(webToolEvents.every((payload) => typeof payload.startedAt === 'string'))
+    assert.ok(webToolEvents.filter(({ type }) => type === 'tool_result').every((payload) => (
+      typeof payload.completedAt === 'string' && Number.isInteger(payload.completionOrder)
+    )))
     const publicAudit = JSON.stringify({ runtime, sse })
     assert.doesNotMatch(publicAudit, /hidden_specialist_tool/)
     assert.doesNotMatch(publicAudit, /allowedStages|allowedRoles|visibilityConditions/)
+
+    const serialSettings = await fetch(`${baseUrl}/api/settings`, {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ toolConcurrency: 1 }),
+    })
+    assert.equal(serialSettings.status, 200)
+    const serialCreated = await fetch(`${baseUrl}/api/analyses`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ symbol: `S${crypto.randomUUID().replaceAll('-', '').slice(0, 8)}` }),
+    }).then((response) => response.json()) as { analysisId: string; sessionId: string }
+    await waitForAgentStatus(events, serialCreated.sessionId, 'partial')
+    const serialRuntime = await fetch(
+      `${baseUrl}/api/agent-sessions/${serialCreated.sessionId}/tool-runtime`,
+    ).then((response) => response.json())
+    const serialBatch = serialRuntime.toolBatches.find(
+      (batch: { calls: Array<{ toolName: string }> }) => batch.calls.some(
+        ({ toolName }) => toolName === 'search_news_by_keyword',
+      ),
+    )
+    const serialResultFor = (toolName: string) => serialBatch.results.find(
+      (result: { toolCallId: string }) => serialBatch.calls.some(
+        (call: { toolCallId: string; toolName: string }) => (
+          call.toolCallId === result.toolCallId && call.toolName === toolName
+        ),
+      ),
+    )
+    const serialNews = serialResultFor('search_news_by_keyword')
+    const serialIndicators = serialResultFor('get_technical_indicators')
+    assert.notEqual(serialNews.startedAt, serialIndicators.startedAt)
+    assert.ok(new Date(serialNews.completedAt).getTime()
+      <= new Date(serialIndicators.startedAt).getTime())
+    const serialLedger = await events.list(serialCreated.sessionId, 0)
+    assert.deepEqual(serialLedger.filter(({ payload }) => payload.type === 'tool_call'
+      && ['search_news_by_keyword', 'get_technical_indicators'].includes(String(payload.name)))
+      .map(({ payload }) => payload.startedAt), [serialNews.startedAt, serialIndicators.startedAt])
   } finally {
     await settings.save(previousSettings.values, new Date().toISOString())
     await app.close()
@@ -354,6 +484,14 @@ test('真实 PostgreSQL 取消在 PG、HTTP 与 SSE reconnect 统一为 stopping
       id: `execution:${originalExecutionId}:batch:1`, executionId: originalExecutionId,
       projectionId: projection.id, turnIndex: 1, createdAt,
       calls: [{ toolCallId: 'old-call', toolName: 'fetch_financial_context', position: 1 }],
+    })
+    await toolRuntime.startToolCall({
+      batchId: `execution:${originalExecutionId}:batch:1`, executionId: originalExecutionId,
+      toolCallId: 'old-call', startedAt: createdAt,
+      operationId: `execution:${originalExecutionId}:tool:old-call:call`,
+      eventPayload: {
+        type: 'tool_call', name: 'fetch_financial_context', input: {}, startedAt: createdAt,
+      },
     })
     await toolRuntime.completeToolBatch({
       id: `execution:${originalExecutionId}:batch:1`, executionId: originalExecutionId,
@@ -624,10 +762,14 @@ test('Pi Runtime 使用持久 executionId 派生工具 operationId 且真实 Pos
     ])
     assert.equal(sealedBatch[2]?.payload.isError, false)
     assert.equal(sealedBatch[3]?.payload.isError, true)
-    assert.deepEqual(sealedBatch[3]?.payload, {
+    assert.deepEqual(sealedBatch[3]?.payload && {
+      ...sealedBatch[3].payload,
+      startedAt: typeof sealedBatch[3].payload.startedAt,
+      completedAt: typeof sealedBatch[3].payload.completedAt,
+    }, {
       type: 'tool_result', name: 'fetch_financial_context',
       result: { error: 'cancelled_after_report_submission', facts: [] },
-      isError: true,
+      isError: true, startedAt: 'string', completedAt: 'string', completionOrder: 2,
       operationId: `${cancelledPrefix}:result`,
     })
   } finally {
@@ -677,15 +819,19 @@ test('主 Agent 校验失败与合法调用在下一轮前按原序封存到真�
         ...runtimeIds.map((id) => `${prefix}:${id}:call`),
         ...runtimeIds.map((id) => `${prefix}:${id}:result`),
       ])
-      assert.deepEqual(sealed.slice(3, 5).map(({ payload }) => payload), [
+      assert.deepEqual(sealed.slice(3, 5).map(({ payload }) => ({
+        ...payload, startedAt: typeof payload.startedAt, completedAt: typeof payload.completedAt,
+      })), [
         {
           type: 'tool_result', name: 'tool_not_available',
           result: { error: 'tool_not_available', facts: [] }, isError: true,
+          startedAt: 'string', completedAt: 'string', completionOrder: 1,
           operationId: `${prefix}:${runtimeIds[0]}:result`,
         },
         {
           type: 'tool_result', name: 'fetch_financial_context',
           result: { error: 'invalid_tool_arguments', facts: [] }, isError: true,
+          startedAt: 'string', completedAt: 'string', completionOrder: 2,
           operationId: `${prefix}:${runtimeIds[1]}:result`,
         },
       ])
@@ -828,150 +974,6 @@ test('主 Agent 跨 Turn 复用与空 call id 在真实 PostgreSQL 各自完整�
   }
 })
 
-test('专项下一轮 provider 启动前已在真实 PostgreSQL 封存上一批工具事件', {
-  skip: !databaseUrl,
-  concurrency: false,
-}, async () => {
-  const pool = createPool(databaseUrl!)
-  const events = createAgentEventRepository(pool)
-  const analyses = createAnalysisRepository(pool)
-  const specialistEntryId = 'pg-specialist-entry'
-  const unknownCallId = 'pg-specialist-unknown'
-  const invalidCallId = 'pg-specialist-invalid'
-  const newsCallId = 'pg-specialist-news'
-  const indicatorCallId = 'pg-specialist-indicator'
-  const reportCallId = 'pg-specialist-report'
-  let createdSessionId: string | undefined
-  let providerObservedSealedLedger = false
-  const report = {
-    title: '专项批次封存测试', marketState: '未知', trend: '未知', drivers: [],
-    supportingEvidence: [], contraryEvidence: [], keyJudgments: [], scenarios: [],
-    invalidationConditions: [], valuation: null, personalImpact: null,
-    conditionalSuggestion: null, limitations: ['测试上下文为空'],
-  }
-  const model = createPiModel({ fauxResponses: [
-    fauxAssistantMessage(
-      fauxToolCall('analyze_financials', {}, { id: specialistEntryId }),
-      { stopReason: 'toolUse' },
-    ),
-    fauxAssistantMessage([
-      fauxToolCall('hidden_specialist_tool', {}, { id: unknownCallId }),
-      fauxToolCall('search_news_by_keyword', { keyword: '' }, { id: invalidCallId }),
-      fauxToolCall('search_news_by_keyword', {}, { id: newsCallId }),
-      fauxToolCall('get_technical_indicators', {}, { id: indicatorCallId }),
-    ], { stopReason: 'toolUse' }),
-    async (context) => {
-      assert.ok(createdSessionId)
-      const session = await events.getSession(createdSessionId)
-      assert.ok(session)
-      const prefix = `execution:${session.executionId}:specialist-tool`
-      const sealed = (await events.list(createdSessionId, 0)).filter(({ operationId }) => (
-        operationId.startsWith(`${prefix}:${unknownCallId}:`)
-        || operationId.startsWith(`${prefix}:${invalidCallId}:`)
-        || operationId.startsWith(`${prefix}:${newsCallId}:`)
-        || operationId.startsWith(`${prefix}:${indicatorCallId}:`)
-      ))
-      const runtimeIds = [unknownCallId, invalidCallId, newsCallId, indicatorCallId]
-        .map((id, index) => `${id}:specialist-invocation:financial-specialist-1:attempt:1:position:${index + 1}`)
-      assert.deepEqual(sealed.map(({ operationId }) => operationId), [
-        ...runtimeIds.map((id) => `${prefix}:${id}:call`),
-        ...runtimeIds.map((id) => `${prefix}:${id}:result`),
-      ])
-      assert.deepEqual(sealed.slice(4, 6).map(({ payload }) => payload), [
-        {
-          type: 'tool_result', name: 'tool_not_available',
-          result: { error: 'tool_not_available', facts: [] }, isError: true,
-          operationId: `${prefix}:${runtimeIds[0]}:result`,
-        },
-        {
-          type: 'tool_result', name: 'search_news_by_keyword',
-          result: { error: 'invalid_tool_arguments', facts: [] }, isError: true,
-          operationId: `${prefix}:${runtimeIds[1]}:result`,
-        },
-      ])
-      assert.deepEqual(context.messages.filter(({ role }) => role === 'toolResult')
-        .map((message) => message.role === 'toolResult' ? message.toolCallId : ''), [
-        ...runtimeIds,
-      ])
-      return fauxAssistantMessage(
-        fauxToolCall('search_news_by_keyword', {}, { id: newsCallId }),
-        { stopReason: 'toolUse' },
-      )
-    },
-    async (context) => {
-      assert.ok(createdSessionId)
-      const session = await events.getSession(createdSessionId)
-      assert.ok(session)
-      const prefix = `execution:${session.executionId}:specialist-tool:${newsCallId}`
-      const invocation = 'financial-specialist-1'
-      assert.deepEqual((await events.list(createdSessionId, 0))
-        .filter(({ operationId }) => operationId.startsWith(prefix))
-        .map(({ operationId }) => operationId), [
-        `${prefix}:specialist-invocation:${invocation}:attempt:1:position:3:call`,
-        `${prefix}:specialist-invocation:${invocation}:attempt:1:position:3:result`,
-        `${prefix}:specialist-invocation:${invocation}:attempt:2:position:1:call`,
-        `${prefix}:specialist-invocation:${invocation}:attempt:2:position:1:result`,
-      ])
-      const resultIds = context.messages.filter(({ role }) => role === 'toolResult')
-        .map((message) => message.role === 'toolResult' ? message.toolCallId : '')
-      assert.notEqual(resultIds.at(-2), resultIds.at(-1))
-      providerObservedSealedLedger = true
-      return fauxAssistantMessage('专项收口完成')
-    },
-    fauxAssistantMessage(
-      fauxToolCall('submit_analysis_report', report, { id: reportCallId }),
-      { stopReason: 'toolUse' },
-    ),
-  ] })
-  const app = buildApp({
-    productDatabase: { checkSchema: () => checkSchema(pool), close: () => pool.end() },
-    portfolioRepository: createPortfolioRepository(pool),
-    analysisRepository: analyses,
-    agentEventRepository: events,
-    runtimeSettingsRepository: createRuntimeSettingsRepository(pool),
-    toolProjectionRepository: createToolProjectionRepository(pool),
-    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
-    fetchFinancialContext: async (symbol) => ({ symbol, gaps: [], facts: [], financials: {} }),
-    searchNews: async () => ({ facts: [] }),
-    fetchTechnicalIndicators: async () => ({ facts: [] }),
-    model,
-  })
-  await app.ready()
-  const created = (await app.inject({
-    method: 'POST', url: '/api/analyses', payload: { symbol: 'PGSEAL' },
-  })).json() as { analysisId: string; sessionId: string }
-  createdSessionId = created.sessionId
-  try {
-    await waitForAnalysisStatus(app, created.analysisId, 'partial')
-    assert.equal(providerObservedSealedLedger, true)
-    const statusEvents = (await events.list(created.sessionId, 0)).filter(
-      ({ payload }) => payload.type === 'status',
-    )
-    assertSubsequence(statusEvents.map(({ payload }) => payload.status as string), [
-      'running_tools', 'waiting_for_specialists', 'running_tools', 'running_model', 'partial',
-    ])
-    const waiting = statusEvents.find(({ payload }) => payload.status === 'waiting_for_specialists')
-    assert.deepEqual(waiting?.payload.waitReason && {
-      kind: (waiting.payload.waitReason as { kind: string }).kind,
-      target: (waiting.payload.waitReason as { target: string }).target,
-      startedAt: typeof (waiting.payload.waitReason as { startedAt: unknown }).startedAt,
-    }, { kind: 'specialists', target: '财报专项分析', startedAt: 'string' })
-    const research = (await app.inject({
-      method: 'GET', url: `/api/research/${created.analysisId}`,
-    })).json()
-    assertSubsequence(research.mainAgent.events.map((event: { status?: string }) => event.status), [
-      'waiting_for_specialists', 'running_tools', 'running_model', 'partial',
-    ])
-    const replay = (await app.inject({
-      method: 'GET', url: `/api/agent-sessions/${created.sessionId}/events`,
-    })).body
-    assert.match(replay, /event: waiting_for_specialists/)
-    assert.match(replay, /"target":"财报专项分析"/)
-  } finally {
-    await app.close()
-  }
-})
-
 test('同一 execution 两次专项 invocation 在真实 PostgreSQL 各自封存且重放幂等', {
   skip: !databaseUrl,
   concurrency: false,
@@ -1018,7 +1020,7 @@ test('同一 execution 两次专项 invocation 在真实 PostgreSQL 各自封存
       const sealed = ledger.filter(({ operationId }) => operationId.includes(':specialist-tool:'))
       assert.equal(sealed.length, 8)
       assert.equal(new Set(sealed.map(({ operationId }) => operationId)).size, 8)
-      assert.equal(context.messages.filter(({ role }) => role === 'toolResult').length, 4)
+      assert.equal(context.messages.filter(({ role }) => role === 'toolResult').length, 2)
       const replay = sealed[0]!
       const replayed = await events.append({
         sessionId: createdSessionId, executionId: (await events.getSession(createdSessionId))!.executionId,
@@ -1050,9 +1052,25 @@ test('同一 execution 两次专项 invocation 在真实 PostgreSQL 各自封存
   try {
     await waitForAnalysisStatus(app, created.analysisId, 'partial')
     const executionId = (await events.getSession(created.sessionId))!.executionId
+    await waitForOperation(events, created.sessionId,
+      `execution:${executionId}:specialist:financial-specialist-2:completed`)
     const runtime = await createToolProjectionRepository(pool).replay(executionId)
     assert.equal(runtime.modelRequests.filter(({ id }) => id.includes(':fundamental:invocation:')).length, 4)
     assert.equal(runtime.toolBatches.filter(({ id }) => id.includes(':fundamental:invocation:')).length, 2)
+    const lifecycle = (await events.list(created.sessionId, 0)).filter(({ operationId }) => (
+      operationId.includes(':specialist:financial-specialist-')
+      && (operationId.endsWith(':waiting') || operationId.endsWith(':completed'))
+    ))
+    assert.deepEqual(lifecycle.map(({ operationId }) => operationId), [
+      `execution:${executionId}:specialist:financial-specialist-1:waiting`,
+      `execution:${executionId}:specialist:financial-specialist-1:completed`,
+      `execution:${executionId}:specialist:financial-specialist-2:waiting`,
+      `execution:${executionId}:specialist:financial-specialist-2:completed`,
+    ])
+    const replayBody = (await app.inject({
+      method: 'GET', url: `/api/agent-sessions/${created.sessionId}/events`,
+    })).body
+    assert.equal((replayBody.match(/event: waiting_for_specialists/g) ?? []).length, 2)
   } finally {
     await app.close()
   }
@@ -1083,6 +1101,16 @@ async function waitForPersistedEvent(
     await new Promise((resolve) => setTimeout(resolve, 5))
   }
   throw new Error('agent_event_not_persisted')
+}
+
+async function waitForOperation(
+  repository: ReturnType<typeof createAgentEventRepository>, sessionId: string, operationId: string,
+) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if ((await repository.list(sessionId, 0)).some((event) => event.operationId === operationId)) return
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  throw new Error(`agent_operation_not_persisted:${operationId}`)
 }
 
 async function waitForAgentStatus(

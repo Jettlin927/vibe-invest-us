@@ -525,7 +525,16 @@ function TraceSummary({ trace }: { trace: Array<Record<string, unknown>> }) {
   const capabilities = Array.isArray(financialContext?.capabilities)
     ? financialContext.capabilities.map(asRecord)
     : []
-  return <aside className="trace-panel"><p className="micro">分析轨迹</p>{stages.map(([type, label], index) => { const entries = trace.filter((entry) => entry.type === type); const count = entries.length; const expandable = type === 'financial_context' && capabilities.length > 0; return expandable ? <details className="trace-stage" key={type}><summary><i>{index + 1}</i><span>{label}</span><small>{count} 次</small></summary><div className="source-diagnostics">{capabilities.map((capability) => <CapabilityTrace key={String(capability.capability)} capability={capability} />)}</div></details> : <div key={type}><i>{index + 1}</i><span>{label}</span><small>{count ? `${count} 次` : '无'}</small></div> })}<details><summary>开发者信息</summary><p>底层共保存 {trace.length} 条原始事件，用于排查和审计；此处不逐条渲染模型 token。</p></details></aside>
+  return <aside className="trace-panel"><p className="micro">分析轨迹</p>{stages.map(([type, label], index) => { const entries = trace.filter((entry) => entry.type === type); const count = entries.length; const expandable = (type === 'financial_context' && capabilities.length > 0) || ((type === 'tool_call' || type === 'tool_result') && count > 0); return expandable ? <details className="trace-stage" key={type}><summary><i>{index + 1}</i><span>{label}</span><small>{count} 次</small></summary>{type === 'financial_context' ? <div className="source-diagnostics">{capabilities.map((capability) => <CapabilityTrace key={String(capability.capability)} capability={capability} />)}</div> : <ToolTrace entries={entries} />}</details> : <div key={type}><i>{index + 1}</i><span>{label}</span><small>{count ? `${count} 次` : '无'}</small></div> })}<details><summary>开发者信息</summary><p>底层共保存 {trace.length} 条原始事件，用于排查和审计；此处不逐条渲染模型 token。</p></details></aside>
+}
+
+function ToolTrace({ entries }: { entries: Array<Record<string, unknown>> }) {
+  return <ol className="tool-timing-list">{entries.map((entry, index) => {
+    const startedAt = typeof entry.startedAt === 'string' ? entry.startedAt : null
+    const completedAt = typeof entry.completedAt === 'string' ? entry.completedAt : null
+    const duration = startedAt && completedAt ? Math.max(0, new Date(completedAt).getTime() - new Date(startedAt).getTime()) : null
+    return <li key={`${String(entry.name)}-${String(entry.completionOrder ?? index)}`}><strong>{String(entry.name ?? '工具')}</strong>{startedAt && <span>开始 {formatTime(startedAt)}</span>}{completedAt && <span>完成 {formatTime(completedAt)}</span>}{duration !== null && <small>耗时 {duration.toLocaleString('zh-CN')} 毫秒 · 完成序 #{String(entry.completionOrder)}</small>}</li>
+  })}</ol>
 }
 
 function CapabilityTrace({ capability }: { capability: Record<string, unknown> }) {

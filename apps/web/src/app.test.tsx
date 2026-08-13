@@ -176,7 +176,11 @@ test('用户创建分析并打开研究记录后能看到报告依据', async ()
         { id: 'fact-1', type: 'quote', value: 217.5, observedAt: '2026-08-12T13:48:38Z', source: 'sina', sourceReference: 'https://example.com' },
         { id: 'valuation-1', type: 'valuation', value: { methods: { pe: { multiple: 70.28 } }, historical_ranges: { pe: [30.74, 56.58] } }, observedAt: '2026-08-12T13:48:38Z', source: 'yahoo-timeseries', sourceReference: 'https://example.com' },
       ],
-      trace: [{ type: 'status', status: 'completed' }],
+      trace: [
+        { type: 'tool_call', name: 'search_news_by_keyword', startedAt: '2026-08-12T13:48:38.000Z' },
+        { type: 'tool_result', name: 'search_news_by_keyword', startedAt: '2026-08-12T13:48:38.000Z', completedAt: '2026-08-12T13:48:38.125Z', completionOrder: 1 },
+        { type: 'status', status: 'completed' },
+      ],
     })
     throw new Error(`unexpected_fetch:${url}`)
   }
@@ -193,6 +197,10 @@ test('用户创建分析并打开研究记录后能看到报告依据', async ()
   await view.findByText('未来一至四周偏强')
   await view.findByText('PE 区间支持当前价格')
   await waitFor(() => assert.ok(view.getByText('偏强震荡')))
+  await user.click(view.getByText('调用只读工具'))
+  assert.ok(view.getAllByText(/开始/).some((item) => /2026/.test(item.textContent ?? '')))
+  await user.click(view.getByText('工具返回事实'))
+  await view.findByText('耗时 125 毫秒 · 完成序 #1')
 })
 
 test('新建分析页展示分析历史并能重新打开报告', async () => {

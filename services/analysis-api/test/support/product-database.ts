@@ -447,6 +447,24 @@ export function createTestProductDatabase() {
     async beginToolBatch(input) {
       toolBatches.set(input.id, { ...structuredClone(input), status: 'running', results: [] })
     },
+    async startToolCall(input) {
+      const batch = toolBatches.get(input.batchId)
+      if (!batch || batch.executionId !== input.executionId || batch.status !== 'running'
+        || !batch.calls.some(({ toolCallId }) => toolCallId === input.toolCallId)) {
+        throw new Error('tool_call_not_running')
+      }
+      const session = [...agentSessions.values()].find(({ executionId }) => executionId === input.executionId)
+      if (!session) throw new Error('agent_session_not_found')
+      const existing = agentEvents.get(session.id) ?? []
+      const prior = existing.find(({ operationId }) => operationId === input.operationId)
+      if (prior) return structuredClone(prior)
+      const event = {
+        sessionId: session.id, sequence: existing.length + 1, operationId: input.operationId,
+        payload: structuredClone(input.eventPayload), createdAt: input.startedAt,
+      }
+      agentEvents.set(session.id, [...existing, event])
+      return structuredClone(event)
+    },
     async completeToolBatch(input) {
       const batch = toolBatches.get(input.id)
       if (!batch) throw new Error('tool_batch_not_found')
@@ -504,7 +522,7 @@ export function createTestProductDatabase() {
 
   return {
     productDatabase: {
-      checkSchema: async () => ({ status: 'ok' as const, version: 14 }),
+      checkSchema: async () => ({ status: 'ok' as const, version: 15 }),
       close: async () => {},
     },
     portfolioRepository,

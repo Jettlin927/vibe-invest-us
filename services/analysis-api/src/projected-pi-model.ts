@@ -77,12 +77,15 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
         return frozenContext
       }
 
-      const withMainToolSlot = async <T>(name: string, run: (signal: AbortSignal) => Promise<T>) => {
+      const withMainToolSlot = async <T>(
+        name: string, onStart: () => Promise<void>, run: (signal: AbortSignal) => Promise<T>,
+      ) => {
         const owner = await acquireActiveSlot({
           acquire: () => acquireToolSlot(input, toolGate, executionSignal),
           activeBudget, signal: executionSignal,
         })
         try {
+          await onStart()
           return await run(AbortSignal.any([
             owner.signal, AbortSignal.timeout(options.toolTimeoutMs ?? 5_000),
           ]))
@@ -118,12 +121,12 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
         onPolicyFailure: (error) => { policyFailure ??= error },
         modelGate, toolGate, provider, queue, initialTools: analysisModelTools,
         systemPrompt: input.systemPrompt, userPrompt: input.userPrompt,
-        execute: async (name, params, signal) => {
-          if (name === unavailableToolName) return failed('tool_not_available')
+        execute: async (name, params, signal, onStart) => {
+          if (name === unavailableToolName) { await onStart(); return failed('tool_not_available') }
           if (name === 'fetch_financial_context') {
             const symbol = stringParam(params, 'symbol') || input.symbol
             try {
-              return succeeded(await withMainToolSlot(name, async (toolSignal) => (
+              return succeeded(await withMainToolSlot(name, onStart, async (toolSignal) => (
                 toolRegistry.handler(name)!(params, {
                   loadFinancialContext: async () => {
                     if (symbol.trim().toUpperCase() !== input.symbol.trim().toUpperCase()) {
@@ -141,9 +144,10 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
           }
           if (name === 'analyze_financials') {
             const symbol = stringParam(params, 'symbol') || input.symbol
+            const invocationId = `financial-specialist-${++specialistInvocation}`
             let financialContext: Awaited<ReturnType<AnalyzeInput['fetchFinancialContext']>>
             try {
-              financialContext = await withMainToolSlot(name, async (toolSignal) => {
+              financialContext = await withMainToolSlot(name, onStart, async (toolSignal) => {
                 if (symbol.trim().toUpperCase() !== input.symbol.trim().toUpperCase()) {
                   throw new Error('tool_symbol_not_allowed')
                 }
@@ -156,13 +160,13 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
             } catch (error) { return failedMainTool(name, error) }
             queue.push({
               type: 'lifecycle', status: 'waiting_for_specialists',
-              operationId: `execution:${input.executionId}:specialist:waiting`,
+              operationId: `execution:${input.executionId}:specialist:${invocationId}:waiting`,
               waitTarget: '财报专项分析',
             })
             const specialist = await toolRegistry.handler(name)!(params, {
               runFinancialSpecialist: async () => runProjectedAgent({
                 role: 'fundamental', input, options, settings, executionSignal: agentSignal, activeBudget,
-                invocationId: `financial-specialist-${++specialistInvocation}`,
+                invocationId,
                 onPolicyFailure: (error) => { policyFailure ??= error },
                 modelGate, toolGate, provider, queue,
                 initialTools: projectedSpecialistTools(input),
@@ -171,20 +175,22 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
                   symbol: input.symbol, financials: financialContext.financials ?? null,
                   facts: financialContext.facts,
                 }),
-                execute: (toolName, toolParams, toolSignal) => executeSpecialistTool(
-                  toolName, toolParams, toolSignal, input, options, settings, activeBudget, toolGate,
+                execute: (toolName, toolParams, toolSignal, toolStart) => executeSpecialistTool(
+                  toolName, toolParams, toolSignal, toolStart,
+                  input, options, settings, activeBudget, toolGate,
                 ),
               }),
             }) as Awaited<ReturnType<typeof runProjectedAgent>>
             queue.push({
               type: 'lifecycle', status: 'running_tools',
-              operationId: `execution:${input.executionId}:specialist:completed`,
+              operationId: `execution:${input.executionId}:specialist:${invocationId}:completed`,
             })
             for (const fact of specialist.facts) knownFactIds.add(fact.id)
             return succeeded({ analysis: specialist.text, facts: specialist.facts })
           }
           if (name === 'submit_analysis_report') {
             try {
+              await onStart()
               return await toolRegistry.handler(name)!(params, {
                 submitAnalysisReport: async (submitted) => {
                   const report = normalizeReport(submitted)
@@ -230,7 +236,9 @@ async function runProjectedAgent(config: {
   provider: ReturnType<typeof createProviderRuntime>; queue: ReturnType<typeof createAsyncQueue<ModelEvent>>
   initialTools: Tool[]; systemPrompt: string; userPrompt: string
   invocationId?: string
-  execute: (name: string, params: unknown, signal: AbortSignal) => Promise<ExecutedTool>
+  execute: (
+    name: string, params: unknown, signal: AbortSignal, onStart: () => Promise<void>,
+  ) => Promise<ExecutedTool>
   onPolicyFailure: (error: Error) => void
 }) {
   const { input } = config
@@ -249,6 +257,7 @@ async function runProjectedAgent(config: {
   let finalUsage: unknown
   let finalStopReason: string | undefined
   let requestPolicyFailure: Error | undefined
+  let toolAuditFailure: Error | undefined
   let lastAssistantHadCalls = false
   let modelEventIndex = 0
   let textDeltaIndex = 0
@@ -258,7 +267,20 @@ async function runProjectedAgent(config: {
 
   const projectedTools = () => [
     ...visibleTools.map((definition) => toAdapterTool(definition, async (callId, params, signal) => {
-      const startedAt = new Date().toISOString()
+      let startedAt: string | undefined
+      let startTask: Promise<void> | undefined
+      const start = async () => {
+        startTask ??= (async () => {
+          const value = new Date().toISOString()
+          await persistToolCallStart(callId, value)
+          startedAt = value
+          callStartedAt.set(callId, value)
+        })().catch((error) => {
+          toolAuditFailure ??= error instanceof Error ? error : new Error(String(error))
+          throw error
+        })
+        await startTask
+      }
       let executed: ExecutedTool
       let validatedParams = params
       try {
@@ -266,7 +288,7 @@ async function runProjectedAgent(config: {
           type: 'toolCall', id: callId, name: definition.name,
           arguments: params as Record<string, unknown>,
         })
-      } catch { executed = failed('invalid_tool_arguments') }
+      } catch { await start(); executed = failed('invalid_tool_arguments') }
       if (executed!) { /* validation failure is already normalized */ }
       else if (completedReport) executed = {
         ...failed('cancelled_after_report_submission'), terminate: true,
@@ -280,14 +302,16 @@ async function runProjectedAgent(config: {
         executed = failed('research_active_timeout')
       }
       else try { executed = await config.execute(
-        definition.name, validatedParams, signal ?? config.executionSignal,
+        definition.name, validatedParams, signal ?? config.executionSignal, start,
       ) }
       catch (error) { executed = failed(error instanceof Error ? error.message : String(error)) }
+      await start()
       const isCancelled = config.executionSignal.aborted || input.signal?.aborted
       const status: ToolStatus = isCancelled ? 'cancelled' : executed.isError ? 'failed' : 'completed'
       const audit: ToolAudit = {
-        toolCallId: callId, toolName: definition.name, status, startedAt,
-        completedAt: new Date().toISOString(), completionOrder: ++completionOrder,
+        toolCallId: callId, toolName: definition.name, status, startedAt: startedAt!,
+        completedAt: executed.completedAt ?? new Date().toISOString(),
+        completionOrder: ++completionOrder,
         result: executed.result, isError: status !== 'completed',
         operationId: toolOperationId(config.role, input.executionId, callId, 'result'),
       }
@@ -303,6 +327,8 @@ async function runProjectedAgent(config: {
       parameters: { type: 'object', additionalProperties: true },
     } as Tool, async (callId) => {
       const now = new Date().toISOString()
+      callStartedAt.set(callId, now)
+      await persistToolCallStart(callId, now)
       const audit: ToolAudit = {
         toolCallId: callId, toolName: unavailableToolName, status: 'failed',
         startedAt: now, completedAt: now, completionOrder: ++completionOrder,
@@ -313,6 +339,22 @@ async function runProjectedAgent(config: {
       return { content: [{ type: 'text', text: JSON.stringify(audit.result) }], details: { audit } }
     }),
   ]
+
+  const persistToolCallStart = async (toolCallId: string, startedAt: string) => {
+    const call = currentBatch?.calls.find((candidate) => candidate.toolCallId === toolCallId)
+    if (!currentBatch || !call) throw new Error('tool_call_not_in_batch')
+    const operationId = toolOperationId(config.role, input.executionId, call.toolCallId, 'call')
+    await input.toolRuntime!.startToolCall({
+      batchId: currentBatch.id, executionId: input.executionId,
+      toolCallId: call.toolCallId, startedAt, operationId,
+      eventPayload: {
+        type: 'tool_call', name: call.toolName, input: call.input, startedAt, operationId,
+      },
+    })
+    config.queue.push(trace({
+      type: 'tool_call', name: call.toolName, input: call.input, startedAt, operationId,
+    }))
+  }
 
   const prepareProjection = async (tools: Tool[]) => {
     visibleTools = [...tools]
@@ -346,7 +388,9 @@ async function runProjectedAgent(config: {
       left.completionOrder - right.completionOrder
     ))) config.queue.push(trace({
       type: 'tool_result', name: result.toolName, result: result.result,
-      isError: result.isError, operationId: result.operationId,
+      isError: result.isError, startedAt: result.startedAt,
+      completedAt: result.completedAt, completionOrder: result.completionOrder,
+      operationId: result.operationId,
     }))
     currentBatch = undefined
   }
@@ -360,6 +404,23 @@ async function runProjectedAgent(config: {
     streamFn: async (model, context, streamOptions) => {
       const request = await beginBudgetedModelRequest(config, config.role === 'fundamental')
       try {
+        turnIndex += 1
+        const roleScope = config.invocationId
+          ? `${config.role}:invocation:${encodeURIComponent(config.invocationId)}` : config.role
+        const requestId = `execution:${input.executionId}:${roleScope}:model-attempt:${turnIndex}`
+        await input.toolRuntime!.recordModelRequest({
+          requestId, executionId: input.executionId, projectionId: activeProjection.id,
+          turnIndex, createdAt: new Date().toISOString(),
+        })
+        config.queue.push(trace({
+          type: 'tool_projection', projectionId: activeProjection.id, version: activeProjection.version,
+          visibleToolNames: visibleTools.map(({ name }) => name),
+          operationId: `${requestId}:tool-projection`,
+        }))
+        config.queue.push({
+          type: 'lifecycle', status: stage === 'finalization' ? 'finalizing' : 'running_model',
+          operationId: `${requestId}:running-model`,
+        })
         const stream = await config.provider.streamFn(model, {
           ...context, tools: visibleTools.map((tool) => ({ ...tool, label: tool.name } as PiAgentAdapterTool)),
         }, { ...streamOptions, signal: request.signal })
@@ -372,26 +433,6 @@ async function runProjectedAgent(config: {
           return normalized
         })
       } catch (error) { request.finish(); throw error }
-    },
-    beforeModelRequest: async ({ tools }) => {
-      turnIndex += 1
-      const roleScope = config.invocationId
-        ? `${config.role}:invocation:${encodeURIComponent(config.invocationId)}` : config.role
-      const requestId = `execution:${input.executionId}:${roleScope}:model-attempt:${turnIndex}`
-      await input.toolRuntime!.recordModelRequest({
-        requestId, executionId: input.executionId, projectionId: activeProjection.id,
-        turnIndex, createdAt: new Date().toISOString(),
-      })
-      config.queue.push(trace({
-        type: 'tool_projection', projectionId: activeProjection.id, version: activeProjection.version,
-        visibleToolNames: visibleTools.map(({ name }) => name),
-        operationId: `${requestId}:tool-projection`,
-      }))
-      config.queue.push({
-        type: 'lifecycle', status: stage === 'finalization' ? 'finalizing' : 'running_model',
-        operationId: `${requestId}:running-model`,
-      })
-      return { tools }
     },
     afterToolCall: async ({ result, isError }) => ({
       isError: Boolean((result.details as { audit?: ToolAudit } | undefined)?.audit?.isError ?? isError),
@@ -470,23 +511,12 @@ async function runProjectedAgent(config: {
       completionOrder = 0
       await input.toolRuntime!.beginToolBatch({
         id: batch.id, executionId: input.executionId, projectionId: activeProjection.id,
-        turnIndex, calls: batch.calls.map((call) => ({
-          ...call,
-          operationId: toolOperationId(config.role, input.executionId, call.toolCallId, 'call'),
-          eventPayload: { type: 'tool_call', name: call.toolName, input: call.input },
-        })), createdAt: new Date().toISOString(),
+        turnIndex, calls: batch.calls, createdAt: new Date().toISOString(),
       })
       config.queue.push({
         type: 'lifecycle', status: 'running_tools',
         operationId: `${batch.id}:running-tools`,
       })
-      for (const call of batch.calls) config.queue.push(trace({
-        type: 'tool_call', name: call.toolName, input: call.input,
-        operationId: toolOperationId(config.role, input.executionId, call.toolCallId, 'call'),
-      }))
-    }
-    if (event.type === 'tool_execution_start') {
-      callStartedAt.set(event.toolCallId, new Date().toISOString())
     }
     if (event.type === 'tool_execution_end' && currentBatch
       && !currentBatch.results.has(event.toolCallId)) {
@@ -501,6 +531,7 @@ async function runProjectedAgent(config: {
       })
     }
     if (event.type === 'turn_end' && currentBatch) {
+      if (toolAuditFailure) throw toolAuditFailure
       await completeCurrentBatch()
     }
   })
@@ -524,6 +555,7 @@ async function runProjectedAgent(config: {
   const snapshot = adapter.snapshot()
   adapter.dispose()
   if (requestPolicyFailure) throw requestPolicyFailure
+  if (toolAuditFailure) throw toolAuditFailure
   if (snapshot.errorMessage) throw new Error(snapshot.errorMessage)
   const facts = snapshot.messages.filter((message) => message.role === 'toolResult')
     .flatMap((message) => parseFacts(message))
@@ -535,14 +567,15 @@ async function runProjectedAgent(config: {
 
 type ExecutedTool = {
   result: Record<string, unknown>; isError: boolean; terminate?: boolean; report?: AnalysisReport
+  completedAt?: string
 }
 
 async function executeSpecialistTool(
-  name: string, params: unknown, signal: AbortSignal, input: AnalyzeInput,
+  name: string, params: unknown, signal: AbortSignal, onStart: () => Promise<void>, input: AnalyzeInput,
   options: ModelOptions, settings: RuntimeSettings, activeBudget: ActiveBudget,
   toolGate: ReturnType<typeof createConcurrencyGate>,
 ): Promise<ExecutedTool> {
-  if (name === unavailableToolName) return failed('tool_not_available')
+  if (name === unavailableToolName) { await onStart(); return failed('tool_not_available') }
   const owner = await acquireActiveSlot({
     acquire: () => acquireToolSlot(input, toolGate, signal), activeBudget, signal,
     onStart: () => options.log?.({
@@ -552,31 +585,41 @@ async function executeSpecialistTool(
       type: 'tool_request_end', executionId: input.executionId, toolName: name,
     }),
   })
+  let executed: ExecutedTool
   try {
+    await onStart()
     if (name === 'search_news_by_keyword') {
-      if (!input.searchNews) return failed('tool_not_available')
+      if (!input.searchNews) executed = failed('tool_not_available')
+      else {
       const keyword = stringParam(params, 'keyword') || input.symbol
-      return succeeded(await toolRegistry.handler(name)!(params, {
+      executed = succeeded(await toolRegistry.handler(name)!(params, {
         searchNews: async () => input.searchNews!(
           keyword, toolSignal(options, settings, owner.signal),
         ),
       }))
+      }
     }
-    if (name === 'get_technical_indicators') {
-      if (!input.fetchTechnicalIndicators) return failed('tool_not_available')
+    else if (name === 'get_technical_indicators') {
+      if (!input.fetchTechnicalIndicators) executed = failed('tool_not_available')
+      else {
       const symbol = stringParam(params, 'symbol') || input.symbol
       const endDate = stringParam(params, 'endDate') || new Date().toISOString().slice(0, 10)
       const startDate = stringParam(params, 'startDate') || oneYearBefore(endDate)
-      return succeeded(await toolRegistry.handler(name)!(params, {
+      executed = succeeded(await toolRegistry.handler(name)!(params, {
         fetchTechnicalIndicators: async () => input.fetchTechnicalIndicators!(
           symbol, startDate, endDate, toolSignal(options, settings, owner.signal),
         ),
       }))
+      }
     }
-    return failed('tool_not_available')
+    else executed = failed('tool_not_available')
   } catch (error) {
-    return failed(error instanceof Error ? error.message : String(error))
-  } finally { owner.finish() }
+    executed = failed(error instanceof Error ? error.message : String(error))
+  } finally {
+    executed!.completedAt = new Date().toISOString()
+    owner.finish()
+  }
+  return executed!
 }
 
 function createProviderRuntime(options: ModelOptions) {

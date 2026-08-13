@@ -17,6 +17,10 @@
 .source-diagnostics ul { margin: 5px 0 10px; padding: 0; list-style: none; }
 .source-diagnostics li { display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; padding: 5px 0; border-top: 1px dotted #d8d1c4; }
 .source-diagnostics li small { grid-column: 1 / -1; overflow-wrap: anywhere; }
+.tool-timing-list { display: grid; gap: 7px; margin: 0; padding: 8px 0 12px 22px; border-bottom: 1px solid #d8d1c4; list-style: none; }
+.tool-timing-list li { display: grid; gap: 2px; padding: 7px 0; border-top: 1px dotted #d8d1c4; }
+.tool-timing-list strong { color: #211d18; overflow-wrap: anywhere; }
+.tool-timing-list span, .tool-timing-list small { color: #756d64; }
 .source-ok { color: #3a7c49; }
 .source-empty,
 .source-failed { color: #9b3e31; }
