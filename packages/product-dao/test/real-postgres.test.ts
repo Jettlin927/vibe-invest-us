@@ -23,6 +23,8 @@ test('真实 PostgreSQL 持久化 Tool Projection 版本、模型请求与批次
   const analysisId = `projection-${crypto.randomUUID()}`
   const sessionId = `projection-session-${crypto.randomUUID()}`
   const executionId = `projection-execution-${crypto.randomUUID()}`
+  const otherAnalysisId = `projection-other-${crypto.randomUUID()}`
+  const otherExecutionId = `projection-other-execution-${crypto.randomUUID()}`
   try {
     await events.createResearch({
       analysisId, sessionId, executionId, symbol: `P${crypto.randomUUID().slice(0, 8)}`,
@@ -49,6 +51,14 @@ test('真实 PostgreSQL 持久化 Tool Projection 版本、模型请求与批次
       id: 'request-1', executionId, projectionId: first.id, turnIndex: 1,
       createdAt: '2026-08-13T04:00:03.000Z',
     })
+    await projections.recordModelRequest({
+      id: 'request-1', executionId, projectionId: first.id, turnIndex: 1,
+      createdAt: '2026-08-13T04:00:03.000Z',
+    })
+    await assert.rejects(projections.recordModelRequest({
+      id: 'request-1', executionId, projectionId: first.id, turnIndex: 2,
+      createdAt: '2026-08-13T04:00:03.000Z',
+    }), /model_request_conflict/)
     await projections.beginToolBatch({
       id: 'batch-1', executionId, projectionId: first.id, turnIndex: 1,
       calls: [{ toolCallId: 'call-2', toolName: 'hidden_guess', position: 2 },
@@ -77,6 +87,14 @@ test('真实 PostgreSQL 持久化 Tool Projection 版本、模型请求与批次
       id: 'request-2', executionId, projectionId: second.id, turnIndex: 2,
       createdAt: '2026-08-13T04:00:08.000Z',
     })
+    await projections.recordModelRequest({
+      id: 'request-z', executionId, projectionId: second.id, turnIndex: 3,
+      createdAt: '2026-08-13T04:00:09.000Z',
+    })
+    await projections.recordModelRequest({
+      id: 'request-a', executionId, projectionId: second.id, turnIndex: 3,
+      createdAt: '2026-08-13T04:00:09.000Z',
+    })
     assert.equal(second.version, 2)
     const replay = await projections.replay(executionId)
     assert.deepEqual(replay.projections.map(({ version, visibleToolNames }) => ({ version, visibleToolNames })), [
@@ -85,12 +103,31 @@ test('真实 PostgreSQL 持久化 Tool Projection 版本、模型请求与批次
     ])
     assert.deepEqual(replay.modelRequests.map(({ id, projectionVersion }) => ({ id, projectionVersion })), [
       { id: 'request-1', projectionVersion: 1 }, { id: 'request-2', projectionVersion: 2 },
+      { id: 'request-a', projectionVersion: 2 }, { id: 'request-z', projectionVersion: 2 },
     ])
+    assert.equal(replay.toolBatches[0]?.projectionVersion, 1)
+    assert.equal(replay.toolBatches[0]?.status, 'failed')
     assert.deepEqual(replay.toolBatches[0]?.calls.map(({ toolCallId }) => toolCallId), ['call-1', 'call-2'])
     assert.deepEqual(replay.toolBatches[0]?.results.map(({ toolCallId, status }) => ({ toolCallId, status })), [
       { toolCallId: 'call-1', status: 'completed' }, { toolCallId: 'call-2', status: 'failed' },
     ])
+    await assert.rejects(pool.query(
+      `UPDATE tool_call_batches SET projection_id = $1 WHERE id = 'batch-1'`, [second.id],
+    ), /permission denied/)
+
+    await events.createResearch({
+      analysisId: otherAnalysisId, sessionId: `projection-other-session-${crypto.randomUUID()}`,
+      executionId: otherExecutionId, symbol: `O${crypto.randomUUID().slice(0, 8)}`,
+      status: 'planning', analysisStatus: 'queued', operationId: 'runtime-context',
+      event: { type: 'runtime_context', status: 'planning' },
+      createdAt: '2026-08-13T04:00:10.000Z',
+    })
+    await assert.rejects(projections.beginToolBatch({
+      id: 'cross-execution-batch', executionId: otherExecutionId, projectionId: first.id,
+      turnIndex: 1, calls: [], createdAt: '2026-08-13T04:00:11.000Z',
+    }), /foreign key constraint/)
   } finally {
+    await createAnalysisRepository(pool).removeResearch(otherAnalysisId)
     await createAnalysisRepository(pool).removeResearch(analysisId)
     await pool.end()
   }
@@ -429,6 +466,7 @@ test('真实 PostgreSQL execution fence 先于既有 operationId 幂等判定', 
   await migrate(migrationUrl!)
   const pool = createPool(applicationUrl!)
   const events = createAgentEventRepository(pool)
+  const projections = createToolProjectionRepository(pool)
   const analyses = createAnalysisRepository(pool)
   const analysisId = `fence-replay-${crypto.randomUUID()}`
   const sessionId = `fence-replay-session-${crypto.randomUUID()}`
@@ -450,10 +488,21 @@ test('真实 PostgreSQL execution fence 先于既有 operationId 幂等判定', 
       sessionId, executionId, operationId: operation.id, event: operation.event,
       createdAt: '2026-08-13T03:20:01.000Z',
     })
+    const projection = await projections.ensureVersion({
+      executionId, role: 'main', stage: 'research', schemaHash: 'fence-hash',
+      projectedTools: [], visibleToolNames: [], reasons: { stage: 'research' },
+      createdAt: '2026-08-13T03:20:01.000Z',
+    })
+    await projections.beginToolBatch({
+      id: `${executionId}:batch`, executionId, projectionId: projection.id, turnIndex: 1,
+      calls: [{ toolCallId: `${executionId}:call`, toolName: 'fetch_financial_context', position: 1 }],
+      createdAt: '2026-08-13T03:20:01.000Z',
+    })
     await events.fenceForStopping({
       sessionId, executionId, fenceExecutionId, operationId: 'current-stopping',
       event: { type: 'status', status: 'stopping' }, createdAt: '2026-08-13T03:20:02.000Z',
     })
+    assert.equal((await projections.replay(executionId)).toolBatches[0]?.status, 'cancelled')
     const before = await events.list(sessionId, 0)
     const lifecycleBefore = await events.primaryLifecycle(analysisId)
 
@@ -1030,6 +1079,7 @@ test('真实 PostgreSQL 启动恢复在一个事务内中断全部活跃 Session
   const pool = createPool(applicationUrl!)
   const analyses = createAnalysisRepository(pool)
   const events = createAgentEventRepository(pool)
+  const projections = createToolProjectionRepository(pool)
   const analysisId = 'interrupt-all-analysis'
   const now = '2026-08-13T00:00:00.000Z'
   try {
@@ -1053,6 +1103,18 @@ test('真实 PostgreSQL 启动恢复在一个事务内中断全部活跃 Session
       event: { type: 'status', status: 'running', at: now },
       createdAt: now,
     })
+    for (const executionId of ['interrupt-all-main-execution', 'interrupt-all-specialist-execution']) {
+      const projection = await projections.ensureVersion({
+        executionId, role: executionId.includes('main') ? 'main' : 'fundamental_specialist',
+        stage: 'research', schemaHash: `${executionId}:hash`, projectedTools: [],
+        visibleToolNames: [], reasons: { stage: 'research' }, createdAt: now,
+      })
+      await projections.beginToolBatch({
+        id: `${executionId}:batch`, executionId, projectionId: projection.id, turnIndex: 1,
+        calls: [{ toolCallId: `${executionId}:call`, toolName: 'fetch_financial_context', position: 1 }],
+        createdAt: now,
+      })
+    }
 
     const interrupted = await events.interruptActiveSessions('2026-08-13T00:00:01.000Z')
 
@@ -1074,6 +1136,11 @@ test('真实 PostgreSQL 启动恢复在一个事务内中断全部活跃 Session
       ).then((result) => result.rows[0]),
     ])).map((value) => value?.status), ['interrupted', 'interrupted'])
     assert.equal((await analyses.get(analysisId))?.status, 'interrupted')
+    assert.deepEqual(await Promise.all([
+      projections.replay('interrupt-all-main-execution'),
+      projections.replay('interrupt-all-specialist-execution'),
+    ]).then((replays) => replays.map((replay) => replay.toolBatches[0]?.status)),
+    ['cancelled', 'cancelled'])
     const replacement = await events.createResearch({
       analysisId: 'interrupt-all-replacement',
       sessionId: 'interrupt-all-replacement-session',

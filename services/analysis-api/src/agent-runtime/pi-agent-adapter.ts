@@ -153,6 +153,8 @@ type CreatePiAgentAdapterOptions = {
   signal?: AbortSignal
   prepareNextTurn?: (state: TurnBoundaryState, signal?: AbortSignal) =>
     Promise<Partial<TurnBoundaryState> | undefined> | Partial<TurnBoundaryState> | undefined
+  commitToolProjection?: (state: TurnBoundaryState, signal?: AbortSignal) =>
+    Promise<{ tools: PiAgentAdapterTool[] } | undefined>
   compaction?: {
     settings: { enabled: boolean; reserveTokens: number; keepRecentTokens: number }
     compact: (input: {
@@ -190,6 +192,8 @@ export function createPiAgentAdapter(options: CreatePiAgentAdapterOptions) {
       }
       const replacement = await options.prepareNextTurn?.(copyBoundaryState(boundaryState), signal)
       const nextState = mergeBoundaryState(boundaryState, replacement)
+      const persistedProjection = await options.commitToolProjection?.(copyBoundaryState(nextState), signal)
+      if (persistedProjection) nextState.tools = [...persistedProjection.tools]
       if (options.compaction && shouldCompact(
         estimateContextTokens(toPiMessages(nextState.messages)).tokens,
         nextState.model.contextWindow,

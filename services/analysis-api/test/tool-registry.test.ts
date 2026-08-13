@@ -66,6 +66,9 @@ test('Registry 启动校验 fail closed 拒绝重复名称、缺失 schema、han
   assert.throws(() => createToolRegistry([definition('semantic-bad-result', {
     resultSchema: { description: 'missing type' },
   })], { 'semantic-bad-result': handler }), /tool_registry_invalid:result_schema/)
+  assert.throws(() => createToolRegistry([definition('illegal-schema-type', {
+    resultSchema: { type: 'definitely-not-json-schema' },
+  })], { 'illegal-schema-type': handler }), /tool_registry_invalid:result_schema/)
   assert.throws(() => createToolRegistry([definition('bad-handler')], {}), /tool_registry_invalid:handler/)
   assert.throws(() => createToolRegistry([definition('bad-roles', {
     allowedRoles: [],
@@ -79,6 +82,16 @@ test('Registry 启动校验 fail closed 拒绝重复名称、缺失 schema、han
   assert.throws(() => createToolRegistry([definition('bad-retention', {
     resultRetention: undefined as never,
   })], { 'bad-retention': handler }), /tool_registry_invalid:result_retention/)
+  assert.throws(() => createToolRegistry([definition('illegal-network', {
+    externalNetwork: 'arbitrary' as never,
+  })], { 'illegal-network': handler }), /tool_registry_invalid:external_network/)
+  assert.throws(() => createToolRegistry([definition('illegal-effect', {
+    sideEffect: 'arbitrary' as never,
+  })], { 'illegal-effect': handler }), /tool_registry_invalid:side_effect/)
+})
+
+test('Registry handler 缺失运行能力时 fail closed 而不是静默返回 undefined', async () => {
+  await assert.rejects(registeredToolHandlers.fetch_financial_context({}, {}), /tool_handler_context_missing/)
 })
 
 test('Registry 只按角色和阶段返回模型定义且不提供隐藏工具 discovery', () => {

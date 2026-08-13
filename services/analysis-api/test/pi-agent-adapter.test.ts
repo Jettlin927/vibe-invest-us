@@ -303,7 +303,7 @@ test('持久化 Projection 提交失败时 Pi 不会在下一 Turn 暴露新工�
       contexts.push((context.tools ?? []).map(({ name }) => name))
       return fixture.streamFn(model, context, options)
     },
-    prepareNextTurn: async () => { throw new Error('projection_commit_failed') },
+    commitToolProjection: async () => { throw new Error('projection_commit_failed') },
   })
 
   await adapter.submit(userMessage('开始'))

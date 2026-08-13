@@ -111,7 +111,7 @@ export type ToolRuntime = {
   }): Promise<void>
 }
 
-type ModelOptions = {
+export type ModelOptions = {
   modelsFactory?: typeof createModels
   fauxResponses?: FauxResponseStep[]
   fauxTokensPerSecond?: number
@@ -132,6 +132,7 @@ export function createPiModel(options: ModelOptions = {}) {
   const toolGate = createConcurrencyGate()
   return {
     async *analyze(input: AnalyzeInput): AsyncGenerator<ModelEvent> {
+      if (!input.toolRuntime) throw new Error('tool_runtime_required')
       const runtimeSettings = input.runtimeSettings
       modelGate.setLimit(runtimeSettings.modelConcurrency)
       toolGate.setLimit(runtimeSettings.toolConcurrency)
@@ -368,7 +369,7 @@ export function createPiModel(options: ModelOptions = {}) {
             `main-attempt:${modelAttempts}`,
           )
           const batchId = `${attemptId}:tool-batch`
-          await input.toolRuntime?.beginToolBatch({
+          await input.toolRuntime!.beginToolBatch({
             id: batchId, executionId: input.executionId, projectionId: projection.id,
             turnIndex: modelAttempts, createdAt: new Date().toISOString(),
             calls: preparedCalls.map(({ call }, index) => ({
@@ -416,7 +417,7 @@ export function createPiModel(options: ModelOptions = {}) {
             }
             if (call.name === 'submit_analysis_report') {
               try {
-                const report = await toolRegistry.handler(call.name)?.(toolInput, {
+                const report = await toolRegistry.handler(call.name)!(toolInput, {
                   submitAnalysisReport: async (params) => {
                     const candidate = normalizeReport(params)
                     validateEvidence(candidate, knownFactIds)
@@ -462,7 +463,7 @@ export function createPiModel(options: ModelOptions = {}) {
             }
             try {
               const toolSymbol = (toolInput as { symbol?: string }).symbol ?? input.symbol
-              const financialContext = await toolRegistry.handler('fetch_financial_context')?.(
+              const financialContext = await toolRegistry.handler('fetch_financial_context')!(
                 toolInput, { loadFinancialContext: async () => loadFrozenContext(toolSymbol) },
               ) as Awaited<ReturnType<AnalyzeInput['fetchFinancialContext']>>
               if (call.name === 'analyze_financials') {
@@ -518,7 +519,7 @@ export function createPiModel(options: ModelOptions = {}) {
                   operationId: `${toolOperationId}:specialist-completed`,
                 }
                 for (const fact of specialist.facts) knownFactIds.add(fact.id)
-                result = await toolRegistry.handler(call.name)?.(toolInput, {
+                result = await toolRegistry.handler(call.name)!(toolInput, {
                   runFinancialSpecialist: async () => ({
                     facts: specialist.facts, analysis: specialist.analysis,
                   }),
@@ -574,7 +575,7 @@ export function createPiModel(options: ModelOptions = {}) {
             options.log?.({ type: 'tool_result', toolName: call.name, isError })
           }
           runtimeWork.stop()
-          await input.toolRuntime?.completeToolBatch({
+          await input.toolRuntime!.completeToolBatch({
             id: batchId, executionId: input.executionId,
             status: batchResults.some(({ status }) => status === 'cancelled') ? 'cancelled'
               : batchResults.some(({ status }) => status === 'failed') ? 'failed' : 'completed',
@@ -633,15 +634,15 @@ async function* runFinancialSpecialist(
       closingAttempts += 1
       context.tools = []
     }
-    const request = await beginModelRequest({
-      input, options, runtimeSettings, executionSignal, activeBudget, modelGate, specialist: true,
-      countActive: !closing,
-    })
     const requestId = `execution:${input.executionId}:specialist:${encodeURIComponent(invocationId)}:model-attempt:${modelAttempts}`
     const projection = await beginProjectedModelRequest(
       input, requestId, 'fundamental', closing ? 'finalization' : 'research',
       modelAttempts, context.tools ?? [],
     )
+    const request = await beginModelRequest({
+      input, options, runtimeSettings, executionSignal, activeBudget, modelGate, specialist: true,
+      countActive: !closing,
+    })
     yield {
       type: 'tool_projection', projectionId: projection.id, version: projection.version,
       visibleToolNames: (context.tools ?? []).map(({ name }) => name),
@@ -701,7 +702,7 @@ async function* runFinancialSpecialist(
         `specialist-invocation:${encodeURIComponent(invocationId)}:attempt:${modelAttempts}`,
       )
       const batchId = `${requestId}:tool-batch`
-      await input.toolRuntime?.beginToolBatch({
+      await input.toolRuntime!.beginToolBatch({
         id: batchId, executionId: input.executionId, projectionId: projection.id,
         turnIndex: modelAttempts, createdAt: new Date().toISOString(),
         calls: preparedCalls.map(({ call }, index) => ({
@@ -717,23 +718,13 @@ async function* runFinancialSpecialist(
           operationId: `${toolOperationId}:call`,
         }
       }
-      for (const { call, toolInput, validationError, toolOperationId } of preparedCalls) {
-        const terminalError = validationError
-          ? { error: validationError, facts: [] as Fact[] }
-          : undefined
-        if (terminalError) {
-          const result = terminalError
-          context.messages.push(toolResultMessage(call, result, true))
-          yield {
-            type: 'tool_result', name: call.name, result, isError: true,
-            operationId: `${toolOperationId}:result`,
-          }
-          batchResults.push({ toolCallId: call.id, status: 'failed', completedAt: new Date().toISOString() })
-          continue
+      runtimeWork.stop()
+      const settled = await Promise.all(preparedCalls.map(async (prepared) => {
+        const { call, toolInput, validationError } = prepared
+        if (validationError) return {
+          ...prepared, result: { error: validationError, facts: [] as Fact[] }, isError: true,
+          status: 'failed' as const, completedAt: new Date().toISOString(),
         }
-        let result: { facts: Fact[]; [key: string]: unknown }
-        let isError = false
-        runtimeWork.stop()
         let toolOwner: Awaited<ReturnType<typeof acquireActiveSlot>> | undefined
         try {
           toolOwner = await acquireActiveSlot({
@@ -746,10 +737,11 @@ async function* runFinancialSpecialist(
               type: 'tool_request_end', executionId: input.executionId, toolName: call.name,
             }),
           })
+          let result: { facts: Fact[]; [key: string]: unknown }
           if (call.name === 'search_news_by_keyword') {
             if (!input.searchNews) throw new Error('news_search_unavailable')
             const keyword = (toolInput as { keyword?: string }).keyword ?? input.symbol
-            result = await toolRegistry.handler(call.name)?.(toolInput, {
+            result = await toolRegistry.handler(call.name)!(toolInput, {
               searchNews: async () => input.searchNews!(keyword, toolSignal(
                 input, options, runtimeSettings, toolOwner!.signal,
               )),
@@ -759,65 +751,49 @@ async function* runFinancialSpecialist(
             const values = toolInput as { symbol?: string; startDate?: string; endDate?: string }
             const endDate = values.endDate ?? new Date().toISOString().slice(0, 10)
             const startDate = values.startDate ?? oneYearBefore(endDate)
-            result = await toolRegistry.handler(call.name)?.(toolInput, {
+            result = await toolRegistry.handler(call.name)!(toolInput, {
               fetchTechnicalIndicators: async () => input.fetchTechnicalIndicators!(
                 values.symbol ?? input.symbol, startDate, endDate,
                 toolSignal(input, options, runtimeSettings, toolOwner!.signal),
               ),
             }) as { facts: Fact[]; [key: string]: unknown }
-          } else {
-            throw new Error(`tool_not_allowed:${call.name}`)
-          }
+          } else throw new Error(`tool_not_allowed:${call.name}`)
           assertExecutionPolicy(input, executionSignal, activeBudget)
-          facts.push(...result.facts)
+          return { ...prepared, result, isError: false, status: 'completed' as const,
+            completedAt: new Date().toISOString() }
         } catch (error) {
-          if (executionSignal.aborted || toolOwner?.exhausted() || activeBudget.exhausted()) {
-            for (const pending of calls.slice(calls.indexOf(call))) {
-              const cancelledResult = policyToolResult(input, executionSignal, activeBudget)
-              context.messages.push(toolResultMessage(pending, cancelledResult, true))
-              batchResults.push({ toolCallId: pending.id, status: 'cancelled', completedAt: new Date().toISOString() })
-              yield {
-                type: 'tool_result', name: pending.name, result: cancelledResult, isError: true,
-                operationId: `execution:${input.executionId}:specialist-tool:${pending.id}:result`,
-              }
-            }
-            if (input.signal?.aborted) {
-              return {
-                analysis: '专项研究已取消。', facts,
-                policyError: 'cancelled' as const,
-              }
-            }
-            if (executionSignal.aborted && !activeBudget.exhausted()) {
-              return {
-                analysis: '专项研究超过 execution wall。', facts,
-                policyError: 'execution_runtime_timeout' as const,
-              }
-            }
-            closing = true
-            break
+          const cancelled = executionSignal.aborted || toolOwner?.exhausted() || activeBudget.exhausted()
+          return {
+            ...prepared,
+            result: cancelled ? policyToolResult(input, executionSignal, activeBudget)
+              : { error: error instanceof Error ? error.message : String(error), facts: [] as Fact[] },
+            isError: true, status: cancelled ? 'cancelled' as const : 'failed' as const,
+            completedAt: new Date().toISOString(),
           }
-          isError = true
-          result = { error: error instanceof Error ? error.message : String(error), facts: [] }
-        } finally {
-          toolOwner?.finish()
-        }
-        runtimeWork = activeBudget.start(executionSignal)
-        context.messages.push(toolResultMessage(call, result, isError))
+        } finally { toolOwner?.finish() }
+      }))
+      runtimeWork = activeBudget.start(executionSignal)
+      for (const item of settled) {
+        context.messages.push(toolResultMessage(item.call, item.result, item.isError))
+        facts.push(...item.result.facts)
         yield {
-          type: 'tool_result', name: call.name, result, isError,
-          operationId: `${toolOperationId}:result`,
+          type: 'tool_result', name: item.call.name, result: item.result, isError: item.isError,
+          operationId: `${item.toolOperationId}:result`,
         }
-        batchResults.push({
-          toolCallId: call.id, status: isError ? 'failed' : 'completed', completedAt: new Date().toISOString(),
-        })
+        batchResults.push({ toolCallId: item.call.id, status: item.status, completedAt: item.completedAt })
       }
       runtimeWork.stop()
-      await input.toolRuntime?.completeToolBatch({
+      await input.toolRuntime!.completeToolBatch({
         id: batchId, executionId: input.executionId,
         status: batchResults.some(({ status }) => status === 'cancelled') ? 'cancelled'
           : batchResults.some(({ status }) => status === 'failed') ? 'failed' : 'completed',
         results: uniqueBatchResults(batchResults), completedAt: new Date().toISOString(),
       })
+      if (input.signal?.aborted) return { analysis: '专项研究已取消。', facts, policyError: 'cancelled' }
+      if (executionSignal.aborted && !activeBudget.exhausted()) {
+        return { analysis: '专项研究超过 execution wall。', facts, policyError: 'execution_runtime_timeout' }
+      }
+      if (activeBudget.exhausted()) closing = true
       if (toolRounds >= runtimeSettings.specialistAgentToolRounds) closing = true
     } finally {
       runtimeWork.stop()
@@ -855,10 +831,10 @@ async function beginProjectedModelRequest(
   input: AnalyzeInput, requestId: string, role: 'main' | 'fundamental',
   stage: 'research' | 'finalization', turnIndex: number, tools: Tool[],
 ) {
-  return input.toolRuntime?.beginModelRequest({
+  return input.toolRuntime!.beginModelRequest({
     requestId, executionId: input.executionId, role, stage, turnIndex, tools,
     createdAt: new Date().toISOString(),
-  }) ?? { id: `${requestId}:ephemeral-projection`, version: turnIndex }
+  })
 }
 
 function uniqueBatchResults<T extends { toolCallId: string }>(results: T[]) {

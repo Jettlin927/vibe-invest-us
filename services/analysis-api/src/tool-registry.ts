@@ -1,3 +1,6 @@
+import AjvModule from 'ajv'
+import addFormatsModule from 'ajv-formats'
+
 import { analyzeFinancialsDefinition } from './tool-definitions/analyze-financials.js'
 import { fetchFinancialContextDefinition } from './tool-definitions/fetch-financial-context.js'
 import { getTechnicalIndicatorsDefinition } from './tool-definitions/get-technical-indicators.js'
@@ -27,15 +30,17 @@ export function createToolRegistry(
     const name = definition.model?.name
     if (!name || names.has(name)) invalid(name || 'unknown', 'duplicate_name')
     names.add(name)
-    if (!serializableSchema(definition.model.parameters)) invalid(name, 'parameters_schema')
-    if (!serializableSchema(definition.resultSchema)) invalid(name, 'result_schema')
+    if (!validSchema(definition.model.parameters)) invalid(name, 'parameters_schema')
+    if (!validSchema(definition.resultSchema)) invalid(name, 'result_schema')
     if (typeof handlers[name] !== 'function') invalid(name, 'handler')
     if (!definition.allowedRoles?.length) invalid(name, 'allowed_roles')
     if (!definition.allowedStages?.length) invalid(name, 'allowed_stages')
-    if (!definition.sideEffect) invalid(name, 'side_effect')
-    if (!definition.externalNetwork) invalid(name, 'external_network')
-    if (!definition.resultRetention) invalid(name, 'result_retention')
-    if (!definition.modelProjection) invalid(name, 'model_projection')
+    if (!oneOf(definition.sideEffect, ['read_only', 'creates_report'])) invalid(name, 'side_effect')
+    if (!oneOf(definition.externalNetwork, ['none', 'financial_data'])) invalid(name, 'external_network')
+    if (!oneOf(definition.resultRetention, ['research_record', 'report_version'])) invalid(name, 'result_retention')
+    if (!oneOf(definition.modelProjection, ['full_result', 'bounded_summary', 'acknowledgement'])) {
+      invalid(name, 'model_projection')
+    }
     if (typeof definition.countsAsToolRound !== 'boolean') invalid(name, 'round_behavior')
     return Object.freeze({ ...definition })
   })
@@ -49,12 +54,20 @@ export function createToolRegistry(
   })
 }
 
-function serializableSchema(value: unknown) {
+function validSchema(value: unknown) {
   if (!value || typeof value !== 'object') return false
   try {
     const schema = JSON.parse(JSON.stringify(value)) as Record<string, unknown>
-    return typeof schema.type === 'string' || Array.isArray(schema.anyOf)
+    if (!('type' in schema) && !('anyOf' in schema) && !('$ref' in schema)) return false
+    const Ajv = AjvModule as unknown as new (options?: object) => { compile(schema: object): unknown }
+    const addFormats = addFormatsModule as unknown as <T>(ajv: T) => T
+    addFormats(new Ajv({ strict: true })).compile(schema)
+    return true
   } catch { return false }
+}
+
+function oneOf<T extends string>(value: unknown, allowed: readonly T[]): value is T {
+  return typeof value === 'string' && allowed.includes(value as T)
 }
 
 function invalid(name: string, field: string): never {

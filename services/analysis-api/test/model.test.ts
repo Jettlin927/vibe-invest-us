@@ -6,7 +6,10 @@ import {
 } from '@earendil-works/pi-ai'
 import { defaultRuntimeSettings } from '@vibe-invest/contracts'
 
-import { createPiModel } from '../src/model.js'
+import {
+  createPiModel as createProductionPiModel,
+  type AnalyzeInput, type ModelOptions, type ToolRuntime,
+} from '../src/model.js'
 import { createActiveBudget } from '../src/runtime-policy.js'
 import { analysisModelTools, financialSpecialistTools } from '../src/tools.js'
 
@@ -19,6 +22,26 @@ const facts = [{
   source: 'sina',
   sourceReference: 'https://example.com/nvda',
 }]
+
+function createPiModel(options: ModelOptions = {}) {
+  const model = createProductionPiModel(options)
+  return {
+    analyze(input: AnalyzeInput) {
+      return model.analyze({ ...input, toolRuntime: input.toolRuntime ?? createTestToolRuntime() })
+    },
+  }
+}
+
+function createTestToolRuntime(): ToolRuntime {
+  let version = 0
+  return {
+    async beginModelRequest(input) {
+      return { id: `${input.requestId}:test-projection`, version: ++version }
+    },
+    async beginToolBatch() {},
+    async completeToolBatch() {},
+  }
+}
 
 const validReport = {
   title: 'NVDA 一至四周综合分析',
@@ -1084,7 +1107,7 @@ test('专项 abort result 的消费者提前关闭时仍释放已取得的工具
   }
 
   assert.equal(acquired, 2)
-  assert.equal(released, 1)
+  assert.equal(released, 2)
   await iterator.return(undefined)
   assert.equal(released, 2)
 })
@@ -1178,6 +1201,44 @@ test('财报专家可自由调用新闻和技术指标工具并把新增事实�
     assert.equal(completed.report.title, validReport.title)
     assert.deepEqual(completed.report.limitations, [])
   }
+})
+
+test('专项同批工具实际并行完成但下一轮仍按原 call 顺序接收结果', async () => {
+  let releaseSlow!: () => void
+  const slowBarrier = new Promise<void>((resolve) => { releaseSlow = resolve })
+  const completionOrder: string[] = []
+  let nextTurnResultOrder: string[] = []
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall('analyze_financials', {}, { id: 'parallel-entry' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage([
+      fauxToolCall('search_news_by_keyword', {}, { id: 'parallel-slow' }),
+      fauxToolCall('get_technical_indicators', {}, { id: 'parallel-fast' }),
+    ], { stopReason: 'toolUse' }),
+    (context) => {
+      nextTurnResultOrder = context.messages.filter(({ role }) => role === 'toolResult')
+        .map((message) => message.role === 'toolResult' ? providerCallId(message.toolCallId) : '')
+        .filter((id) => id.startsWith('parallel-'))
+      return fauxAssistantMessage(fauxText('专项完成'))
+    },
+    fauxAssistantMessage(fauxToolCall('submit_analysis_report', validReport), { stopReason: 'toolUse' }),
+  ] })
+  for await (const _event of model.analyze({
+    executionId: 'parallel-specialist', runtimeSettings: runtimeSettings(),
+    symbol: 'NVDA', systemPrompt: 'system', userPrompt: 'user', knownFacts: facts,
+    fetchFinancialContext: async () => ({ facts, financials: {} }),
+    searchNews: async () => {
+      await slowBarrier
+      completionOrder.push('slow')
+      return { facts: [] }
+    },
+    fetchTechnicalIndicators: async () => {
+      completionOrder.push('fast')
+      releaseSlow()
+      return { facts: [] }
+    },
+  })) {}
+  assert.deepEqual(completionOrder, ['fast', 'slow'])
+  assert.deepEqual(nextTurnResultOrder, ['parallel-slow', 'parallel-fast'])
 })
 
 test('真实 Pi 仅在含工具调用的 Turn 消耗主与专项冻结轮次', async () => {
