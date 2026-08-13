@@ -16,7 +16,9 @@ import type {
 import type {
   FactQueryResult, FinancialContext, FinancialFact, PaginatedFactQueryResult,
 } from './financial-data-client.js'
-import { acquireActiveSlot, createActiveBudget, createConcurrencyGate } from './runtime-policy.js'
+import {
+  acquireActiveSlot, createActiveBudget, createConcurrencyGate, raceWithAbort,
+} from './runtime-policy.js'
 import { analysisModelTools } from './tools.js'
 
 type Fact = FinancialFact
@@ -381,7 +383,9 @@ export function createAnalysisService(options: {
         acquire: () => toolGate.acquire(executionSignal), activeBudget, signal: executionSignal,
       })
       try {
-        context = await options.fetchFinancialContext(job.symbol, contextOwner.signal)
+        context = await raceWithAbort(
+          () => options.fetchFinancialContext(job.symbol, contextOwner.signal), contextOwner.signal,
+        )
       } finally {
         contextOwner.finish()
       }
@@ -398,8 +402,11 @@ export function createAnalysisService(options: {
             acquire: () => toolGate.acquire(executionSignal), activeBudget, signal: executionSignal,
           })
           try {
-            portfolioPrices = await options.fetchMarketPrices(
-              await options.listPortfolioSymbols(), pricesOwner.signal,
+            const fetchMarketPrices = options.fetchMarketPrices
+            const listPortfolioSymbols = options.listPortfolioSymbols
+            portfolioPrices = await raceWithAbort(async () => fetchMarketPrices!(
+              await listPortfolioSymbols!(), pricesOwner.signal,
+            ), pricesOwner.signal,
             )
           } finally {
             pricesOwner.finish()

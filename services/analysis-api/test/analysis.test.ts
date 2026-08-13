@@ -1278,9 +1278,7 @@ test('running 轨迹写入失败会中断已领取任务并恢复后续调度', 
 test('取消运行任务会以 stopping → stopped 统一收敛模型与生命周期投影', async () => {
   const database = createTestProductDatabase()
   let modelStarted!: () => void
-  let releaseSettle!: () => void
   const started = new Promise<void>((resolve) => { modelStarted = resolve })
-  const settle = new Promise<void>((resolve) => { releaseSettle = resolve })
   const app = buildProductionApp({
     ...database,
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
@@ -1289,7 +1287,6 @@ test('取消运行任务会以 stopping → stopped 统一收敛模型与生命�
       async *analyze(input) {
         modelStarted()
         await new Promise<void>((resolve) => input.signal?.addEventListener('abort', () => resolve(), { once: true }))
-        await settle
         yield { type: 'cancelled' as const }
       },
     },
@@ -1297,13 +1294,10 @@ test('取消运行任务会以 stopping → stopped 统一收敛模型与生命�
   await app.ready()
   const { analysisId } = (await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' } })).json()
   await started
-  let cancelSettled = false
-  const cancelling = app.inject({ method: 'POST', url: `/api/analyses/${analysisId}/cancel` })
-    .finally(() => { cancelSettled = true })
-  await waitForStatus(app as any, analysisId, 'stopping')
-  assert.equal(cancelSettled, false)
-  releaseSettle()
-  const cancelled = await cancelling
+  const cancelled = await Promise.race([
+    app.inject({ method: 'POST', url: `/api/analyses/${analysisId}/cancel` }),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error('cancel_waited_for_provider')), 100)),
+  ])
   assert.equal(cancelled.statusCode, 202)
   await waitForStatus(app, analysisId, 'stopped')
   const research = await app.inject({ method: 'GET', url: `/api/research/${analysisId}` })
@@ -1312,6 +1306,52 @@ test('取消运行任务会以 stopping → stopped 统一收敛模型与生命�
     .map((entry: { status: string }) => entry.status), ['stopping', 'stopped'])
   assert.equal(research.json().status, 'stopped')
   assert.equal(research.json().mainAgent.status, 'stopped')
+  await app.close()
+})
+
+test('外部 HTTP 工具不响应 Abort 时停止仍立即收口且不启动模型', async () => {
+  const database = createTestProductDatabase()
+  await database.runtimeSettingsRepository.save({
+    analysisConcurrency: 2, toolConcurrency: 1,
+  }, new Date().toISOString())
+  let toolStarted!: () => void
+  let toolAborted!: () => void
+  const started = new Promise<void>((resolve) => { toolStarted = resolve })
+  const aborted = new Promise<void>((resolve) => { toolAborted = resolve })
+  let modelCalls = 0
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol, signal) => {
+      if (symbol === 'NEXTSTOP') return { symbol, facts: [fact], gaps: [] }
+      toolStarted()
+      await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve(), {
+        once: true,
+      }))
+      toolAborted()
+      await new Promise(() => {})
+      throw new Error('unreachable')
+    },
+    model: { async *analyze() { modelCalls += 1; yield { type: 'completed' as const, report } } },
+  })
+  await app.ready()
+  const { analysisId } = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'HTTPSTOP' },
+  })).json()
+  await started
+  const response = await Promise.race([
+    app.inject({ method: 'POST', url: `/api/analyses/${analysisId}/cancel` }),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error('cancel_waited_for_http')), 100)),
+  ])
+  assert.equal(response.statusCode, 202)
+  await aborted
+  await waitForStatus(app as any, analysisId, 'stopped')
+  assert.equal(modelCalls, 0)
+  const next = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'NEXTSTOP' },
+  })).json()
+  await waitForStatus(app as any, next.analysisId, 'completed')
+  assert.equal(modelCalls, 1)
   await app.close()
 })
 

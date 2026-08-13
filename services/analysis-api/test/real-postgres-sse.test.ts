@@ -619,7 +619,9 @@ test('真实 PostgreSQL 取消在 PG、HTTP 与 SSE reconnect 统一为 stopping
   const events = createAgentEventRepository(pool)
   const toolRuntime = createToolProjectionRepository(pool)
   let modelStarted!: () => void
+  let modelAborted!: () => void
   const started = new Promise<void>((resolve) => { modelStarted = resolve })
+  const aborted = new Promise<void>((resolve) => { modelAborted = resolve })
   const app = buildApp({
     productDatabase: { checkSchema: () => checkSchema(pool), close: () => pool.end() },
     portfolioRepository: createPortfolioRepository(pool),
@@ -635,6 +637,7 @@ test('真实 PostgreSQL 取消在 PG、HTTP 与 SSE reconnect 统一为 stopping
         await new Promise<void>((resolve) => {
           input.signal?.addEventListener('abort', () => resolve(), { once: true })
         })
+        modelAborted()
         yield { type: 'cancelled' }
       },
     },
@@ -702,10 +705,14 @@ test('真实 PostgreSQL 取消在 PG、HTTP 与 SSE reconnect 统一为 stopping
     })
     const before = await events.list(created.sessionId, 0)
     const cursor = `${created.sessionId}:${before.at(-1)!.sequence}`
-    const cancelled = await fetch(`${baseUrl}/api/analyses/${created.analysisId}/cancel`, {
-      method: 'POST',
-    })
+    const cancelled = await Promise.race([
+      fetch(`${baseUrl}/api/analyses/${created.analysisId}/cancel`, { method: 'POST' }),
+      new Promise<never>((_, reject) => setTimeout(
+        () => reject(new Error('cancel_waited_for_provider')), 500,
+      )),
+    ])
     assert.equal(cancelled.status, 202)
+    await aborted
     await waitForAgentStatus(events, created.sessionId, 'stopped')
 
     const status = await fetch(`${baseUrl}/api/analyses/${created.analysisId}`).then((response) => response.json())
@@ -745,6 +752,15 @@ test('真实 PostgreSQL 取消在 PG、HTTP 与 SSE reconnect 统一为 stopping
       operationId: `execution:${originalExecutionId}:late-tool-result`,
       event: { type: 'tool_result', name: 'fetch_financial_context', result: { facts: [] } },
       createdAt: new Date().toISOString(),
+    }), /agent_execution_fenced/)
+    await assert.rejects(toolRuntime.recordModelRequest({
+      id: `execution:${originalExecutionId}:late-model`, executionId: originalExecutionId,
+      projectionId: projection.id, turnIndex: 3, createdAt: new Date().toISOString(),
+    }), /agent_execution_fenced/)
+    await assert.rejects(toolRuntime.beginToolBatch({
+      id: `execution:${originalExecutionId}:late-batch`, executionId: originalExecutionId,
+      projectionId: projection.id, turnIndex: 3, createdAt: new Date().toISOString(),
+      calls: [{ toolCallId: 'late-call', toolName: 'fetch_financial_context', position: 1 }],
     }), /agent_execution_fenced/)
     await assert.rejects(events.append({
       sessionId: created.sessionId, executionId: originalExecutionId,

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { createActiveBudget, createConcurrencyGate } from '../src/runtime-policy.js'
+import { createActiveBudget, createConcurrencyGate, raceWithAbort } from '../src/runtime-policy.js'
 
 test('并发槽拒绝预先取消的等待者且不会泄漏槽位', async () => {
   const gate = createConcurrencyGate()
@@ -23,6 +23,17 @@ test('并发槽未满时也拒绝预先取消的请求', async () => {
   controller.abort(new Error('already_cancelled'))
 
   await assert.rejects(gate.acquire(controller.signal), /already_cancelled/)
+})
+
+test('Abort 已生效时不会启动新的外部任务', async () => {
+  const controller = new AbortController()
+  controller.abort(new Error('stopped'))
+  let calls = 0
+  await assert.rejects(raceWithAbort(async () => {
+    calls += 1
+    return 'unreachable'
+  }, controller.signal), /stopped/)
+  assert.equal(calls, 0)
 })
 
 test('execution active budget 对跨层重叠计时只累计一次且共享剩余值', () => {

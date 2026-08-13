@@ -1265,6 +1265,40 @@ test('Pi Model 收到取消后关闭 provider、释放预算与槽位且后续�
   assert.equal(released, 2)
 })
 
+test('Provider 建连不响应 Abort 时本地 Agent 仍 settle 并释放模型槽', async () => {
+  const models = createModels()
+  let providerStarted!: () => void
+  const started = new Promise<void>((resolve) => { providerStarted = resolve })
+  models.stream = (() => {
+    providerStarted()
+    return new Promise(() => {})
+  }) as typeof models.stream
+  const model = createPiModel({
+    modelsFactory: () => models,
+    fauxResponses: [fauxAssistantMessage(fauxText('不会返回'))],
+  })
+  const controller = new AbortController()
+  let released = 0
+  const consume = async () => {
+    for await (const _event of model.analyze({
+      executionId: 'provider-connect-stuck', runtimeSettings: runtimeSettings(),
+      symbol: 'NVDA', systemPrompt: 'system', userPrompt: 'user', knownFacts: facts,
+      fetchFinancialContext: async () => ({ facts }), signal: controller.signal,
+      acquireModelSlot: async () => () => { released += 1 },
+    })) { /* consume */ }
+  }
+  const running = consume()
+  await started
+  controller.abort(new Error('stopped'))
+  await Promise.race([
+    running,
+    new Promise<never>((_, reject) => setTimeout(
+      () => reject(new Error('local_agent_did_not_settle')), 100,
+    )),
+  ])
+  assert.equal(released, 1)
+})
+
 test('Pi Model 工具超时形成可引用失败事实', async () => {
   const timeoutFact = 'fact:tool-error:fetch_financial_context:1'
   const report = {

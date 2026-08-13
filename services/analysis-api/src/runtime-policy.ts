@@ -47,6 +47,17 @@ export function createConcurrencyGate() {
 
 export type ActiveBudget = ReturnType<typeof createActiveBudget>
 
+export async function raceWithAbort<T>(task: () => Promise<T>, signal: AbortSignal): Promise<T> {
+  signal.throwIfAborted()
+  let remove = () => {}
+  const aborted = new Promise<never>((_resolve, reject) => {
+    const onAbort = () => reject(signal.reason)
+    signal.addEventListener('abort', onAbort, { once: true })
+    remove = () => signal.removeEventListener('abort', onAbort)
+  })
+  try { return await Promise.race([task(), aborted]) } finally { remove() }
+}
+
 export async function acquireActiveSlot(input: {
   acquire: () => Promise<() => void>
   activeBudget: ActiveBudget

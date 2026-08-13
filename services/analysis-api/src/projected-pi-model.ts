@@ -16,7 +16,8 @@ import type {
   ModelEvent, ModelOptions,
 } from './model.js'
 import {
-  acquireActiveSlot, createActiveBudget, createConcurrencyGate, deadlineSignal, type ActiveBudget,
+  acquireActiveSlot, createActiveBudget, createConcurrencyGate, deadlineSignal, raceWithAbort,
+  type ActiveBudget,
 } from './runtime-policy.js'
 import { toolRegistry } from './tool-registry.js'
 import {
@@ -123,9 +124,10 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
         })
         try {
           await onStart()
-          return await run(AbortSignal.any([
+          const signal = AbortSignal.any([
             owner.signal, AbortSignal.timeout(options.toolTimeoutMs ?? 5_000),
-          ]))
+          ])
+          return await raceWithAbort(() => run(signal), signal)
         } finally { owner.finish() }
       }
 
@@ -399,7 +401,8 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
         })
         try {
           await onStart()
-          const result = await task(toolSignal(options, settings, owner.signal))
+          const signal = toolSignal(options, settings, owner.signal)
+          const result = await raceWithAbort(() => task(signal), signal)
           const facts = asRecord(result).facts
           if (Array.isArray(facts)) for (const fact of facts as Fact[]) knownFacts.set(fact.id, fact)
           return succeeded(result)
@@ -626,7 +629,8 @@ async function* runStructuredSpecialist(config: {
     })
     try {
       await onStart()
-      const result = await task(toolSignal(options, settings, owner.signal))
+      const signal = toolSignal(options, settings, owner.signal)
+      const result = await raceWithAbort(() => task(signal), signal)
       const facts = asRecord(result).facts
       if (Array.isArray(facts)) for (const fact of facts as Fact[]) knownFacts.set(fact.id, fact)
       return succeeded(result)
@@ -928,9 +932,9 @@ async function runProjectedAgent(config: {
           type: 'lifecycle', status: stage === 'finalization' ? 'finalizing' : 'running_model',
           operationId: `${requestId}:running-model`,
         })
-        const stream = await config.provider.streamFn(model, {
+        const stream = await raceWithAbort(() => Promise.resolve(config.provider.streamFn(model, {
           ...context, tools: visibleTools.map((tool) => ({ ...tool, label: tool.name } as PiAgentAdapterTool)),
-        }, { ...streamOptions, signal: request.signal })
+        }, { ...streamOptions, signal: request.signal })), request.signal)
         return finishableStream(stream, request.signal, request.finish, (error) => {
           const normalized = request.normalizeError(error)
           if (normalized instanceof Error && isPolicyFailure(normalized)) {
