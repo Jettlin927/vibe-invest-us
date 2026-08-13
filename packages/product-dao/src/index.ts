@@ -2108,6 +2108,7 @@ export function createToolProjectionRepository(pool: Pool) {
       const client = await pool.connect()
       try {
         await client.query('BEGIN')
+        await assertCurrentExecution(client, input.executionId)
         const session = await client.query<{ id: string; latest_sequence: number }>(
           `SELECT session.id, session.latest_sequence FROM agent_executions execution
            JOIN agent_sessions session ON session.id = execution.session_id
@@ -2649,11 +2650,20 @@ async function cancelRunningToolBatches(
 }
 
 async function assertCurrentExecution(database: PoolClient, executionId: string) {
+  const identity = await database.query<{ analysis_id: string }>(
+    `SELECT session.analysis_id FROM agent_executions execution
+     JOIN agent_sessions session ON session.id = execution.session_id
+     WHERE execution.id = $1`, [executionId],
+  )
+  if (!identity.rows[0]) throw new Error('agent_execution_fenced')
+  await database.query(
+    'SELECT id FROM analyses WHERE id = $1 FOR UPDATE', [identity.rows[0].analysis_id],
+  )
   const execution = await database.query(
     `SELECT execution.id FROM agent_executions execution
      JOIN agent_sessions session ON session.id = execution.session_id
      WHERE execution.id = $1 AND session.execution_id = execution.id AND NOT execution.terminal
-     FOR UPDATE OF execution`, [executionId],
+     FOR UPDATE OF session, execution`, [executionId],
   )
   if (!execution.rowCount) throw new Error('agent_execution_fenced')
 }

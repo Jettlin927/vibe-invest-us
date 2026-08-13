@@ -1064,6 +1064,62 @@ test('真实 PostgreSQL 树级 fence 与带事实的 Tool Batch 完成使用同�
   }
 })
 
+test('真实 PostgreSQL 树级 fence 与无批次因果 Projection 使用同一锁序', {
+  skip: !migrationUrl || !applicationUrl,
+  concurrency: false,
+}, async () => {
+  await migrate(migrationUrl!)
+  const pool = createPool(applicationUrl!)
+  const events = createAgentEventRepository(pool)
+  const projections = createToolProjectionRepository(pool)
+  const analyses = createAnalysisRepository(pool)
+  const blocker = await pool.connect()
+  const suffix = crypto.randomUUID()
+  const analysisId = `tree-fence-projection-${suffix}`
+  const sessionId = `${analysisId}:main`
+  const executionId = `${sessionId}:execution`
+  try {
+    await events.createResearch({
+      analysisId, sessionId, executionId, symbol: `P${suffix.slice(0, 8)}`,
+      status: 'running', operationId: 'main-created',
+      event: { type: 'status', status: 'running' }, createdAt: '2026-08-14T05:00:00.000Z',
+    })
+    await projections.ensureVersion({
+      executionId, role: 'main', stage: 'research', schemaHash: 'projection-before-fence',
+      projectedTools: [], visibleToolNames: [], reasons: { stage: 'research' },
+      createdAt: '2026-08-14T05:00:00.000Z',
+    })
+    await blocker.query('BEGIN')
+    await blocker.query('SELECT id FROM analyses WHERE id = $1 FOR UPDATE', [analysisId])
+    const fencing = events.fenceForStopping({
+      sessionId, executionId, fenceExecutionId: `${executionId}:stopping`,
+      operationId: 'projection-race-stopping', event: { type: 'status', status: 'stopping' },
+      createdAt: '2026-08-14T05:00:01.000Z',
+    })
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    const advancing = projections.ensureVersion({
+      executionId, role: 'main', stage: 'finalization', schemaHash: 'projection-after-fence',
+      projectedTools: [], visibleToolNames: [], reasons: { stage: 'finalization' },
+      causativeEvent: {
+        operationId: 'runtime-turn-advanced',
+        payload: { type: 'runtime_turn_advanced', stage: 'finalization' },
+      }, createdAt: '2026-08-14T05:00:01.000Z',
+    })
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    await blocker.query('COMMIT')
+    await fencing
+    await assert.rejects(advancing, /agent_execution_fenced/)
+    assert.equal((await projections.replay(executionId)).projections.length, 1)
+    assert.equal((await events.list(sessionId, 0))
+      .some(({ operationId }) => operationId === 'runtime-turn-advanced'), false)
+  } finally {
+    await blocker.query('ROLLBACK').catch(() => undefined)
+    blocker.release()
+    await analyses.removeResearch(analysisId)
+    await pool.end()
+  }
+})
+
 test('真实 PostgreSQL 并发保存 Runtime settings 不丢失不同字段更新', {
   skip: !migrationUrl || !applicationUrl,
   concurrency: false,
