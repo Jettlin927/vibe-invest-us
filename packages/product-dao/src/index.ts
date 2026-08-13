@@ -326,90 +326,6 @@ ALTER TABLE tool_projection_versions ADD CONSTRAINT tool_projection_versions_sta
 ALTER TABLE tool_batch_calls ADD COLUMN IF NOT EXISTS started_at timestamptz;
 ALTER TABLE tool_batch_calls ADD COLUMN IF NOT EXISTS completion_order integer;
 ALTER TABLE tool_batch_calls ADD COLUMN IF NOT EXISTS result_payload_json jsonb;
-INSERT INTO tool_event_migration_provenance (session_id, sequence, provenance)
-SELECT event.session_id, event.sequence, 'pre_registry_v12'
-FROM agent_events event
-CROSS JOIN vibe_invest_migration_provenance provenance
-WHERE (provenance.max_version <= 12 OR (
-    provenance.had_v13 AND provenance.through_v13_complete
-    AND event.created_at < provenance.v13_applied_at
-  ))
-  AND event.payload_json->>'type' IN ('tool_call', 'tool_result')
-ON CONFLICT (session_id, sequence) DO NOTHING;
-UPDATE tool_batch_calls call SET
-  completion_order = COALESCE(call.completion_order, call.position),
-  result_payload_json = CASE WHEN call.tool_name = 'tool_not_available' THEN jsonb_build_object(
-    'toolCallId', call.tool_call_id, 'toolName', call.tool_name,
-    'result', jsonb_build_object('error', 'tool_not_available', 'facts', '[]'::jsonb),
-    'isError', true
-  ) ELSE COALESCE(call.result_payload_json, jsonb_build_object(
-    'toolName', call.tool_name,
-    'result', jsonb_build_object('error', 'tool_execution_interrupted', 'facts', '[]'::jsonb),
-    'isError', true
-  )) || jsonb_build_object('toolCallId', call.tool_call_id, 'toolName', call.tool_name) END
-WHERE call.status <> 'running';
-DO $$
-DECLARE
-  target record;
-  candidate_count integer;
-  authoritative_call_id text;
-  authoritative_name text;
-BEGIN
-  FOR target IN
-    SELECT event.session_id, event.sequence, event.operation_id, event.payload_json
-    FROM agent_events event
-    WHERE event.payload_json->>'type' IN ('tool_call', 'tool_result')
-      AND NOT EXISTS (
-        SELECT 1 FROM tool_event_migration_provenance provenance
-        WHERE provenance.session_id = event.session_id AND provenance.sequence = event.sequence
-          AND provenance.provenance = 'pre_registry_v12'
-      )
-  LOOP
-    SELECT count(*), min(call.tool_call_id), min(call.tool_name)
-      INTO candidate_count, authoritative_call_id, authoritative_name
-    FROM agent_sessions session
-    JOIN agent_executions execution ON execution.session_id = session.id
-    JOIN tool_call_batches batch ON batch.execution_id = execution.id
-    JOIN tool_projection_versions projection ON projection.id = batch.projection_id
-    JOIN tool_batch_calls call ON call.batch_id = batch.id
-    WHERE session.id = target.session_id
-      AND target.operation_id IN (
-        'execution:' || batch.execution_id || ':'
-          || CASE projection.role WHEN 'main' THEN 'tool' WHEN 'fundamental' THEN 'specialist-tool' END
-          || ':' || call.tool_call_id || ':'
-          || CASE target.payload_json->>'type' WHEN 'tool_call' THEN 'call' ELSE 'result' END,
-        batch.id || ':cancelled-'
-          || CASE target.payload_json->>'type' WHEN 'tool_call' THEN 'call' ELSE 'result' END
-          || ':' || call.tool_call_id
-      )
-      AND (projection.visible_tool_names_json ? call.tool_name OR call.tool_name = 'tool_not_available');
-    IF candidate_count <> 1 THEN
-      RAISE EXCEPTION 'tool_event_call_association_failed:%:%', target.session_id, target.sequence;
-    END IF;
-    IF target.payload_json ? 'toolCallId'
-       AND target.payload_json->>'toolCallId' <> authoritative_call_id THEN
-      RAISE EXCEPTION 'tool_event_call_id_conflict:%:%', target.session_id, target.sequence;
-    END IF;
-    UPDATE agent_events SET payload_json = CASE
-      WHEN authoritative_name = 'tool_not_available'
-        AND target.payload_json->>'type' = 'tool_call' THEN
-          (target.payload_json - 'name' - 'input' - 'toolCallId') || jsonb_build_object(
-          'type', 'tool_call', 'name', authoritative_name, 'toolCallId', authoritative_call_id,
-          'input', '{}'::jsonb)
-      WHEN authoritative_name = 'tool_not_available' THEN
-        (target.payload_json - 'name' - 'result' - 'toolCallId') || jsonb_build_object(
-          'type', 'tool_result', 'name', authoritative_name, 'toolCallId', authoritative_call_id,
-          'result', jsonb_build_object('error', 'tool_not_available', 'facts', '[]'::jsonb),
-          'isError', true)
-      ELSE CASE target.payload_json->>'type'
-      WHEN 'tool_call' THEN target.payload_json || jsonb_build_object(
-        'toolCallId', authoritative_call_id, 'name', authoritative_name)
-      ELSE target.payload_json || jsonb_build_object(
-        'toolCallId', authoritative_call_id, 'name', authoritative_name)
-      END END
-    WHERE session_id = target.session_id AND sequence = target.sequence;
-  END LOOP;
-END $$;
 ALTER TABLE tool_batch_calls DROP CONSTRAINT IF EXISTS tool_batch_calls_completion_order_check;
 ALTER TABLE tool_batch_calls ADD CONSTRAINT tool_batch_calls_completion_order_check
   CHECK (completion_order IS NULL OR completion_order > 0);
@@ -420,7 +336,8 @@ ALTER TABLE tool_batch_calls ADD CONSTRAINT tool_batch_calls_completion_check CH
   (status = 'running' AND completed_at IS NULL AND completion_order IS NULL
     AND result_payload_json IS NULL)
   OR
-  (status <> 'running' AND completed_at IS NOT NULL
+  (status <> 'running' AND (started_at IS NOT NULL OR status = 'cancelled')
+    AND completed_at IS NOT NULL
     AND completion_order IS NOT NULL AND result_payload_json IS NOT NULL)
 );
 
@@ -534,51 +451,39 @@ export async function migrate(connectionString: string) {
   try {
     await client.query('BEGIN')
     await client.query('SELECT pg_advisory_xact_lock($1)', [8_613_091])
-    const migrationTable = await client.query<{ exists: boolean }>(
-      `SELECT to_regclass('public.product_schema_migrations') IS NOT NULL AS exists`,
+    const existingTables = await client.query<{ migration_exists: boolean; events_exist: boolean }>(
+      `SELECT
+         to_regclass('public.product_schema_migrations') IS NOT NULL AS migration_exists,
+         to_regclass('public.agent_events') IS NOT NULL AS events_exist`,
     )
-    let provenance: {
-      max_version: number
-      through_v13_complete: boolean
-      had_v13: boolean; v13_applied_at: string | null
-      had_v14: boolean; v14_applied_at: string | null
-    } = {
-      max_version: 0,
-      through_v13_complete: false,
-      had_v13: false, v13_applied_at: null, had_v14: false, v14_applied_at: null,
-    }
-    if (migrationTable.rows[0]?.exists) {
-      const existing = await client.query<typeof provenance>(
-        `SELECT
-           COALESCE(max(version), 0)::integer AS max_version,
-           count(*) FILTER (WHERE version BETWEEN 1 AND 13) = 13 AS through_v13_complete,
-           EXISTS (SELECT 1 FROM product_schema_migrations WHERE version = 13) AS had_v13,
-           (SELECT applied_at::text FROM product_schema_migrations WHERE version = 13) AS v13_applied_at,
-           EXISTS (SELECT 1 FROM product_schema_migrations WHERE version = 14) AS had_v14,
-           (SELECT applied_at::text FROM product_schema_migrations WHERE version = 14) AS v14_applied_at
+    let maxVersion = 0
+    if (existingTables.rows[0]?.migration_exists) {
+      const existing = await client.query<{ max_version: number }>(
+        `SELECT COALESCE(max(version), 0)::integer AS max_version
          FROM product_schema_migrations`,
       )
-      provenance = existing.rows[0]!
-      if (provenance.had_v14 && (!provenance.had_v13 || !provenance.through_v13_complete)) {
-        throw new Error('product_schema_migration_receipt_gap:v14_without_complete_v13')
+      maxVersion = existing.rows[0]!.max_version
+      if (maxVersion >= 13 && maxVersion <= 15) {
+        throw new Error(`product_schema_intermediate_candidate_unsupported:${maxVersion}`)
       }
     }
-    await client.query(
-      `CREATE TEMP TABLE vibe_invest_migration_provenance (
-         max_version integer NOT NULL,
-         through_v13_complete boolean NOT NULL,
-         had_v13 boolean NOT NULL, v13_applied_at timestamptz,
-         had_v14 boolean NOT NULL, v14_applied_at timestamptz
-       ) ON COMMIT DROP`,
-    )
-    await client.query(
-      `INSERT INTO vibe_invest_migration_provenance
-         (max_version, through_v13_complete, had_v13, v13_applied_at, had_v14, v14_applied_at)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      [provenance.max_version, provenance.through_v13_complete,
-        provenance.had_v13, provenance.v13_applied_at,
-        provenance.had_v14, provenance.v14_applied_at],
-    )
+    if (maxVersion <= 12 && existingTables.rows[0]?.events_exist) {
+      await client.query(
+      `CREATE TABLE IF NOT EXISTS tool_event_migration_provenance (
+         session_id text NOT NULL,
+         sequence integer NOT NULL,
+         provenance text NOT NULL CHECK (provenance = 'pre_registry_v12'),
+         recorded_at timestamptz NOT NULL DEFAULT now(),
+         PRIMARY KEY (session_id, sequence),
+         FOREIGN KEY (session_id, sequence) REFERENCES agent_events(session_id, sequence) ON DELETE CASCADE
+       );
+       INSERT INTO tool_event_migration_provenance (session_id, sequence, provenance)
+       SELECT session_id, sequence, 'pre_registry_v12'
+       FROM agent_events
+       WHERE payload_json->>'type' IN ('tool_call', 'tool_result')
+       ON CONFLICT (session_id, sequence) DO NOTHING`,
+      )
+    }
     await client.query(migrationSql)
     await client.query('COMMIT')
   } catch (error) {
