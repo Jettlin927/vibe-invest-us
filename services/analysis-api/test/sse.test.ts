@@ -148,7 +148,8 @@ for (const terminal of ['stopped', 'budget_exhausted']) {
       event: { type: 'runtime_context', status: 'planning' }, createdAt,
     })
     await database.agentEventRepository.append({
-      sessionId: `session-${terminal}`, operationId: `terminal-${terminal}`,
+      sessionId: `session-${terminal}`, executionId: `execution-${terminal}`,
+      operationId: `terminal-${terminal}`,
       event: { type: 'status', status: terminal },
       projection: { status: terminal, executionStatus: terminal as 'stopped' | 'budget_exhausted' },
       createdAt,
