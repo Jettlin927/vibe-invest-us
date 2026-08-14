@@ -187,7 +187,6 @@ test('真实 PostgreSQL 在模型槽等待取消时不留下 phantom model reque
         turnIndex: input.turnIndex, createdAt: input.createdAt,
       })
     },
-    async beginModelRequest() { throw new Error('legacy_begin_model_request_not_allowed') },
     async beginToolBatch(input) { await projections.beginToolBatch(input) },
     async startToolCall(input) { await projections.startToolCall(input) },
     async completeToolBatch() { return {} },

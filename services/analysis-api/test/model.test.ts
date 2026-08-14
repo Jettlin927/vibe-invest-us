@@ -41,9 +41,6 @@ function createTestToolRuntime(): ToolRuntime {
     },
     async recordModelRequest() {},
     async completeModelRequest() {},
-    async beginModelRequest(input) {
-      return { id: `${input.requestId}:test-projection`, version: ++version }
-    },
     async beginToolBatch() {},
     async startToolCall() {},
     async completeToolBatch(input) {

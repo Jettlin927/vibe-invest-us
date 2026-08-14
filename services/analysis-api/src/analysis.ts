@@ -123,14 +123,6 @@ export function createAnalysisService(options: {
         usageStatus: input.usageStatus, usage: input.usage, completedAt: input.completedAt,
       })
     },
-    async beginModelRequest(input) {
-      const projection = await toolRuntime.ensureProjection(input)
-      await toolRuntime.recordModelRequest({
-        requestId: input.requestId, executionId: input.executionId,
-        projectionId: projection.id, turnIndex: input.turnIndex, createdAt: input.createdAt,
-      })
-      return projection
-    },
     async beginToolBatch(input) {
       await options.toolProjectionRepository.beginToolBatch(input)
     },

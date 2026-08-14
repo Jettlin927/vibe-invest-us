@@ -20,10 +20,8 @@ import { submitAnalysisReportDefinition } from './tool-definitions/submit-analys
 import type {
   RegisteredToolDefinition, ToolRole, ToolStage,
 } from './tool-definitions/types.js'
-import { registeredToolHandlers, type RegisteredToolHandler } from './tool-handlers.js'
 
 export type { RegisteredToolDefinition } from './tool-definitions/types.js'
-export { registeredToolHandlers } from './tool-handlers.js'
 
 export const registeredToolDefinitions = [
   fetchFinancialContextDefinition,
@@ -44,9 +42,7 @@ export const registeredToolDefinitions = [
   submitSpecialistReportDefinition,
 ]
 
-export function createToolRegistry(
-  definitions: RegisteredToolDefinition[], handlers: Record<string, RegisteredToolHandler>,
-) {
+export function createToolRegistry(definitions: RegisteredToolDefinition[]) {
   const names = new Set<string>()
   const validated = definitions.map((definition) => {
     const name = definition.model?.name
@@ -55,7 +51,6 @@ export function createToolRegistry(
     names.add(name)
     if (!validSchema(definition.model.parameters)) invalid(name, 'parameters_schema')
     if (!validSchema(definition.resultSchema)) invalid(name, 'result_schema')
-    if (typeof handlers[name] !== 'function') invalid(name, 'handler')
     if (!definition.allowedRoles?.length
       || !definition.allowedRoles.every((role) => oneOf(role, ['main', 'fundamental', 'news', 'technical']))) {
       invalid(name, 'allowed_roles')
@@ -83,7 +78,6 @@ export function createToolRegistry(
         && definition.allowedStages.includes(stage))
       .map((definition) => definition.model),
     definition: (name: string) => validated.find((definition) => definition.model.name === name),
-    handler: (name: string) => handlers[name],
     projectResult(name: string, result: Record<string, unknown>) {
       const projection = validated.find((definition) => definition.model.name === name)?.modelProjection
       if (projection === 'full_result') return result
@@ -399,4 +393,4 @@ function invalid(name: string, field: string): never {
   throw new Error(`tool_registry_invalid:${field}:${name}`)
 }
 
-export const toolRegistry = createToolRegistry(registeredToolDefinitions, registeredToolHandlers)
+export const toolRegistry = createToolRegistry(registeredToolDefinitions)

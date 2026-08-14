@@ -240,20 +240,16 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
           if (name === 'fetch_financial_context') {
             const symbol = stringParam(params, 'symbol') || input.symbol
             try {
-              const modelResult = await withMainToolSlot(name, onStart, async (toolSignal) => (
-                toolRegistry.handler(name)!(params, {
-                  loadFinancialContext: async () => {
-                    if (symbol.trim().toUpperCase() !== input.symbol.trim().toUpperCase()) {
-                      throw new Error('tool_symbol_not_allowed')
-                    }
-                    if (!frozenContext) {
-                      frozenContext = await input.fetchFinancialContext(symbol, toolSignal)
-                      rememberFacts(frozenContext.facts)
-                    }
-                    return frozenContext
-                  },
-                })
-              ))
+              const modelResult = await withMainToolSlot(name, onStart, async (toolSignal) => {
+                if (symbol.trim().toUpperCase() !== input.symbol.trim().toUpperCase()) {
+                  throw new Error('tool_symbol_not_allowed')
+                }
+                if (!frozenContext) {
+                  frozenContext = await input.fetchFinancialContext(symbol, toolSignal)
+                  rememberFacts(frozenContext.facts)
+                }
+                return frozenContext
+              })
               return succeeded(input.financialContextToolViews
                 ? {
                     ...input.financialContextToolViews.retained,
@@ -348,39 +344,37 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
               if (input.runTechnicalSpecialist && !technicalDecisionRecorded) {
                 return failed('technical_specialist_decision_required')
               }
-              return await toolRegistry.handler(name)!(params, {
-                submitAnalysisReport: async (submitted) => {
-                  if (input.refreshKnownFacts) rememberFacts(await input.refreshKnownFacts())
-                  const validation = validateReportCandidate(submitted, {
-                    role: 'main', knownFacts: [...knownFacts.values()],
-                    specialistStatuses: [...specialistOutcomes].map(([domain, outcome]) => ({
-                      domain: domain as 'news' | 'fundamental_valuation' | 'technical',
-                      status: asString(outcome.status),
-                    })),
-                    specialistReports: [...specialistOutcomes].flatMap(([domain, outcome]) => (
-                      typeof outcome.sessionId === 'string' && typeof outcome.reportId === 'string'
-                      && typeof outcome.reportVersion === 'number'
-                      && ['completed', 'partial'].includes(asString(outcome.status)) ? [{
-                          domain: domain as 'news' | 'fundamental_valuation' | 'technical',
-                          sessionId: outcome.sessionId, reportId: outcome.reportId,
-                          version: outcome.reportVersion,
-                          status: asString(outcome.status) as 'completed' | 'partial',
-                        }] : []
-                    )),
-                  })
-                  if (!validation.ok) {
-                    reportValidationState.failures += 1
-                    if (reportValidationState.failures >= 3) reportValidationState.exhausted = true
-                    return failedReportValidation(validation.errors, submitted)
-                  }
-                  const report = legacyReport(validation.report)
-                  return {
-                    ...succeeded({ submitted: true }), report,
-                    reportVersion: { kind: validation.report.kind, report: validation.report },
-                    terminate: true,
-                  }
-                },
-              }) as ExecutedTool
+              return await (async (submitted: unknown) => {
+                if (input.refreshKnownFacts) rememberFacts(await input.refreshKnownFacts())
+                const validation = validateReportCandidate(submitted, {
+                  role: 'main', knownFacts: [...knownFacts.values()],
+                  specialistStatuses: [...specialistOutcomes].map(([domain, outcome]) => ({
+                    domain: domain as 'news' | 'fundamental_valuation' | 'technical',
+                    status: asString(outcome.status),
+                  })),
+                  specialistReports: [...specialistOutcomes].flatMap(([domain, outcome]) => (
+                    typeof outcome.sessionId === 'string' && typeof outcome.reportId === 'string'
+                    && typeof outcome.reportVersion === 'number'
+                    && ['completed', 'partial'].includes(asString(outcome.status)) ? [{
+                        domain: domain as 'news' | 'fundamental_valuation' | 'technical',
+                        sessionId: outcome.sessionId, reportId: outcome.reportId,
+                        version: outcome.reportVersion,
+                        status: asString(outcome.status) as 'completed' | 'partial',
+                      }] : []
+                  )),
+                })
+                if (!validation.ok) {
+                  reportValidationState.failures += 1
+                  if (reportValidationState.failures >= 3) reportValidationState.exhausted = true
+                  return failedReportValidation(validation.errors, submitted)
+                }
+                const report = legacyReport(validation.report)
+                return {
+                  ...succeeded({ submitted: true }), report,
+                  reportVersion: { kind: validation.report.kind, report: validation.report },
+                  terminate: true,
+                }
+              })(params) as ExecutedTool
             } catch (error) {
               return failed(error instanceof Error ? error.message : String(error))
             }

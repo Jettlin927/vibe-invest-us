@@ -314,15 +314,6 @@ export type ToolRuntime = {
     }
     completedAt: string
   }): Promise<void>
-  beginModelRequest(input: {
-    requestId: string
-    executionId: string
-    role: 'main' | 'fundamental' | 'news' | 'technical'
-    stage: 'research' | 'finalization'
-    turnIndex: number
-    tools: Tool[]
-    createdAt: string
-  }): Promise<{ id: string; version: number }>
   beginToolBatch(input: {
     id: string
     executionId: string
