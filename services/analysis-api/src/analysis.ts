@@ -202,6 +202,7 @@ export function createAnalysisService(options: {
       report?: unknown; snapshot?: unknown; error?: string; facts?: Fact[]
       reportVersion?: {
         id: string; kind: 'integrated' | 'specialist'; payloadHash: string; report: unknown
+        snapshot?: unknown
       }
     },
   ) {
@@ -419,12 +420,32 @@ export function createAnalysisService(options: {
         && typeof resumedFollowUp === 'object' && !Array.isArray(resumedFollowUp)
         ? { ...resumedFollowUp as Record<string, unknown>, executionId }
         : undefined)
+      const reportUpdateRequested = followUpEvent?.updateReport === true
+      const reportVersions = await options.eventRepository.listReportVersions(analysisId)
+      const baseReportVersion = typeof followUpEvent?.baseReportVersion === 'number'
+        ? followUpEvent.baseReportVersion : null
+      const baseReport = baseReportVersion === null ? undefined : reportVersions.find((version) => (
+        version.sessionId === sessionId && version.kind === 'integrated'
+          && version.version === baseReportVersion
+      ))
       const continuationEvent = followUpEvent ?? resumeEvent
       const restoredResearch = continuationEvent ? await repository.research(analysisId) : undefined
-      const restoredSnapshot = continuationEvent && job.snapshot && typeof job.snapshot === 'object'
+      const activeSnapshot = job.snapshot && typeof job.snapshot === 'object'
+        ? job.snapshot as FinancialContext & { portfolioContext?: unknown } : undefined
+      const baseSnapshot = baseReport
+        ? baseReport.snapshot && typeof baseReport.snapshot === 'object'
+          ? baseReport.snapshot as FinancialContext & { portfolioContext?: unknown }
+          : {
+              symbol: job.symbol, facts: [], indicators: {}, portfolioContext: null,
+              gaps: [{ capability: 'base_report_snapshot', reason: 'unavailable' }],
+            }
+        : activeSnapshot
+      const restoredSnapshot = continuationEvent && !reportUpdateRequested && baseSnapshot
         ? {
-            ...job.snapshot as FinancialContext & { portfolioContext?: unknown },
-            facts: (restoredResearch?.facts ?? []) as Fact[],
+            ...baseSnapshot,
+            facts: followUpEvent
+              ? baseSnapshot.facts
+              : (restoredResearch?.facts ?? baseSnapshot.facts) as Fact[],
           } : undefined
       if (restoredSnapshot) context = restoredSnapshot
       else {
@@ -443,6 +464,15 @@ export function createAnalysisService(options: {
       }
       assertPolicy()
       if (!context) throw new Error('financial_context_unavailable')
+      if (reportUpdateRequested && restoredResearch?.facts.length) {
+        const refreshedFactIds = new Set(context.facts.map(({ id }) => id))
+        context = {
+          ...context,
+          facts: [...context.facts, ...(restoredResearch.facts as Fact[]).filter(({ id }) => (
+            !refreshedFactIds.has(id)
+          ))],
+        }
+      }
       const quoteFact = context.facts.find((fact) => fact.type === 'quote' && typeof fact.value === 'number')
       let portfolioPrices: Record<string, number> = {}
       let portfolioPriceGap = false
@@ -508,7 +538,6 @@ export function createAnalysisService(options: {
       )
       const specialistSessions = (await options.eventRepository.listSessions(analysisId))
         .filter(({ isPrimary }) => !isPrimary)
-      const reportVersions = await options.eventRepository.listReportVersions(analysisId)
       const specialistLifecycles = new Map(await Promise.all(specialistSessions.map(async (specialist) => (
         [specialist.id, await options.eventRepository.sessionLifecycle(specialist.id)] as const
       ))))
@@ -582,16 +611,12 @@ export function createAnalysisService(options: {
           unresolved: unresolvedResults(previousRuntimes),
         },
       } : undefined
-      const baseReportVersion = typeof followUpEvent?.baseReportVersion === 'number'
-        ? followUpEvent.baseReportVersion : null
-      const baseReport = baseReportVersion === null ? undefined : reportVersions.find((version) => (
-        version.sessionId === sessionId && version.kind === 'integrated'
-          && version.version === baseReportVersion
-      ))
-      const reportCreatedAt = job.reportCreatedAt
+      const reportCreatedAt = baseReport?.createdAt ?? job.reportCreatedAt
       const reportAgeDays = reportCreatedAt
         ? Math.max(0, (Date.now() - Date.parse(reportCreatedAt)) / 86_400_000) : null
-      const updateReport = followUpEvent?.updateReport === true
+      const updateReport = reportUpdateRequested
+      const freshness = reportAgeDays === null ? 'unavailable'
+        : reportAgeDays > runtimeSettings.reportFreshnessDays ? 'stale' : 'current'
       const latestCompaction = currentLifecycle?.compactions.at(-1)
       const latestCompactionEvent = currentLifecycle?.events.findLast((event) => (
         (event as Record<string, unknown>).type === 'compaction'
@@ -622,16 +647,22 @@ export function createAnalysisService(options: {
         content: {
           message: String(followUpEvent.message ?? ''),
           updateReport,
+          intent: updateReport ? 'request_report_update' as const : 'chat' as const,
           conversationHistory,
           ...(resumeEvent ? {} : latestCompactionSummary(currentLifecycle)),
           baseReportVersion,
           baseReport: baseReport?.report ?? null,
           baseReportCreatedAt: reportCreatedAt,
           reportAgeDays,
-          freshness: reportAgeDays === null ? 'unavailable'
-            : reportAgeDays > runtimeSettings.reportFreshnessDays ? 'stale' : 'current',
-          reportPositionContext: (job.snapshot as { portfolioContext?: unknown } | null)
-            ?.portfolioContext ?? null,
+          freshness,
+          freshnessWarning: freshness === 'stale'
+            ? `基准报告可能过期：已超过 ${runtimeSettings.reportFreshnessDays} 天时效阈值。`
+            : null,
+          reportPositionContext: baseReport
+            ? (baseReport.snapshot as { portfolioContext?: unknown } | null)
+              ?.portfolioContext ?? null
+            : (job.snapshot as { portfolioContext?: unknown } | null)
+              ?.portfolioContext ?? null,
           currentPositionSummary: portfolioContext,
           specialistStatuses,
           availableTools: analysisModelTools.filter(({ name }) => (
@@ -992,10 +1023,13 @@ export function createAnalysisService(options: {
           }
           const report = enforceDataGaps(personalized, gaps)
           const status = report.limitations.length ? 'partial' : 'completed'
+          const finalizedSnapshot = terminalSnapshot()
           const reportVersion = event.reportVersion
-            ? finalReportVersion(executionId, event.reportVersion, report, status, gaps) : undefined
+            ? finalReportVersion(
+                executionId, event.reportVersion, report, status, gaps, finalizedSnapshot,
+              ) : undefined
           await setStatus(sessionId, executionId, operationId(`status-${status}`), status, {
-            report, snapshot: terminalSnapshot(), ...(reportVersion ? { reportVersion } : {}),
+            report, snapshot: finalizedSnapshot, ...(reportVersion ? { reportVersion } : {}),
           })
           return
         }
@@ -1058,13 +1092,15 @@ export function createAnalysisService(options: {
             }
             if (event.type === 'completed') {
               const report = enforceDataGaps(event.report, limitedContext.gaps ?? [])
+              const finalizedSnapshot = terminalSnapshot()
               const reportVersion = event.reportVersion
                 ? finalReportVersion(
                     executionId, event.reportVersion, report, 'partial', limitedContext.gaps ?? [],
+                    finalizedSnapshot,
                   )
                 : undefined
               await setStatus(sessionId, executionId, operationId('status-partial'), 'partial', {
-                report, snapshot: terminalSnapshot(), ...(reportVersion ? { reportVersion } : {}),
+                report, snapshot: finalizedSnapshot, ...(reportVersion ? { reportVersion } : {}),
               })
               return
             }
@@ -1151,6 +1187,7 @@ export function createAnalysisService(options: {
           messageId: sourceFollowUp.messageId,
           message: sourceFollowUp.message,
           updateReport: sourceFollowUp.updateReport === true,
+          intent: sourceFollowUp.updateReport === true ? 'request_report_update' : 'chat',
           baseReportVersion: typeof sourceFollowUp.baseReportVersion === 'number'
             ? sourceFollowUp.baseReportVersion : null,
         } } : {}),
@@ -1164,6 +1201,7 @@ export function createAnalysisService(options: {
   }
   async function followUp(
     analysisId: string, messageIdInput: string, messageInput: string, updateReport = false,
+    requestedBaseReportVersion?: number,
   ) {
     await initialized
     const message = messageInput.trim()
@@ -1183,18 +1221,27 @@ export function createAnalysisService(options: {
     const replayPayload = replay?.payload as Record<string, unknown> | undefined
     if (replayPayload && (replayPayload.messageId !== messageId
       || replayPayload.message !== message || replayPayload.updateReport !== updateReport
-      || replayPayload.executionId !== executionId)) {
+      || replayPayload.executionId !== executionId
+      || (requestedBaseReportVersion !== undefined
+        && replayPayload.baseReportVersion !== requestedBaseReportVersion))) {
       throw new Error('agent_operation_conflict')
     }
     const versions = replayPayload ? [] : await options.eventRepository.listReportVersions(analysisId)
-    const baseReport = versions.filter(({ sessionId, kind }) => (
+    const integratedReports = versions.filter(({ sessionId, kind }) => (
       sessionId === lifecycle.id && kind === 'integrated'
-    )).at(-1)
+    ))
+    const baseReport = requestedBaseReportVersion === undefined
+      ? integratedReports.at(-1)
+      : integratedReports.find(({ version }) => version === requestedBaseReportVersion)
+    if (!replayPayload && requestedBaseReportVersion !== undefined && !baseReport) {
+      throw new Error('base_report_version_not_found')
+    }
     const baseReportVersion = typeof replayPayload?.baseReportVersion === 'number'
       ? replayPayload.baseReportVersion : replayPayload ? null : baseReport?.version ?? null
+    const intent = updateReport ? 'request_report_update' : 'chat'
     const event = replayPayload ?? {
       type: 'runtime_follow_up', status: 'planning', executionId,
-      baseReportVersion, messageId, message, updateReport,
+      baseReportVersion, messageId, message, updateReport, intent,
     }
     const createdAt = new Date().toISOString()
     const result = await options.eventRepository.createFollowUpExecution({
@@ -1203,7 +1250,7 @@ export function createAnalysisService(options: {
       createdAt,
     })
     queueMicrotask(() => void schedule())
-    return { ...result, messageId, message, updateReport }
+    return { ...result, messageId, message, updateReport, intent }
   }
   async function research(analysisId: string) {
     await initialized
@@ -1272,6 +1319,9 @@ export function createAnalysisService(options: {
       ...record, trace,
       mainAgent: await options.eventRepository.primaryLifecycle(analysisId),
       specialistAgents: projectedSpecialists,
+      reportVersions: reportVersions.filter(({ sessionId, kind }) => (
+        sessionId === session?.id && kind === 'integrated'
+      )).map(({ snapshot: _snapshot, ...version }) => version),
     }
   }
   async function listResearch(symbol?: string) {
@@ -1381,6 +1431,7 @@ const ANALYSIS_SYSTEM_PROMPT = `你是个人美股研究助手，分析周期为
 必须区分“当前估值倍数”和“目标价估值方法”：目标价方法不可用不等于当前 PE 等倍数不可用。
 模型上下文中的日线是冻结快照的裁剪样本，不得据此声称数据源只有这些交易日；以 contextScope 中的数量说明裁剪范围。
 数据不足时明确写入 limitations；缺行情不得判断走势，缺财报或估值输入不得给目标价，缺新闻不得推断新闻驱动。
+追问同时提供 reportPositionContext 和 currentPositionSummary 时，必须区分报告时的历史判断与当前持仓影响。
 操作建议只能是带前提的方向建议，不给具体股数或无条件买卖指令。`
 
 function sourceDegradations(context: FinancialContext) {
@@ -1447,6 +1498,7 @@ function finalReportVersion(
   report: AnalysisReport,
   status: 'completed' | 'partial',
   gaps: unknown[],
+  snapshot?: unknown,
 ) {
   const candidateGaps = Array.isArray(candidate.report.gaps) ? candidate.report.gaps : []
   const payload = {
@@ -1461,6 +1513,7 @@ function finalReportVersion(
     kind: candidate.kind,
     payloadHash,
     report: payload,
+    ...(snapshot !== undefined ? { snapshot } : {}),
   }
 }
 

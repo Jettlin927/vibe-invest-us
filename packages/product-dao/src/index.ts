@@ -6,7 +6,7 @@ import {
   type ExecutionSettingsSnapshot, type RuntimeSettings, type RuntimeSettingsRevision,
 } from '@vibe-invest/contracts'
 
-export const schemaVersion = 22
+export const schemaVersion = 23
 
 const migrationSql = `
 CREATE TABLE IF NOT EXISTS product_schema_migrations (
@@ -191,6 +191,7 @@ CREATE TABLE IF NOT EXISTS report_versions (
   kind text NOT NULL CHECK (kind IN ('integrated', 'specialist')),
   payload_hash text NOT NULL CHECK (payload_hash ~ '^[a-f0-9]{64}$'),
   report_json jsonb NOT NULL,
+  snapshot_json jsonb,
   created_at timestamptz NOT NULL,
   UNIQUE (session_id, version),
   UNIQUE (execution_id, payload_hash)
@@ -550,6 +551,24 @@ WHERE id ~ ':compaction:[^:]+:attempt:[0-9]+$' AND EXISTS (
 
 INSERT INTO product_schema_migrations (version)
 VALUES (22)
+ON CONFLICT (version) DO NOTHING;
+
+ALTER TABLE report_versions ADD COLUMN IF NOT EXISTS snapshot_json jsonb;
+
+UPDATE report_versions AS report
+SET snapshot_json = analysis.snapshot_json
+FROM analyses AS analysis
+WHERE report.analysis_id = analysis.id
+  AND report.kind = 'integrated'
+  AND report.snapshot_json IS NULL
+  AND analysis.snapshot_json IS NOT NULL
+  AND report.version = (
+    SELECT max(candidate.version) FROM report_versions AS candidate
+    WHERE candidate.session_id = report.session_id AND candidate.kind = 'integrated'
+  );
+
+INSERT INTO product_schema_migrations (version)
+VALUES (23)
 ON CONFLICT (version) DO NOTHING;
 
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM vibe_invest_app;
@@ -1910,6 +1929,7 @@ export function createAgentEventRepository(pool: Pool) {
           kind: 'integrated' | 'specialist'
           payloadHash: string
           report: unknown
+          snapshot?: unknown
         }
       }
       createdAt: string
@@ -1986,11 +2006,13 @@ export function createAgentEventRepository(pool: Pool) {
           await client.query(
             `INSERT INTO report_versions (
                id, analysis_id, session_id, execution_id, version,
-               kind, payload_hash, report_json, created_at
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+               kind, payload_hash, report_json, snapshot_json, created_at
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
             [reportVersion.id, session.rows[0].analysis_id, input.sessionId, input.executionId,
               nextVersion.rows[0]!.version, reportVersion.kind, reportVersion.payloadHash,
-              JSON.stringify(reportVersion.report), input.createdAt],
+              JSON.stringify(reportVersion.report),
+              reportVersion.snapshot === undefined ? null : JSON.stringify(reportVersion.snapshot),
+              input.createdAt],
           )
         }
         if (input.projection?.executionStatus) {
@@ -2053,10 +2075,10 @@ export function createAgentEventRepository(pool: Pool) {
       const result = await pool.query<{
         id: string; analysis_id: string; session_id: string; execution_id: string
         version: number; kind: 'integrated' | 'specialist'; payload_hash: string
-        report_json: unknown; created_at: string
+        report_json: unknown; snapshot_json: unknown; created_at: string
       }>(
         `SELECT id, analysis_id, session_id, execution_id, version, kind,
-                payload_hash, report_json, created_at::text
+                payload_hash, report_json, snapshot_json, created_at::text
          FROM report_versions WHERE analysis_id = $1 ORDER BY created_at, id`,
         [analysisId],
       )
@@ -2064,6 +2086,7 @@ export function createAgentEventRepository(pool: Pool) {
         id: row.id, analysisId: row.analysis_id, sessionId: row.session_id,
         executionId: row.execution_id, version: row.version, kind: row.kind,
         payloadHash: row.payload_hash, report: row.report_json,
+        ...(row.snapshot_json === null ? {} : { snapshot: row.snapshot_json }),
         createdAt: new Date(row.created_at).toISOString(),
       }))
     },

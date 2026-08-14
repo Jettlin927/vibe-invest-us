@@ -332,6 +332,135 @@ test('追问通过 SSE 实时展示用户消息、文本增量与最终回答', 
   })
 })
 
+test('研究页重新分析同一标的时创建全新研究而不是更新旧报告', async () => {
+  setupDom()
+  Reflect.deleteProperty(globalThis, 'EventSource')
+  let requestedSymbol = ''
+  const oldRecord: any = {
+    id: 'old-research', symbol: 'NVDA', status: 'completed', report: null,
+    reportCreatedAt: null, facts: [], trace: [],
+    mainAgent: {
+      id: 'old-session', status: 'completed', waitReason: null,
+      execution: { id: 'old-execution', generation: 1, status: 'completed' },
+      segments: [], events: [], compactionAttempts: [], modelAttempts: [],
+    }, specialistAgents: [],
+  }
+  const newRecord = {
+    ...oldRecord, id: 'new-research', status: 'completed',
+    mainAgent: {
+      ...oldRecord.mainAgent, id: 'new-session',
+      execution: { id: 'new-execution', generation: 1, status: 'completed' },
+    },
+  }
+  globalThis.fetch = async (input, init) => {
+    const url = String(input)
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok' }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/settings') return Response.json({ ...settingsResponse(), model: { configured: true } })
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+    if (url === '/api/portfolio') return Response.json(portfolioResponse([]))
+    if (url === '/api/research') return Response.json({ records: [
+      { id: oldRecord.id, symbol: oldRecord.symbol, status: oldRecord.status },
+      ...(requestedSymbol ? [{ id: newRecord.id, symbol: newRecord.symbol, status: newRecord.status }] : []),
+    ] })
+    if (url === '/api/research/old-research') return Response.json(oldRecord)
+    if (url === '/api/research/new-research') return Response.json(newRecord)
+    if (url === '/api/analyses' && init?.method === 'POST') {
+      requestedSymbol = JSON.parse(String(init.body)).symbol
+      return Response.json({
+        analysisId: 'new-research', sessionId: 'new-session', executionId: 'new-execution',
+      }, { status: 202 })
+    }
+    if (url === '/api/analyses/new-research') {
+      return Response.json({ id: 'new-research', status: 'completed', terminal: true })
+    }
+    throw new Error(`unexpected_fetch:${url}`)
+  }
+  const view = render(React.createElement(App))
+  const user = userEvent.setup({ document: window.document })
+  await user.click(await view.findByRole('button', { name: '新建分析' }))
+  await user.click(await view.findByRole('button', { name: /打开 NVDA/ }))
+  await user.click(await view.findByRole('button', { name: '重新分析 NVDA' }))
+  await waitFor(() => assert.equal(requestedSymbol, 'NVDA'))
+  await waitFor(() => assert.match(
+    view.getByRole('region', { name: '主 Agent Runtime' }).textContent ?? '', /new-session/,
+  ))
+})
+
+test('研究页可选择历史报告版本作为追问基准且运行中不显示重新分析', async () => {
+  setupDom()
+  Reflect.deleteProperty(globalThis, 'EventSource')
+  let followUpBody: Record<string, unknown> | undefined
+  let pollCompleted = false
+  const record: any = {
+    id: 'versioned-research', symbol: 'NVDA', status: 'completed', terminal: true,
+    report: { title: '当前 V2' }, reportCreatedAt: '2026-08-14T00:00:00Z', facts: [], trace: [],
+    reportVersions: [
+      { version: 1, createdAt: '2026-08-01T00:00:00Z', report: { title: '历史 V1' } },
+      { version: 2, createdAt: '2026-08-14T00:00:00Z', report: { title: '当前 V2' } },
+    ],
+    mainAgent: {
+      id: 'versioned-session', status: 'completed', waitReason: null,
+      execution: { id: 'versioned-execution', generation: 2, status: 'completed' },
+      segments: [], events: [], compactionAttempts: [], modelAttempts: [],
+    }, specialistAgents: [],
+  }
+  globalThis.fetch = async (input, init) => {
+    const url = String(input)
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok' }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/settings') return Response.json({ ...settingsResponse(), model: { configured: true } })
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+    if (url === '/api/portfolio') return Response.json(portfolioResponse([]))
+    if (url === '/api/research') return Response.json({ records: [{ id: record.id, symbol: record.symbol, status: record.status }] })
+    if (url === '/api/research/versioned-research') return Response.json(record)
+    if (url === '/api/analyses/versioned-research/messages' && init?.method === 'POST') {
+      followUpBody = JSON.parse(String(init.body))
+      return Response.json({ sessionId: 'versioned-session', executionId: 'ask-v1' }, { status: 202 })
+    }
+    if (url === '/api/analyses/versioned-research') {
+      pollCompleted = true
+      return Response.json({ status: 'completed', terminal: true })
+    }
+    throw new Error(`unexpected_fetch:${url}`)
+  }
+  const view = render(React.createElement(App))
+  const user = userEvent.setup({ document: window.document })
+  await user.click(await view.findByRole('button', { name: '新建分析' }))
+  await user.click(await view.findByRole('button', { name: /打开 NVDA/ }))
+  assert.equal(view.queryByText('此报告可能过期：已超过当前 7 天时效阈值。'), null)
+  await user.selectOptions(await view.findByLabelText('报告基准版本'), '1')
+  await view.findByText('此报告可能过期：已超过当前 7 天时效阈值。')
+  await view.findByText('当前报告可能过期，追问会同时提供报告时与当前持仓语境。')
+  await user.type(view.getByLabelText('追问主 Agent'), '请解释历史 V1。')
+  await user.click(view.getByRole('button', { name: '发送追问' }))
+  await waitFor(() => assert.equal(followUpBody?.baseReportVersion, 1))
+  await waitFor(() => assert.equal(pollCompleted, true))
+})
+
+test('运行中的研究不显示重新分析入口', async () => {
+  setupDom()
+  const running: any = {
+    id: 'running-research', symbol: 'NVDA', status: 'running', terminal: false,
+    report: null, facts: [], trace: [], specialistAgents: [],
+  }
+  globalThis.fetch = async (input) => {
+    const url = String(input)
+    if (url === '/api/research') return Response.json({ records: [{
+      id: running.id, symbol: running.symbol, status: running.status,
+    }] })
+    if (url === '/api/research/running-research') return Response.json(running)
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok' }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/settings') return Response.json({ ...settingsResponse(), model: { configured: true } })
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+    if (url === '/api/portfolio') return Response.json(portfolioResponse([]))
+    throw new Error(`unexpected_fetch:${url}`)
+  }
+  const view = render(React.createElement(App))
+  const user = userEvent.setup({ document: window.document })
+  await user.click(await view.findByRole('button', { name: '新建分析' }))
+  await user.click(await view.findByRole('button', { name: /打开 NVDA/ }))
+  assert.equal(view.queryByRole('button', { name: '重新分析 NVDA' }), null)
+})
+
 test('新建分析页展示分析历史并能重新打开报告', async () => {
   setupDom()
   const summary = {
@@ -1001,7 +1130,8 @@ test('报告 freshness 按报告年龄提示且不因历史事实改写报告内
   const view = render(React.createElement(App))
   const user = userEvent.setup({ document: window.document })
   await user.click(await view.findByRole('button', { name: '研究记录' }))
-  await view.findByText('此报告已超过当前 7 天有效期，请重新生成后再据此判断。')
+  await view.findByText('此报告可能过期：已超过当前 7 天时效阈值。')
+  await view.findByText('当前报告可能过期，追问会同时提供报告时与当前持仓语境。')
   assert.equal(view.getByRole('heading', { name: oldTitle }).textContent, oldTitle)
   assert.deepEqual(oldRecord.report.limitations, oldLimitations)
 })
@@ -1054,7 +1184,7 @@ test('备注更新不改变报告 freshness 年龄', async () => {
   }
   const view = render(React.createElement(App))
   await userEvent.setup({ document: window.document }).click(await view.findByRole('button', { name: '研究记录' }))
-  await view.findByText('此报告已超过当前 7 天有效期，请重新生成后再据此判断。')
+  await view.findByText('此报告可能过期：已超过当前 7 天时效阈值。')
   assert.equal(record.reportCreatedAt, reportCreatedAt)
   assert.equal(record.report.title, '备注后的旧报告')
 })

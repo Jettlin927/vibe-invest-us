@@ -161,7 +161,7 @@ test('普通追问不向 Provider 投影综合报告提交工具并以聊天文�
       role: 'runtime_follow_up', generatedBy: 'product_runtime', isUserInput: false,
       content: {
         message: '报告还有效吗？', baseReportVersion: 1, updateReport: false,
-        conversationHistory: [],
+        intent: 'chat', conversationHistory: [],
       },
     },
     fetchFinancialContext: async () => ({ facts }),
@@ -192,7 +192,7 @@ test('显式更新报告的追问保留综合报告提交工具并生成新候�
       role: 'runtime_follow_up', generatedBy: 'product_runtime', isUserInput: false,
       content: {
         message: '请更新综合报告。', baseReportVersion: 1, updateReport: true,
-        conversationHistory: [],
+        intent: 'request_report_update', conversationHistory: [],
       },
     },
     fetchFinancialContext: async () => ({ facts }),

@@ -430,7 +430,7 @@ test('真实 PostgreSQL 模型 attempt 在 execution 终态后仍可精确重放
   }
 })
 
-test('真实 PostgreSQL v21 升级到 v22 时将未终态模型请求封存为 outcome_unknown', {
+test('真实 PostgreSQL v21 经当前迁移将未终态模型请求封存为 outcome_unknown', {
   skip: !migrationUrl || !applicationUrl,
   concurrency: false,
 }, async () => {
@@ -459,7 +459,7 @@ test('真实 PostgreSQL v21 升级到 v22 时将未终态模型请求封存为 o
       projectionId: projection.id, turnIndex: 1,
       createdAt: '2026-08-14T03:30:01.000Z',
     })
-    await migrationPool.query('DELETE FROM product_schema_migrations WHERE version = 22')
+    await migrationPool.query('DELETE FROM product_schema_migrations WHERE version >= 22')
     await migrate(migrationUrl!)
     const lifecycle = await events.primaryLifecycle(analysisId)
     assert.equal(lifecycle?.modelAttempts[0]?.status, 'outcome_unknown')
@@ -468,11 +468,12 @@ test('真实 PostgreSQL v21 升级到 v22 时将未终态模型请求封存为 o
     assert.deepEqual(lifecycle?.modelAttempts[0]?.usage, {
       input: null, cacheRead: null, cacheWrite: null, output: null, total: null,
     })
-    assert.deepEqual(await checkSchema(appPool), { status: 'ok', version: 22 })
+    assert.deepEqual(await checkSchema(appPool), { status: 'ok', version: 23 })
   } finally {
     await createAnalysisRepository(appPool).removeResearch(analysisId)
     await migrationPool.query(
-      'INSERT INTO product_schema_migrations (version) VALUES (22) ON CONFLICT DO NOTHING',
+      `INSERT INTO product_schema_migrations (version) VALUES (22), (23)
+       ON CONFLICT DO NOTHING`,
     )
     await appPool.end()
     await migrationPool.end()
@@ -505,7 +506,7 @@ test('真实 PostgreSQL v22 接受技术面 Tool Projection 角色', {
       createdAt: '2026-08-14T00:00:01.000Z',
     })
     assert.equal(projection.role, 'technical')
-    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 22 })
+    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 23 })
   } finally {
     const cleanup = createPool(migrationUrl!)
     await cleanup.query('DELETE FROM analyses WHERE id = $1', [analysisId])
@@ -1611,7 +1612,7 @@ test('真实 PostgreSQL migration 幂等且 application role 没有 DDL 权限',
   await migrate(migrationUrl!)
 
   const pool = createPool(applicationUrl!)
-  assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 22 })
+  assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 23 })
   const privileges = await pool.query<{ can_create: boolean; can_temp: boolean }>(
     `SELECT has_schema_privilege(current_user, 'public', 'CREATE') AS can_create,
             has_database_privilege(current_user, current_database(), 'TEMP') AS can_temp`,
@@ -1668,7 +1669,7 @@ test('真实 PostgreSQL migration receipt 为空时按 max=0 升级', {
     )
     await pool.query('DELETE FROM product_schema_migrations')
     await migrate(migrationUrl!)
-    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 22 })
+    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 23 })
     assert.deepEqual((await pool.query<{ sequence: number; provenance: string }>(
       `SELECT sequence, provenance FROM tool_event_migration_provenance WHERE session_id = $1`,
       [sessionId],
@@ -1735,23 +1736,23 @@ test('真实 PostgreSQL 拒绝未来 schema 且不修改数据库', {
   })
   try {
     await pool.query('DROP TABLE tool_event_migration_provenance')
-    await pool.query('INSERT INTO product_schema_migrations (version) VALUES (23)')
+    await pool.query('INSERT INTO product_schema_migrations (version) VALUES (24)')
     const before = await fingerprint()
 
     await assert.rejects(
       migrate(migrationUrl!),
-      /product_schema_future_version_unsupported:23/,
+      /product_schema_future_version_unsupported:24/,
     )
 
     assert.deepEqual(await fingerprint(), before)
   } finally {
-    await pool.query('DELETE FROM product_schema_migrations WHERE version = 23')
+    await pool.query('DELETE FROM product_schema_migrations WHERE version = 24')
     await migrate(migrationUrl!)
     await pool.end()
   }
 })
 
-test('真实 PostgreSQL v12 无 Tool Batch 的历史工具事件原样升级到 v22', {
+test('真实 PostgreSQL v12 无 Tool Batch 的历史工具事件原样升级到 v23', {
   skip: !migrationUrl,
   concurrency: false,
 }, async () => {
@@ -1795,7 +1796,7 @@ test('真实 PostgreSQL v12 无 Tool Batch 的历史工具事件原样升级到 
 
     await migrate(migrationUrl!)
 
-    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 22 })
+    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 23 })
     assert.deepEqual((await pool.query<{ sequence: number; provenance: string }>(
       `SELECT sequence, provenance FROM tool_event_migration_provenance
        WHERE session_id = $1 ORDER BY sequence`, [sessionId],
@@ -2155,10 +2156,11 @@ test('真实 PostgreSQL Agent Session 事件 sequence 严格递增且 operationI
 })
 
 test('真实 PostgreSQL 仅为通过校验的报告原子生成不可变版本', {
-  skip: !applicationUrl,
+  skip: !applicationUrl || !migrationUrl,
   concurrency: false,
 }, async () => {
   const pool = createPool(applicationUrl!)
+  const migrationPool = createPool(migrationUrl!)
   const analyses = createAnalysisRepository(pool)
   const events = createAgentEventRepository(pool)
   const analysisId = `report-version-${crypto.randomUUID()}`
@@ -2167,6 +2169,7 @@ test('真实 PostgreSQL 仅为通过校验的报告原子生成不可变版本',
   const now = '2026-08-13T08:00:00.000Z'
   const payloadHash = 'a'.repeat(64)
   const report = { kind: 'integrated', title: '可追溯的综合报告' }
+  const snapshot = { portfolioContext: { position: { symbol: 'NVDA', quantity: 10 } } }
   try {
     await events.createResearch({
       analysisId, sessionId, executionId, symbol: `R${crypto.randomUUID().slice(0, 8)}`,
@@ -2188,8 +2191,11 @@ test('真实 PostgreSQL 仅为通过校验的报告原子生成不可变版本',
       event: { type: 'status', status: 'completed', terminal: true },
       projection: {
         status: 'completed', executionStatus: 'completed' as const, terminal: true,
-        report,
-        reportVersion: { id: `${executionId}:report`, kind: 'integrated' as const, payloadHash, report },
+        report, snapshot,
+        reportVersion: {
+          id: `${executionId}:report`, kind: 'integrated' as const,
+          payloadHash, report, snapshot,
+        },
       },
       createdAt: now,
     }
@@ -2198,11 +2204,19 @@ test('真实 PostgreSQL 仅为通过校验的报告原子生成不可变版本',
 
     assert.deepEqual(await events.listReportVersions(analysisId), [{
       id: `${executionId}:report`, analysisId, sessionId, executionId, version: 1,
-      kind: 'integrated', payloadHash, report, createdAt: now,
+      kind: 'integrated', payloadHash, report, snapshot, createdAt: now,
     }])
+
+    await migrationPool.query(
+      'UPDATE report_versions SET snapshot_json = NULL WHERE analysis_id = $1', [analysisId],
+    )
+    await migrationPool.query('DELETE FROM product_schema_migrations WHERE version = 23')
+    await migrate(migrationUrl!)
+    assert.deepEqual((await events.listReportVersions(analysisId))[0]?.snapshot, snapshot)
   } finally {
     await analyses.removeResearch(analysisId)
     await pool.end()
+    await migrationPool.end()
   }
 })
 

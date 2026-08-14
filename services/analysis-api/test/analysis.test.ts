@@ -177,6 +177,38 @@ test('报告后每条用户消息在原主 Session 创建独立 execution 并冻
   await app.close()
 })
 
+test('重新分析同一标的会创建全新的研究、主 Session 与 execution', async () => {
+  const app = await makeApp(crypto.randomUUID())
+  const first = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' },
+  })).json()
+  await waitForStatus(app, first.analysisId, 'completed')
+  const firstBefore = (await app.inject({
+    method: 'GET', url: `/api/research/${first.analysisId}`,
+  })).json()
+
+  const secondResponse = await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' },
+  })
+  assert.equal(secondResponse.statusCode, 202, secondResponse.body)
+  const second = secondResponse.json()
+  await waitForStatus(app, second.analysisId, 'completed')
+  const firstAfter = (await app.inject({
+    method: 'GET', url: `/api/research/${first.analysisId}`,
+  })).json()
+  const secondResearch = (await app.inject({
+    method: 'GET', url: `/api/research/${second.analysisId}`,
+  })).json()
+
+  assert.notEqual(second.analysisId, first.analysisId)
+  assert.notEqual(second.sessionId, first.sessionId)
+  assert.notEqual(secondResearch.mainAgent.execution.id, firstBefore.mainAgent.execution.id)
+  assert.equal(secondResearch.mainAgent.execution.generation, 1)
+  assert.deepEqual(firstAfter.report, firstBefore.report)
+  assert.equal(firstAfter.reportCreatedAt, firstBefore.reportCreatedAt)
+  await app.close()
+})
+
 test('普通追问只注入紧凑报告语境并保留 active report', async () => {
   const database = createTestProductDatabase()
   let modelCalls = 0
@@ -255,6 +287,63 @@ test('普通追问只注入紧凑报告语境并保留 active report', async () 
   })).json().items
   assert.equal(versions.length, 1)
   assert.ok(after.trace.some((event: any) => event.type === 'chat_completed'))
+  await app.close()
+})
+
+test('追问时效绑定冻结版本而不随当前 active projection 时间改变', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: new Date('2026-08-01T00:00:00.000Z') })
+  const database = createTestProductDatabase()
+  let calls = 0
+  let frozenReportCreatedAt = ''
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [], indicators: {} }),
+    model: {
+      async *analyze(input) {
+        calls += 1
+        if (calls === 1) {
+          yield { type: 'completed' as const, report, reportVersion: {
+            kind: 'integrated' as const, report: reportCandidate,
+          } }
+          return
+        }
+        assert.equal(input.runtimeFollowUp?.content.freshness, 'stale')
+        assert.ok(Number(input.runtimeFollowUp?.content.reportAgeDays) >= 8)
+        assert.equal(input.runtimeFollowUp?.content.baseReportCreatedAt, frozenReportCreatedAt)
+        assert.match(String(input.runtimeFollowUp?.content.freshnessWarning), /基准报告可能过期/)
+        yield { type: 'chat_completed' as const, text: '已按过期材料边界回答。' }
+      },
+    },
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'STALE' },
+  })).json()
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  frozenReportCreatedAt = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json().reportCreatedAt
+  t.mock.timers.setTime(Date.parse('2026-08-09T00:00:00.000Z'))
+  const activeProjectionCreatedAt = new Date().toISOString()
+  await database.analysisRepository.updateResearch(
+    created.analysisId, { reportCreatedAt: activeProjectionCreatedAt } as any,
+    activeProjectionCreatedAt,
+  )
+  const before = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  assert.equal(before.reportCreatedAt, activeProjectionCreatedAt)
+  assert.equal((await app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/messages`,
+    payload: { messageId: 'stale-follow-up', message: '这份报告还有效吗？' },
+  })).statusCode, 202)
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  const after = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  assert.deepEqual(after.report, before.report)
+  assert.equal(after.reportCreatedAt, before.reportCreatedAt)
   await app.close()
 })
 
@@ -404,6 +493,10 @@ test('显式更新报告的用户消息通过同一报告校验路径生成综�
         if (calls === 2) {
           assert.equal(input.runtimeFollowUp?.content.updateReport, true)
           assert.equal(input.runtimeFollowUp?.content.baseReportVersion, 1)
+          assert.equal((input.runtimeFollowUp?.content.reportPositionContext as any)
+            .position.quantity, 10)
+          assert.equal((input.runtimeFollowUp?.content.currentPositionSummary as any)
+            .position.quantity, 12)
         }
         yield {
           type: 'completed' as const, report: calls === 1 ? report : updatedReport,
@@ -416,10 +509,16 @@ test('显式更新报告的用户消息通过同一报告校验路径生成综�
     },
   })
   await app.ready()
+  await app.inject({
+    method: 'PUT', url: '/api/positions/UPDR', payload: { quantity: 10, averageCost: 100 },
+  })
   const created = (await app.inject({
     method: 'POST', url: '/api/analyses', payload: { symbol: 'UPDR' },
   })).json()
   await waitForStatus(app as any, created.analysisId, 'completed')
+  await app.inject({
+    method: 'PUT', url: '/api/positions/UPDR', payload: { quantity: 12, averageCost: 100 },
+  })
   const response = await app.inject({
     method: 'POST', url: `/api/analyses/${created.analysisId}/messages`,
     payload: { messageId: 'update-report-v2', message: '请更新报告。', updateReport: true },
@@ -434,6 +533,155 @@ test('显式更新报告的用户消息通过同一报告校验路径生成综�
   })).json().items
   assert.equal(research.report.title, updatedReport.title)
   assert.deepEqual(versions.map(({ version }: { version: number }) => version), [1, 2])
+  const updateRequest = research.trace.find((event: { type?: string; messageId?: string }) => (
+    event.type === 'runtime_follow_up' && event.messageId === 'update-report-v2'
+  ))
+  assert.equal(updateRequest.intent, 'request_report_update')
+  await app.close()
+})
+
+test('用户从历史 V1 发起追问时冻结该版本的时间、报告时持仓和正文', async () => {
+  const database = createTestProductDatabase()
+  let calls = 0
+  let contextFetches = 0
+  let v1CreatedAt = ''
+  const v2Report = { ...report, title: '历史基准测试 V2' }
+  const currentFact = {
+    ...fact, id: 'fact:HISTV:quote:current-v2', value: 240,
+    observedAt: '2026-08-14T01:00:00Z', fetchedAt: '2026-08-14T01:00:01Z',
+  }
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => {
+      contextFetches += 1
+      return {
+        symbol, facts: contextFetches === 1 ? [fact] : [currentFact], gaps: [], indicators: {},
+      }
+    },
+    model: {
+      async *analyze(input) {
+        calls += 1
+        if (calls === 3) {
+          assert.equal(input.runtimeFollowUp?.content.baseReportVersion, 1)
+          assert.equal((input.runtimeFollowUp?.content.baseReport as any).title, report.title)
+          assert.equal(input.runtimeFollowUp?.content.baseReportCreatedAt, v1CreatedAt)
+          assert.equal((input.runtimeFollowUp?.content.reportPositionContext as any)
+            .position.quantity, 10)
+          assert.equal((input.runtimeFollowUp?.content.currentPositionSummary as any)
+            .position.quantity, 15)
+          assert.deepEqual(input.knownFacts.map(({ id }) => id), [fact.id])
+          assert.match(input.systemPrompt, /区分报告时的历史判断与当前持仓影响/)
+          yield { type: 'chat_completed' as const, text: '已按 V1 历史语境回答。' }
+          return
+        }
+        const next = calls === 1 ? report : v2Report
+        yield { type: 'completed' as const, report: next, reportVersion: {
+          kind: 'integrated' as const,
+          report: { ...reportCandidate, title: next.title },
+        } }
+      },
+    },
+  } as any)
+  await app.ready()
+  await app.inject({
+    method: 'PUT', url: '/api/positions/HISTV', payload: { quantity: 10, averageCost: 100 },
+  })
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'HISTV' },
+  })).json()
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  v1CreatedAt = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}/report-versions`,
+  })).json().items[0].createdAt
+  await app.inject({
+    method: 'PUT', url: '/api/positions/HISTV', payload: { quantity: 12, averageCost: 100 },
+  })
+  assert.equal((await app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/messages`,
+    payload: {
+      messageId: 'make-v2', message: '更新为 V2。', updateReport: true, baseReportVersion: 1,
+    },
+  })).statusCode, 202)
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  await app.inject({
+    method: 'PUT', url: '/api/positions/HISTV', payload: { quantity: 15, averageCost: 100 },
+  })
+  const historical = await app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/messages`,
+    payload: {
+      messageId: 'ask-v1', message: '基于 V1 解释当前影响。', baseReportVersion: 1,
+    },
+  })
+  assert.equal(historical.statusCode, 202, historical.body)
+  assert.equal(historical.json().baseReportVersion, 1)
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  const research = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  assert.equal(research.report.title, v2Report.title)
+  assert.deepEqual(research.reportVersions.map(({ version }: { version: number }) => version), [1, 2])
+  await app.close()
+})
+
+test('报告更新取得当前资料但失败时保留上一份 active report 与 V1', async () => {
+  const database = createTestProductDatabase()
+  const currentFact = {
+    ...fact, id: 'fact:NVDA:quote:current-update', value: 230,
+    observedAt: '2026-08-14T01:00:00Z', fetchedAt: '2026-08-14T01:00:01Z',
+  }
+  let contextFetches = 0
+  let modelCalls = 0
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => {
+      contextFetches += 1
+      return {
+        symbol, facts: contextFetches === 1 ? [fact] : [currentFact], gaps: [], indicators: {},
+      }
+    },
+    model: {
+      async *analyze(input) {
+        modelCalls += 1
+        if (modelCalls === 1) {
+          yield { type: 'completed' as const, report, reportVersion: {
+            kind: 'integrated' as const, report: reportCandidate,
+          } }
+          return
+        }
+        assert.equal(input.runtimeFollowUp?.content.updateReport, true)
+        assert.equal(input.runtimeFollowUp?.content.baseReportVersion, 1)
+        assert.deepEqual(new Set(input.knownFacts.map(({ id }) => id)), new Set([
+          fact.id, currentFact.id,
+        ]))
+        throw new Error('report_update_failed')
+      },
+    },
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'UPDF' },
+  })).json()
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  const before = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  assert.equal((await app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/messages`,
+    payload: { messageId: 'failed-update', message: '更新本报告。', updateReport: true },
+  })).statusCode, 202)
+  await waitForStatus(app as any, created.analysisId, 'failed')
+  const after = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  const versions = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}/report-versions`,
+  })).json().items
+  assert.equal(contextFetches, 2)
+  assert.deepEqual(after.report, before.report)
+  assert.equal(after.reportCreatedAt, before.reportCreatedAt)
+  assert.deepEqual(versions.map(({ version }: { version: number }) => version), [1])
   await app.close()
 })
 

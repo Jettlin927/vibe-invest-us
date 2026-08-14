@@ -77,7 +77,7 @@ function specialistResults(context: { messages: Array<{
   })
 }
 
-test('真实 v12 历史 Tool 事件升级到 v22 后经 DAO、HTTP 与 SSE 原样读取', {
+test('真实 v12 历史 Tool 事件升级到 v23 后经 DAO、HTTP 与 SSE 原样读取', {
   skip: !databaseUrl || !migrationDatabaseUrl,
   concurrency: false,
 }, async () => {
@@ -958,6 +958,8 @@ test('首次研究经真实 PostgreSQL 与 HTTP SSE 展示 Runtime Context、工
     assert.equal(versions.items[0].kind, 'integrated')
     assert.equal(versions.items[0].report.title, '首次研究候选报告')
     assert.match(versions.items[0].payloadHash, /^[a-f0-9]{64}$/)
+    assert.equal('snapshot' in versions.items[0], false)
+    assert.doesNotMatch(JSON.stringify(versions), /privateDiagnostic|只允许保留在 PostgreSQL 审计视图/)
   } finally {
     await app.close()
     await closeHttp(provider)
@@ -969,6 +971,7 @@ test('报告后追问经真实 PostgreSQL、HTTP Provider 与 SSE 独立执行�
   concurrency: false,
 }, async () => {
   const providerRequests: Array<Record<string, unknown>> = []
+  let contextFetches = 0
   const provider = createServer(async (request, response) => {
     const body = await readJsonBody(request)
     providerRequests.push(body)
@@ -985,7 +988,7 @@ test('报告后追问经真实 PostgreSQL、HTTP Provider 与 SSE 独立执行�
       }])
     } else if (providerRequests.length === 2) {
       writeOpenAiText(response, '普通追问只返回聊天答案，不改写基准报告。')
-    } else {
+    } else if (providerRequests.length === 3) {
       writeOpenAiToolCalls(response, [{
         id: 'follow-up-updated-report', name: 'submit_analysis_report',
         arguments: JSON.stringify(integratedReport({
@@ -995,6 +998,8 @@ test('报告后追问经真实 PostgreSQL、HTTP Provider 与 SSE 独立执行�
           conditionalSuggestion: null, limitations: [],
         })),
       }])
+    } else {
+      writeOpenAiText(response, '历史 V1 追问只解释当前影响，不改写 V2。')
     }
   })
   await listenHttp(provider)
@@ -1009,7 +1014,20 @@ test('报告后追问经真实 PostgreSQL、HTTP Provider 与 SSE 独立执行�
     runtimeSettingsRepository: createRuntimeSettingsRepository(pool),
     toolProjectionRepository: createToolProjectionRepository(pool),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
-    fetchFinancialContext: async (symbol) => ({ symbol, gaps: [], facts: [], indicators: {} }),
+    fetchFinancialContext: async (symbol) => {
+      contextFetches += 1
+      return {
+        symbol, gaps: [], indicators: {}, facts: [{
+          id: `fact:${symbol}:quote:${contextFetches === 1 ? 'report-time' : 'current'}`,
+          type: 'quote', value: contextFetches === 1 ? 100 : 120,
+          observedAt: contextFetches === 1
+            ? '2026-08-01T13:30:00Z' : '2026-08-14T13:30:00Z',
+          fetchedAt: contextFetches === 1
+            ? '2026-08-01T13:30:01Z' : '2026-08-14T13:30:01Z',
+          source: 'integration-provider', sourceReference: `test://${symbol}/quote`,
+        }],
+      }
+    },
     model: createPiModel({
       provider: 'local-openai', apiProtocol: 'chat-completions', modelName: 'follow-up-model',
       baseUrl: `http://127.0.0.1:${providerAddress.port}`, apiKey: 'integration-key',
@@ -1022,6 +1040,10 @@ test('报告后追问经真实 PostgreSQL、HTTP Provider 与 SSE 独立执行�
   const baseUrl = `http://127.0.0.1:${address.port}`
   const symbol = `U${crypto.randomUUID().replaceAll('-', '').slice(0, 8)}`
   try {
+    assert.equal((await fetch(`${baseUrl}/api/positions/${symbol}`, {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ quantity: 10, averageCost: 90 }),
+    })).status, 200)
     const created = await fetch(`${baseUrl}/api/analyses`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ symbol }),
@@ -1056,6 +1078,10 @@ test('报告后追问经真实 PostgreSQL、HTTP Provider 与 SSE 独立执行�
     assert.equal((await fetch(`${baseUrl}/api/research/${created.analysisId}/report-versions`)
       .then((response) => response.json())).items.length, 1)
 
+    assert.equal((await fetch(`${baseUrl}/api/positions/${symbol}`, {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ quantity: 12, averageCost: 90 }),
+    })).status, 200)
     const secondCursor = (await events.list(created.sessionId, 0)).at(-1)!.sequence
     const update = await fetch(`${baseUrl}/api/analyses/${created.analysisId}/messages`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
@@ -1072,8 +1098,14 @@ test('报告后追问经真实 PostgreSQL、HTTP Provider 与 SSE 独立执行�
     assert.match(updateSse, /event: completed/)
     assert.equal(providerToolNames(providerRequests[2]!).includes('submit_analysis_report'), true)
     const updateRequest = JSON.stringify(providerRequests[2])
+    const updateMessages = (providerRequests[2]!.messages as Array<{ content?: string }>)
+      .map(({ content }) => content ?? '').join('\n')
     assert.match(updateRequest, /这份报告现在还有效吗/)
     assert.match(updateRequest, /普通追问只返回聊天答案，不改写基准报告/)
+    assert.match(updateMessages, /"reportPositionContext"[^]*"quantity":10/)
+    assert.match(updateMessages, /"currentPositionSummary"[^]*"quantity":12/)
+    assert.match(updateMessages, /"currentPositionSummary"[^]*"marketPrice":120/)
+    assert.equal(contextFetches, 2)
     const finalResearch = await fetch(`${baseUrl}/api/research/${created.analysisId}`)
       .then((response) => response.json())
     const versions = await fetch(`${baseUrl}/api/research/${created.analysisId}/report-versions`)
@@ -1082,6 +1114,44 @@ test('报告后追问经真实 PostgreSQL、HTTP Provider 与 SSE 独立执行�
     assert.deepEqual(versions.items.map(({ version }: { version: number }) => version), [1, 2])
     assert.equal(finalResearch.mainAgent.segments.length, 3)
     assert.equal(finalResearch.mainAgent.execution.generation, 3)
+    const followUpEvents = (await events.list(created.sessionId, 0)).filter(({ payload }) => (
+      payload.type === 'runtime_follow_up' && typeof payload.intent === 'string'
+    ))
+    assert.deepEqual(followUpEvents.map(({ payload }) => payload.intent), [
+      'chat', 'request_report_update',
+    ])
+
+    assert.equal((await fetch(`${baseUrl}/api/positions/${symbol}`, {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ quantity: 15, averageCost: 90 }),
+    })).status, 200)
+    const historicalCursor = (await events.list(created.sessionId, 0)).at(-1)!.sequence
+    const historical = await fetch(`${baseUrl}/api/analyses/${created.analysisId}/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        messageId: 'historical-v1', message: '基于 V1 解释当前影响。',
+        updateReport: false, baseReportVersion: 1,
+      }),
+    })
+    assert.equal(historical.status, 202)
+    assert.equal((await historical.json()).baseReportVersion, 1)
+    const historicalSse = await readThrough(await fetch(
+      `${baseUrl}/api/agent-sessions/${created.sessionId}/events`,
+      { headers: { 'Last-Event-ID': `${created.sessionId}:${historicalCursor}` } },
+    ), 'event: completed')
+    assert.match(historicalSse, /event: chat_completed/)
+    const historicalMessages = (providerRequests[3]!.messages as Array<{ content?: string }>)
+      .map(({ content }) => content ?? '').join('\n')
+    assert.match(historicalMessages, /"baseReportVersion":1/)
+    assert.match(historicalMessages, /"reportPositionContext"[^]*"quantity":10/)
+    assert.match(historicalMessages, /"currentPositionSummary"[^]*"quantity":15/)
+    const afterHistorical = await fetch(`${baseUrl}/api/research/${created.analysisId}`)
+      .then((response) => response.json())
+    assert.equal(afterHistorical.report.title, '追问更新报告 V2')
+    assert.deepEqual((await fetch(`${baseUrl}/api/research/${created.analysisId}/report-versions`)
+      .then((response) => response.json())).items.map(
+        ({ version }: { version: number }) => version,
+      ), [1, 2])
   } finally {
     await app.close()
     await closeHttp(provider)

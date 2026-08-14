@@ -335,7 +335,10 @@ export function buildApp(dependencies: AppDependencies) {
   })
   app.post<{
     Params: { id: string }
-    Body: { messageId?: unknown; message?: unknown; updateReport?: unknown }
+    Body: {
+      messageId?: unknown; message?: unknown; updateReport?: unknown
+      baseReportVersion?: unknown
+    }
   }>('/api/analyses/:id/messages', async (request, reply) => {
     if (typeof request.body?.message !== 'string' || !request.body.message.trim()) {
       return reply.status(400).send({ error: 'follow_up_message_required' })
@@ -347,10 +350,16 @@ export function buildApp(dependencies: AppDependencies) {
     if (request.body.updateReport !== undefined && typeof request.body.updateReport !== 'boolean') {
       return reply.status(400).send({ error: 'follow_up_update_report_invalid' })
     }
+    if (request.body.baseReportVersion !== undefined
+      && (!Number.isInteger(request.body.baseReportVersion)
+        || Number(request.body.baseReportVersion) <= 0)) {
+      return reply.status(400).send({ error: 'follow_up_base_report_version_invalid' })
+    }
     try {
       const result = await analysis?.followUp(
         request.params.id, request.body.messageId, request.body.message,
         request.body.updateReport ?? false,
+        request.body.baseReportVersion as number | undefined,
       )
       if (!result) return reply.status(404).send({ error: 'analysis_not_found' })
       return reply.status(202).send(result)
@@ -373,7 +382,8 @@ export function buildApp(dependencies: AppDependencies) {
       return reply.status(404).send({ error: 'analysis_not_found' })
     }
     return {
-      items: await dependencies.agentEventRepository.listReportVersions(request.params.id),
+      items: (await dependencies.agentEventRepository.listReportVersions(request.params.id))
+        .map(({ snapshot: _snapshot, ...version }) => version),
     }
   })
   app.get<{ Querystring: { symbol?: string } }>('/api/research', async (request) => ({

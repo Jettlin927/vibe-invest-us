@@ -282,6 +282,7 @@ export type RuntimeFollowUp = {
     message: string
     baseReportVersion: number | null
     updateReport: boolean
+    intent: 'chat' | 'request_report_update'
     conversationHistory: Array<{ role: 'user' | 'assistant'; text: string }>
   }
 }
