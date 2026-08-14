@@ -11,6 +11,7 @@ from app.context import (
     filing_document_page, financial_metric_series_result, financial_overview_facts, search_news_facts,
     official_company_event_facts, price_window_result, technical_evidence_result,
     technical_indicator_facts, web_search_lead_facts, valuation_evidence_result,
+    _first_available,
 )
 from app.models import AtomicFact, FactQueryResult, FilingDocumentResult, FinancialContext, FinancialOverviewResult, NewsDocumentResult, PaginatedFactResult, PriceWindowResult, QuoteBatch, QuoteSnapshot, SourceStatus, TechnicalEvidenceResult, ValuationEvidenceResult
 from app.source_config import build_sources, load_source_config
@@ -185,24 +186,14 @@ def quotes(symbols: List[str]) -> QuoteBatch:
     result = []
     for symbol_input in symbols[:100]:
         symbol = symbol_input.strip().upper()
-        statuses = []
-        adopted = None
-        for source in build_sources(source_config, "quote"):
-            try:
-                quote = source.fetch(symbol)
-                statuses.append(SourceStatus(source=source.name, status="ok", item_count=1))
-                if adopted is None:
-                    adopted = (source.name, quote)
-            except Exception as error:
-                statuses.append(SourceStatus(
-                    source=source.name, status="failed", error=type(error).__name__, item_count=0,
-                ))
+        outcome = _first_available(build_sources(source_config, "quote"), symbol)
+        quote = outcome.value
         result.append(QuoteSnapshot(
             symbol=symbol,
-            price=adopted[1].price if adopted else None,
-            observed_at=adopted[1].observed_at if adopted else None,
-            source=adopted[0] if adopted else None,
-            degraded=bool(adopted and statuses[0].status != "ok"),
-            sources=statuses,
+            price=quote.price if quote else None,
+            observed_at=quote.observed_at if quote else None,
+            source=outcome.adopted_source,
+            degraded=outcome.degraded,
+            sources=outcome.sources,
         ))
     return QuoteBatch(quotes=result)

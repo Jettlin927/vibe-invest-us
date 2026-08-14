@@ -248,8 +248,74 @@ def test_quote_batch_uses_fallback_without_exposing_provider_payload(monkeypatch
         "observed_at": "2026-08-12T00:00:00Z", "source": "backup",
         "degraded": True,
         "sources": [
-            {"source": "primary", "status": "failed", "error": "RuntimeError", "item_count": 0},
+            {"source": "primary", "status": "failed", "error": "down", "item_count": 0},
             {"source": "backup", "status": "ok", "error": None, "item_count": 1},
+        ],
+    }
+
+
+def test_quote_batch_treats_empty_response_as_gap_and_falls_back(monkeypatch):
+    class EmptySource:
+        name = "primary"
+        def __init__(self, timeout=15):
+            self.timeout = timeout
+        def fetch(self, _symbol):
+            return None
+
+    class BackupSource:
+        name = "backup"
+        def __init__(self, timeout=15):
+            self.timeout = timeout
+        def fetch(self, symbol):
+            return Quote(
+                price=123.5,
+                observed_at=datetime(2026, 8, 12, tzinfo=timezone.utc),
+                source_reference=f"https://example.com/{symbol}",
+            )
+
+    monkeypatch.setitem(__import__("app.main", fromlist=["source_config"]).source_config, "quote", [
+        {"name": "primary", "enabled": True, "priority": 10},
+        {"name": "backup", "enabled": True, "priority": 20},
+    ])
+    monkeypatch.setitem(__import__("app.source_config", fromlist=["SOURCE_CLASSES"]).SOURCE_CLASSES, "quote", {
+        "primary": EmptySource, "backup": BackupSource,
+    })
+    response = TestClient(app).post("/v1/quotes", json=["nvda"])
+
+    assert response.status_code == 200
+    assert response.json()["quotes"][0] == {
+        "symbol": "NVDA", "price": 123.5,
+        "observed_at": "2026-08-12T00:00:00Z", "source": "backup",
+        "degraded": True,
+        "sources": [
+            {"source": "primary", "status": "empty", "error": None, "item_count": 0},
+            {"source": "backup", "status": "ok", "error": None, "item_count": 1},
+        ],
+    }
+
+
+def test_quote_batch_reports_gap_when_all_sources_empty(monkeypatch):
+    class EmptySource:
+        name = "primary"
+        def __init__(self, timeout=15):
+            self.timeout = timeout
+        def fetch(self, _symbol):
+            return None
+
+    monkeypatch.setitem(__import__("app.main", fromlist=["source_config"]).source_config, "quote", [
+        {"name": "primary", "enabled": True, "priority": 10},
+    ])
+    monkeypatch.setitem(__import__("app.source_config", fromlist=["SOURCE_CLASSES"]).SOURCE_CLASSES, "quote", {
+        "primary": EmptySource,
+    })
+    response = TestClient(app).post("/v1/quotes", json=["nvda"])
+
+    assert response.status_code == 200
+    assert response.json()["quotes"][0] == {
+        "symbol": "NVDA", "price": None, "observed_at": None, "source": None,
+        "degraded": False,
+        "sources": [
+            {"source": "primary", "status": "empty", "error": None, "item_count": 0},
         ],
     }
 
