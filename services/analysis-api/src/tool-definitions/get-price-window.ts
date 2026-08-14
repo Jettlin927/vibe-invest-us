@@ -18,6 +18,6 @@ export const getPriceWindowDefinition: RegisteredToolDefinition = {
     facts: Type.Array(Type.Unknown()),
   }),
   allowedRoles: ['technical'], allowedStages: ['research'], sideEffect: 'read_only',
-  externalNetwork: 'financial_data', resultRetention: 'research_record',
+  externalNetwork: 'financial_data', hostAccess: 'none', resultRetention: 'research_record',
   modelProjection: 'bounded_summary', executionMode: 'parallel', countsAsToolRound: true,
 }

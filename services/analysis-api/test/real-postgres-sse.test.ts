@@ -953,9 +953,11 @@ test('首次研究经真实 PostgreSQL 与 HTTP SSE 展示 Runtime Context、工
     for (const eventName of ['runtime_context', 'model_event', 'tool_call', 'tool_result', 'completed']) {
       assert.match(sse, new RegExp(`event: ${eventName}`))
     }
+    assert.doesNotMatch(sse, /privateDiagnostic|只允许保留在 PostgreSQL 审计视图/)
     const research = await fetch(`${baseUrl}/api/research/${created.analysisId}`)
       .then((response) => response.json())
     assert.equal(research.report.title, '首次研究候选报告')
+    assert.doesNotMatch(JSON.stringify(research), /privateDiagnostic|只允许保留在 PostgreSQL 审计视图/)
     const versions = await fetch(`${baseUrl}/api/research/${created.analysisId}/report-versions`)
       .then((response) => response.json())
     assert.equal(versions.items.length, 1)
@@ -965,6 +967,15 @@ test('首次研究经真实 PostgreSQL 与 HTTP SSE 展示 Runtime Context、工
     assert.match(versions.items[0].payloadHash, /^[a-f0-9]{64}$/)
     assert.equal('snapshot' in versions.items[0], false)
     assert.doesNotMatch(JSON.stringify(versions), /privateDiagnostic|只允许保留在 PostgreSQL 审计视图/)
+    const exported = await fetch(`${baseUrl}/api/research/${created.analysisId}/export`)
+      .then((response) => response.json())
+    assert.equal(exported.schemaVersion, 1)
+    assert.equal(exported.analysis.id, created.analysisId)
+    assert.equal(exported.reportVersions[0].report.title, '首次研究候选报告')
+    assert.equal(exported.configurationVersions.length, 1)
+    assert.ok(exported.facts.some(({ id }: { id: string }) => id === 'fact:first-research:bar:23'))
+    assert.doesNotMatch(JSON.stringify(exported), /privateDiagnostic|只允许保留在 PostgreSQL 审计视图/)
+    assert.doesNotMatch(JSON.stringify(exported), /generation|previousExecutionId|sourceExecutionIds|fenc/i)
   } finally {
     await app.close()
     await closeHttp(provider)
@@ -1197,8 +1208,8 @@ test('主 Agent 经真实 PostgreSQL、HTTP 与 SSE 启动并展示独立消息�
   }
   const mainModel = createPiModel({ fauxResponses: [
     fauxAssistantMessage(fauxToolCall('run_news_analysis', {
-      launch: true, researchQuestion: '近 30 天是否有改变预期的事件？',
-      reason: '缺少消息面反方证据。',
+      launch: true, researchQuestion: '用户持有 100 股且成本 90 美元，请检查监管调查与诉讼风险。',
+      reason: '用户现金 50000 美元，需要消息面反方证据。',
     }), { stopReason: 'toolUse' }),
     (context) => fauxAssistantMessage(fauxToolCall('submit_analysis_report', integratedReport({
       title: '消息面专项闭环', marketState: '数据有限', trend: '震荡', drivers: [],
@@ -1220,6 +1231,7 @@ test('主 Agent 经真实 PostgreSQL、HTTP 与 SSE 启动并展示独立消息�
     }),
   ] })
   const model = { ...mainModel, analyzeNews: newsModel.analyzeNews }
+  const externalQueries: string[] = []
   const analyses = createAnalysisRepository(pool)
   const app = buildApp({
     productDatabase: { checkSchema: () => checkSchema(pool), close: () => pool.end() },
@@ -1229,7 +1241,10 @@ test('主 Agent 经真实 PostgreSQL、HTTP 与 SSE 启动并展示独立消息�
     toolProjectionRepository: createToolProjectionRepository(pool),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({ symbol, gaps: [], facts: [] }),
-    searchNewsCandidates: async () => ({ facts: [candidate] }),
+    searchNewsCandidates: async (query) => {
+      externalQueries.push(query)
+      return { facts: [candidate] }
+    },
     readNewsDocument: async (input) => {
       assert.equal(input.id, candidate.id)
       return { facts: [verified], excerpt: 'bounded verified excerpt' }
@@ -1256,8 +1271,11 @@ test('主 Agent 经真实 PostgreSQL、HTTP 与 SSE 启动并展示独立消息�
     assert.match(JSON.stringify(news.events), /fact:news:e2e:document/)
     assert.doesNotMatch(JSON.stringify(news.events), /bounded verified excerpt/)
     assert.match(JSON.stringify(news.events), /bounded verified summary/)
-    assert.equal(news.researchQuestion, '近 30 天是否有改变预期的事件？')
-    assert.equal(news.reason, '缺少消息面反方证据。')
+    assert.equal(news.researchQuestion,
+      `核实 ${research.symbol} 的监管、诉讼和合规事件是否改变未来一至四周判断。`)
+    assert.equal(news.reason, '主 Agent 请求独立核实监管与法律风险证据。')
+    assert.deepEqual(externalQueries, [`${research.symbol} 近期公司新闻 公告 事件`])
+    assert.doesNotMatch(JSON.stringify(news), /100 股|成本 90|现金 50000/)
 
     const mainLedger = await events.list(created.sessionId, 0)
     const specialistResult = mainLedger.find(({ payload }) => (
@@ -1561,8 +1579,9 @@ test('主 Agent 经真实 PostgreSQL、HTTP 与 SSE 启动并展示独立基本�
     assert.deepEqual(specialistResult.result.targetPrice, specialistReport.targetPrice)
     assert.match(serialized, /"totalCount":23/)
     assert.match(serialized, /"nextCursor":"20"/)
-    assert.equal(fundamental.researchQuestion, '最新正式财务事实是否改变基本面方向？')
-    assert.equal(fundamental.reason, '需要核验财报、指标序列与官方事件。')
+    assert.equal(fundamental.researchQuestion,
+      '核实 NVDA 的正式财务、Filing 与确定性估值证据是否改变未来一至四周判断。')
+    assert.equal(fundamental.reason, '主 Agent 请求独立基本面估值证据核实。')
 
     const replay = await fetch(`${baseUrl}/api/agent-sessions/${fundamental.id}/events`)
       .then((response) => response.text())

@@ -174,7 +174,7 @@ test('用户创建分析并打开研究记录后能看到报告依据', async ()
       },
       facts: [
         { id: 'fact-1', type: 'quote', value: 217.5, observedAt: '2026-08-12T13:48:38Z', source: 'sina', sourceReference: 'https://example.com' },
-        { id: 'valuation-1', type: 'valuation', value: { methods: { pe: { multiple: 70.28 } }, historical_ranges: { pe: [30.74, 56.58] } }, observedAt: '2026-08-12T13:48:38Z', source: 'yahoo-timeseries', sourceReference: 'https://example.com' },
+        { id: 'valuation-1', type: 'valuation', value: { current_multiples: { pe: 70.28 }, historical_ranges: { pe: [30.74, 56.58] }, comparable_symbols: ['AMD', 'AVGO'] }, observedAt: '2026-08-12T13:48:38Z', source: 'yahoo-timeseries', sourceReference: 'https://example.com' },
       ],
       trace: [
         { type: 'tool_call', name: 'search_news_by_keyword', toolCallId: 'news-call', startedAt: '2026-08-12T13:48:38.000Z' },
@@ -198,6 +198,8 @@ test('用户创建分析并打开研究记录后能看到报告依据', async ()
   await view.findAllByText(/sina/)
   await view.findByText('未来一至四周偏强')
   await view.findByText('PE 区间支持当前价格')
+  await view.findByText('70.3×')
+  assert.ok(view.getByRole('img', { name: '当前 PE 70.3 倍，历史区间 30.7 至 56.6 倍' }))
   await waitFor(() => assert.ok(view.getByText('偏强震荡')))
   await user.click(view.getByText('调用只读工具'))
   assert.ok(view.getAllByText(/开始/).some((item) => /2026/.test(item.textContent ?? '')))
@@ -207,6 +209,9 @@ test('用户创建分析并打开研究记录后能看到报告依据', async ()
   await view.findByText('未开始即取消')
   assert.equal(document.querySelector('[data-tool-call-id="news-call"]') !== null, true)
   assert.equal(document.querySelector('[data-tool-call-id="cancelled-call"]') !== null, true)
+  const exportLink = await view.findByRole('link', { name: '导出研究 JSON' })
+  assert.equal(exportLink.getAttribute('href'), '/api/research/analysis-1/export')
+  assert.equal(exportLink.hasAttribute('download'), true)
 })
 
 test('无有效报告的研究页仍可向原主 Agent 发送追问', async () => {

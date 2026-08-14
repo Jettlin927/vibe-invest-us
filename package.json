@@ -13,7 +13,7 @@
     "prototype": "npm run dev --workspace @vibe-invest/web -- --open '/prototype/workbench?variant=A'",
     "dev:web": "npm run dev --workspace @vibe-invest/web",
     "dev:api": "npm run dev --workspace @vibe-invest/analysis-api",
-    "dev:data": "services/market-data/.venv/bin/uvicorn app.main:app --app-dir services/market-data --reload --port 8000",
+    "dev:data": "services/market-data/.venv/bin/uvicorn app.main:app --app-dir services/market-data --reload --port 8000 --no-access-log",
     "build": "npm run build --workspace @vibe-invest/contracts && npm run build --workspace @vibe-invest/product-dao && npm run build --workspace @vibe-invest/web && npm run build --workspace @vibe-invest/analysis-api",
     "pretest": "npm run build --workspace @vibe-invest/contracts && npm run build --workspace @vibe-invest/product-dao",
     "test": "npm run test --workspaces --if-present",

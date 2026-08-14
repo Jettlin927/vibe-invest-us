@@ -73,6 +73,6 @@ export const submitAnalysisReportDefinition: RegisteredToolDefinition = {
   },
   resultSchema: Type.Object({ submitted: Type.Boolean() }),
   allowedRoles: ['main'], allowedStages: ['research', 'finalization'],
-  sideEffect: 'creates_report', externalNetwork: 'none', resultRetention: 'report_version',
+  sideEffect: 'creates_report', externalNetwork: 'none', hostAccess: 'none', resultRetention: 'report_version',
   modelProjection: 'acknowledgement', executionMode: 'sequential', countsAsToolRound: true,
 }

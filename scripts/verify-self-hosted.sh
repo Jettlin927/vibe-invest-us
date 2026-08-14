@@ -24,6 +24,21 @@ if printf '%s' "$settings" | grep -q 'MODEL_API_KEY'; then
   exit 1
 fi
 
+ACCESS_LOG_SENTINEL="private-tool-argument-must-not-enter-logs"
+docker compose exec -T financial-data python - "$ACCESS_LOG_SENTINEL" <<'PY'
+import sys
+import urllib.parse
+import urllib.request
+
+query = urllib.parse.urlencode({'tool_argument': sys.argv[1]})
+with urllib.request.urlopen(f'http://127.0.0.1:8000/health?{query}', timeout=10) as response:
+    assert response.status == 200
+PY
+if docker compose logs --no-color financial-data analysis-api | grep -Fq "$ACCESS_LOG_SENTINEL"; then
+  echo "ordinary container logs exposed a tool argument" >&2
+  exit 1
+fi
+
 docker compose exec -T financial-data python - <<'PY'
 import json
 import urllib.request

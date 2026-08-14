@@ -26,6 +26,7 @@ function definition(
     allowedStages: ['research'],
     sideEffect: 'read_only',
     externalNetwork: 'none',
+    hostAccess: 'none',
     resultRetention: 'research_record',
     modelProjection: 'full_result',
     executionMode: 'sequential',
@@ -59,6 +60,7 @@ test('唯一 Registry 中每个工具独立声明完整权限、保留、网络�
     assert.ok(tool.allowedStages.length > 0)
     assert.ok(tool.sideEffect)
     assert.ok(tool.externalNetwork)
+    assert.equal(tool.hostAccess, 'none')
     assert.ok(tool.resultRetention)
     assert.ok(tool.modelProjection)
     assert.ok(tool.executionMode)
@@ -113,6 +115,42 @@ test('Registry handler 缺失运行能力时 fail closed 而不是静默返回 u
   await assert.rejects(registeredToolHandlers.fetch_financial_context({}, {}), /tool_handler_context_missing/)
 })
 
+test('Registry 启动时拒绝 Shell、命令执行和任意文件能力', () => {
+  for (const name of ['shell_exec', 'execute_command', 'read_file', 'write_file', 'filesystem_browser']) {
+    assert.throws(
+      () => createToolRegistry([definition(name)], { [name]: handler }),
+      new RegExp(`tool_registry_invalid:prohibited_capability:${name}`),
+    )
+  }
+  assert.throws(() => createToolRegistry([definition('inspect_workspace', {
+    hostAccess: undefined,
+  } as Partial<RegisteredToolDefinition>)], { inspect_workspace: handler }),
+  /tool_registry_invalid:host_access:inspect_workspace/)
+  assert.throws(() => createToolRegistry([definition('inspect_workspace', {
+    hostAccess: 'filesystem',
+  } as unknown as Partial<RegisteredToolDefinition>)], { inspect_workspace: handler }),
+  /tool_registry_invalid:host_access:inspect_workspace/)
+})
+
+test('Registry 启动时校验综合与专项报告工具的角色、网络、保留和投影策略', () => {
+  const reportMetadata: Partial<RegisteredToolDefinition> = {
+    sideEffect: 'creates_report', externalNetwork: 'none', resultRetention: 'report_version',
+    modelProjection: 'acknowledgement', executionMode: 'sequential',
+  }
+  assert.throws(() => createToolRegistry([definition('submit_analysis_report', {
+    ...reportMetadata, allowedRoles: ['news'],
+  })], { submit_analysis_report: handler }), /tool_registry_invalid:report_policy:submit_analysis_report/)
+  assert.throws(() => createToolRegistry([definition('submit_specialist_report', {
+    ...reportMetadata, allowedRoles: ['main'],
+  })], { submit_specialist_report: handler }), /tool_registry_invalid:report_policy:submit_specialist_report/)
+  assert.throws(() => createToolRegistry([definition('submit_analysis_report', {
+    ...reportMetadata, externalNetwork: 'financial_data',
+  })], { submit_analysis_report: handler }), /tool_registry_invalid:report_policy:submit_analysis_report/)
+  assert.throws(() => createToolRegistry([definition('hidden_report_writer', reportMetadata)], {
+    hidden_report_writer: handler,
+  }), /tool_registry_invalid:report_policy:hidden_report_writer/)
+})
+
 test('Registry 只按角色和阶段返回模型定义且不提供隐藏工具 discovery', () => {
   const registry = createToolRegistry([
     definition('main-research'),
@@ -127,6 +165,23 @@ test('Registry 只按角色和阶段返回模型定义且不提供隐藏工具 d
   ])
   assert.equal('get' in registry, false)
   assert.equal('has' in registry, false)
+})
+
+test('Registry 用户投影按具体工具收紧嵌套结果并拒绝未知工具或字段', () => {
+  const registry = createToolRegistry(registeredToolDefinitions, registeredToolHandlers)
+  assert.deepEqual(registry.projectPublicResult('get_financial_overview', {
+    facts: [], overview: {
+      symbol: 'NVDA', latestPeriod: '2026-Q2',
+      qualityFlags: [{ flag_type: 'margin_pressure', severity: 'medium', period: '2026-Q2' }],
+      providerEnvelope: { response: '原包' }, articleText: '版权全文',
+    }, privateDiagnostic: '内部诊断',
+  }), {
+    facts: [], overview: {
+      symbol: 'NVDA', latestPeriod: '2026-Q2',
+      qualityFlags: [{ flag_type: 'margin_pressure', severity: 'medium', period: '2026-Q2' }],
+    },
+  })
+  assert.deepEqual(registry.projectPublicResult('unknown-tool', { summary: '不得出现' }), {})
 })
 
 test('消息面 Agent 只获得新闻候选、文档、公司事件和专项报告工具', () => {

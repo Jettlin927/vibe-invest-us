@@ -15,6 +15,7 @@ import type {
   FactQueryResult, FinancialContext, PaginatedFactQueryResult,
 } from './financial-data-client.js'
 import { createPortfolio, isValidSymbol, normalizeSymbol } from './portfolio.js'
+import { projectResearchExport, projectResearchView } from './research-export.js'
 
 type AppDependencies = {
   productDatabase: {
@@ -278,7 +279,7 @@ export function buildApp(dependencies: AppDependencies) {
   })
   app.get<{ Params: { id: string } }>('/api/analyses/:id', async (request, reply) => {
     const result = await analysis?.get(request.params.id)
-    return result ?? reply.status(404).send({ error: 'analysis_not_found' })
+    return result ? projectResearchView(result) : reply.status(404).send({ error: 'analysis_not_found' })
   })
   app.get<{ Params: { id: string }; Querystring: { executionId?: string } }>(
     '/api/agent-sessions/:id/tool-runtime', async (request, reply) => {
@@ -288,7 +289,9 @@ export function buildApp(dependencies: AppDependencies) {
     const runtime = await dependencies.toolProjectionRepository.replayForSession(
       session.id, executionId,
     )
-    return runtime ?? reply.status(404).send({ error: 'agent_execution_not_found' })
+    return runtime
+      ? projectResearchView(runtime)
+      : reply.status(404).send({ error: 'agent_execution_not_found' })
   })
   app.get<{ Params: { id: string }; Headers: { 'last-event-id'?: string } }>(
     '/api/agent-sessions/:id/events', async (request, reply) => {
@@ -312,7 +315,8 @@ export function buildApp(dependencies: AppDependencies) {
       const payload = entry.payload
       const event = payload.type === 'status' ? payload.status : payload.type
       reply.raw.write(formatSseEvent({
-        id: `${entry.sessionId}:${entry.sequence}`, event: String(event), data: payload,
+        id: `${entry.sessionId}:${entry.sequence}`, event: String(event),
+        data: projectResearchView(payload),
       }))
     }
     reply.raw.end()
@@ -376,20 +380,31 @@ export function buildApp(dependencies: AppDependencies) {
   })
   app.get<{ Params: { id: string } }>('/api/research/:id', async (request, reply) => {
     const result = await analysis?.research(request.params.id)
-    return result ?? reply.status(404).send({ error: 'research_not_found' })
+    return result ? projectResearchView(result) : reply.status(404).send({ error: 'research_not_found' })
+  })
+  app.get<{ Params: { id: string } }>('/api/research/:id/export', async (request, reply) => {
+    const result = await analysis?.research(request.params.id)
+    if (!result) return reply.status(404).send({ error: 'research_not_found' })
+    const configurationVersions = (await Promise.all(
+      researchExecutionIds(result).map((executionId) => (
+        dependencies.runtimeSettingsRepository.getExecutionSnapshot(executionId)
+      )),
+    )).filter((snapshot) => snapshot !== null)
+    reply.header('content-disposition', 'attachment; filename="research.json"')
+    return projectResearchExport({ ...result, configurationVersions })
   })
   app.get<{ Params: { id: string } }>('/api/research/:id/report-versions', async (request, reply) => {
     if (!await dependencies.analysisRepository.get(request.params.id)) {
       return reply.status(404).send({ error: 'analysis_not_found' })
     }
-    return {
+    return projectResearchView({
       items: (await dependencies.agentEventRepository.listReportVersions(request.params.id))
         .map(({ snapshot: _snapshot, ...version }) => version),
-    }
+    })
   })
-  app.get<{ Querystring: { symbol?: string } }>('/api/research', async (request) => ({
-    records: await analysis?.listResearch(request.query.symbol) ?? [],
-  }))
+  app.get<{ Querystring: { symbol?: string } }>('/api/research', async (request) => (
+    projectResearchView({ records: await analysis?.listResearch(request.query.symbol) ?? [] })
+  ))
   app.patch<{
     Params: { id: string }
     Body: { starred?: unknown; note?: unknown }
@@ -399,7 +414,7 @@ export function buildApp(dependencies: AppDependencies) {
       return reply.status(400).send({ error: 'invalid_research_update' })
     }
     const result = await analysis?.updateResearch(request.params.id, { starred, note })
-    return result ?? reply.status(404).send({ error: 'research_not_found' })
+    return result ? projectResearchView(result) : reply.status(404).send({ error: 'research_not_found' })
   })
   app.delete<{ Params: { id: string } }>('/api/research/:id', async (request, reply) => {
     if (!await analysis?.removeResearch(request.params.id)) return reply.status(404).send({ error: 'research_not_found' })
@@ -415,4 +430,25 @@ function parseLastEventId(value: string | undefined, sessionId: string) {
   if (!match || match[1] !== sessionId) return null
   const sequence = Number(match[2])
   return Number.isSafeInteger(sequence) ? sequence : null
+}
+
+function researchExecutionIds(value: unknown) {
+  const research = asRecord(value)
+  const mainAgent = asRecord(research.mainAgent)
+  const specialistAgents = Array.isArray(research.specialistAgents) ? research.specialistAgents : []
+  const reportVersions = Array.isArray(research.reportVersions) ? research.reportVersions : []
+  const ids = [
+    asRecord(mainAgent.execution).id,
+    ...specialistAgents.flatMap((agent) => {
+      const candidate = asRecord(agent)
+      return [asRecord(candidate.execution).id, asRecord(candidate.reportVersion).executionId]
+    }),
+    ...reportVersions.map((version) => asRecord(version).executionId),
+  ].filter((id): id is string => typeof id === 'string' && Boolean(id))
+  return [...new Set(ids)]
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown> : {}
 }

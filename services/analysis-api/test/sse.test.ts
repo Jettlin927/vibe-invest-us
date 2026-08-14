@@ -163,3 +163,55 @@ for (const terminal of ['stopped', 'budget_exhausted']) {
     await app.close()
   })
 }
+
+test('SSE 实时展开保留受控摘要但字段级脱敏内部诊断、凭据与隐藏推理', async () => {
+  const database = createTestProductDatabase()
+  const createdAt = new Date().toISOString()
+  await database.agentEventRepository.createResearch({
+    analysisId: 'analysis-public-sse', sessionId: 'session-public-sse',
+    executionId: 'execution-public-sse', symbol: 'SAFE',
+    status: 'planning', operationId: 'runtime-context',
+    event: { type: 'runtime_context', status: 'planning' }, createdAt,
+  })
+  await database.agentEventRepository.append({
+    sessionId: 'session-public-sse', executionId: 'execution-public-sse',
+    operationId: 'sensitive-tool-result', event: {
+      type: 'tool_result', name: 'fetch_financial_context', isError: false,
+      result: {
+        summary: 'SSE 用户可见摘要 Authorization: Bearer sk-sse-secret',
+        privateDiagnostic: 'SSE 内部诊断',
+        providerRaw: { body: 'SSE 原包' }, authorization: 'Bearer sse-secret',
+        cookie: 'sid=sse-secret', reasoning: 'SSE 隐藏推理',
+      },
+    }, createdAt,
+  })
+  await database.agentEventRepository.append({
+    sessionId: 'session-public-sse', executionId: 'execution-public-sse',
+    operationId: 'sensitive-model-delta', event: {
+      type: 'model_event', event: {
+        type: 'toolcall_delta',
+        delta: '{"authorization":"Bearer sk-sse-delta","fullText":"SSE delta 版权全文"}',
+      },
+    }, createdAt,
+  })
+  await database.agentEventRepository.append({
+    sessionId: 'session-public-sse', executionId: 'execution-public-sse',
+    operationId: 'completed', event: { type: 'status', status: 'completed', terminal: true },
+    projection: { status: 'completed', executionStatus: 'completed', terminal: true }, createdAt,
+  })
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+  })
+
+  const response = await app.inject({
+    method: 'GET', url: '/api/agent-sessions/session-public-sse/events',
+  })
+
+  assert.match(response.body, /SSE 用户可见摘要/)
+  assert.doesNotMatch(response.body, /privateDiagnostic|SSE 内部诊断|providerRaw|SSE 原包/)
+  assert.doesNotMatch(response.body, /authorization|Bearer sse-secret|cookie|reasoning|SSE 隐藏推理/i)
+  assert.doesNotMatch(response.body, /sk-sse-secret/)
+  assert.doesNotMatch(response.body, /sk-sse-delta|SSE delta 版权全文/)
+  await app.close()
+})

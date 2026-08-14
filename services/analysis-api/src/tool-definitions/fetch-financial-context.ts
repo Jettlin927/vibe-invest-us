@@ -9,6 +9,6 @@ export const fetchFinancialContextDefinition: RegisteredToolDefinition = {
   },
   resultSchema: Type.Object({ facts: Type.Array(Type.Unknown()) }),
   allowedRoles: ['main'], allowedStages: ['research'], sideEffect: 'read_only',
-  externalNetwork: 'financial_data', resultRetention: 'research_record',
+  externalNetwork: 'financial_data', hostAccess: 'none', resultRetention: 'research_record',
   modelProjection: 'bounded_summary', executionMode: 'sequential', countsAsToolRound: true,
 }

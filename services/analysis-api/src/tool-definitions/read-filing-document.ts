@@ -16,6 +16,6 @@ export const readFilingDocumentDefinition: RegisteredToolDefinition = {
     nextCursor: Type.Union([Type.String(), Type.Null()]), truncated: Type.Boolean(),
   }),
   allowedRoles: ['fundamental'], allowedStages: ['research'], sideEffect: 'read_only',
-  externalNetwork: 'financial_data', resultRetention: 'research_record',
+  externalNetwork: 'financial_data', hostAccess: 'none', resultRetention: 'research_record',
   modelProjection: 'bounded_summary', executionMode: 'parallel', countsAsToolRound: true,
 }

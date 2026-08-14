@@ -24,6 +24,18 @@ def test_health_reports_financial_data_service_ready():
     }
 
 
+def test_financial_data_runtime_disables_access_logs_that_can_include_tool_parameters():
+    repository = Path(__file__).parents[3]
+    dockerfile = (repository / "services/market-data/Dockerfile").read_text()
+    package = json.loads((repository / "package.json").read_text())
+    verifier = (repository / "scripts/verify-self-hosted.sh").read_text()
+
+    assert '"--no-access-log"' in dockerfile
+    assert "--no-access-log" in package["scripts"]["dev:data"]
+    assert "ACCESS_LOG_SENTINEL" in verifier
+    assert "docker compose logs --no-color financial-data analysis-api" in verifier
+
+
 def test_openapi_contract_matches_application():
     contract_path = Path(__file__).parents[3] / "contracts/market-data/openapi.json"
     contract = json.loads(contract_path.read_text())
@@ -263,7 +275,10 @@ def test_document_url_rejects_non_http_and_non_public_addresses(monkeypatch):
     monkeypatch.setattr("app.adapters.socket.getaddrinfo", lambda host, port, type=0: [
         (2, 1, 6, "", ("127.0.0.1", port)),
     ])
-    for url in ["file:///etc/passwd", "http://127.0.0.1/", "http://169.254.169.254/latest/meta-data"]:
+    for url in [
+        "file:///etc/passwd", "http://127.0.0.1/",
+        "http://169.254.169.254/latest/meta-data", "https://user:password@example.com/",
+    ]:
         try:
             validate_document_url(url)
         except ValueError as error:
@@ -289,6 +304,63 @@ def test_document_connection_uses_the_prevalidated_ip_without_resolving_hostname
     connection.connect()
     assert connection.sock is sentinel
     assert connected == [("93.184.216.34", 80)]
+
+
+def test_document_redirect_revalidates_every_hop_and_sends_no_cookie_or_credentials(monkeypatch):
+    resolved = []
+    requests = []
+    responses = []
+
+    class RedirectResponse:
+        status = 302
+        headers = Message()
+        headers["Location"] = "https://second.example/final"
+
+    class FinalResponse:
+        status = 200
+        headers = Message()
+        headers["Content-Type"] = "text/plain"
+        headers["Content-Length"] = "5"
+
+        def read(self, _limit):
+            return b"hello"
+
+    responses.extend([RedirectResponse(), FinalResponse()])
+
+    def resolve(url):
+        resolved.append(url)
+        host = "first.example" if len(resolved) == 1 else "second.example"
+        return url, "93.184.216.34", 443, host
+
+    class Connection:
+        def __init__(self, hostname, pinned_ip, port, timeout):
+            self.hostname = hostname
+            self.timeout = timeout
+
+        def request(self, method, path, headers):
+            requests.append((self.hostname, self.timeout, method, path, headers))
+
+        def getresponse(self):
+            return responses.pop(0)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("app.adapters._resolve_document_url", resolve)
+    monkeypatch.setattr("app.adapters._PinnedHTTPSConnection", Connection)
+
+    page = read_document_page("https://first.example/start", 0, 64, timeout=7)
+
+    assert resolved == ["https://first.example/start", "https://second.example/final"]
+    assert [request[:4] for request in requests] == [
+        ("first.example", 7, "GET", "/start"),
+        ("second.example", 7, "GET", "/final"),
+    ]
+    for request in requests:
+        headers = {key.lower(): value for key, value in request[4].items()}
+        assert "cookie" not in headers
+        assert "authorization" not in headers
+    assert page["sourceReference"] == "https://second.example/final"
 
 
 def test_document_page_sends_byte_range_and_uses_provider_total(monkeypatch):

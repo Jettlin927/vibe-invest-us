@@ -14,6 +14,6 @@ export const runFundamentalAnalysisDefinition: RegisteredToolDefinition = {
     launched: Type.Boolean(), status: Type.String(), reason: Type.String(),
   }),
   allowedRoles: ['main'], allowedStages: ['research'], sideEffect: 'read_only',
-  externalNetwork: 'none', resultRetention: 'research_record',
+  externalNetwork: 'none', hostAccess: 'none', resultRetention: 'research_record',
   modelProjection: 'bounded_summary', executionMode: 'parallel', countsAsToolRound: true,
 }

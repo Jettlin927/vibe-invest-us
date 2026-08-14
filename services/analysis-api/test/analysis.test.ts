@@ -2988,6 +2988,306 @@ test('分析轨迹永久保存系统指令、用户语境、模型用量和最�
   await app.close()
 })
 
+test('研究导出包含用户可读事实与报告且排除凭据、原包、隐藏推理和 fencing 数据', async () => {
+  const app = buildApp({
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [] }),
+    model: {
+      async *analyze() {
+        yield { type: 'trace' as const, entry: {
+          type: 'model_event' as const,
+          event: {
+            type: 'toolcall_delta',
+            delta: '{"authorization":"Bearer sk-delta-secret","fullText":"delta 版权全文"}',
+          },
+        } }
+        yield { type: 'trace' as const, entry: {
+          type: 'tool_result' as const, name: 'fetch_financial_context', isError: false,
+          result: {
+            facts: [fact, {
+              ...fact, id: 'fact:external:document', type: 'news',
+              value: {
+                title: '受控标题', summary: '受控事实摘要', url: 'https://example.com/news',
+                content: '版权全文不得通过通用 value.content 导出',
+                articleText: '版权全文不得通过 value.articleText 别名导出',
+                providerEnvelope: { response: 'Provider 原始响应不得导出' },
+              },
+            }, {
+              ...fact, id: 'fact:external:event', type: 'company_event',
+              value: {
+                symbol: 'NVDA', title: '受控公司事件', summary: '有限事件摘要',
+                url: 'https://example.com/event', articleText: '事件版权全文',
+              },
+            }, {
+              ...fact, id: 'fact:external:valuation', type: 'valuation',
+              value: {
+                current_multiples: { pe: 70.28 }, historical_ranges: { pe: [30.74, 56.58] },
+                comparable_symbols: ['AMD', 'AVGO'], providerEnvelope: '估值原包',
+              },
+            }, {
+              ...fact, id: 'fact:external:unknown', type: 'provider_blob',
+              value: '未知事实类型携带隐藏 reasoning 或版权全文',
+            }, {
+              ...fact, id: 'fact:external:invalid-quote', type: 'quote',
+              value: '伪装成 quote 的隐藏 reasoning 或版权全文',
+            }, {
+              ...fact, id: 'fact:external:long-news', type: 'news',
+              value: {
+                title: `受控标题${'版权正文'.repeat(200)}`,
+                summary: `受控摘要${'版权正文'.repeat(500)}`,
+                url: 'https://example.com/long-news',
+              },
+            }, {
+              ...fact, id: 'fact:external:userinfo', type: 'news',
+              value: {
+                title: '带凭据 URL', summary: '应保留文本但移除 URL',
+                url: 'https://alice:password@example.com/private',
+              },
+              sourceReference: 'https://alice:password@example.com/private',
+            }],
+            summary: [
+              '可导出的受控摘要 ghp_abcdefghijklmnopqrstuvwxyz123456 AKIAABCDEFGHIJKLMNOP',
+              'AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+            ].join(' '),
+            privateDiagnostic: '仅数据库诊断', providerRaw: { requestId: 'provider-secret' },
+            authorization: 'Bearer private-token', cookie: 'session=private-cookie',
+            reasoning: '隐藏推理', fullText: '版权正文不得导出',
+            credentials: { password: 'credential-secret' },
+            rawPayload: { providerResponse: 'provider-response-secret' },
+            chainOfThought: '隐藏思维链', documentBody: '版权正文别名不得导出',
+          },
+        } }
+        yield { type: 'trace' as const, entry: {
+          type: 'tool_result' as const, name: 'get_financial_overview', isError: false,
+          result: {
+            facts: [], overview: {
+              symbol: 'NVDA', latestPeriod: '2026-Q2',
+              qualityFlags: [{ flag_type: 'margin_pressure', severity: 'medium', period: '2026-Q2' }],
+              providerEnvelope: { raw: 'Overview Provider 原包不得导出' },
+              articleText: 'Overview 版权全文不得导出',
+            },
+          },
+        } }
+        yield {
+          type: 'completed' as const, report,
+          reportVersion: { kind: 'integrated' as const, report: reportCandidate },
+        }
+      },
+    },
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' },
+  })).json() as { analysisId: string }
+  await waitForStatus(app as any, created.analysisId, 'completed')
+
+  const response = await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}/export`,
+  })
+
+  assert.equal(response.statusCode, 200)
+  assert.match(response.headers['content-disposition'] ?? '', /attachment/)
+  const exported = response.json()
+  assert.equal(exported.schemaVersion, 1)
+  assert.equal(exported.analysis.id, created.analysisId)
+  assert.equal(exported.analysis.symbol, 'NVDA')
+  assert.equal(exported.reportVersions[0].report.title, report.title)
+  assert.ok(exported.facts.some((item: { id: string }) => item.id === fact.id))
+  assert.equal(exported.configurationVersions.length, 1)
+  assert.equal(exported.configurationVersions[0].id, 1)
+  assert.equal(typeof exported.configurationVersions[0].createdAt, 'string')
+  assert.equal(exported.configurationVersions[0].values.modelConcurrency, 4)
+  assert.ok(exported.trace.some((item: { type: string; result?: { summary?: string } }) => (
+    item.type === 'tool_result' && item.result?.summary?.includes('可导出的受控摘要')
+  )))
+  const serialized = JSON.stringify(exported)
+  assert.doesNotMatch(serialized, /privateDiagnostic|仅数据库诊断|providerRaw|provider-secret/)
+  assert.doesNotMatch(serialized, /authorization|private-token|cookie|private-cookie/i)
+  assert.doesNotMatch(serialized, /reasoning|隐藏推理|fullText|版权正文不得导出/)
+  assert.doesNotMatch(serialized, /credential-secret|provider-response-secret|隐藏思维链|版权正文别名不得导出/)
+  assert.doesNotMatch(serialized, /sk-export-secret|版权全文不得通过通用 value\.content 导出/)
+  assert.doesNotMatch(serialized, /ghp_abcdefghijklmnopqrstuvwxyz123456|AKIAABCDEFGHIJKLMNOP/)
+  assert.doesNotMatch(serialized, /wJalrXUtnFEMI\/K7MDENG\/bPxRfiCYEXAMPLEKEY/)
+  assert.doesNotMatch(serialized, /value\.articleText|Provider 原始响应不得导出/)
+  assert.doesNotMatch(serialized, /未知事实类型携带隐藏 reasoning 或版权全文/)
+  assert.doesNotMatch(serialized, /伪装成 quote 的隐藏 reasoning 或版权全文/)
+  const boundedNews = exported.facts.find((item: { id: string }) => (
+    item.id === 'fact:external:long-news'
+  ))
+  assert.ok(boundedNews.value.title.length <= 300)
+  assert.ok(boundedNews.value.summary.length <= 1_000)
+  const userinfoFact = exported.facts.find((item: { id: string }) => (
+    item.id === 'fact:external:userinfo'
+  ))
+  assert.equal('url' in userinfoFact.value, false)
+  assert.equal('sourceReference' in userinfoFact, false)
+  assert.doesNotMatch(serialized, /alice:password/)
+  const eventFact = exported.facts.find((item: { id: string }) => item.id === 'fact:external:event')
+  assert.deepEqual(eventFact.value, {
+    symbol: 'NVDA', title: '受控公司事件', summary: '有限事件摘要',
+    url: 'https://example.com/event',
+  })
+  const valuationFact = exported.facts.find((item: { id: string }) => (
+    item.id === 'fact:external:valuation'
+  ))
+  assert.deepEqual(valuationFact.value, {
+    current_multiples: { pe: 70.28 }, historical_ranges: { pe: [30.74, 56.58] },
+    comparable_symbols: ['AMD', 'AVGO'],
+  })
+  const overviewResult = exported.trace.find((item: { type: string; name?: string }) => (
+    item.type === 'tool_result' && item.name === 'get_financial_overview'
+  )).result
+  assert.deepEqual(overviewResult.overview, {
+    symbol: 'NVDA', latestPeriod: '2026-Q2',
+    qualityFlags: [{ flag_type: 'margin_pressure', severity: 'medium', period: '2026-Q2' }],
+  })
+  assert.doesNotMatch(serialized, /Overview Provider 原包不得导出|Overview 版权全文不得导出/)
+  assert.doesNotMatch(serialized, /sk-delta-secret|delta 版权全文/)
+  assert.doesNotMatch(serialized, /generation|fenc|operationId|previousExecutionId|sourceExecutionIds/i)
+  await app.close()
+})
+
+test('研究详情展开视图保留受控工具摘要但字段级脱敏内部诊断、凭据与隐藏推理', async () => {
+  const app = buildApp({
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({
+      symbol, facts: [fact], gaps: [], privateDiagnostic: '快照内部诊断',
+    }),
+    model: {
+      async *analyze() {
+        yield { type: 'trace' as const, entry: {
+          type: 'tool_result' as const, name: 'fetch_financial_context', isError: false,
+          result: {
+            facts: [fact], summary: '用户可见摘要 Authorization: Bearer sk-view-secret',
+            privateDiagnostic: '工具内部诊断',
+            providerRaw: { response: 'raw-secret' }, authorization: 'Bearer secret',
+            cookie: 'sid=secret', reasoning: 'hidden-chain',
+          },
+        } }
+        yield {
+          type: 'completed' as const, report,
+          reportVersion: { kind: 'integrated' as const, report: reportCandidate },
+        }
+      },
+    },
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' },
+  })).json() as { analysisId: string }
+  await waitForStatus(app as any, created.analysisId, 'completed')
+
+  const response = await app.inject({ method: 'GET', url: `/api/research/${created.analysisId}` })
+
+  assert.equal(response.statusCode, 200)
+  const serialized = response.body
+  assert.match(serialized, /用户可见摘要/)
+  assert.doesNotMatch(serialized, /privateDiagnostic|快照内部诊断|工具内部诊断/)
+  assert.doesNotMatch(serialized, /providerRaw|raw-secret|authorization|Bearer secret/i)
+  assert.doesNotMatch(serialized, /cookie|sid=secret|reasoning|hidden-chain/i)
+  assert.doesNotMatch(serialized, /sk-view-secret/)
+  const statusResponse = await app.inject({
+    method: 'GET', url: `/api/analyses/${created.analysisId}`,
+  })
+  assert.match(statusResponse.body, /NVDA/)
+  assert.doesNotMatch(statusResponse.body, /privateDiagnostic|快照内部诊断/)
+  const listResponse = await app.inject({ method: 'GET', url: '/api/research?symbol=NVDA' })
+  assert.match(listResponse.body, /NVDA/)
+  assert.doesNotMatch(listResponse.body, /privateDiagnostic|快照内部诊断|raw-secret|hidden-chain/)
+  const updateResponse = await app.inject({
+    method: 'PATCH', url: `/api/research/${created.analysisId}`, payload: { note: '公开备注' },
+  })
+  assert.equal(updateResponse.statusCode, 200)
+  assert.match(updateResponse.body, /公开备注/)
+  assert.doesNotMatch(updateResponse.body, /privateDiagnostic|快照内部诊断|raw-secret|hidden-chain/)
+  await app.close()
+})
+
+test('工具运行时回放保留受控结果但字段级脱敏内部诊断、凭据与隐藏推理', async () => {
+  const database = createTestProductDatabase()
+  const createdAt = new Date().toISOString()
+  const analysisId = 'analysis-public-tool-runtime'
+  const sessionId = 'session-public-tool-runtime'
+  const executionId = 'execution-public-tool-runtime'
+  await database.agentEventRepository.createResearch({
+    analysisId, sessionId, executionId, symbol: 'SAFE', status: 'planning',
+    operationId: 'runtime-context', event: { type: 'runtime_context' }, createdAt,
+  })
+  const projection = await database.toolProjectionRepository.ensureVersion({
+    executionId, role: 'main', stage: 'research', schemaHash: 'public-runtime',
+    projectedTools: [], visibleToolNames: ['fetch_financial_context'], reasons: {}, createdAt,
+  })
+  const result = {
+    summary: '运行时用户可见摘要', privateDiagnostic: '运行时内部诊断',
+    providerRaw: { body: '运行时原包' }, authorization: 'Bearer runtime-secret',
+    cookie: 'sid=runtime-secret', reasoning: '运行时隐藏推理',
+  }
+  await database.toolProjectionRepository.beginToolBatch({
+    id: 'public-runtime-batch', executionId, projectionId: projection.id, turnIndex: 1,
+    calls: [{ toolCallId: 'public-runtime-call', toolName: 'fetch_financial_context', position: 1 }],
+    createdAt,
+  })
+  await database.toolProjectionRepository.completeToolBatch({
+    id: 'public-runtime-batch', executionId, completedAt: createdAt,
+    results: [{
+      toolCallId: 'public-runtime-call', status: 'completed', startedAt: createdAt,
+      completedAt: createdAt, completionOrder: 1,
+      resultPayload: { toolName: 'fetch_financial_context', result, isError: false },
+      operationId: 'public-runtime-result', eventPayload: {
+        type: 'tool_result', name: 'fetch_financial_context', result, isError: false,
+      },
+    }],
+  })
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+  })
+
+  const response = await app.inject({
+    method: 'GET', url: `/api/agent-sessions/${sessionId}/tool-runtime?executionId=${executionId}`,
+  })
+
+  assert.equal(response.statusCode, 200)
+  assert.match(response.body, /运行时用户可见摘要/)
+  assert.doesNotMatch(response.body, /privateDiagnostic|运行时内部诊断|providerRaw|运行时原包/)
+  assert.doesNotMatch(response.body, /authorization|runtime-secret|cookie|reasoning|运行时隐藏推理/i)
+  await app.close()
+})
+
+test('报告版本读取保留报告正文但字段级脱敏内部诊断、凭据与隐藏推理', async () => {
+  const app = buildApp({
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [] }),
+    model: {
+      async *analyze() {
+        yield {
+          type: 'completed' as const, report,
+          reportVersion: { kind: 'integrated' as const, report: {
+            ...reportCandidate, privateDiagnostic: '报告内部诊断',
+            providerRaw: { body: '报告原包' }, authorization: 'Bearer report-secret',
+            cookie: 'sid=report-secret', reasoning: '报告隐藏推理',
+          } },
+        }
+      },
+    },
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' },
+  })).json() as { analysisId: string }
+  await waitForStatus(app as any, created.analysisId, 'completed')
+
+  const response = await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}/report-versions`,
+  })
+
+  assert.equal(response.statusCode, 200)
+  assert.match(response.body, new RegExp(report.title))
+  assert.doesNotMatch(response.body, /privateDiagnostic|报告内部诊断|providerRaw|报告原包/)
+  assert.doesNotMatch(response.body, /authorization|report-secret|cookie|reasoning|报告隐藏推理/i)
+  await app.close()
+})
+
 test('首次研究把系统生成的 Runtime Context 追加到上下文末尾且不伪装为用户问题', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'vibe-first-research-runtime-context-'))
   let modelInput: Record<string, unknown> | undefined

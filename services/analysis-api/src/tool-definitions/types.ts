@@ -10,6 +10,7 @@ export type RegisteredToolDefinition = {
   allowedStages: ToolStage[]
   sideEffect: 'read_only' | 'creates_report'
   externalNetwork: 'none' | 'financial_data'
+  hostAccess: 'none'
   resultRetention: 'research_record' | 'report_version'
   modelProjection: 'full_result' | 'bounded_summary' | 'acknowledgement'
   executionMode: 'sequential' | 'parallel'

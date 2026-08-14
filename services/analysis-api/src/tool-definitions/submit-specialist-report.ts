@@ -40,6 +40,6 @@ export const submitSpecialistReportDefinition: RegisteredToolDefinition = {
   },
   resultSchema: Type.Object({ submitted: Type.Boolean() }),
   allowedRoles: ['news', 'fundamental', 'technical'], allowedStages: ['research', 'finalization'], sideEffect: 'creates_report',
-  externalNetwork: 'none', resultRetention: 'report_version',
+  externalNetwork: 'none', hostAccess: 'none', resultRetention: 'report_version',
   modelProjection: 'acknowledgement', executionMode: 'sequential', countsAsToolRound: true,
 }
