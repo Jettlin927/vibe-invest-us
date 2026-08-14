@@ -964,6 +964,130 @@ test('首次研究经真实 PostgreSQL 与 HTTP SSE 展示 Runtime Context、工
   }
 })
 
+test('报告后追问经真实 PostgreSQL、HTTP Provider 与 SSE 独立执行且按意图更新报告', {
+  skip: !databaseUrl,
+  concurrency: false,
+}, async () => {
+  const providerRequests: Array<Record<string, unknown>> = []
+  const provider = createServer(async (request, response) => {
+    const body = await readJsonBody(request)
+    providerRequests.push(body)
+    response.writeHead(200, { 'content-type': 'text/event-stream' })
+    if (providerRequests.length === 1) {
+      writeOpenAiToolCalls(response, [{
+        id: 'follow-up-initial-report', name: 'submit_analysis_report',
+        arguments: JSON.stringify(integratedReport({
+          title: '追问基准报告 V1', marketState: '基准状态', trend: '震荡', drivers: [],
+          supportingEvidence: [], contraryEvidence: [], keyJudgments: [], scenarios: [],
+          invalidationConditions: [], valuation: null, personalImpact: null,
+          conditionalSuggestion: null, limitations: [],
+        })),
+      }])
+    } else if (providerRequests.length === 2) {
+      writeOpenAiText(response, '普通追问只返回聊天答案，不改写基准报告。')
+    } else {
+      writeOpenAiToolCalls(response, [{
+        id: 'follow-up-updated-report', name: 'submit_analysis_report',
+        arguments: JSON.stringify(integratedReport({
+          title: '追问更新报告 V2', marketState: '更新状态', trend: '偏强震荡', drivers: [],
+          supportingEvidence: [], contraryEvidence: [], keyJudgments: [], scenarios: [],
+          invalidationConditions: [], valuation: null, personalImpact: null,
+          conditionalSuggestion: null, limitations: [],
+        })),
+      }])
+    }
+  })
+  await listenHttp(provider)
+  const providerAddress = provider.address()
+  assert.ok(providerAddress && typeof providerAddress === 'object')
+  const pool = createPool(databaseUrl!)
+  const events = createAgentEventRepository(pool)
+  const app = buildApp({
+    productDatabase: { checkSchema: () => checkSchema(pool), close: () => pool.end() },
+    portfolioRepository: createPortfolioRepository(pool),
+    analysisRepository: createAnalysisRepository(pool), agentEventRepository: events,
+    runtimeSettingsRepository: createRuntimeSettingsRepository(pool),
+    toolProjectionRepository: createToolProjectionRepository(pool),
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, gaps: [], facts: [], indicators: {} }),
+    model: createPiModel({
+      provider: 'local-openai', apiProtocol: 'chat-completions', modelName: 'follow-up-model',
+      baseUrl: `http://127.0.0.1:${providerAddress.port}`, apiKey: 'integration-key',
+      contextWindow: 128_000,
+    }),
+  })
+  await app.listen({ host: '127.0.0.1', port: 0 })
+  const address = app.server.address()
+  assert.ok(address && typeof address === 'object')
+  const baseUrl = `http://127.0.0.1:${address.port}`
+  const symbol = `U${crypto.randomUUID().replaceAll('-', '').slice(0, 8)}`
+  try {
+    const created = await fetch(`${baseUrl}/api/analyses`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ symbol }),
+    }).then((response) => response.json()) as { analysisId: string; sessionId: string }
+    await waitForAgentStatus(events, created.sessionId, 'completed')
+    const initial = await fetch(`${baseUrl}/api/research/${created.analysisId}`)
+      .then((response) => response.json())
+    assert.equal(initial.report.title, '追问基准报告 V1')
+
+    const firstCursor = (await events.list(created.sessionId, 0)).at(-1)!.sequence
+    const ordinary = await fetch(`${baseUrl}/api/analyses/${created.analysisId}/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        messageId: 'ordinary-message', message: '这份报告现在还有效吗？', updateReport: false,
+      }),
+    })
+    assert.equal(ordinary.status, 202)
+    const ordinarySse = await readThrough(await fetch(
+      `${baseUrl}/api/agent-sessions/${created.sessionId}/events`,
+      { headers: { 'Last-Event-ID': `${created.sessionId}:${firstCursor}` } },
+    ), 'event: completed')
+    assert.match(ordinarySse, /event: runtime_follow_up/)
+    assert.match(ordinarySse, /event: chat_completed/)
+    const afterChat = await fetch(`${baseUrl}/api/research/${created.analysisId}`)
+      .then((response) => response.json())
+    assert.equal(afterChat.report.title, '追问基准报告 V1')
+    assert.equal(providerToolNames(providerRequests[1]!).includes('submit_analysis_report'), false)
+    const ordinaryRequest = JSON.stringify(providerRequests[1])
+    assert.match(ordinaryRequest, /Follow-up Runtime Context/)
+    assert.match(ordinaryRequest, /这份报告现在还有效吗/)
+    assert.doesNotMatch(ordinaryRequest, /recentDailyBars/)
+    assert.equal((await fetch(`${baseUrl}/api/research/${created.analysisId}/report-versions`)
+      .then((response) => response.json())).items.length, 1)
+
+    const secondCursor = (await events.list(created.sessionId, 0)).at(-1)!.sequence
+    const update = await fetch(`${baseUrl}/api/analyses/${created.analysisId}/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        messageId: 'update-message', message: '请据此更新综合报告。', updateReport: true,
+      }),
+    })
+    assert.equal(update.status, 202)
+    const updateSse = await readThrough(await fetch(
+      `${baseUrl}/api/agent-sessions/${created.sessionId}/events`,
+      { headers: { 'Last-Event-ID': `${created.sessionId}:${secondCursor}` } },
+    ), 'event: completed')
+    assert.match(updateSse, /event: runtime_follow_up/)
+    assert.match(updateSse, /event: completed/)
+    assert.equal(providerToolNames(providerRequests[2]!).includes('submit_analysis_report'), true)
+    const updateRequest = JSON.stringify(providerRequests[2])
+    assert.match(updateRequest, /这份报告现在还有效吗/)
+    assert.match(updateRequest, /普通追问只返回聊天答案，不改写基准报告/)
+    const finalResearch = await fetch(`${baseUrl}/api/research/${created.analysisId}`)
+      .then((response) => response.json())
+    const versions = await fetch(`${baseUrl}/api/research/${created.analysisId}/report-versions`)
+      .then((response) => response.json())
+    assert.equal(finalResearch.report.title, '追问更新报告 V2')
+    assert.deepEqual(versions.items.map(({ version }: { version: number }) => version), [1, 2])
+    assert.equal(finalResearch.mainAgent.segments.length, 3)
+    assert.equal(finalResearch.mainAgent.execution.generation, 3)
+  } finally {
+    await app.close()
+    await closeHttp(provider)
+  }
+})
+
 test('主 Agent 经真实 PostgreSQL、HTTP 与 SSE 启动并展示独立消息面 Agent', {
   skip: !databaseUrl,
   concurrency: false,

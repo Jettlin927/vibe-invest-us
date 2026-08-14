@@ -333,6 +333,37 @@ export function buildApp(dependencies: AppDependencies) {
       throw error
     }
   })
+  app.post<{
+    Params: { id: string }
+    Body: { messageId?: unknown; message?: unknown; updateReport?: unknown }
+  }>('/api/analyses/:id/messages', async (request, reply) => {
+    if (typeof request.body?.message !== 'string' || !request.body.message.trim()) {
+      return reply.status(400).send({ error: 'follow_up_message_required' })
+    }
+    if (typeof request.body?.messageId !== 'string' || !request.body.messageId.trim()
+      || request.body.messageId.length > 200) {
+      return reply.status(400).send({ error: 'follow_up_message_id_required' })
+    }
+    if (request.body.updateReport !== undefined && typeof request.body.updateReport !== 'boolean') {
+      return reply.status(400).send({ error: 'follow_up_update_report_invalid' })
+    }
+    try {
+      const result = await analysis?.followUp(
+        request.params.id, request.body.messageId, request.body.message,
+        request.body.updateReport ?? false,
+      )
+      if (!result) return reply.status(404).send({ error: 'analysis_not_found' })
+      return reply.status(202).send(result)
+    } catch (error) {
+      if (error instanceof Error && [
+        'analysis_follow_up_not_available', 'agent_operation_conflict',
+        'base_report_version_not_found', 'analysis_resume_required',
+      ].includes(error.message)) {
+        return reply.status(409).send({ error: error.message })
+      }
+      throw error
+    }
+  })
   app.get<{ Params: { id: string } }>('/api/research/:id', async (request, reply) => {
     const result = await analysis?.research(request.params.id)
     return result ?? reply.status(404).send({ error: 'research_not_found' })

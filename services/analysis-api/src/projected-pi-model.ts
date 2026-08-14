@@ -159,6 +159,10 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
         type: 'runtime_context', content: input.runtimeContext,
         operationId: `execution:${input.executionId}:runtime-context`,
       }))
+      if (input.runtimeFollowUp) queue.push(trace({
+        type: 'runtime_follow_up', content: input.runtimeFollowUp,
+        operationId: `execution:${input.executionId}:runtime-follow-up`,
+      }))
       else if (input.userPrompt) queue.push(trace({
         type: 'user_input', content: input.userPrompt,
         operationId: `execution:${input.executionId}:user-input`,
@@ -168,14 +172,25 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
         operationId: `execution:${input.executionId}:runtime-policy`,
       }))
 
+      const ordinaryFollowUp = Boolean(input.runtimeFollowUp
+        && input.runtimeFollowUp.content.updateReport !== true)
+      const followUpResearchTools = ordinaryFollowUp
+        ? analysisModelTools.filter(({ name }) => name !== 'submit_analysis_report')
+        : analysisModelTools
       const main = runProjectedAgent({
         role: 'main', input, options, settings, executionSignal: agentSignal, activeBudget,
         onPolicyFailure: (error) => { policyFailure ??= error },
         modelGate, toolGate, provider, queue,
-        initialTools: input.finalizationOnly ? finalizationModelTools : analysisModelTools,
+        initialTools: input.finalizationOnly ? finalizationModelTools : followUpResearchTools,
         initialStage: input.finalizationOnly ? 'finalization' : 'research',
+        nextResearchTools: () => followUpResearchTools,
+        nextFinalizationTools: () => ordinaryFollowUp ? [] : finalizationModelTools,
         systemPrompt: input.systemPrompt,
-        userPrompt: input.runtimeContext
+        userPrompt: input.runtimeFollowUp
+          ? [input.runtimeFollowUp.content.message, runtimeFollowUpMessage(input.runtimeFollowUp),
+              input.runtimeResume ? runtimeResumeMessage(input.runtimeResume) : '']
+              .filter(Boolean).join('\n')
+          : input.runtimeContext
           ? [runtimeContextMessage(input.runtimeContext), input.runtimeResume
             ? runtimeResumeMessage(input.runtimeResume) : ''].filter(Boolean).join('\n')
           : input.userPrompt ?? '',
@@ -349,6 +364,15 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
 
       const task = main.then((outcome) => {
         if (policyFailure) throw policyFailure
+        if (input.runtimeFollowUp && input.runtimeFollowUp.content.updateReport !== true
+          && !outcome.report) {
+          queue.push({
+            type: 'chat_completed', text: outcome.text, usage: outcome.usage,
+            stopReason: outcome.stopReason,
+            operationId: `execution:${input.executionId}:chat-completed`,
+          })
+          return
+        }
         if (!outcome.report) throw new Error('report_tool_required')
         queue.push({
           type: 'completed', report: outcome.report, usage: outcome.usage,
@@ -722,6 +746,7 @@ async function runProjectedAgent(config: {
   invocationId?: string
   shouldRejectNextTurn?: () => boolean
   nextResearchTools?: () => Tool[]
+  nextFinalizationTools?: () => Tool[]
   beforeNextProjection?: () => Extract<ModelEvent, { type: 'trace' }>['entry'] | undefined
   prepareSpecialistBatch?: (calls: Batch['calls'], batchId: string) => Promise<string[]>
   execute: (
@@ -1049,7 +1074,9 @@ async function runProjectedAgent(config: {
       }
       const causativeEvent = config.beforeNextProjection?.()
       const next = config.role === 'main'
-        ? stage === 'finalization' ? finalizationModelTools : analysisModelTools
+        ? stage === 'finalization'
+          ? config.nextFinalizationTools?.() ?? finalizationModelTools
+          : config.nextResearchTools?.() ?? analysisModelTools
         : stage === 'finalization'
           ? toolRegistry.project({ role: config.role, stage: 'finalization' })
           : config.role === 'news'
@@ -1283,7 +1310,8 @@ async function runProjectedAgent(config: {
             ...attempt, status: 'failed' as const,
           })), createdAt,
         })
-        const tools = config.role === 'main' ? finalizationModelTools
+        const tools = config.role === 'main'
+          ? config.nextFinalizationTools?.() ?? finalizationModelTools
           : toolRegistry.project({ role: config.role, stage: 'finalization' })
         await prepareProjection(tools, failed)
         config.queue.push(trace(failed))
@@ -1315,6 +1343,13 @@ async function runProjectedAgent(config: {
       const calls = event.message.content.filter((content) => content.type === 'toolCall')
       lastAssistantHadCalls = calls.length > 0
       if (!calls.length) {
+        if ('runtimeFollowUp' in input && input.runtimeFollowUp
+          && input.runtimeFollowUp.content.updateReport !== true) {
+          finalText = event.message.content.flatMap((content) => (
+            content.type === 'text' ? [content.text] : []
+          )).join('')
+          return
+        }
         const submitTool = config.role === 'main'
           ? 'submit_analysis_report' : 'submit_specialist_report'
         adapter.followUp(userMessage(stage === 'finalization'
@@ -1780,6 +1815,9 @@ function runtimeContextMessage(context: NonNullable<AnalyzeInput['runtimeContext
 }
 function runtimeResumeMessage(context: NonNullable<AnalyzeInput['runtimeResume']>) {
   return `【系统生成的 Runtime Resume，不是用户输入】\n${JSON.stringify(context.content)}`
+}
+function runtimeFollowUpMessage(context: NonNullable<AnalyzeInput['runtimeFollowUp']>) {
+  return `【系统生成的 Follow-up Runtime Context，不是用户输入】\n${JSON.stringify(context.content)}`
 }
 function specialistUserPrompt(input: AnalyzeNewsInput | AnalyzeFundamentalInput | AnalyzeTechnicalInput) {
   return [input.researchQuestion, input.runtimeResume

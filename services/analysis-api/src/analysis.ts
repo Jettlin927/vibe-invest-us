@@ -390,6 +390,7 @@ export function createAnalysisService(options: {
     let context: FinancialContext | undefined
     let adoptedFacts: Fact[] = []
     let terminalSnapshotBase: Record<string, unknown> = {}
+    let followUpEvent: Record<string, unknown> | undefined
     const specialistOutcomes = new Map<SpecialistDomain, Record<string, unknown>>()
     const refreshKnownFacts = async () => {
       const research = await repository.research(analysisId)
@@ -409,8 +410,18 @@ export function createAnalysisService(options: {
         const payload = event as Record<string, unknown>
         return payload.type === 'runtime_resume' && payload.executionId === executionId
       }) as (Record<string, unknown> | undefined)
-      const restoredResearch = resumeEvent ? await repository.research(analysisId) : undefined
-      const restoredSnapshot = resumeEvent && job.snapshot && typeof job.snapshot === 'object'
+      const directFollowUpEvent = currentLifecycle?.events.findLast((event) => {
+        const payload = event as Record<string, unknown>
+        return payload.type === 'runtime_follow_up' && payload.executionId === executionId
+      }) as (Record<string, unknown> | undefined)
+      const resumedFollowUp = resumeEvent?.followUp
+      followUpEvent = directFollowUpEvent ?? (resumedFollowUp
+        && typeof resumedFollowUp === 'object' && !Array.isArray(resumedFollowUp)
+        ? { ...resumedFollowUp as Record<string, unknown>, executionId }
+        : undefined)
+      const continuationEvent = followUpEvent ?? resumeEvent
+      const restoredResearch = continuationEvent ? await repository.research(analysisId) : undefined
+      const restoredSnapshot = continuationEvent && job.snapshot && typeof job.snapshot === 'object'
         ? {
             ...job.snapshot as FinancialContext & { portfolioContext?: unknown },
             facts: (restoredResearch?.facts ?? []) as Fact[],
@@ -435,7 +446,8 @@ export function createAnalysisService(options: {
       const quoteFact = context.facts.find((fact) => fact.type === 'quote' && typeof fact.value === 'number')
       let portfolioPrices: Record<string, number> = {}
       let portfolioPriceGap = false
-      if (!restoredSnapshot && options.fetchMarketPrices && options.listPortfolioSymbols) {
+      if ((!restoredSnapshot || followUpEvent)
+        && options.fetchMarketPrices && options.listPortfolioSymbols) {
         try {
           pauseProcessing()
           const pricesOwner = await acquireActiveSlot({
@@ -460,9 +472,12 @@ export function createAnalysisService(options: {
         }
       }
       if (quoteFact) portfolioPrices[job.symbol] = quoteFact.value as number
-      const portfolioContext = restoredSnapshot?.portfolioContext
-        ?? await options.getPortfolioContext?.(job.symbol, portfolioPrices)
-        ?? { position: null, portfolio: null }
+      const portfolioContext = followUpEvent
+        ? await options.getPortfolioContext?.(job.symbol, portfolioPrices)
+          ?? { position: null, portfolio: null }
+        : restoredSnapshot?.portfolioContext
+          ?? await options.getPortfolioContext?.(job.symbol, portfolioPrices)
+          ?? { position: null, portfolio: null }
       const gaps = [
         ...(context.gaps ?? []),
         ...(portfolioPriceGap ? [{ capability: 'portfolio_prices', reason: 'source_unavailable' }] : []),
@@ -470,12 +485,12 @@ export function createAnalysisService(options: {
       const snapshot = { ...context, gaps, portfolioContext, createdAt: new Date().toISOString() }
       terminalSnapshotBase = snapshot
       adoptedFacts = snapshot.facts
-      await appendEvent(sessionId, executionId, operationId('financial-context'), {
-        type: 'financial_context',
-        gaps,
-        capabilities: sourceDiagnostics(context),
-        degradedSources: sourceDegradations(context),
-      }, { snapshot, facts: context.facts })
+      if (!followUpEvent) await appendEvent(sessionId, executionId, operationId('financial-context'), {
+          type: 'financial_context',
+          gaps,
+          capabilities: sourceDiagnostics(context),
+          degradedSources: sourceDegradations(context),
+        }, { snapshot, facts: context.facts })
       assertPolicy()
       const modelContext = createModelContext(snapshot)
       const runtimeContext = createInitialRuntimeContext(modelContext, portfolioContext)
@@ -494,6 +509,17 @@ export function createAnalysisService(options: {
       const specialistSessions = (await options.eventRepository.listSessions(analysisId))
         .filter(({ isPrimary }) => !isPrimary)
       const reportVersions = await options.eventRepository.listReportVersions(analysisId)
+      const specialistLifecycles = new Map(await Promise.all(specialistSessions.map(async (specialist) => (
+        [specialist.id, await options.eventRepository.sessionLifecycle(specialist.id)] as const
+      ))))
+      const specialistDomains = new Map(specialistSessions.flatMap((specialist) => {
+        const lifecycle = specialistLifecycles.get(specialist.id)
+        const domainEvent = lifecycle?.events.find((event) => {
+          const payload = event as Record<string, unknown>
+          return ['news', 'fundamental_valuation', 'technical'].includes(String(payload.domain))
+        }) as Record<string, unknown> | undefined
+        return domainEvent ? [[specialist.id, domainEvent.domain as SpecialistDomain] as const] : []
+      }))
       const reusableSpecialistReports = specialistSessions.flatMap((specialist) => {
         const version = reportVersions.filter(({ sessionId: id }) => id === specialist.id).at(-1)
         if (!version) return []
@@ -504,10 +530,23 @@ export function createAnalysisService(options: {
           status: report.status === 'partial' ? 'partial' : 'completed',
         }]
       })
+      const specialistStatuses = (['news', 'fundamental_valuation', 'technical'] as const).map((domain) => {
+        const specialist = specialistSessions.find((candidate) => (
+          specialistDomains.get(candidate.id) === domain
+        ))
+        const reusable = reusableSpecialistReports.find((candidate) => candidate.domain === domain)
+        const lifecycle = specialist ? specialistLifecycles.get(specialist.id) : undefined
+        return {
+          domain,
+          status: reusable?.status ?? lifecycle?.execution.status ?? 'not_started',
+          ...(specialist ? { sessionId: specialist.id } : {}),
+          ...(reusable ? { reportId: reusable.reportId, version: reusable.version } : {}),
+        }
+      })
       const specialistRecovery = new Map<SpecialistDomain, NonNullable<AnalyzeInput['runtimeResume']>>()
       for (const specialist of specialistSessions) {
         if (reusableSpecialistReports.some(({ sessionId: id }) => id === specialist.id)) continue
-        const lifecycle = await options.eventRepository.sessionLifecycle(specialist.id)
+        const lifecycle = specialistLifecycles.get(specialist.id)
         const domainEvent = lifecycle?.events.find((event) => {
           const payload = event as Record<string, unknown>
           return ['news', 'fundamental_valuation', 'technical'].includes(String(payload.domain))
@@ -541,6 +580,65 @@ export function createAnalysisService(options: {
           ...latestCompactionSummary(currentLifecycle),
           reusableToolResults, reusableSpecialistReports,
           unresolved: unresolvedResults(previousRuntimes),
+        },
+      } : undefined
+      const baseReportVersion = typeof followUpEvent?.baseReportVersion === 'number'
+        ? followUpEvent.baseReportVersion : null
+      const baseReport = baseReportVersion === null ? undefined : reportVersions.find((version) => (
+        version.sessionId === sessionId && version.kind === 'integrated'
+          && version.version === baseReportVersion
+      ))
+      const reportCreatedAt = job.reportCreatedAt
+      const reportAgeDays = reportCreatedAt
+        ? Math.max(0, (Date.now() - Date.parse(reportCreatedAt)) / 86_400_000) : null
+      const updateReport = followUpEvent?.updateReport === true
+      const latestCompaction = currentLifecycle?.compactions.at(-1)
+      const latestCompactionEvent = currentLifecycle?.events.findLast((event) => (
+        (event as Record<string, unknown>).type === 'compaction'
+          && (event as Record<string, unknown>).status === 'completed'
+      ))
+      const historyCutoff = latestCompaction ? Date.parse(latestCompaction.createdAt) : Number.NEGATIVE_INFINITY
+      const historySequenceCutoff = latestCompactionEvent?.sequence ?? Number.NEGATIVE_INFINITY
+      const conversationHistory = (currentLifecycle?.events ?? []).reduce<Array<{
+        role: 'user' | 'assistant'; text: string
+      }>>((history, event) => {
+        if (latestCompactionEvent ? event.sequence <= historySequenceCutoff
+          : Date.parse(event.createdAt) <= historyCutoff) return history
+        const payload = event as Record<string, unknown>
+        if (payload.type === 'runtime_follow_up'
+          && payload.messageId !== followUpEvent?.messageId
+          && typeof payload.message === 'string') {
+          history.push({ role: 'user', text: payload.message })
+        }
+        if (payload.type === 'chat_completed' && typeof payload.text === 'string') {
+          history.push({ role: 'assistant', text: payload.text })
+        }
+        return history
+      }, [])
+      const runtimeFollowUp = followUpEvent ? {
+        role: 'runtime_follow_up' as const,
+        generatedBy: 'product_runtime' as const,
+        isUserInput: false as const,
+        content: {
+          message: String(followUpEvent.message ?? ''),
+          updateReport,
+          conversationHistory,
+          ...(resumeEvent ? {} : latestCompactionSummary(currentLifecycle)),
+          baseReportVersion,
+          baseReport: baseReport?.report ?? null,
+          baseReportCreatedAt: reportCreatedAt,
+          reportAgeDays,
+          freshness: reportAgeDays === null ? 'unavailable'
+            : reportAgeDays > runtimeSettings.reportFreshnessDays ? 'stale' : 'current',
+          reportPositionContext: (job.snapshot as { portfolioContext?: unknown } | null)
+            ?.portfolioContext ?? null,
+          currentPositionSummary: portfolioContext,
+          specialistStatuses,
+          availableTools: analysisModelTools.filter(({ name }) => (
+            updateReport || name !== 'submit_analysis_report'
+          )).map(({ name, description }) => ({
+            name, purpose: description,
+          })),
         },
       } : undefined
       const newsRuntimeAvailable = Boolean(options.model.analyzeNews && options.searchNewsCandidates
@@ -823,8 +921,9 @@ export function createAnalysisService(options: {
         runtimeSettings,
         symbol: job.symbol,
         systemPrompt: ANALYSIS_SYSTEM_PROMPT,
-        runtimeContext,
+        runtimeContext: followUpEvent ? undefined : runtimeContext,
         runtimeResume,
+        runtimeFollowUp,
         knownFacts: modelContext.facts,
         refreshKnownFacts,
         onSpecialistOutcome: rememberSpecialistOutcome,
@@ -864,6 +963,15 @@ export function createAnalysisService(options: {
             sessionId, executionId, event.operationId ?? nextModelOperationId('stopped'), 'stopped',
           ); return
         }
+        else if (event.type === 'chat_completed') {
+          await appendTrace(sessionId, executionId, {
+            type: 'chat_completed', text: event.text, usage: event.usage ?? null,
+            stopReason: event.stopReason ?? null,
+            operationId: event.operationId ?? nextModelOperationId('chat-completed'),
+          })
+          await setStatus(sessionId, executionId, operationId('status-completed'), 'completed')
+          return
+        }
         else if (event.type === 'completed') {
           if (lifecycleStatus !== 'finalizing') await setStatus(
             sessionId, executionId, event.operationId
@@ -902,6 +1010,13 @@ export function createAnalysisService(options: {
           error: 'execution_runtime_timeout',
         })
       } else if (activeBudget.exhausted()) {
+        if (followUpEvent && followUpEvent.updateReport !== true) {
+          await setStatus(
+            sessionId, executionId, operationId('budget-exhausted'), 'budget_exhausted',
+            { error: 'follow_up_active_timeout' },
+          )
+          return
+        }
         await setStatus(sessionId, executionId, operationId('budget-exhausted'), 'budget_exhausted', { terminal: false })
         await setStatus(sessionId, executionId, operationId('finalizing'), 'finalizing')
         const limitedContext = context ?? {
@@ -1020,6 +1135,11 @@ export function createAnalysisService(options: {
     const sourceExecutionIds = job.status === 'stopped'
       && typeof stoppedSource?.previousExecutionId === 'string'
       ? [stoppedSource.previousExecutionId] : [lifecycle.execution.id]
+    const sourceFollowUp = lifecycle.events.findLast((event) => {
+      const payload = event as Record<string, unknown>
+      return payload.type === 'runtime_follow_up'
+        && payload.executionId === sourceExecutionIds[0]
+    }) as (Record<string, unknown> | undefined)
     const result = await options.eventRepository.resumeResearch({
       analysisId, executionId, segmentId: randomUUID(),
       operationId: `execution:${executionId}:resumed`,
@@ -1027,6 +1147,13 @@ export function createAnalysisService(options: {
         type: 'runtime_resume', status: 'planning', resumed: true,
         previousExecutionId: lifecycle.execution.id, executionId, generation,
         sourceExecutionIds,
+        ...(sourceFollowUp ? { followUp: {
+          messageId: sourceFollowUp.messageId,
+          message: sourceFollowUp.message,
+          updateReport: sourceFollowUp.updateReport === true,
+          baseReportVersion: typeof sourceFollowUp.baseReportVersion === 'number'
+            ? sourceFollowUp.baseReportVersion : null,
+        } } : {}),
         waitReason: { kind: 'database', target: '恢复研究上下文', startedAt: createdAt },
         at: createdAt,
       },
@@ -1034,6 +1161,49 @@ export function createAnalysisService(options: {
     })
     queueMicrotask(() => void schedule())
     return result
+  }
+  async function followUp(
+    analysisId: string, messageIdInput: string, messageInput: string, updateReport = false,
+  ) {
+    await initialized
+    const message = messageInput.trim()
+    const messageId = messageIdInput.trim()
+    if (!messageId || messageId.length > 200) throw new Error('follow_up_message_id_required')
+    if (!message) throw new Error('follow_up_message_required')
+    const record = await repository.get(analysisId)
+    if (!record) return null
+    const lifecycle = await options.eventRepository.primaryLifecycle(analysisId)
+    if (!lifecycle) throw new Error('analysis_follow_up_not_available')
+    const stableId = encodeURIComponent(messageId)
+    const executionId = `analysis:${analysisId}:message:${stableId}`
+    const operationId = `session:${lifecycle.id}:message:${stableId}`
+    const replay = (await options.eventRepository.list(lifecycle.id, 0)).find(
+      (event) => event.operationId === operationId,
+    )
+    const replayPayload = replay?.payload as Record<string, unknown> | undefined
+    if (replayPayload && (replayPayload.messageId !== messageId
+      || replayPayload.message !== message || replayPayload.updateReport !== updateReport
+      || replayPayload.executionId !== executionId)) {
+      throw new Error('agent_operation_conflict')
+    }
+    const versions = replayPayload ? [] : await options.eventRepository.listReportVersions(analysisId)
+    const baseReport = versions.filter(({ sessionId, kind }) => (
+      sessionId === lifecycle.id && kind === 'integrated'
+    )).at(-1)
+    const baseReportVersion = typeof replayPayload?.baseReportVersion === 'number'
+      ? replayPayload.baseReportVersion : replayPayload ? null : baseReport?.version ?? null
+    const event = replayPayload ?? {
+      type: 'runtime_follow_up', status: 'planning', executionId,
+      baseReportVersion, messageId, message, updateReport,
+    }
+    const createdAt = new Date().toISOString()
+    const result = await options.eventRepository.createFollowUpExecution({
+      analysisId, executionId, segmentId: `${executionId}:segment`,
+      baseReportVersion, operationId, event,
+      createdAt,
+    })
+    queueMicrotask(() => void schedule())
+    return { ...result, messageId, message, updateReport }
   }
   async function research(analysisId: string) {
     await initialized
@@ -1186,7 +1356,7 @@ export function createAnalysisService(options: {
     queueMicrotask(() => void schedule())
   }
   return {
-    create, get, cancel, resume, research, listResearch, updateResearch, removeResearch,
+    create, get, cancel, resume, followUp, research, listResearch, updateResearch, removeResearch,
     streamEvents, close, updateRuntimePolicy,
   }
 }

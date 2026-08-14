@@ -296,6 +296,74 @@ export function createTestProductDatabase() {
       })
       return { sessionId: session.id, executionId: input.executionId, generation, created: true }
     },
+    async createFollowUpExecution(input) {
+      const eventBaseReportVersion = typeof input.event.baseReportVersion === 'number'
+        ? input.event.baseReportVersion : input.event.baseReportVersion === null ? null : undefined
+      if (eventBaseReportVersion !== input.baseReportVersion) throw new Error('agent_operation_conflict')
+      const record = analyses.get(input.analysisId)
+      const session = [...agentSessions.values()].find((candidate) => (
+        candidate.analysisId === input.analysisId && candidate.isPrimary
+      ))
+      if (!record || !session) throw new Error('analysis_not_found')
+      const lifecycle = lifecycles.get(session.id)!
+      const replay = (agentEvents.get(session.id) ?? []).find(
+        ({ operationId }) => operationId === input.operationId,
+      )
+      if (replay) {
+        if (JSON.stringify(replay.payload) !== JSON.stringify(input.event)
+          || lifecycle.execution.id !== input.executionId) {
+          throw new Error('agent_operation_conflict')
+        }
+        return {
+          sessionId: session.id, executionId: input.executionId,
+          generation: lifecycle.execution.generation,
+          baseReportVersion: eventBaseReportVersion, created: false,
+        }
+      }
+      if (!lifecycle.execution.terminal && ![
+        'completed', 'partial', 'failed', 'stopped', 'interrupted', 'budget_exhausted',
+      ].includes(lifecycle.execution.status)) throw new Error('analysis_follow_up_not_available')
+      if (['stopped', 'interrupted'].includes(lifecycle.execution.status)) {
+        throw new Error('analysis_resume_required')
+      }
+      const generation = lifecycle.execution.generation + 1
+      const sequence = session.latestSequence + 1
+      agentEvents.set(session.id, [...(agentEvents.get(session.id) ?? []), {
+        sessionId: session.id, sequence, operationId: input.operationId,
+        payload: structuredClone(input.event), createdAt: input.createdAt,
+      }])
+      agentSessions.set(session.id, {
+        ...session, executionId: input.executionId, status: 'planning',
+        latestSequence: sequence, updatedAt: input.createdAt,
+      })
+      lifecycles.set(session.id, {
+        ...lifecycle,
+        execution: {
+          id: input.executionId, generation, status: 'planning', terminal: false,
+          createdAt: input.createdAt, updatedAt: input.createdAt,
+        },
+        waitReason: { kind: 'database', target: '组装追问上下文', startedAt: input.createdAt },
+        segments: [...lifecycle.segments, {
+          id: input.segmentId ?? `${session.id}:segment:${lifecycle.segments.length + 1}`,
+          ordinal: lifecycle.segments.length + 1, createdAt: input.createdAt,
+        }],
+        events: [...(lifecycle.events ?? []), {
+          sequence, createdAt: input.createdAt, ...structuredClone(input.event),
+        }],
+      })
+      analyses.set(input.analysisId, {
+        ...record, status: 'queued', terminal: false, error: null, updatedAt: input.createdAt,
+      })
+      const current = runtimeSettingsRevisions.at(-1)!
+      executionSettingsSnapshots.set(input.executionId, {
+        executionId: input.executionId, id: current.id,
+        values: { ...current.values }, createdAt: input.createdAt,
+      })
+      return {
+        sessionId: session.id, executionId: input.executionId, generation,
+        baseReportVersion: input.baseReportVersion, created: true,
+      }
+    },
     async fenceForStopping(input) {
       const session = agentSessions.get(input.sessionId)
       const lifecycle = lifecycles.get(input.sessionId)

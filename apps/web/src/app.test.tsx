@@ -209,6 +209,129 @@ test('用户创建分析并打开研究记录后能看到报告依据', async ()
   assert.equal(document.querySelector('[data-tool-call-id="cancelled-call"]') !== null, true)
 })
 
+test('无有效报告的研究页仍可向原主 Agent 发送追问', async () => {
+  setupDom()
+  Reflect.deleteProperty(globalThis, 'EventSource')
+  let sent = ''
+  const record: any = {
+    id: 'follow-up-ui', symbol: 'NVDA', status: 'failed', report: null,
+    reportCreatedAt: null, facts: [], trace: [],
+    mainAgent: {
+      id: 'follow-up-session', status: 'failed', waitReason: null,
+      execution: { id: 'old-execution', generation: 1, status: 'failed' },
+      segments: [], events: [], compactionAttempts: [], modelAttempts: [],
+    }, specialistAgents: [],
+  }
+  globalThis.fetch = async (input, init) => {
+    const url = String(input)
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok' }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/settings') return Response.json({ ...settingsResponse(), model: { configured: true } })
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+    if (url === '/api/portfolio') return Response.json(portfolioResponse([]))
+    if (url === '/api/research') return Response.json({ records: [{ id: record.id, symbol: record.symbol, status: record.status }] })
+    if (url === '/api/research/follow-up-ui') return Response.json(record)
+    if (url === '/api/analyses/follow-up-ui/messages' && init?.method === 'POST') {
+      const payload = JSON.parse(String(init.body))
+      sent = payload.message
+      assert.match(payload.messageId, /^[0-9a-f-]{36}$/)
+      assert.equal(payload.updateReport, false)
+      record.status = 'completed'
+      record.mainAgent.status = 'completed'
+      record.mainAgent.execution = { id: 'follow-up-execution', generation: 2, status: 'completed' }
+      record.mainAgent.events = [{
+        sequence: 1, type: 'runtime_follow_up', message: payload.message,
+        createdAt: '2026-08-14T01:00:00.000Z',
+      }, {
+        sequence: 2, type: 'chat_completed', text: '这是主 Agent 的可回放回答。',
+        createdAt: '2026-08-14T01:00:01.000Z',
+      }]
+      return Response.json({ sessionId: 'follow-up-session', executionId: 'follow-up-execution' }, { status: 202 })
+    }
+    if (url === '/api/analyses/follow-up-ui') return Response.json({ status: 'completed', terminal: true })
+    throw new Error(`unexpected_fetch:${url}`)
+  }
+  const view = render(React.createElement(App))
+  const user = userEvent.setup({ document: window.document })
+  await user.click(await view.findByRole('button', { name: '新建分析' }))
+  await user.click(await view.findByRole('button', { name: /打开 NVDA/ }))
+  await user.type(await view.findByLabelText('追问主 Agent'), '继续补充研究')
+  await user.click(view.getByRole('button', { name: '发送追问' }))
+  await waitFor(() => assert.equal(sent, '继续补充研究'))
+  await waitFor(() => assert.match(view.getByRole('region', { name: '主 Agent Runtime' }).textContent ?? '', /Generation 2/))
+  const conversation = await view.findByRole('region', { name: '与主 Agent 的对话' })
+  assert.match(conversation.textContent ?? '', /你继续补充研究/)
+  assert.match(conversation.textContent ?? '', /主 Agent这是主 Agent 的可回放回答/)
+})
+
+test('追问通过 SSE 实时展示用户消息、文本增量与最终回答', async (t) => {
+  setupDom()
+  let stream: {
+    emit: (name: string, payload: Record<string, unknown>, sequence: number) => void
+  } | undefined
+  class TestEventSource {
+    listeners = new Map<string, Array<(event: MessageEvent) => void>>()
+    onerror: (() => void) | null = null
+    constructor(_url: string) { stream = this }
+    addEventListener(name: string, listener: EventListenerOrEventListenerObject) {
+      const callback = typeof listener === 'function'
+        ? listener as (event: MessageEvent) => void
+        : (event: MessageEvent) => listener.handleEvent(event)
+      this.listeners.set(name, [...(this.listeners.get(name) ?? []), callback])
+    }
+    emit(name: string, payload: Record<string, unknown>, sequence: number) {
+      const event = new MessageEvent(name, {
+        data: JSON.stringify(payload), lastEventId: `live-session:${sequence}`,
+      })
+      for (const listener of this.listeners.get(name) ?? []) listener(event)
+    }
+    close() {}
+  }
+  Object.assign(globalThis, { EventSource: TestEventSource })
+  t.after(() => { Reflect.deleteProperty(globalThis, 'EventSource') })
+  const record: any = {
+    id: 'live-follow-up', symbol: 'AAPL', status: 'completed', report: null,
+    reportCreatedAt: null, facts: [], trace: [],
+    mainAgent: {
+      id: 'live-session', status: 'completed', waitReason: null,
+      execution: { id: 'live-execution-1', generation: 1, status: 'completed' },
+      segments: [], events: [], compactionAttempts: [], modelAttempts: [],
+    }, specialistAgents: [],
+  }
+  globalThis.fetch = async (input, init) => {
+    const url = String(input)
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok' }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/settings') return Response.json({ ...settingsResponse(), model: { configured: true } })
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+    if (url === '/api/portfolio') return Response.json(portfolioResponse([]))
+    if (url === '/api/research') return Response.json({ records: [{ id: record.id, symbol: record.symbol, status: record.status }] })
+    if (url === '/api/research/live-follow-up') return Response.json(record)
+    if (url === '/api/analyses/live-follow-up/messages' && init?.method === 'POST') {
+      return Response.json({ sessionId: 'live-session', executionId: 'live-execution-2' }, { status: 202 })
+    }
+    throw new Error(`unexpected_fetch:${url}`)
+  }
+  const view = render(React.createElement(App))
+  const user = userEvent.setup({ document: window.document })
+  await user.click(await view.findByRole('button', { name: '新建分析' }))
+  await user.click(await view.findByRole('button', { name: /打开 AAPL/ }))
+  await user.type(await view.findByLabelText('追问主 Agent'), '实时追问')
+  await user.click(view.getByRole('button', { name: '发送追问' }))
+  await waitFor(() => assert.ok(stream))
+  stream!.emit('runtime_follow_up', { messageId: 'live-message', message: '实时追问' }, 10)
+  stream!.emit('text_delta', { text: '实时' }, 11)
+  stream!.emit('text_delta', { text: '回答' }, 12)
+  await waitFor(() => assert.match(
+    view.getByRole('region', { name: '与主 Agent 的对话' }).textContent ?? '',
+    /你实时追问.*主 Agent实时回答/,
+  ))
+  stream!.emit('chat_completed', { text: '最终回答' }, 13)
+  await waitFor(() => {
+    const text = view.getByRole('region', { name: '与主 Agent 的对话' }).textContent ?? ''
+    assert.match(text, /主 Agent最终回答/)
+    assert.doesNotMatch(text, /实时回答/)
+  })
+})
+
 test('新建分析页展示分析历史并能重新打开报告', async () => {
   setupDom()
   const summary = {

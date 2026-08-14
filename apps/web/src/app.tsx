@@ -59,6 +59,7 @@ type ResearchRecord = ResearchSummary & {
     events: Array<{
       sequence: number; type?: string; status?: string; createdAt: string
       previousExecutionId?: string; executionId?: string
+      message?: string; messageId?: string; text?: string
       contextTokens?: number; contextWindow?: number; reserveTokens?: number
       keepRecentTokens?: number; durationMs?: number
       tokensAfter?: number
@@ -220,10 +221,27 @@ export function App() {
   }
   function streamAnalysis(sessionId: string, analysisId: string) {
     const source = new EventSource(`/api/agent-sessions/${sessionId}/events`)
-    const eventNames = ['runtime_context', 'runtime_resume', 'planning', 'running_model', 'running_tools', 'waiting_for_specialists', 'finalizing', 'financial_context', 'model_event', 'text_delta', 'model_completed', 'completed', 'partial', 'failed', 'stopping', 'stopped', 'interrupted', 'budget_exhausted']
+    const eventNames = ['runtime_context', 'runtime_resume', 'runtime_follow_up', 'chat_completed', 'planning', 'running_model', 'running_tools', 'waiting_for_specialists', 'finalizing', 'financial_context', 'model_event', 'text_delta', 'model_completed', 'completed', 'partial', 'failed', 'stopping', 'stopped', 'interrupted', 'budget_exhausted']
     for (const name of eventNames) source.addEventListener(name, (event) => {
       const entry = JSON.parse((event as MessageEvent).data) as Record<string, unknown>
-      if (name !== 'text_delta') addStage(name)
+      if (['runtime_follow_up', 'chat_completed', 'text_delta'].includes(name)) {
+        const cursor = (event as MessageEvent).lastEventId.split(':').at(-1)
+        const sequence = Number(cursor)
+        if (Number.isInteger(sequence)) setSelectedResearch((current) => {
+          if (current?.id !== analysisId || !current.mainAgent
+            || current.mainAgent.events.some((candidate) => candidate.sequence === sequence)) return current
+          return { ...current, mainAgent: {
+            ...current.mainAgent,
+            events: [...current.mainAgent.events, {
+              sequence, type: name, createdAt: new Date().toISOString(),
+              ...(typeof entry.message === 'string' ? { message: entry.message } : {}),
+              ...(typeof entry.messageId === 'string' ? { messageId: entry.messageId } : {}),
+              ...(typeof entry.text === 'string' ? { text: entry.text } : {}),
+            }],
+          } }
+        })
+      }
+      if (!['runtime_follow_up', 'chat_completed', 'text_delta'].includes(name)) addStage(name)
       if (['planning', 'running_model', 'running_tools', 'waiting_for_specialists', 'finalizing', 'completed', 'partial', 'failed', 'stopping', 'stopped', 'interrupted', 'budget_exhausted'].includes(name)) setAnalysisStatus(name)
       if (isTerminalAgentExecutionStatus(
         name, typeof entry.terminal === 'boolean' ? entry.terminal : undefined,
@@ -274,6 +292,28 @@ export function App() {
     await openResearch(selectedResearch.id)
     await loadResearch()
   }
+  async function sendFollowUp(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!selectedResearch) return
+    const form = event.currentTarget
+    const data = new FormData(form)
+    const message = String(data.get('message') ?? '').trim()
+    const updateReport = data.get('updateReport') === 'on'
+    if (!message) return
+    setError('')
+    const response = await fetch(`/api/analyses/${selectedResearch.id}/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ messageId: crypto.randomUUID(), message, updateReport }),
+    })
+    const result = await response.json() as { sessionId?: string }
+    if (!response.ok || !result.sessionId) { setError('追问发送失败'); return }
+    form.reset()
+    setActiveAnalysisId(selectedResearch.id)
+    setAnalysisStatus('planning')
+    if ('EventSource' in globalThis) streamAnalysis(result.sessionId, selectedResearch.id)
+    else await pollAnalysis(selectedResearch.id)
+    await openResearch(selectedResearch.id)
+  }
   async function updateResearch(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
     if (!selectedResearch) return
@@ -303,7 +343,7 @@ export function App() {
       {error && <p role="alert" className="error-banner">{error}</p>}
       {page === 'overview' && <Overview records={records} selected={selectedResearch} positions={positions} health={health} modelConfigured={modelConfigured} onNavigate={navigate} onOpen={async (id) => { await openResearch(id); navigate('research') }} />}
       {page === 'analysis' && <AnalysisPage symbol={analysisSymbol} setSymbol={setAnalysisSymbol} status={analysisStatus} stages={analysisStages} active={Boolean(activeAnalysisId)} onStart={startAnalysis} onCancel={cancelAnalysis} health={health} modelConfigured={modelConfigured} records={records} onOpen={async (id) => { await openResearch(id); navigate('research') }} />}
-      {page === 'research' && <ResearchPage records={records} record={selectedResearch} onOpen={openResearch} onUpdate={updateResearch} onDelete={removeResearch} onResume={resumeResearch} freshnessDays={runtimeSettings?.current.values.reportFreshnessDays ?? null} />}
+      {page === 'research' && <ResearchPage records={records} record={selectedResearch} onOpen={openResearch} onUpdate={updateResearch} onDelete={removeResearch} onResume={resumeResearch} onFollowUp={sendFollowUp} freshnessDays={runtimeSettings?.current.values.reportFreshnessDays ?? null} />}
       {page === 'portfolio' && <PortfolioPage portfolio={portfolio} history={portfolioHistory} onSave={savePosition} onSaveCash={saveCash} onReduce={reducePosition} onDelete={removePosition} />}
       {page === 'settings' && <SettingsPage health={health} modelConfigured={modelConfigured} settings={runtimeSettings} onReload={loadSettings} />}
     </main>
@@ -351,17 +391,18 @@ function AnalysisPage({ symbol, setSymbol, status, stages, active, onStart, onCa
   </>
 }
 
-function ResearchPage({ records, record, onOpen, onUpdate, onDelete, onResume, freshnessDays }: {
+function ResearchPage({ records, record, onOpen, onUpdate, onDelete, onResume, onFollowUp, freshnessDays }: {
   records: ResearchSummary[]; record: ResearchRecord | null; onOpen: (id: string) => Promise<void>
   onUpdate: (event: React.FormEvent<HTMLFormElement>) => Promise<void>; onDelete: () => Promise<void>
   onResume: () => Promise<void>
+  onFollowUp: (event: React.FormEvent<HTMLFormElement>) => Promise<void>
   freshnessDays: number | null
 }) {
   return <>
     <PageHeader eyebrow="RESEARCH ARCHIVE" title="研究记录" description="每份报告都绑定当时的数据快照、来源和分析轨迹，结论变化也有迹可循。" />
     <div className="research-layout">
       <aside className="research-index"><p className="micro">全部记录 · {records.length}</p>{records.map((item) => <button className={record?.id === item.id ? 'active' : ''} key={item.id} onClick={() => void onOpen(item.id)}><strong>{item.symbol}</strong><span>{item.report?.title ?? statusLabel(item.status)}</span><small>{item.starred ? `已标记 · ${statusLabel(item.status)}` : statusLabel(item.status)}</small></button>)}</aside>
-      <ResearchReport record={record} onUpdate={onUpdate} onDelete={onDelete} onResume={onResume} freshnessDays={freshnessDays} />
+      <ResearchReport record={record} onUpdate={onUpdate} onDelete={onDelete} onResume={onResume} onFollowUp={onFollowUp} freshnessDays={freshnessDays} />
       <div><TokenUsageDashboard record={record} /><AgentRuntime agent={record?.mainAgent} /><SpecialistAgents agents={record?.specialistAgents} /><TraceSummary trace={record?.trace ?? []} /></div>
     </div>
   </>
@@ -595,9 +636,10 @@ function CompactionAttempts({ attempts = [] }: {
   </li>)}</ol>
 }
 
-function ResearchReport({ record, onUpdate, onDelete, onResume, freshnessDays }: {
+function ResearchReport({ record, onUpdate, onDelete, onResume, onFollowUp, freshnessDays }: {
   record: ResearchRecord | null; onUpdate: (event: React.FormEvent<HTMLFormElement>) => Promise<void>; onDelete: () => Promise<void>
   onResume: () => Promise<void>
+  onFollowUp: (event: React.FormEvent<HTMLFormElement>) => Promise<void>
   freshnessDays: number | null
 }) {
   if (!record) return <article className="research-report empty">选择一条研究记录开始阅读。</article>
@@ -607,6 +649,25 @@ function ResearchReport({ record, onUpdate, onDelete, onResume, freshnessDays }:
   const indicator = asRecord(indicatorFact?.value)
   const valuationFact = record.facts.find((fact) => fact.type === 'valuation')
   const stale = freshnessDays !== null && isReportOlderThan(record.reportCreatedAt, freshnessDays)
+  const conversation = (record.mainAgent?.events ?? []).reduce<Array<{
+    key: string; role: 'user' | 'assistant'; text: string; streaming?: boolean
+  }>>((messages, event) => {
+    if (event.type === 'runtime_follow_up' && event.message) {
+      messages.push({ key: `user:${event.sequence}`, role: 'user', text: event.message })
+    }
+    if (event.type === 'chat_completed' && event.text) {
+      if (messages.at(-1)?.streaming) messages.pop()
+      messages.push({ key: `assistant:${event.sequence}`, role: 'assistant', text: event.text })
+    }
+    if (event.type === 'text_delta' && event.text) {
+      const previous = messages.at(-1)
+      if (previous?.role === 'assistant' && previous.streaming) previous.text += event.text
+      else messages.push({
+        key: `assistant-stream:${event.sequence}`, role: 'assistant', text: event.text, streaming: true,
+      })
+    }
+    return messages
+  }, [])
   return <article className="research-report">
     <header className="report-title"><div><p className="micro">{record.symbol} · {statusLabel(record.status)}</p><h2>{report?.title ?? '受限分析'}</h2>{stale && <p role="status" className="data-warning">此报告已超过当前 {freshnessDays} 天有效期，请重新生成后再据此判断。</p>}</div><span className={`verdict ${record.status}`}>{trendVerdict(report?.trend)}<small>未来 1—4 周</small></span></header>
     {record.error && <p role="alert" className="error-banner">{friendlyError(record.error)}</p>}
@@ -620,6 +681,19 @@ function ResearchReport({ record, onUpdate, onDelete, onResume, freshnessDays }:
     {(report?.personalImpact || report?.conditionalSuggestion) && <ReportBlock number="06" title="与你的持仓"><p>{report.personalImpact}</p>{report.conditionalSuggestion && <p className="suggestion">条件式方向：{report.conditionalSuggestion}</p>}</ReportBlock>}
     <details className="evidence-drawer"><summary>查看全部支持与相反证据</summary><div className="evidence-columns"><section><h3>支持证据</h3><Evidence facts={facts} ids={report?.supportingEvidence ?? []} /></section><section><h3>相反证据</h3><Evidence facts={facts} ids={report?.contraryEvidence ?? []} /></section></div></details>
     {!!report?.limitations?.length && <section className="limitations"><p className="micro">数据与分析限制</p><BulletList values={report.limitations} /></section>}
+    {!!conversation.length && <section className="research-conversation" aria-label="与主 Agent 的对话">
+      <p className="micro">继续对话</p>
+      {conversation.map((message) => <p key={message.key} className={message.role}>
+        <strong>{message.role === 'user' ? '你' : '主 Agent'}</strong>{message.text}
+      </p>)}
+    </section>}
+    <form className="research-follow-up" onSubmit={(event) => void onFollowUp(event)}>
+      <label>继续与主 Agent 对话<textarea name="message" aria-label="追问主 Agent" required /></label>
+      <label className="follow-up-report-toggle"><input type="checkbox" name="updateReport" />
+        用本次结果更新综合报告</label>
+      {stale && <p className="data-warning">当前报告可能过期，追问会同时提供报告时与当前持仓语境。</p>}
+      <button type="submit">发送追问</button>
+    </form>
     <form className="research-meta" onSubmit={(event) => void onUpdate(event)}><label><input type="checkbox" name="starred" defaultChecked={record.starred} /> 标记这份研究</label><label>个人备注<textarea name="note" defaultValue={record.note ?? ''} /></label><div><button type="submit">保存备注</button>{['stopped', 'interrupted'].includes(record.status) && <button type="button" className="quiet" onClick={() => void onResume()}>恢复研究</button>}<button type="button" className="quiet danger" onClick={() => void onDelete()}>删除记录</button></div></form>
   </article>
 }

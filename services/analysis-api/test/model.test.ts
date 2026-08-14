@@ -142,6 +142,67 @@ test('主分析模型和财报专家使用不同的显式工具集', () => {
   ])
 })
 
+test('普通追问不向 Provider 投影综合报告提交工具并以聊天文本结束', async () => {
+  const projections: string[][] = []
+  const toolRuntime = createTestToolRuntime()
+  const ensureProjection = toolRuntime.ensureProjection.bind(toolRuntime)
+  toolRuntime.ensureProjection = async (input) => {
+    projections.push(input.tools.map(({ name }) => name))
+    return ensureProjection(input)
+  }
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxText('报告仍可作为基准，但应关注持仓变化。')),
+  ] })
+  const events = []
+  for await (const event of model.analyze({
+    executionId: 'ordinary-follow-up', runtimeSettings: runtimeSettings(),
+    symbol: 'NVDA', systemPrompt: 'system', knownFacts: facts, toolRuntime,
+    runtimeFollowUp: {
+      role: 'runtime_follow_up', generatedBy: 'product_runtime', isUserInput: false,
+      content: {
+        message: '报告还有效吗？', baseReportVersion: 1, updateReport: false,
+        conversationHistory: [],
+      },
+    },
+    fetchFinancialContext: async () => ({ facts }),
+  })) events.push(event)
+
+  assert.equal(projections[0]?.includes('submit_analysis_report'), false)
+  assert.equal(events.some((event) => event.type === 'chat_completed'
+    && event.text === '报告仍可作为基准，但应关注持仓变化。'), true)
+  assert.equal(events.some((event) => event.type === 'completed'), false)
+})
+
+test('显式更新报告的追问保留综合报告提交工具并生成新候选', async () => {
+  const projections: string[][] = []
+  const toolRuntime = createTestToolRuntime()
+  const ensureProjection = toolRuntime.ensureProjection.bind(toolRuntime)
+  toolRuntime.ensureProjection = async (input) => {
+    projections.push(input.tools.map(({ name }) => name))
+    return ensureProjection(input)
+  }
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall('submit_analysis_report', validReport), { stopReason: 'toolUse' }),
+  ] })
+  const events = []
+  for await (const event of model.analyze({
+    executionId: 'report-update-follow-up', runtimeSettings: runtimeSettings(),
+    symbol: 'NVDA', systemPrompt: 'system', knownFacts: facts, toolRuntime,
+    runtimeFollowUp: {
+      role: 'runtime_follow_up', generatedBy: 'product_runtime', isUserInput: false,
+      content: {
+        message: '请更新综合报告。', baseReportVersion: 1, updateReport: true,
+        conversationHistory: [],
+      },
+    },
+    fetchFinancialContext: async () => ({ facts }),
+  })) events.push(event)
+
+  assert.equal(projections[0]?.includes('submit_analysis_report'), true)
+  assert.equal(events.some((event) => event.type === 'completed'), true)
+  assert.equal(events.some((event) => event.type === 'chat_completed'), false)
+})
+
 test('主 Agent 可以明确不启动消息面 Agent 并保留理由', async () => {
   let specialistCalls = 0
   const model = createPiModel({ fauxResponses: [

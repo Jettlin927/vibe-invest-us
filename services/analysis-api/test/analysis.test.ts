@@ -93,12 +93,14 @@ async function makeApp(storageKey: string, model = fakeModel(), concurrency = 2)
 }
 
 async function waitForStatus(app: Awaited<ReturnType<typeof makeApp>>, id: string, expected: string) {
+  let latest: unknown
   for (let attempt = 0; attempt < 100; attempt += 1) {
     const response = await app.inject({ method: 'GET', url: `/api/analyses/${id}` })
-    if (response.json().status === expected) return response.json()
+    latest = response.json()
+    if ((latest as { status?: string }).status === expected) return latest
     await new Promise((resolve) => setTimeout(resolve, 5))
   }
-  throw new Error(`analysis_not_${expected}`)
+  throw new Error(`analysis_not_${expected}:${JSON.stringify(latest)}`)
 }
 
 test('创建分析立即返回标识并自动保存完成报告、快照、事实和轨迹', async () => {
@@ -138,6 +140,300 @@ test('创建分析立即返回标识并自动保存完成报告、快照、事�
   const afterNote = await app.inject({ method: 'GET', url: `/api/research/${analysisId}` })
   assert.equal(afterNote.json().reportCreatedAt, reportCreatedAt)
   assert.deepEqual(afterNote.json().report, research.json().report)
+  await app.close()
+})
+
+test('报告后每条用户消息在原主 Session 创建独立 execution 并冻结基准报告版本', async () => {
+  const app = await makeApp(crypto.randomUUID())
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' },
+  })).json()
+  await waitForStatus(app, created.analysisId, 'completed')
+  const before = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  const messagePayload = { messageId: 'message-1', message: '这份报告现在还有效吗？' }
+  const [response, replay] = await Promise.all([app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/messages`, payload: messagePayload,
+  }), app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/messages`, payload: messagePayload,
+  })])
+  assert.equal(response.statusCode, 202, response.body)
+  const followUp = response.json()
+  assert.equal(followUp.sessionId, created.sessionId)
+  assert.notEqual(followUp.executionId, before.mainAgent.execution.id)
+  assert.equal(followUp.generation, before.mainAgent.execution.generation + 1)
+  assert.equal(followUp.baseReportVersion, 1)
+  assert.equal(followUp.message, '这份报告现在还有效吗？')
+  assert.equal(replay.statusCode, 202, replay.body)
+  assert.equal(replay.json().executionId, followUp.executionId)
+  assert.equal(replay.json().generation, followUp.generation)
+  const conflict = await app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/messages`,
+    payload: { ...messagePayload, message: '同一消息 ID 不得改写内容。' },
+  })
+  assert.equal(conflict.statusCode, 409)
+  assert.equal(conflict.json().error, 'agent_operation_conflict')
+  await app.close()
+})
+
+test('普通追问只注入紧凑报告语境并保留 active report', async () => {
+  const database = createTestProductDatabase()
+  let modelCalls = 0
+  let contextFetches = 0
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => {
+      contextFetches += 1
+      return { symbol, facts: [fact], gaps: [], indicators: {} }
+    },
+    model: {
+      async *analyze(input) {
+        modelCalls += 1
+        if (modelCalls === 1) {
+          yield { type: 'completed' as const, report, reportVersion: {
+            kind: 'integrated' as const,
+            report: { kind: 'integrated', availability: 'available', status: 'completed' },
+          } }
+          return
+        }
+        assert.equal(input.runtimeContext, undefined)
+        assert.equal(input.runtimeResume, undefined)
+        assert.equal(input.runtimeFollowUp?.content.message, '持仓增加后，这份报告怎么看？')
+        assert.equal(input.runtimeFollowUp?.content.baseReportVersion, 1)
+        assert.equal((input.runtimeFollowUp?.content.baseReport as any).kind, 'integrated')
+        assert.equal((input.runtimeFollowUp?.content.reportPositionContext as any).position.quantity, 10)
+        assert.equal((input.runtimeFollowUp?.content.currentPositionSummary as any).position.quantity, 12)
+        assert.equal(input.runtimeFollowUp?.content.freshness, 'current')
+        assert.deepEqual((input.runtimeFollowUp?.content.specialistStatuses as Array<{
+          domain: string; status: string
+        }>).map(({ domain, status }) => ({ domain, status })), [
+          { domain: 'news', status: 'not_started' },
+          { domain: 'fundamental_valuation', status: 'not_started' },
+          { domain: 'technical', status: 'not_started' },
+        ])
+        assert.ok(Array.isArray(input.runtimeFollowUp?.content.availableTools))
+        assert.equal((input.runtimeFollowUp?.content.availableTools as Array<{ name: string }>)
+          .some(({ name }) => name === 'submit_analysis_report'), false)
+        assert.equal('recentDailyBars' in input.runtimeFollowUp!.content, false)
+        yield { type: 'text_delta' as const, text: '持仓增加会放大原报告风险敞口。' }
+        yield {
+          type: 'chat_completed' as const,
+          text: '持仓增加会放大原报告风险敞口。', stopReason: 'stop',
+        }
+      },
+    },
+  } as any)
+  await app.ready()
+  await app.inject({
+    method: 'PUT', url: '/api/positions/NVDA', payload: { quantity: 10, averageCost: 100 },
+  })
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' },
+  })).json()
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  const before = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  await app.inject({
+    method: 'PUT', url: '/api/positions/NVDA', payload: { quantity: 12, averageCost: 100 },
+  })
+  assert.equal((await app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/messages`,
+    payload: { messageId: 'position-follow-up', message: '持仓增加后，这份报告怎么看？' },
+  })).statusCode, 202)
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  const after = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  assert.deepEqual(after.report, before.report)
+  assert.equal(after.reportCreatedAt, before.reportCreatedAt)
+  assert.equal(contextFetches, 1)
+  const versions = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}/report-versions`,
+  })).json().items
+  assert.equal(versions.length, 1)
+  assert.ok(after.trace.some((event: any) => event.type === 'chat_completed'))
+  await app.close()
+})
+
+test('停止后的用户追问以新 generation 恢复同一消息与基准报告', async () => {
+  const database = createTestProductDatabase()
+  let calls = 0
+  let followUpStarted!: () => void
+  const started = new Promise<void>((resolve) => { followUpStarted = resolve })
+  let resumedInput: Parameters<ReturnType<typeof fakeModel>['analyze']>[0] | undefined
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [], indicators: {} }),
+    model: {
+      async *analyze(input) {
+        calls += 1
+        if (calls === 1) {
+          yield {
+            type: 'completed' as const, report,
+            reportVersion: { kind: 'integrated' as const, report: reportCandidate },
+          }
+          return
+        }
+        if (calls === 2) {
+          followUpStarted()
+          await new Promise<void>((resolve) => input.signal?.addEventListener(
+            'abort', () => resolve(), { once: true },
+          ))
+          yield { type: 'cancelled' as const }
+          return
+        }
+        resumedInput = input
+        yield { type: 'chat_completed' as const, text: '恢复后的回答' }
+      },
+    },
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'RFUP' },
+  })).json()
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  const followUp = (await app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/messages`,
+    payload: { messageId: 'resume-message', message: '继续解释风险。' },
+  })).json()
+  await started
+  assert.equal((await app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/cancel`,
+  })).statusCode, 202)
+  await waitForStatus(app as any, created.analysisId, 'stopped')
+  const bypass = await app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/messages`,
+    payload: { messageId: 'must-resume-first', message: '不得绕过恢复。' },
+  })
+  assert.equal(bypass.statusCode, 409)
+  assert.equal(bypass.json().error, 'analysis_resume_required')
+  const resumed = await app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/resume`,
+  })
+  assert.equal(resumed.statusCode, 202, resumed.body)
+  assert.equal(resumed.json().generation, followUp.generation + 2)
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  assert.equal(calls, 3)
+  assert.equal(resumedInput?.runtimeFollowUp?.content.message, '继续解释风险。')
+  assert.equal(resumedInput?.runtimeFollowUp?.content.baseReportVersion, 1)
+  assert.equal(resumedInput?.runtimeFollowUp?.content.updateReport, false)
+  assert.ok(resumedInput?.runtimeResume)
+  await app.close()
+})
+
+test('第二条追问从 PostgreSQL 重建同一主 Session 的前序问答', async () => {
+  const database = createTestProductDatabase()
+  let calls = 0
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [], indicators: {} }),
+    model: {
+      async *analyze(input) {
+        calls += 1
+        if (calls === 1) {
+          yield { type: 'completed' as const, report, reportVersion: {
+            kind: 'integrated' as const, report: reportCandidate,
+          } }
+          return
+        }
+        if (calls === 2) {
+          assert.deepEqual(input.runtimeFollowUp?.content.conversationHistory, [])
+          const compactedAt = new Date().toISOString()
+          await input.toolRuntime!.commitCompaction!({
+            id: `${input.executionId}:compaction:1`, executionId: input.executionId,
+            segmentId: `${input.executionId}:segment:compacted`,
+            operationId: `${input.executionId}:compaction:1:completed`,
+            event: { type: 'compaction', status: 'completed', tokensAfter: 1000 },
+            contextTokens: 100000, contextWindow: 128000, reserveTokens: 16384,
+            keepRecentTokens: 20000, tokensAfter: 1000,
+            summary: { narrative: '第一问已压缩为摘要', isReportEvidence: false },
+            usage: { input: 100, output: 20, totalTokens: 120 },
+            attempts: [{
+              attempt: 1, status: 'completed', durationMs: 10,
+              usage: { input: 100, output: 20, totalTokens: 120 },
+            }],
+            createdAt: compactedAt,
+          })
+          yield { type: 'chat_completed' as const, text: '第一轮回答：关注失效条件。' }
+          return
+        }
+        assert.deepEqual(input.runtimeFollowUp?.content.conversationHistory, [
+          { role: 'assistant', text: '第一轮回答：关注失效条件。' },
+        ])
+        assert.equal((input.runtimeFollowUp?.content.compactionSummary as any).narrative,
+          '第一问已压缩为摘要')
+        yield { type: 'chat_completed' as const, text: '第二轮回答：沿用上一轮语境。' }
+      },
+    },
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'HIST' },
+  })).json()
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  for (const payload of [
+    { messageId: 'history-1', message: '第一问是什么风险？' },
+    { messageId: 'history-2', message: '请展开你刚才的回答。' },
+  ]) {
+    assert.equal((await app.inject({
+      method: 'POST', url: `/api/analyses/${created.analysisId}/messages`, payload,
+    })).statusCode, 202)
+    await waitForStatus(app as any, created.analysisId, 'completed')
+  }
+  assert.equal(calls, 3)
+  await app.close()
+})
+
+test('显式更新报告的用户消息通过同一报告校验路径生成综合报告 V2', async () => {
+  const database = createTestProductDatabase()
+  let calls = 0
+  const updatedReport = { ...report, title: 'NVDA 更新后的综合分析' }
+  const updatedCandidate = { ...reportCandidate, title: updatedReport.title }
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [], indicators: {} }),
+    model: {
+      async *analyze(input) {
+        calls += 1
+        if (calls === 2) {
+          assert.equal(input.runtimeFollowUp?.content.updateReport, true)
+          assert.equal(input.runtimeFollowUp?.content.baseReportVersion, 1)
+        }
+        yield {
+          type: 'completed' as const, report: calls === 1 ? report : updatedReport,
+          reportVersion: {
+            kind: 'integrated' as const,
+            report: calls === 1 ? reportCandidate : updatedCandidate,
+          },
+        }
+      },
+    },
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'UPDR' },
+  })).json()
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  const response = await app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/messages`,
+    payload: { messageId: 'update-report-v2', message: '请更新报告。', updateReport: true },
+  })
+  assert.equal(response.statusCode, 202, response.body)
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  const research = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  const versions = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}/report-versions`,
+  })).json().items
+  assert.equal(research.report.title, updatedReport.title)
+  assert.deepEqual(versions.map(({ version }: { version: number }) => version), [1, 2])
   await app.close()
 })
 
@@ -586,6 +882,123 @@ test('主 Agent 跨 Turn 追问同一领域时复用长期专项 Session 并创�
   assert.equal(newsAgents[0].segments.length, 2)
   assert.equal(newsAgents[0].researchQuestion, '消息面后续追问')
   assert.deepEqual(versions.map(({ version }: any) => version), [1, 2])
+  await app.close()
+})
+
+test('报告后用户追问复用长期专项 Session 并创建专项新 execution 与 V2', async () => {
+  const database = createTestProductDatabase()
+  let mainRun = 0
+  let specialistRun = 0
+  const model = {
+    async *analyze(input: any) {
+      mainRun += 1
+      const question = mainRun === 1 ? '首次消息面问题' : '报告后的消息面追问'
+      const [prepared] = await input.prepareSpecialistBatch([{
+        domain: 'news', researchQuestion: question, reason: '补充消息面证据',
+      }], `execution:${input.executionId}:news:${mainRun}`)
+      const result = await input.runNewsSpecialist({
+        launch: true, researchQuestion: question, reason: '补充消息面证据', prepared,
+      })
+      assert.equal(result.reportVersion, mainRun)
+      if (mainRun === 1) yield { type: 'completed' as const, report, reportVersion: {
+        kind: 'integrated' as const, report: reportCandidate,
+      } }
+      else yield {
+        type: 'chat_completed' as const, text: '消息面专项已更新到 V2。', stopReason: 'stop',
+      }
+    },
+    async *analyzeNews() {
+      specialistRun += 1
+      const specialistReport = {
+        kind: 'specialist' as const, domain: 'news', availability: 'partial' as const,
+        status: 'partial' as const, gaps: [], limitations: [], keyJudgments: [],
+      }
+      yield { type: 'completed' as const, report: specialistReport, reportVersion: {
+        kind: 'specialist' as const, report: specialistReport,
+      } }
+    },
+  }
+  const emptyFacts = async () => ({ facts: [] })
+  const app = buildProductionApp({
+    ...database, model,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [] }),
+    searchNewsCandidates: emptyFacts, readNewsDocument: emptyFacts, listCompanyEvents: emptyFacts,
+  } as any)
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'NEWSMSG' },
+  })).json()
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  assert.equal((await app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/messages`,
+    payload: { messageId: 'news-follow-up', message: '请更新消息面判断。' },
+  })).statusCode, 202)
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  const research = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  const news = research.specialistAgents.filter((agent: any) => agent.domain === 'news')
+  const versions = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}/report-versions`,
+  })).json().items
+  assert.equal(mainRun, 2)
+  assert.equal(specialistRun, 2)
+  assert.equal(news.length, 1)
+  assert.equal(news[0].execution.generation, 2)
+  assert.equal(news[0].segments.length, 2)
+  assert.deepEqual(versions.filter(({ sessionId }: any) => sessionId === news[0].id)
+    .map(({ version }: any) => version), [1, 2])
+  assert.equal(versions.filter(({ kind }: any) => kind === 'integrated').length, 1)
+  await app.close()
+})
+
+test('没有有效综合报告的终态研究仍允许继续聊天', async () => {
+  let run = 0
+  const app = await makeApp(crypto.randomUUID(), {
+    async *analyze(input: any) {
+      run += 1
+      if (run === 1) throw new Error('initial_report_failed')
+      assert.equal(input.runtimeFollowUp?.content.baseReportVersion, null)
+      assert.equal(input.runtimeFollowUp?.content.baseReport, null)
+      if (run === 2) {
+        yield { type: 'chat_completed' as const, text: '可以继续补充研究。', stopReason: 'stop' }
+        return
+      }
+      assert.equal(input.runtimeFollowUp?.content.updateReport, true)
+      yield { type: 'completed' as const, report, reportVersion: {
+        kind: 'integrated' as const, report: reportCandidate,
+      } }
+    },
+  } as any)
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'NOREPORT' },
+  })).json()
+  await waitForStatus(app as any, created.analysisId, 'failed')
+  const response = await app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/messages`,
+    payload: { messageId: 'no-report-follow-up', message: '继续补充研究。' },
+  })
+  assert.equal(response.statusCode, 202, response.body)
+  assert.equal(response.json().baseReportVersion, null)
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  const research = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  assert.equal(research.report, null)
+  assert.ok(research.trace.some((event: any) => event.type === 'chat_completed'))
+  assert.equal((await app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/messages`,
+    payload: { messageId: 'retry-report', message: '重新生成报告。', updateReport: true },
+  })).statusCode, 202)
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  const recovered = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  assert.equal(recovered.report.title, report.title)
+  assert.equal((await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}/report-versions`,
+  })).json().items[0].version, 1)
   await app.close()
 })
 

@@ -37,6 +37,7 @@ type TraceEntry =
   | { type: 'user_input'; content: string; operationId?: string }
   | { type: 'runtime_context'; content: RuntimeContext; operationId?: string }
   | { type: 'runtime_resume'; content: RuntimeResume; operationId?: string }
+  | { type: 'runtime_follow_up'; content: RuntimeFollowUp; operationId?: string }
   | { type: 'runtime_policy'; settings: RuntimeSettings; operationId?: string }
   | { type: 'model_event'; event: unknown; operationId?: string }
   | {
@@ -100,6 +101,10 @@ export type ModelEvent =
     operationId?: string
   }
   | { type: 'cancelled'; operationId?: string }
+  | {
+    type: 'chat_completed'; text: string; usage?: unknown; stopReason?: string
+    operationId?: string
+  }
 
 export type AnalyzeInput = {
   executionId: string
@@ -109,6 +114,7 @@ export type AnalyzeInput = {
   userPrompt?: string
   runtimeContext?: RuntimeContext
   runtimeResume?: RuntimeResume
+  runtimeFollowUp?: RuntimeFollowUp
   knownFacts: Fact[]
   refreshKnownFacts?: () => Promise<Fact[]>
   finalizationOnly?: boolean
@@ -265,6 +271,18 @@ export type RuntimeResume = {
       factIds: string[]
       modelProjection: Record<string, unknown>
     }>
+  }
+}
+
+export type RuntimeFollowUp = {
+  role: 'runtime_follow_up'
+  generatedBy: 'product_runtime'
+  isUserInput: false
+  content: Record<string, unknown> & {
+    message: string
+    baseReportVersion: number | null
+    updateReport: boolean
+    conversationHistory: Array<{ role: 'user' | 'assistant'; text: string }>
   }
 }
 

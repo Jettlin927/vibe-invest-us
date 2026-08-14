@@ -2206,6 +2206,87 @@ test('真实 PostgreSQL 仅为通过校验的报告原子生成不可变版本',
   }
 })
 
+test('真实 PostgreSQL 原子创建主 Agent 追问 execution 并按消息 ID 幂等重放', {
+  skip: !applicationUrl,
+  concurrency: false,
+}, async () => {
+  const pool = createPool(applicationUrl!)
+  const analyses = createAnalysisRepository(pool)
+  const events = createAgentEventRepository(pool)
+  const suffix = crypto.randomUUID()
+  const analysisId = `follow-up-${suffix}`
+  const sessionId = `${analysisId}:main`
+  const firstExecutionId = `${sessionId}:execution:1`
+  const followUpExecutionId = `${sessionId}:message:message-1`
+  const operationId = `${sessionId}:message:message-1`
+  const createdAt = '2026-08-14T12:00:00.000Z'
+  const followUpAt = '2026-08-14T12:01:00.000Z'
+  const report = { kind: 'integrated', title: 'V1' }
+  const event = {
+    type: 'runtime_follow_up', status: 'planning', executionId: followUpExecutionId,
+    baseReportVersion: 1, messageId: 'message-1', message: '报告还有效吗？', updateReport: false,
+  }
+  try {
+    await events.createResearch({
+      analysisId, sessionId, executionId: firstExecutionId,
+      symbol: `F${suffix.slice(0, 8)}`, status: 'planning',
+      operationId: 'create-follow-up-research', event: { type: 'runtime_context' }, createdAt,
+    })
+    await events.append({
+      sessionId, executionId: firstExecutionId, operationId: 'complete-v1',
+      event: { type: 'status', status: 'completed', terminal: true },
+      projection: {
+        status: 'completed', executionStatus: 'completed', terminal: true, report,
+        reportVersion: {
+          id: `${firstExecutionId}:report`, kind: 'integrated', payloadHash: 'c'.repeat(64), report,
+        },
+      },
+      createdAt,
+    })
+    const input = {
+      analysisId, executionId: followUpExecutionId,
+      segmentId: `${followUpExecutionId}:segment`, baseReportVersion: 1,
+      operationId, event, createdAt: followUpAt,
+    }
+    const created = await Promise.all([
+      events.createFollowUpExecution(input), events.createFollowUpExecution(input),
+    ])
+    assert.equal(created.filter(({ created }) => created).length, 1)
+    assert.deepEqual(new Set(created.map(({ generation }) => generation)), new Set([2]))
+    const lifecycle = await events.primaryLifecycle(analysisId)
+    assert.equal(lifecycle?.id, sessionId)
+    assert.equal(lifecycle?.execution.id, followUpExecutionId)
+    assert.equal(lifecycle?.execution.generation, 2)
+    assert.equal(lifecycle?.segments.length, 2)
+    assert.equal(lifecycle?.events.filter((candidate) => (
+      (candidate as Record<string, unknown>).type === 'runtime_follow_up'
+    )).length, 1)
+    await assert.rejects(events.createFollowUpExecution({
+      ...input, event: { ...event, message: '不得改写同一消息 ID' },
+    }), /agent_operation_conflict/)
+    await events.append({
+      sessionId, executionId: followUpExecutionId, operationId: 'follow-up-stopped',
+      event: { type: 'status', status: 'stopped', terminal: true },
+      projection: { status: 'stopped', executionStatus: 'stopped', terminal: true },
+      createdAt: '2026-08-14T12:02:00.000Z',
+    })
+    await assert.rejects(events.createFollowUpExecution({
+      ...input,
+      executionId: `${sessionId}:message:message-2`,
+      segmentId: `${sessionId}:message:message-2:segment`,
+      operationId: `${sessionId}:message:message-2`,
+      event: {
+        ...event, executionId: `${sessionId}:message:message-2`,
+        messageId: 'message-2', message: '停止后必须先恢复',
+      },
+      createdAt: '2026-08-14T12:03:00.000Z',
+    }), /analysis_resume_required/)
+  } finally {
+    await analyses.removeResearch(analysisId)
+    await pool.end()
+  }
+})
+
 test('真实 PostgreSQL 事件与 Session 读取投影在投影失败时一起回滚', {
   skip: !applicationUrl,
   concurrency: false,
