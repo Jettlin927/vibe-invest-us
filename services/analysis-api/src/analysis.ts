@@ -557,10 +557,25 @@ export function createAnalysisService(options: {
         const report = version.report as Record<string, unknown>
         return [{
           domain: typeof report.domain === 'string' ? report.domain : 'unknown',
-          sessionId: specialist.id, reportId: version.id, version: version.version,
+          sessionId: specialist.id, executionId: version.executionId,
+          reportId: version.id, version: version.version,
           status: report.status === 'partial' ? 'partial' : 'completed',
         }]
       })
+      const priorSpecialistOutcomes = reusableSpecialistReports.flatMap((report) => (
+        ['news', 'fundamental_valuation', 'technical'].includes(report.domain) ? [{
+          domain: report.domain as SpecialistDomain,
+          outcome: {
+            launched: true, reused: true, status: report.status,
+            sessionId: report.sessionId, executionId: report.executionId,
+            reportId: report.reportId, reportVersion: report.version,
+            summary: '沿用基准报告已封存的专项版本', keyFactIds: [], contraryFactIds: [], gaps: [],
+          },
+        }] : []
+      ))
+      for (const { domain, outcome } of priorSpecialistOutcomes) {
+        specialistOutcomes.set(domain, outcome)
+      }
       const specialistStatuses = (['news', 'fundamental_valuation', 'technical'] as const).map((domain) => {
         const specialist = specialistSessions.find((candidate) => (
           specialistDomains.get(candidate.id) === domain
@@ -875,7 +890,7 @@ export function createAnalysisService(options: {
             specialistWallDeadline,
           ) => options.model.analyzeNews!({
             executionId: specialistExecutionId, runtimeSettings, symbol: job.symbol,
-            systemPrompt: '你是独立消息面 Agent。只使用新闻候选、新闻文档和公司事件工具；每项判断引用合格事实 ID，禁止个人买卖或仓位建议。',
+            systemPrompt: '你是独立消息面 Agent。只使用新闻候选、新闻文档和公司事件工具；news 判断只能由 verified_news 或 official_company_event 支撑。报告的 supportingEvidence 与 contraryEvidence 数组只能逐字复制工具结果中的精确 fact.id，禁止填写标题、摘要、数值或自然语言证据描述；title_only 只能作为继续读取正文的线索，不能支撑判断。禁止个人买卖或仓位建议。',
             researchQuestion: request.researchQuestion,
             runtimeResume: specialistRecovery.get('news'), knownFacts: modelContext.facts,
             searchNewsCandidates: options.searchNewsCandidates!,
@@ -903,7 +918,7 @@ export function createAnalysisService(options: {
             specialistWallDeadline,
           ) => options.model.analyzeFundamental!({
             executionId: specialistExecutionId, runtimeSettings, symbol: job.symbol,
-            systemPrompt: '你是独立基本面 Agent。只使用财务概览、指标序列、Filing 和官方公司事件；每项判断引用正式或确定性财务事实，禁止个人买卖或仓位建议。',
+            systemPrompt: '你是独立基本面 Agent。只使用财务概览、指标序列、Filing 和官方公司事件；fundamental 判断只能由 evidenceLevel 为 official_filing、reported_financial、deterministic_financial_metric 或 deterministic_valuation 的事实支撑，不得引用 verified_valuation_input 或 official_company_event 支撑判断。报告的 supportingEvidence 与 contraryEvidence 数组只能逐字复制工具结果中的精确 fact.id，禁止填写指标名、数值或自然语言证据描述；没有合格事实时省略该判断并写入 gaps。禁止个人买卖或仓位建议。',
             researchQuestion: request.researchQuestion,
             runtimeResume: specialistRecovery.get('fundamental_valuation'),
             knownFacts: modelContext.facts,
@@ -931,7 +946,7 @@ export function createAnalysisService(options: {
             specialistWallDeadline,
           ) => options.model.analyzeTechnical!({
             executionId: specialistExecutionId, runtimeSettings, symbol: job.symbol,
-            systemPrompt: '你是独立技术面 Agent。只使用宿主确定性技术证据和受控价格窗口；不得把模型上下文裁剪长度称为数据源总历史长度，不自行计算新指标；每项判断保留反方证据与失效条件，禁止个人买卖或仓位建议。',
+            systemPrompt: '你是独立技术面 Agent。只使用宿主确定性技术证据和受控价格窗口；technical 判断的 supportingEvidence 与 contraryEvidence 都只能引用 evidenceLevel 为 deterministic_technical 的事实，不得引用 daily_bar、market_observation 或 indicators。两个数组只能逐字复制工具结果中的精确 fact.id，禁止填写指标名、数值或自然语言证据描述；技术专项报告必须省略 targetPrice。不得把模型上下文裁剪长度称为数据源总历史长度，不自行计算新指标；每项判断保留反方证据与失效条件，禁止个人买卖或仓位建议。',
             researchQuestion: request.researchQuestion,
             runtimeResume: specialistRecovery.get('technical'), knownFacts: modelContext.facts,
             getTechnicalEvidence: options.getTechnicalEvidence!,
@@ -957,6 +972,7 @@ export function createAnalysisService(options: {
         runtimeContext: followUpEvent ? undefined : runtimeContext,
         runtimeResume,
         runtimeFollowUp,
+        priorSpecialistOutcomes,
         knownFacts: modelContext.facts,
         refreshKnownFacts,
         onSpecialistOutcome: rememberSpecialistOutcome,
@@ -1498,8 +1514,10 @@ const ANALYSIS_SYSTEM_PROMPT = `你是个人美股研究助手，分析周期为
 你可以自主规划分析路径。建议先确认本次冻结的金融上下文；按需调用 fetch_financial_context。需要深入解释正式财务事实、消息面或多周期技术结构时，必须分别通过 run_fundamental_analysis、run_news_analysis、run_technical_analysis 明确决定是否启动独立专项 Agent。专项 Agent 只接收本领域受控工具，主 Agent 最终必须调用 submit_analysis_report 提交报告。
 不得编造行情、新闻、财报、估值或持仓；所有事实判断只能引用工具结果中真实存在的事实 ID。
 每条 keyJudgments 都必须关联一个或多个事实 ID；supportingEvidence 和 contraryEvidence 也必须引用事实 ID。
+证据资格必须逐条匹配：market 只能引用 market_observation 或 verified_market；news 只能引用 verified_news 或 official_company_event；fundamental 只能引用 official_filing、reported_financial、deterministic_financial_metric 或 deterministic_valuation；technical 只能引用 deterministic_technical；operational 只能引用 runtime_observation。supportingEvidence 与 contraryEvidence 数组只能逐字复制工具结果中的精确 fact.id，禁止填写标题、指标名、数值或自然语言证据描述；没有合格事实时删除该判断并把缺口写入 gaps，不能用不合格证据硬凑。
 财报增长率、利润率、TTM、自由现金流、质量标记、技术指标与估值结果由宿主程序计算，你只负责解释，不重新计算或改写输入数字。
 必须区分“当前估值倍数”和“目标价估值方法”：目标价方法不可用不等于当前 PE 等倍数不可用。
+只有存在 unit 为 USD/share 且 status 为 available 的 deterministic_valuation 事实时才能填写 targetPrice；从同一个事实的 value 中将 method、inputs、range、asOf 原样复制，evidence 数组只能填写该 deterministic_valuation 的精确 fact.id。不得改写 method、不得把估值事实 ID 塞进 inputs、不得把输入事实 ID 塞进 evidence；不能逐字段原样复制时必须省略 targetPrice。
 模型上下文中的日线是冻结快照的裁剪样本，不得据此声称数据源只有这些交易日；以 contextScope 中的数量说明裁剪范围。
 数据不足时明确写入 limitations；缺行情不得判断走势，缺财报或估值输入不得给目标价，缺新闻不得推断新闻驱动。
 追问同时提供 reportPositionContext 和 currentPositionSummary 时，必须区分报告时的历史判断与当前持仓影响。

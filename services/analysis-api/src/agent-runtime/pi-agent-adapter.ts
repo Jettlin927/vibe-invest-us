@@ -1,6 +1,6 @@
 import {
   Agent,
-  estimateContextTokens,
+  estimateTokens,
   prepareCompaction,
   shouldCompact,
   type AgentTool,
@@ -129,6 +129,21 @@ export type PiAgentAdapterState = {
 }
 
 type TurnBoundaryState = Pick<PiAgentAdapterState, 'systemPrompt' | 'model' | 'messages' | 'tools'>
+
+function estimateFullContextTokens(
+  state: Pick<TurnBoundaryState, 'systemPrompt' | 'tools'>,
+  messages: PiAgentAdapterMessage[],
+) {
+  const messageTokens = toPiMessages(messages).reduce(
+    (total, message) => total + estimateTokens(message), 0,
+  )
+  const systemTokens = state.systemPrompt
+    ? estimateTokens({ role: 'user', content: state.systemPrompt, timestamp: 0 }) : 0
+  const toolSchema = state.tools.length > 0 ? JSON.stringify(state.tools) : ''
+  const toolTokens = toolSchema
+    ? estimateTokens({ role: 'user', content: toolSchema, timestamp: 0 }) : 0
+  return messageTokens + systemTokens + toolTokens
+}
 
 export type PiToolProjectionCommit = (
   state: TurnBoundaryState, signal?: AbortSignal,
@@ -276,7 +291,7 @@ export function createPiAgentAdapter(options: CreatePiAgentAdapterOptions) {
       }
       const persistedProjection = await options.commitToolProjection?.(copyBoundaryState(nextState), signal)
       if (persistedProjection) nextState.tools = [...persistedProjection.tools]
-      const contextTokens = estimateContextTokens(toPiMessages(nextState.messages)).tokens
+      const contextTokens = estimateFullContextTokens(nextState, nextState.messages)
       const latestAssistant = [...nextState.messages].reverse().find(
         (message) => message.role === 'assistant',
       )
@@ -288,7 +303,8 @@ export function createPiAgentAdapter(options: CreatePiAgentAdapterOptions) {
           ? latestAssistant.usage.input + latestAssistant.usage.cacheRead
             + latestAssistant.usage.cacheWrite + latestAssistant.usage.output
           : 0
-      const measuredContextTokens = providerTokens > 0 ? providerTokens : contextTokens
+      const measuredContextTokens = Math.max(contextTokens, providerTokens)
+      const contextUsageEstimated = providerTokens <= 0 || contextTokens > providerTokens
       const compactionAllowed = options.compaction?.allowed?.() ?? true
       const compactionRequired = Boolean(options.compaction && compactionAllowed && shouldCompact(
         measuredContextTokens,
@@ -299,7 +315,7 @@ export function createPiAgentAdapter(options: CreatePiAgentAdapterOptions) {
         contextTokens: measuredContextTokens, contextWindow: nextState.model.contextWindow,
         reserveTokens: options.compaction.settings.reserveTokens,
         keepRecentTokens: options.compaction.settings.keepRecentTokens,
-        estimated: providerTokens <= 0,
+        estimated: contextUsageEstimated,
       }, signal)
       if (options.compaction && compactionRequired) {
         const preparation = prepareCompaction(toCompactionEntries(nextState.messages), options.compaction.settings)
@@ -321,7 +337,12 @@ export function createPiAgentAdapter(options: CreatePiAgentAdapterOptions) {
                 reserveTokens: options.compaction.settings.reserveTokens,
                 keepRecentTokens: options.compaction.settings.keepRecentTokens,
               }, signal)
-              compacted = await options.compaction.compact(compactInput, signal)
+              const candidate = await options.compaction.compact(compactInput, signal)
+              const tokensAfter = estimateFullContextTokens(nextState, candidate)
+              if (tokensAfter >= measuredContextTokens || shouldCompact(
+                tokensAfter, nextState.model.contextWindow, options.compaction.settings,
+              )) throw new Error('compaction_did_not_reduce_context')
+              compacted = candidate
               break
             } catch (error) {
               await options.compaction.onAttemptFailure?.({
@@ -343,7 +364,7 @@ export function createPiAgentAdapter(options: CreatePiAgentAdapterOptions) {
             await options.compaction.commit?.({
               ...compactInput, compactedMessages: compacted,
               contextTokens: measuredContextTokens,
-              tokensAfter: estimateContextTokens(toPiMessages(compacted)).tokens,
+              tokensAfter: estimateFullContextTokens(nextState, compacted),
               contextWindow: nextState.model.contextWindow,
               reserveTokens: options.compaction.settings.reserveTokens,
               keepRecentTokens: options.compaction.settings.keepRecentTokens,

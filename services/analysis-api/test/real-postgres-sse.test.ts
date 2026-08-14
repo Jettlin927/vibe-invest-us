@@ -1826,7 +1826,7 @@ test('真实 PostgreSQL 与 HTTP SSE 原子展示 Compaction usage 和链接 Seg
   const events = createAgentEventRepository(pool)
   const settings = createRuntimeSettingsRepository(pool)
   const previousSettings = await settings.current()
-  await settings.save({ compactionReserveTokens: 1_000_000 }, new Date().toISOString())
+  await settings.save({ compactionReserveTokens: 126_000 }, new Date().toISOString())
   const symbol = `C${crypto.randomUUID().replaceAll('-', '').slice(0, 8)}`
   const report = integratedReport({
     title: 'Compaction 纵向验收', marketState: '未知', trend: '未知', drivers: [],
@@ -1887,7 +1887,7 @@ test('真实 PostgreSQL 与 HTTP SSE 原子展示 Compaction usage 和链接 Seg
       (event: { type?: string }) => event.type === 'compaction',
     )
     assert.equal(compactEvent.status, 'completed')
-    assert.equal(compactEvent.reserveTokens, 1_000_000)
+    assert.equal(compactEvent.reserveTokens, 126_000)
     assert.equal(compactEvent.keepRecentTokens, 20_000)
     assert.equal(typeof compactEvent.tokensAfter, 'number')
     assert.equal(compactEvent.usage.totalTokens, 880)

@@ -1,8 +1,21 @@
 #!/bin/sh
 set -eu
 
-if [ -z "${MODEL_PROVIDER:-}" ] || [ -z "${MODEL_API_PROTOCOL:-}" ] || [ -z "${MODEL_BASE_URL:-}" ] || [ -z "${MODEL_NAME:-}" ] || [ -z "${MODEL_API_KEY:-}" ]; then
-  echo "MODEL_PROVIDER, MODEL_API_PROTOCOL, MODEL_BASE_URL, MODEL_NAME and MODEL_API_KEY are required" >&2
+if [ -z "${MODEL_PROVIDER:-}" ] || [ -z "${MODEL_API_PROTOCOL:-}" ] || [ -z "${MODEL_BASE_URL:-}" ] || [ -z "${MODEL_NAME:-}" ] || [ -z "${MODEL_CONTEXT_WINDOW:-}" ] || [ -z "${MODEL_API_KEY:-}" ]; then
+  echo "MODEL_PROVIDER, MODEL_API_PROTOCOL, MODEL_BASE_URL, MODEL_NAME, MODEL_CONTEXT_WINDOW and MODEL_API_KEY are required" >&2
+  exit 2
+fi
+
+case "${COMPOSE_PROJECT_NAME:-}" in
+  ''|vibe-invest-us|vibeinvestus)
+    echo "COMPOSE_PROJECT_NAME must name a fresh isolated project" >&2
+    exit 2
+    ;;
+esac
+
+postgres_volume="${COMPOSE_PROJECT_NAME}_vibe-invest-postgres"
+if docker volume inspect "$postgres_volume" >/dev/null 2>&1; then
+  echo "refusing to reuse existing PostgreSQL volume: $postgres_volume" >&2
   exit 2
 fi
 
@@ -13,35 +26,20 @@ trap cleanup EXIT INT TERM
 
 docker compose up --build -d --wait
 
-base_url="http://127.0.0.1:${VIBE_INVEST_PORT:-3000}"
-created="$(curl -fsS -X POST -H 'content-type: application/json' -d '{"symbol":"NVDA"}' "$base_url/api/analyses")"
-analysis_id="$(printf '%s' "$created" | node -e "let s='';process.stdin.on('data',c=>s+=c).on('end',()=>process.stdout.write(JSON.parse(s).analysisId??''))")"
-test -n "$analysis_id"
+test -n "$(docker compose ps -q postgres)"
+test -n "$(docker compose ps -q financial-data)"
+test -n "$(docker compose ps -q analysis-api)"
+test -n "$(docker volume inspect -f '{{.Name}}' "$postgres_volume")"
 
-attempt=0
-while [ "$attempt" -lt 300 ]; do
-  analysis="$(curl -fsS "$base_url/api/analyses/$analysis_id")"
-  status="$(printf '%s' "$analysis" | node -e "let s='';process.stdin.on('data',c=>s+=c).on('end',()=>process.stdout.write(JSON.parse(s).status??''))")"
-  case "$status" in
-    completed|partial) break ;;
-    failed|cancelled|interrupted)
-      printf '%s' "$analysis" | node -e "let s='';process.stdin.on('data',c=>s+=c).on('end',()=>{const v=JSON.parse(s);console.error(JSON.stringify({id:v.id,status:v.status,error:v.error}))})"
-      exit 1
-      ;;
-  esac
-  attempt=$((attempt + 1))
-  sleep 1
+for service_port in 'postgres 5432/tcp' 'financial-data 8000/tcp'; do
+  service=${service_port% *}
+  port=${service_port#* }
+  container=$(docker compose ps -q "$service")
+  if docker inspect --format "{{with (index .NetworkSettings.Ports \"$port\")}}{{println .}}{{end}}" "$container" | grep -q .; then
+    echo "$service must not publish a host port" >&2
+    exit 1
+  fi
 done
 
-if [ "$attempt" -ge 300 ]; then
-  echo "real analysis timed out" >&2
-  exit 1
-fi
-
-research="$(curl -fsS "$base_url/api/research/$analysis_id")"
-printf '%s' "$research" | grep -q '"report"'
-printf '%s' "$research" | grep -q '"keyJudgments"'
-printf '%s' "$research" | grep -q '"facts"'
-printf '%s' "$research" | grep -q '"trace"'
-
-echo "real provider analysis verification passed: $analysis_id ($status)"
+VIBE_INVEST_BASE_URL="http://127.0.0.1:${VIBE_INVEST_PORT:-3000}" \
+  node scripts/verify-real-analysis.mjs

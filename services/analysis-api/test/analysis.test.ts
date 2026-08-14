@@ -702,6 +702,7 @@ test('主 Agent 启动的消息面 Agent 拥有独立 Session、轨迹和不可�
       } }
     },
     async *analyzeNews(input: Parameters<NonNullable<ReturnType<typeof createPiModel>['analyzeNews']>>[0]) {
+      assert.match(input.systemPrompt, /supportingEvidence.*contraryEvidence.*精确 fact\.id/)
       yield { type: 'trace' as const, entry: {
         type: 'user_input' as const, content: input.researchQuestion,
         operationId: `execution:${input.executionId}:research-question`,
@@ -818,6 +819,7 @@ test('主 Agent 启动的基本面 Agent 拥有独立 Session、受限工具和�
     },
     async *analyzeFundamental(input: any) {
       assert.equal(input.portfolioContext, undefined)
+      assert.match(input.systemPrompt, /supportingEvidence.*contraryEvidence.*精确 fact\.id/)
       yield { type: 'trace' as const, entry: {
         type: 'tool_result' as const, name: 'get_financial_overview', toolCallId: 'overview',
         result: { facts: [fundamentalFact], overview: { latestPeriod: '2026-Q2' } },
@@ -904,6 +906,7 @@ test('主 Agent 启动的技术面 Agent 拥有独立 Session、受限工具和�
     },
     async *analyzeTechnical(input: any) {
       assert.equal(input.portfolioContext, undefined)
+      assert.match(input.systemPrompt, /supportingEvidence.*contraryEvidence.*精确 fact\.id/)
       yield { type: 'trace' as const, entry: {
         type: 'tool_result' as const, name: 'get_technical_evidence', toolCallId: 'technical',
         result: { facts: [technicalFact], totalBarCount: 260 }, isError: false,
@@ -1716,6 +1719,13 @@ test('专项已有 V1 后主预算耗尽的二次收口保留真实状态与精�
     method: 'GET', url: `/api/research/${created.analysisId}/report-versions`,
   })).json().items
   assert.deepEqual(versions.at(-1).report.specialistReferences, closingReport.specialistReferences)
+  const lifecycle = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json().mainAgent
+  const requestIds = lifecycle.modelAttempts.map(({ id }: { id: string }) => id)
+  assert.ok(requestIds.length >= 2)
+  assert.equal(new Set(requestIds).size, requestIds.length)
+  assert.ok(requestIds.some((id: string) => id.includes(':main:invocation:finalization-only:')))
   await app.close()
 })
 
@@ -3502,6 +3512,11 @@ test('系统指令要求先取冻结上下文、逐项引用依据并按缺口�
   await waitForStatus(app as any, created.json().analysisId, 'completed')
   assert.match(systemPrompt, /fetch_financial_context/)
   assert.match(systemPrompt, /keyJudgments/)
+  assert.match(systemPrompt, /market.*market_observation.*news.*verified_news.*fundamental.*reported_financial.*technical.*deterministic_technical.*operational.*runtime_observation/)
+  assert.match(systemPrompt, /supportingEvidence.*contraryEvidence.*精确 fact\.id/)
+  assert.match(systemPrompt, /targetPrice/)
+  assert.match(systemPrompt, /deterministic_valuation.*method.*inputs.*range.*asOf.*原样复制/)
+  assert.match(systemPrompt, /evidence.*deterministic_valuation.*精确 fact\.id/)
   assert.match(systemPrompt, /缺行情不得判断走势/)
   assert.match(systemPrompt, /财报增长率.*由宿主程序计算/)
   assert.match(systemPrompt, /不重新计算/)

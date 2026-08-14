@@ -88,6 +88,9 @@ export function createToolRegistry(
       const projection = validated.find((definition) => definition.model.name === name)?.modelProjection
       if (projection === 'full_result') return result
       if (projection === 'acknowledgement') {
+        if (['submit_analysis_report', 'submit_specialist_report'].includes(name)) {
+          return projectReportSubmission(result)
+        }
         return { submitted: result.submitted === true, ...(result.error ? { error: result.error } : {}) }
       }
       if (result.modelProjection && typeof result.modelProjection === 'object') {
@@ -290,13 +293,23 @@ function projectTargetPrice(value: unknown) {
 
 function projectReportSubmission(result: Record<string, unknown>) {
   return {
-    ...selectTyped(result, ['submitted'], 'boolean'),
+    submitted: result.submitted === true,
+    ...selectTyped(result, ['mustChangeCandidate'], 'boolean'),
     ...selectTyped(result, ['error', 'candidatePayloadHash'], 'string'),
     ...optionalArray('errors', result.errors, (entry) => {
       const error = record(entry)
       return {
         ...selectTyped(error, ['path', 'rule', 'message'], 'string'),
         ...optionalArray('allowedEvidenceTypes', error.allowedEvidenceTypes, stringValue),
+      }
+    }),
+    ...optionalArray('repairInstructions', result.repairInstructions, (entry) => {
+      const instruction = record(entry)
+      return {
+        ...selectTyped(instruction, ['path', 'action', 'instruction'], 'string'),
+        ...optionalArray(
+          'allowedEvidenceTypes', instruction.allowedEvidenceTypes, stringValue,
+        ),
       }
     }),
     ...optionalArray('facts', result.facts, identity),

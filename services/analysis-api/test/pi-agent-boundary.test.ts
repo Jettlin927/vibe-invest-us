@@ -148,7 +148,8 @@ test('Adapter 从 pi-agent-core 包根导入仅限显式 allowlist', async () =>
     join(root, 'services/analysis-api/src/agent-runtime/pi-agent-adapter.ts'), 'utf8',
   )
   assertPiAgentCoreBoundary(source, [
-    'Agent', 'AgentTool', 'estimateContextTokens', 'prepareCompaction', 'shouldCompact',
+    'Agent', 'AgentTool', 'estimateTokens',
+    'prepareCompaction', 'shouldCompact',
   ])
 })
 

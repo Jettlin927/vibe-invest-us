@@ -100,6 +100,18 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
         specialistOutcomes.set(domain, outcome)
         input.onSpecialistOutcome?.(domain, outcome)
       }
+      const declinedSpecialistOutcome = (
+        domain: 'news' | 'fundamental_valuation' | 'technical',
+        reason: string, researchQuestion: string,
+      ) => {
+        const prior = specialistOutcomes.get(domain)
+        if (prior && ['completed', 'partial'].includes(asString(prior.status))
+          && typeof prior.sessionId === 'string' && typeof prior.reportId === 'string'
+          && typeof prior.reportVersion === 'number') {
+          return { ...prior, launched: false, reused: true, reason, researchQuestion }
+        }
+        return { launched: false, status: 'not_started', reason, researchQuestion }
+      }
       if (!input.runNewsSpecialist && !specialistOutcomes.has('news')) rememberSpecialistOutcome('news', {
         launched: false, status: 'not_started', reason: 'news_specialist_runtime_unavailable',
       })
@@ -180,6 +192,7 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
         : analysisModelTools
       const main = runProjectedAgent({
         role: 'main', input, options, settings, executionSignal: agentSignal, activeBudget,
+        invocationId: input.finalizationOnly ? 'finalization-only' : undefined,
         onPolicyFailure: (error) => { policyFailure ??= error },
         modelGate, toolGate, provider, queue,
         initialTools: input.finalizationOnly ? finalizationModelTools : followUpResearchTools,
@@ -258,7 +271,9 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
             const reason = asString(request.reason)
             const researchQuestion = asString(request.researchQuestion)
             if (request.launch !== true) {
-              const result = { launched: false, status: 'not_started', reason, researchQuestion }
+              const result = declinedSpecialistOutcome(
+                'fundamental_valuation', reason, researchQuestion,
+              )
               rememberSpecialistOutcome('fundamental_valuation', result)
               return succeeded(result)
             }
@@ -282,7 +297,7 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
             const reason = asString(request.reason)
             const researchQuestion = asString(request.researchQuestion)
             if (request.launch !== true) {
-              const result = { launched: false, status: 'not_started', reason, researchQuestion }
+              const result = declinedSpecialistOutcome('news', reason, researchQuestion)
               rememberSpecialistOutcome('news', result)
               return succeeded(result)
             }
@@ -306,7 +321,7 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
             const reason = asString(request.reason)
             const researchQuestion = asString(request.researchQuestion)
             if (request.launch !== true) {
-              const result = { launched: false, status: 'not_started', reason, researchQuestion }
+              const result = declinedSpecialistOutcome('technical', reason, researchQuestion)
               rememberSpecialistOutcome('technical', result)
               return succeeded(result)
             }
@@ -772,7 +787,7 @@ async function runProjectedAgent(config: {
   let stage: Stage = config.initialStage ?? 'research'
   let turnIndex = 0
   let toolRounds = 0
-  let finalizationAttempts = 0
+  let finalizationAttempts = stage === 'finalization' ? 1 : 0
   let completionOrder = 0
   let activeProjection = await input.toolRuntime!.ensureProjection({
     executionId: input.executionId, role: config.role, stage,
@@ -795,6 +810,7 @@ async function runProjectedAgent(config: {
   let compactionDisabled = false
   let compactionAttempt: 1 | 2 = 1
   let activeCompactionRequestId: string | undefined
+  let activeCompactionUsage: unknown = null
   let compactionAttemptResults: Array<{ attempt: number; durationMs: number; usage: unknown }> = []
   let pendingCompaction: {
     id: string
@@ -1071,7 +1087,7 @@ async function runProjectedAgent(config: {
       if (lastAssistantHadCalls) toolRounds += 1
       const limit = config.role === 'main'
         ? config.settings.mainAgentToolRounds : config.settings.specialistAgentToolRounds
-      if (config.activeBudget.exhausted() || toolRounds >= limit) {
+      if (stage === 'finalization' || config.activeBudget.exhausted() || toolRounds >= limit) {
         if (stage !== 'finalization') {
           stage = 'finalization'
           if (config.role === 'main') config.queue.push({
@@ -1123,7 +1139,8 @@ async function runProjectedAgent(config: {
         await prepareProjection(visibleTools, usageEvent)
         config.queue.push(trace(usageEvent))
       },
-      shouldRetry: (error) => error instanceof CompactionGenerationError,
+      shouldRetry: (error) => error instanceof CompactionGenerationError
+        || (error instanceof Error && error.message === 'compaction_did_not_reduce_context'),
       onAttempt: (metrics) => {
         if (metrics.attempt === 1) {
           compactionIndex += 1
@@ -1131,11 +1148,17 @@ async function runProjectedAgent(config: {
         }
         compactionAttempt = metrics.attempt
         compactionMetrics = metrics
+        activeCompactionUsage = null
       },
       onAttemptFailure: async ({ attempt, durationMs, error }) => {
+        const usage = error instanceof CompactionGenerationError
+          ? error.usage
+          : error instanceof Error && error.message === 'compaction_did_not_reduce_context'
+            ? activeCompactionUsage
+            : null
         const result = {
           attempt, durationMs,
-          usage: error instanceof CompactionGenerationError ? error.usage : null,
+          usage,
         }
         compactionAttemptResults.push(result)
         const requestId = activeCompactionRequestId
@@ -1143,9 +1166,7 @@ async function runProjectedAgent(config: {
           if (!input.toolRuntime?.completeModelRequest) {
             throw new Error('model_request_completion_required')
           }
-          const normalizedUsage = modelUsage(
-            error instanceof CompactionGenerationError ? error.usage : null,
-          )
+          const normalizedUsage = modelUsage(usage)
           try {
             await input.toolRuntime.completeModelRequest({
               requestId, executionId: input.executionId,
@@ -1225,6 +1246,7 @@ async function runProjectedAgent(config: {
           completedAt: new Date().toISOString(),
         })
         activeCompactionRequestId = undefined
+        activeCompactionUsage = compacted.usage
         const summary = compactionSummaryContract(
           config.role, config.userPrompt, input,
           [...cut.messagesToSummarize, ...cut.turnPrefixMessages, ...cut.retainedTail],
@@ -1316,6 +1338,7 @@ async function runProjectedAgent(config: {
           throw new Error('compaction_capacity_exhausted')
         }
         stage = 'finalization'
+        finalizationAttempts = Math.max(finalizationAttempts, 1)
         if (!input.toolRuntime?.failCompaction) throw new Error('compaction_failure_commit_required')
         await input.toolRuntime.failCompaction({
           id: `execution:${input.executionId}:${config.role}:compaction:${compactionIndex}`,
@@ -1970,6 +1993,23 @@ function failedReportValidation(
   return {
     result: {
       error: 'report_validation_failed', errors,
+      mustChangeCandidate: true,
+      repairInstructions: errors.map((error) => {
+        const removeConditionalField = error.path === '/targetPrice'
+          && error.rule === 'conditional_field_qualification'
+        return {
+          path: error.path,
+          action: removeConditionalField ? 'remove_field'
+            : ['reference_integrity', 'evidence_qualification'].includes(error.rule)
+              ? 'remove_or_replace_reference' : 'correct_field',
+          allowedEvidenceTypes: error.allowedEvidenceTypes,
+          instruction: removeConditionalField
+            ? '删除整个 targetPrice 字段；只有取得合格 deterministic_valuation 事实并能逐字段原样复制时才能重新添加。禁止原样重交。'
+            : ['reference_integrity', 'evidence_qualification'].includes(error.rule)
+              ? '删除该路径引用，或替换为 allowedEvidenceTypes 中证据等级的当前研究 fact.id；禁止原样重交。'
+              : '按 path、rule 和 message 修正字段；禁止原样重交。',
+        }
+      }),
       candidatePayloadHash: reportPayloadHash(candidate), facts: [],
     },
     isError: true,

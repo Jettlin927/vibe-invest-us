@@ -34,6 +34,10 @@ function textMessage(text: string) {
   return assistantMessage([{ type: 'text', text }])
 }
 
+function withTotalTokens(message: AssistantMessage, totalTokens: number) {
+  return { ...message, usage: { ...message.usage, input: totalTokens, totalTokens } }
+}
+
 function toolCall(name: string, id: string) {
   return { type: 'toolCall' as const, id, name, arguments: {} }
 }
@@ -378,7 +382,7 @@ test('Pi compaction 阈值只在 turn boundary 切换并保留到后续提交', 
   const seenContents: string[][] = []
   const cuts: Array<{ summarized: string[]; turnPrefix: string[]; retained: string[] }> = []
   const fixture = createFixture([
-    assistantMessage([toolCall('continue', 'call-continue')], 'toolUse'),
+    withTotalTokens(assistantMessage([toolCall('continue', 'call-continue')], 'toolUse'), 120_000),
     textMessage('完成'),
     textMessage('再次完成'),
   ])
@@ -396,7 +400,7 @@ test('Pi compaction 阈值只在 turn boundary 切换并保留到后续提交', 
       return fixture.streamFn(model, context, options)
     },
     compaction: {
-      settings: { enabled: true, reserveTokens: fixture.model.contextWindow, keepRecentTokens: 4 },
+      settings: { enabled: true, reserveTokens: 20_000, keepRecentTokens: 4 },
       compact: async ({ messagesToSummarize, turnPrefixMessages, retainedTail }) => {
         cuts.push({
           summarized: messagesToSummarize.map((message) => message.role),
@@ -485,9 +489,38 @@ test('Pi 在 Provider totalTokens 无效时回退包含 cacheWrite 的 usage 分
   assert.deepEqual(tokens, [50])
 })
 
+test('Pi 不以偏小的 Provider totalTokens 掩盖同批大型工具结果', async () => {
+  const fixture = createFixture([
+    assistantMessage([toolCall('large-result', 'call-large-result')], 'toolUse'),
+    textMessage('完成'),
+  ])
+  const tokens: number[] = []
+  let compactCalls = 0
+  const adapter = createPiAgentAdapter({
+    initialState: {
+      systemPrompt: 'system', model: fixture.model, messages: [],
+      tools: [textTool('large-result', async () => ({
+        content: [{ type: 'text', text: 'x'.repeat(600_000) }], details: {},
+      }))],
+    },
+    streamFn: fixture.streamFn,
+    compaction: {
+      settings: { enabled: true, reserveTokens: 1, keepRecentTokens: 1 },
+      onContextUsage: ({ contextTokens }) => { tokens.push(contextTokens) },
+      compact: async () => {
+        compactCalls += 1
+        return [userMessage('工具结果摘要')]
+      },
+    },
+  })
+  await adapter.submit(userMessage('开始'))
+  assert.equal(compactCalls, 1)
+  assert.ok((tokens[0] ?? 0) > 100_000)
+})
+
 test('Pi compaction 首次失败只重试一次且成功前不切换上下文', async () => {
   const fixture = createFixture([
-    assistantMessage([toolCall('continue', 'call-retry')], 'toolUse'),
+    withTotalTokens(assistantMessage([toolCall('continue', 'call-retry')], 'toolUse'), 120_000),
     textMessage('完成'),
   ])
   let attempts = 0
@@ -507,7 +540,7 @@ test('Pi compaction 首次失败只重试一次且成功前不切换上下文', 
       return fixture.streamFn(model, context, options)
     },
     compaction: {
-      settings: { enabled: true, reserveTokens: fixture.model.contextWindow, keepRecentTokens: 4 },
+      settings: { enabled: true, reserveTokens: 20_000, keepRecentTokens: 4 },
       onAttempt: ({ attempt }) => { attemptNumbers.push(attempt) },
       compact: async ({ retainedTail }) => {
         attempts += 1
@@ -523,9 +556,10 @@ test('Pi compaction 首次失败只重试一次且成功前不切换上下文', 
   assert.equal(seen[1]?.[0], '重试后的摘要')
 })
 
-test('Pi compaction 持久化失败时不重试摘要也不切换上下文', async () => {
+test('Pi 拒绝压缩后仍超过触发线的上下文且不提交新 Segment', async () => {
   const fixture = createFixture([
-    assistantMessage([toolCall('continue', 'call-commit')], 'toolUse'),
+    withTotalTokens(assistantMessage([toolCall('continue', 'call-ineffective')], 'toolUse'), 120_000),
+    textMessage('不应进入下一轮'),
   ])
   let compactCalls = 0
   let commitCalls = 0
@@ -539,7 +573,67 @@ test('Pi compaction 持久化失败时不重试摘要也不切换上下文', asy
     },
     streamFn: fixture.streamFn,
     compaction: {
-      settings: { enabled: true, reserveTokens: fixture.model.contextWindow, keepRecentTokens: 4 },
+      settings: { enabled: true, reserveTokens: 20_000, keepRecentTokens: 4 },
+      compact: async ({ retainedTail }) => {
+        compactCalls += 1
+        return [userMessage('x'.repeat(500_000)), ...retainedTail]
+      },
+      commit: async () => { commitCalls += 1 },
+    },
+  })
+  await adapter.submit(userMessage('原始内容'))
+  await adapter.waitForIdle()
+  assert.equal(compactCalls, 2)
+  assert.equal(commitCalls, 0)
+  assert.match(adapter.snapshot().errorMessage ?? '', /compaction_failed_after_retry/)
+})
+
+test('Pi 压缩后仍超过包含系统指令和工具 Schema 的触发线时拒绝提交', async () => {
+  const fixture = createFixture([
+    withTotalTokens(assistantMessage([toolCall('continue', 'call-fixed-overhead')], 'toolUse'), 120_000),
+  ])
+  let commitCalls = 0
+  const adapter = createPiAgentAdapter({
+    initialState: {
+      systemPrompt: 'system'.repeat(13_500), model: fixture.model,
+      messages: [userMessage('旧问题'), textMessage('旧回答')],
+      tools: [{
+        ...textTool('continue', async () => ({
+          content: [{ type: 'text', text: 'continue' }], details: {},
+        })),
+        description: 'tool-schema'.repeat(13_500),
+      }],
+    },
+    streamFn: fixture.streamFn,
+    compaction: {
+      settings: { enabled: true, reserveTokens: 100_000, keepRecentTokens: 4 },
+      compact: async ({ retainedTail }) => [userMessage('摘要'), ...retainedTail],
+      commit: async () => { commitCalls += 1 },
+    },
+  })
+  await adapter.submit(userMessage('原始内容'))
+  await adapter.waitForIdle()
+  assert.equal(commitCalls, 0)
+  assert.match(adapter.snapshot().errorMessage ?? '', /compaction_failed_after_retry/)
+})
+
+test('Pi compaction 持久化失败时不重试摘要也不切换上下文', async () => {
+  const fixture = createFixture([
+    withTotalTokens(assistantMessage([toolCall('continue', 'call-commit')], 'toolUse'), 120_000),
+  ])
+  let compactCalls = 0
+  let commitCalls = 0
+  const adapter = createPiAgentAdapter({
+    initialState: {
+      systemPrompt: 'system', model: fixture.model,
+      messages: [userMessage('旧问题'), textMessage('旧回答')],
+      tools: [textTool('continue', async () => ({
+        content: [{ type: 'text', text: 'continue' }], details: {},
+      }))],
+    },
+    streamFn: fixture.streamFn,
+    compaction: {
+      settings: { enabled: true, reserveTokens: 20_000, keepRecentTokens: 4 },
       compact: async ({ retainedTail }) => {
         compactCalls += 1
         return [userMessage('不应生效的摘要'), ...retainedTail]
