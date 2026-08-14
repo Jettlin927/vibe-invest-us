@@ -1314,9 +1314,15 @@ test('主 Agent 经真实 PostgreSQL、HTTP 与 SSE 启动并展示独立消息�
       method: 'GET', url: `/api/research/${created.analysisId}`,
     })).json()
     assert.ok(beforeRefresh.snapshot.facts.some(({ id }: { id: string }) => id === verified.id))
-    await analyses.saveFact(created.analysisId, {
-      id: `fact:post-terminal:${crypto.randomUUID()}`, type: 'quote', value: 999,
-    })
+    const lateFactId = `fact:post-terminal:${crypto.randomUUID()}`
+    await pool.query(
+      'INSERT INTO atomic_facts (id, payload_json, is_public) VALUES ($1, $2, true) ON CONFLICT (id) DO NOTHING',
+      [lateFactId, JSON.stringify({ id: lateFactId, type: 'quote', value: 999 })],
+    )
+    await pool.query(
+      'INSERT INTO analysis_facts (analysis_id, fact_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+      [created.analysisId, lateFactId],
+    )
     await analyses.saveSnapshot(created.analysisId, { overwritten: true })
     const afterRefresh = (await app.inject({
       method: 'GET', url: `/api/research/${created.analysisId}`,

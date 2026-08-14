@@ -1115,47 +1115,6 @@ type AnalysisRow = {
 export function createAnalysisRepository(pool: Pool) {
   const terminal = terminalAgentExecutionStatuses
   return {
-    async interruptRunning(updatedAt: string) {
-      await pool.query(
-        `UPDATE analyses SET status = 'interrupted', updated_at = $1
-         WHERE status IN ('queued', 'running')`, [updatedAt],
-      )
-    },
-    async saveFact(analysisId: string, fact: { id: string } & Record<string, unknown>) {
-      const client = await pool.connect()
-      try {
-        await client.query('BEGIN')
-        await client.query(
-          `INSERT INTO atomic_facts (id, payload_json, is_public) VALUES ($1, $2, true)
-           ON CONFLICT (id) DO NOTHING`, [fact.id, JSON.stringify(fact)],
-        )
-        await client.query(
-          `INSERT INTO analysis_facts (analysis_id, fact_id) VALUES ($1, $2)
-           ON CONFLICT DO NOTHING`, [analysisId, fact.id],
-        )
-        await client.query('COMMIT')
-      } catch (error) {
-        await client.query('ROLLBACK'); throw error
-      } finally { client.release() }
-    },
-    async appendTrace(analysisId: string, payload: unknown) {
-      const client = await pool.connect()
-      try {
-        await client.query('BEGIN')
-        const parent = await client.query('SELECT id FROM analyses WHERE id = $1 FOR UPDATE', [analysisId])
-        if (!parent.rowCount) throw new Error('analysis_not_found')
-        await client.query(
-          `INSERT INTO analysis_trace (analysis_id, sequence, payload_json)
-           SELECT $1, COALESCE(max(sequence), 0) + 1, $2
-           FROM analysis_trace WHERE analysis_id = $1`,
-          [analysisId, JSON.stringify(payload)],
-        )
-        await client.query('COMMIT')
-      } catch (error) {
-        await client.query('ROLLBACK')
-        throw error
-      } finally { client.release() }
-    },
     async setStatus(id: string, status: string, updatedAt: string, extra: {
       report?: unknown; snapshot?: unknown; error?: string
     } = {}) {
@@ -1183,33 +1142,6 @@ export function createAnalysisRepository(pool: Pool) {
       )
       return result.rows[0] ? mapAnalysisRow(result.rows[0]) : null
     },
-    async createOrReturn(record: { id: string; symbol: string; status: string; createdAt: string; updatedAt: string }) {
-      const active = ['queued', 'running'].includes(record.status)
-      const client = await pool.connect()
-      try {
-        await client.query('BEGIN')
-        await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [record.id])
-        const deleted = await client.query(
-          'SELECT 1 FROM analysis_deletion_tombstones WHERE analysis_id = $1', [record.id],
-        )
-        if (deleted.rowCount) throw new Error('analysis_deleted')
-        const result = await client.query<{ id: string; created: boolean }>(
-          `INSERT INTO analyses (id, symbol, status, active, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, $5, $6)
-           ON CONFLICT (symbol) WHERE active
-           DO UPDATE SET symbol = excluded.symbol
-           RETURNING id, id = $1 AS created`,
-          [record.id, record.symbol, record.status, active, record.createdAt, record.updatedAt],
-        )
-        await client.query('COMMIT')
-        return { analysisId: result.rows[0]!.id, created: result.rows[0]!.created }
-      } catch (error) {
-        await client.query('ROLLBACK')
-        throw error
-      } finally {
-        client.release()
-      }
-    },
     async claimNextQueued(updatedAt: string) {
       const result = await pool.query<{ id: string }>(
         `WITH candidate AS (
@@ -1236,16 +1168,11 @@ export function createAnalysisRepository(pool: Pool) {
     async research(id: string) {
       const analysis = await this.get(id)
       if (!analysis) return null
-      const [facts, trace] = await Promise.all([
-        pool.query<{ payload_json: unknown }>(
-          `SELECT f.payload_json FROM atomic_facts f
-           JOIN analysis_facts af ON af.fact_id = f.id WHERE af.analysis_id = $1`, [id],
-        ),
-        pool.query<{ payload_json: unknown }>(
-          'SELECT payload_json FROM analysis_trace WHERE analysis_id = $1 ORDER BY sequence', [id],
-        ),
-      ])
-      return { ...analysis, facts: facts.rows.map((row) => row.payload_json), trace: trace.rows.map((row) => row.payload_json) }
+      const facts = await pool.query<{ payload_json: unknown }>(
+        `SELECT f.payload_json FROM atomic_facts f
+         JOIN analysis_facts af ON af.fact_id = f.id WHERE af.analysis_id = $1`, [id],
+      )
+      return { ...analysis, facts: facts.rows.map((row) => row.payload_json) }
     },
     async listResearch(symbol?: string) {
       const params: unknown[] = [terminal]

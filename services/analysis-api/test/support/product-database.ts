@@ -17,7 +17,6 @@ export function createTestProductDatabase() {
   const analysisTombstones = new Set<string>()
   const facts = new Map<string, Record<string, unknown>>()
   const analysisFacts = new Map<string, Set<string>>()
-  const traces = new Map<string, unknown[]>()
   const agentSessions = new Map<string, AgentSession>()
   const agentEvents = new Map<string, AgentEvent[]>()
   const reportVersions = new Map<string, Array<{
@@ -120,22 +119,6 @@ export function createTestProductDatabase() {
   }
 
   const analysisRepository: AnalysisRepository = {
-    async interruptRunning(updatedAt) {
-      for (const [id, record] of analyses) {
-        if (['queued', 'running'].includes(record.status)) {
-          analyses.set(id, { ...record, status: 'interrupted', updatedAt })
-        }
-      }
-    },
-    async saveFact(analysisId, fact) {
-      facts.set(fact.id, fact)
-      const ids = analysisFacts.get(analysisId) ?? new Set()
-      ids.add(fact.id)
-      analysisFacts.set(analysisId, ids)
-    },
-    async appendTrace(analysisId, payload) {
-      traces.set(analysisId, [...(traces.get(analysisId) ?? []), payload])
-    },
     async setStatus(id, status, updatedAt, extra = {}) {
       const record = analyses.get(id)
       if (!record) return
@@ -148,15 +131,6 @@ export function createTestProductDatabase() {
       })
     },
     async get(id) { return analyses.get(id) ?? null },
-    async createOrReturn(record) {
-      if (analysisTombstones.has(record.id)) throw new Error('analysis_deleted')
-      const existing = [...analyses.values()]
-        .filter((candidate) => candidate.symbol === record.symbol && ['queued', 'running'].includes(candidate.status))
-        .sort((left, right) => left.createdAt.localeCompare(right.createdAt))[0]
-      if (existing) return { analysisId: existing.id, created: false }
-      analyses.set(record.id, { ...record, snapshot: null, report: null, reportCreatedAt: null, error: null, starred: false, note: '' })
-      return { analysisId: record.id, created: true }
-    },
     async claimNextQueued(updatedAt) {
       const record = [...analyses.values()].filter((candidate) => candidate.status === 'queued')
         .sort((left, right) => left.createdAt.localeCompare(right.createdAt))[0]
@@ -175,7 +149,6 @@ export function createTestProductDatabase() {
       return {
         ...record,
         facts: [...(analysisFacts.get(id) ?? [])].flatMap((factId) => facts.get(factId) ?? []),
-        trace: traces.get(id) ?? [],
       }
     },
     async listResearch(symbol) {
@@ -201,7 +174,6 @@ export function createTestProductDatabase() {
       if (!analyses.delete(id)) return false
       analysisTombstones.add(id)
       analysisFacts.delete(id)
-      traces.delete(id)
       const removedSessions = [...agentSessions.values()].filter((session) => session.analysisId === id)
       const sessionIds = new Set(removedSessions.map(({ id: sessionId }) => sessionId))
       const executionIds = new Set(removedSessions.map(({ executionId }) => executionId))

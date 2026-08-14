@@ -1932,19 +1932,30 @@ test('真实 PostgreSQL 持仓 DAO 完成 CRUD、现金和原子减仓', {
   }
 })
 
-test('真实 PostgreSQL 研究 DAO 保存任务、事实、轨迹并安全删除', {
+test('真实 PostgreSQL 研究 DAO 保存任务与事实并安全删除', {
   skip: !applicationUrl,
   concurrency: false,
 }, async () => {
   const pool = createPool(applicationUrl!)
   const repository = createAnalysisRepository(pool)
+  const events = createAgentEventRepository(pool)
   const id = 'dao-analysis-test'
+  const sessionId = `${id}:main`
+  const executionId = `${sessionId}:execution`
   try {
-    await repository.removeResearch(id)
+    await removeResearchFixture(pool, id)
     const now = '2026-08-13T00:00:00.000Z'
-    await repository.createOrReturn({ id, symbol: 'NVDA', status: 'queued', createdAt: now, updatedAt: now })
-    await repository.saveFact(id, { id: 'dao-fact-test', type: 'quote', value: 100 })
-    await repository.appendTrace(id, { type: 'status', status: 'queued' })
+    await events.createResearch({
+      analysisId: id, sessionId, executionId, symbol: 'NVDA',
+      status: 'planning', analysisStatus: 'queued',
+      operationId: 'dao-test-context', event: { type: 'runtime_context' }, createdAt: now,
+    })
+    await events.append({
+      sessionId, executionId, operationId: 'dao-test-facts',
+      event: { type: 'financial_context' },
+      projection: { facts: [{ id: 'dao-fact-test', type: 'quote', value: 100 }] },
+      createdAt: now,
+    })
     await repository.saveSnapshot(id, { symbol: 'NVDA' })
     await repository.setStatus(id, 'completed', now, { report: { title: 'DAO 测试' } })
     await repository.saveSnapshot(id, { symbol: 'NVDA', refreshed: true })
@@ -1956,8 +1967,7 @@ test('真实 PostgreSQL 研究 DAO 保存任务、事实、轨迹并安全删除
     await repository.updateResearch(id, { note: '更新备注' }, '2026-08-20T00:00:00.000Z')
     assert.equal((await repository.research(id))?.reportCreatedAt, now)
     assert.deepEqual(research?.facts, [{ id: 'dao-fact-test', type: 'quote', value: 100 }])
-    assert.deepEqual(research?.trace, [{ type: 'status', status: 'queued' }])
-    assert.equal(await repository.removeResearch(id), true)
+    assert.equal(await removeResearchFixture(pool, id), true)
     assert.equal(await repository.get(id), null)
   } finally {
     await pool.end()
@@ -1984,9 +1994,11 @@ test('真实 PostgreSQL 硬删除完整研究树、保留共享事实并以 tomb
   const exclusiveFactId = `${analysisId}:exclusive-fact`
   const createdAt = '2026-08-14T14:00:00.000Z'
   try {
-    await analyses.createOrReturn({
-      id: sharedAnalysisId, symbol: `S${suffix.slice(0, 8)}`, status: 'completed',
-      createdAt, updatedAt: createdAt,
+    await events.createResearch({
+      analysisId: sharedAnalysisId, sessionId: `${sharedAnalysisId}:main`,
+      executionId: `${sharedAnalysisId}:main:execution`, symbol: `S${suffix.slice(0, 8)}`,
+      status: 'planning', analysisStatus: 'completed',
+      operationId: 'hard-delete-shared-context', event: { type: 'runtime_context' }, createdAt,
     })
     await events.createResearch({
       analysisId, sessionId, executionId, segmentId: `${sessionId}:segment:1`,
@@ -1999,10 +2011,21 @@ test('真实 PostgreSQL 硬删除完整研究树、保留共享事实并以 tomb
       status: 'planning', operationId: 'hard-delete-news-context',
       event: { type: 'specialist_context', domain: 'news' }, createdAt,
     })
-    await analyses.saveFact(analysisId, { id: sharedFactId, type: 'quote', value: 100 })
-    await analyses.saveFact(sharedAnalysisId, { id: sharedFactId, type: 'quote', value: 100 })
-    await analyses.saveFact(analysisId, { id: exclusiveFactId, type: 'quote', value: 101 })
-    await analyses.appendTrace(analysisId, { type: 'runtime_context', privateContext: '不得保留' })
+    await events.append({
+      sessionId, executionId, operationId: 'hard-delete-facts',
+      event: { type: 'financial_context' },
+      projection: { facts: [
+        { id: sharedFactId, type: 'quote', value: 100 },
+        { id: exclusiveFactId, type: 'quote', value: 101 },
+      ] },
+      createdAt,
+    })
+    await events.append({
+      sessionId: `${sharedAnalysisId}:main`, executionId: `${sharedAnalysisId}:main:execution`,
+      operationId: 'hard-delete-shared-facts', event: { type: 'financial_context' },
+      projection: { facts: [{ id: sharedFactId, type: 'quote', value: 100 }] },
+      createdAt,
+    })
     await analyses.saveSnapshot(analysisId, { symbol: 'DELETE', privateContext: '不得保留' })
 
     const projection = await projections.ensureVersion({
@@ -2183,25 +2206,35 @@ test('真实 PostgreSQL 并发创建同一标的只产生一个首次研究', {
   concurrency: false,
 }, async () => {
   const pool = createPool(applicationUrl!)
-  const repository = createAnalysisRepository(pool)
+  const events = createAgentEventRepository(pool)
   const symbol = 'CONCURRENT-CREATE'
+  let winner: string | undefined
   try {
-    await pool.query('DELETE FROM analyses WHERE symbol = $1', [symbol])
+    for (const stale of await pool.query<{ id: string }>(
+      'SELECT id FROM analyses WHERE symbol = $1', [symbol],
+    ).then(({ rows }) => rows)) {
+      await removeResearchFixture(pool, stale.id)
+    }
     const now = '2026-08-13T00:00:00.000Z'
     const results = await Promise.all(Array.from({ length: 24 }, (_, index) => (
-      repository.createOrReturn({
-        id: `concurrent-create-${index}`, symbol, status: 'queued', createdAt: now, updatedAt: now,
+      events.createResearch({
+        analysisId: `concurrent-create-${index}`, sessionId: `concurrent-create-${index}:main`,
+        executionId: `concurrent-create-${index}:main:execution`, symbol,
+        status: 'planning', analysisStatus: 'queued',
+        operationId: `concurrent-create-${index}:context`,
+        event: { type: 'runtime_context' }, createdAt: now,
       })
     )))
     assert.equal(new Set(results.map(({ analysisId }) => analysisId)).size, 1)
     assert.equal(results.filter(({ created }) => created).length, 1)
+    winner = results[0]!.analysisId
     const rows = await pool.query<{ count: number }>(
       `SELECT count(*)::integer AS count FROM analyses
        WHERE symbol = $1 AND status IN ('queued', 'running')`, [symbol],
     )
     assert.equal(rows.rows[0]?.count, 1)
   } finally {
-    await pool.query('DELETE FROM analyses WHERE symbol = $1', [symbol])
+    if (winner) await removeResearchFixture(pool, winner)
     await pool.end()
   }
 })
@@ -2212,13 +2245,22 @@ test('真实 PostgreSQL 并发队列 claim 每个任务只会被领取一次', {
 }, async () => {
   const pool = createPool(applicationUrl!)
   const repository = createAnalysisRepository(pool)
+  const events = createAgentEventRepository(pool)
   const prefix = 'concurrent-claim-'
   try {
-    await pool.query('DELETE FROM analyses WHERE id LIKE $1', [`${prefix}%`])
+    for (const stale of await pool.query<{ id: string }>(
+      'SELECT id FROM analyses WHERE id LIKE $1', [`${prefix}%`],
+    ).then(({ rows }) => rows)) {
+      await removeResearchFixture(pool, stale.id)
+    }
     const now = '2026-08-13T00:00:00.000Z'
     for (let index = 0; index < 8; index += 1) {
-      await repository.createOrReturn({
-        id: `${prefix}${index}`, symbol: `CLAIM-${index}`, status: 'queued', createdAt: now, updatedAt: now,
+      await events.createResearch({
+        analysisId: `${prefix}${index}`, sessionId: `${prefix}${index}:main`,
+        executionId: `${prefix}${index}:main:execution`, symbol: `CLAIM-${index}`,
+        status: 'planning', analysisStatus: 'queued',
+        operationId: `${prefix}${index}:context`,
+        event: { type: 'runtime_context' }, createdAt: now,
       })
     }
     const claimed = await Promise.all(Array.from({ length: 24 }, () => repository.claimNextQueued(now)))
@@ -2231,31 +2273,11 @@ test('真实 PostgreSQL 并发队列 claim 每个任务只会被领取一次', {
     )
     assert.equal(rows.rows[0]?.count, 8)
   } finally {
-    await pool.query('DELETE FROM analyses WHERE id LIKE $1', [`${prefix}%`])
-    await pool.end()
-  }
-})
-
-test('真实 PostgreSQL 并发追加轨迹无丢失且 sequence 严格连续', {
-  skip: !applicationUrl,
-  concurrency: false,
-}, async () => {
-  const pool = createPool(applicationUrl!)
-  const repository = createAnalysisRepository(pool)
-  const id = 'concurrent-trace'
-  try {
-    await repository.removeResearch(id)
-    const now = '2026-08-13T00:00:00.000Z'
-    await repository.createOrReturn({ id, symbol: 'TRACE', status: 'queued', createdAt: now, updatedAt: now })
-    await Promise.all(Array.from({ length: 40 }, (_, index) => (
-      repository.appendTrace(id, { type: 'concurrent', index })
-    )))
-    const rows = await pool.query<{ sequence: number }>(
-      'SELECT sequence FROM analysis_trace WHERE analysis_id = $1 ORDER BY sequence', [id],
-    )
-    assert.deepEqual(rows.rows.map(({ sequence }) => sequence), Array.from({ length: 40 }, (_, index) => index + 1))
-  } finally {
-    await repository.removeResearch(id)
+    for (const stale of await pool.query<{ id: string }>(
+      'SELECT id FROM analyses WHERE id LIKE $1', [`${prefix}%`],
+    ).then(({ rows }) => rows)) {
+      await removeResearchFixture(pool, stale.id)
+    }
     await pool.end()
   }
 })
