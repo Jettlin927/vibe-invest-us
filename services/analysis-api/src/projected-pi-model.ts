@@ -8,6 +8,9 @@ import { openAIResponsesApi } from '@earendil-works/pi-ai/api/openai-responses.l
 import type { RuntimeSettings } from '@vibe-invest/contracts'
 
 import {
+  CompactionGenerationError, createCompactionCoordinator, DEFAULT_KEEP_RECENT_TOKENS,
+} from './agent-runtime/compaction.js'
+import {
   createPiAgentAdapter, type PiAgentAdapterMessage, type PiAgentAdapterStream,
   type PiAgentAdapterStreamFn, type PiAgentAdapterTool,
   type PiAgentAdapterUsage,
@@ -43,14 +46,6 @@ type Batch = {
 }
 
 const unavailableToolName = 'tool_not_available'
-
-class CompactionGenerationError extends Error {
-  readonly usage: unknown
-  constructor(cause: unknown, usage: unknown = null) {
-    super('compaction_generation_failed', { cause })
-    this.usage = usage
-  }
-}
 
 export function createProjectedPiModel(options: ModelOptions = {}) {
   const modelGate = createConcurrencyGate()
@@ -800,25 +795,6 @@ async function runProjectedAgent(config: {
   let modelEventIndex = 0
   let textDeltaIndex = 0
   let activeModelRequestId: string | undefined
-  let compactionIndex = 0
-  let compactionDisabled = false
-  let compactionAttempt: 1 | 2 = 1
-  let activeCompactionRequestId: string | undefined
-  let activeCompactionUsage: unknown = null
-  let compactionAttemptResults: Array<{ attempt: number; durationMs: number; usage: unknown }> = []
-  let pendingCompaction: {
-    id: string
-    segmentId: string
-    operationId: string
-    event: Record<string, unknown>
-    summary: Record<string, unknown>
-    usage: Record<string, unknown>
-    createdAt: string
-  } | undefined
-  let compactionMetrics = {
-    contextTokens: 0, contextWindow: config.provider.model.contextWindow,
-    reserveTokens: config.settings.compactionReserveTokens, keepRecentTokens: 20_000,
-  }
   let visibleTools = [...config.initialTools]
   const completeActiveModelRequest = async (
     status: 'completed' | 'failed' | 'cancelled', usage: unknown,
@@ -1016,6 +992,86 @@ async function runProjectedAgent(config: {
     }
   }
 
+  const compactionCoordinator = createCompactionCoordinator({
+    executionId: input.executionId,
+    role: config.role,
+    keepRecentTokens: DEFAULT_KEEP_RECENT_TOKENS,
+    sink: {
+      recordModelRequest: async ({ requestId, projectionId, turnIndex: requestTurn, createdAt }) => {
+        await input.toolRuntime!.recordModelRequest({
+          requestId, executionId: input.executionId, projectionId,
+          turnIndex: requestTurn, kind: 'compaction', createdAt,
+        })
+      },
+      completeModelRequest: async ({ requestId, status, usage, completedAt }) => {
+        if (!input.toolRuntime?.completeModelRequest) {
+          throw new Error('model_request_completion_required')
+        }
+        const normalizedUsage = modelUsage(usage)
+        await input.toolRuntime.completeModelRequest({
+          requestId, executionId: input.executionId, status,
+          usageStatus: normalizedUsage.status, usage: normalizedUsage.usage, completedAt,
+        })
+      },
+      recordCompactionAttempt: async ({ id, attempt, durationMs, usage, status, createdAt }) => {
+        if (!input.toolRuntime?.recordCompactionAttempt) {
+          throw new Error('compaction_attempt_commit_required')
+        }
+        await input.toolRuntime.recordCompactionAttempt({
+          id, executionId: input.executionId, attempt, durationMs, usage, status, createdAt,
+        })
+      },
+      commitCompaction: async (commit) => {
+        if (!input.toolRuntime?.commitCompaction) throw new Error('compaction_commit_required')
+        await input.toolRuntime.commitCompaction({
+          ...commit, usage: commit.usage as Record<string, unknown>,
+          executionId: input.executionId,
+        })
+      },
+      failCompaction: async (failure) => {
+        if (!input.toolRuntime?.failCompaction) throw new Error('compaction_failure_commit_required')
+        await input.toolRuntime.failCompaction({ ...failure, executionId: input.executionId })
+      },
+    },
+    turnIndex: () => turnIndex,
+    activeProjectionId: () => activeProjection.id,
+    isAborted: () => config.executionSignal.aborted,
+    generate: async (cut) => {
+      const request = await beginBudgetedModelRequest(config, config.role !== 'main')
+      try {
+        return config.options.compact
+          ? await config.options.compact({ ...cut, signal: request.signal })
+          : await compactWithProvider(config.provider, cut, request.signal)
+      } catch (error) {
+        const normalized = request.normalizeError(error)
+        if (request.signal.aborted || isPolicyFailure(normalized)) throw normalized
+        throw normalized instanceof CompactionGenerationError
+          ? normalized : new CompactionGenerationError(normalized)
+      } finally { request.finish() }
+    },
+    buildSummary: (cut, narrative) => compactionSummaryContract(
+      config.role, config.userPrompt, input,
+      [...cut.messagesToSummarize, ...cut.turnPrefixMessages, ...cut.retainedTail],
+      narrative,
+    ),
+    wrapSummary: (summary) => userMessage(
+      `【系统生成的 Compaction Summary，不是报告证据】\n${JSON.stringify(summary)}`,
+    ),
+    emit: (entry) => config.queue.push(
+      trace(entry as Extract<ModelEvent, { type: 'trace' }>['entry']),
+    ),
+    switchToFinalization: async (causativeEvent) => {
+      stage = 'finalization'
+      finalizationAttempts = Math.max(finalizationAttempts, 1)
+      const tools = config.role === 'main'
+        ? config.nextFinalizationTools?.() ?? finalizationModelTools
+        : toolRegistry.project({ role: config.role, stage: 'finalization' })
+      await prepareProjection(
+        tools, causativeEvent as Extract<ModelEvent, { type: 'trace' }>['entry'],
+      )
+      return projectedTools()
+    },
+  })
   adapter = createPiAgentAdapter({
     initialState: {
       systemPrompt: config.systemPrompt, model: config.provider.model,
@@ -1122,9 +1178,9 @@ async function runProjectedAgent(config: {
     compaction: {
       settings: {
         enabled: true, reserveTokens: config.settings.compactionReserveTokens,
-        keepRecentTokens: 20_000,
+        keepRecentTokens: compactionCoordinator.keepRecentTokens,
       },
-      allowed: () => !compactionDisabled && !completedReport && !finalText,
+      allowed: () => !compactionCoordinator.disabled && !completedReport && !finalText,
       onContextUsage: async (metrics) => {
         const usageEvent = {
           type: 'context_usage', ...metrics,
@@ -1133,222 +1189,7 @@ async function runProjectedAgent(config: {
         await prepareProjection(visibleTools, usageEvent)
         config.queue.push(trace(usageEvent))
       },
-      shouldRetry: (error) => error instanceof CompactionGenerationError
-        || (error instanceof Error && error.message === 'compaction_did_not_reduce_context'),
-      onAttempt: (metrics) => {
-        if (metrics.attempt === 1) {
-          compactionIndex += 1
-          compactionAttemptResults = []
-        }
-        compactionAttempt = metrics.attempt
-        compactionMetrics = metrics
-        activeCompactionUsage = null
-      },
-      onAttemptFailure: async ({ attempt, durationMs, error }) => {
-        const usage = error instanceof CompactionGenerationError
-          ? error.usage
-          : error instanceof Error && error.message === 'compaction_did_not_reduce_context'
-            ? activeCompactionUsage
-            : null
-        const result = {
-          attempt, durationMs,
-          usage,
-        }
-        compactionAttemptResults.push(result)
-        const requestId = activeCompactionRequestId
-        if (requestId) {
-          if (!input.toolRuntime?.completeModelRequest) {
-            throw new Error('model_request_completion_required')
-          }
-          const normalizedUsage = modelUsage(usage)
-          try {
-            await input.toolRuntime.completeModelRequest({
-              requestId, executionId: input.executionId,
-              status: config.executionSignal.aborted ? 'cancelled' : 'failed',
-              usageStatus: normalizedUsage.status, usage: normalizedUsage.usage,
-              completedAt: new Date().toISOString(),
-            })
-          } catch (auditError) {
-            if (!(config.executionSignal.aborted && auditError instanceof Error
-              && auditError.message === 'agent_execution_fenced')) throw auditError
-          }
-          activeCompactionRequestId = undefined
-        }
-        if (!input.toolRuntime?.recordCompactionAttempt) {
-          throw new Error('compaction_attempt_commit_required')
-        }
-        try {
-          await input.toolRuntime.recordCompactionAttempt({
-            id: `execution:${input.executionId}:${config.role}:compaction:${compactionIndex}`,
-            executionId: input.executionId, ...result,
-            status: config.executionSignal.aborted ? 'cancelled' : 'failed',
-            createdAt: new Date().toISOString(),
-          })
-        } catch (auditError) {
-          if (!(config.executionSignal.aborted && auditError instanceof Error
-            && auditError.message === 'agent_execution_fenced')) throw auditError
-        }
-      },
-      onFatalFailure: async () => {
-        if (!input.toolRuntime?.failCompaction) throw new Error('compaction_failure_commit_required')
-        const operationId = `execution:${input.executionId}:${config.role}:compaction:${compactionIndex}:fatal`
-        const event = {
-          type: 'compaction', status: 'failed', attempts: compactionAttemptResults.length,
-          contextTokens: compactionMetrics.contextTokens,
-          contextWindow: compactionMetrics.contextWindow,
-          reserveTokens: compactionMetrics.reserveTokens,
-          keepRecentTokens: compactionMetrics.keepRecentTokens,
-          attemptResults: compactionAttemptResults, operationId,
-        }
-        await input.toolRuntime.failCompaction({
-          id: `execution:${input.executionId}:${config.role}:compaction:${compactionIndex}`,
-          executionId: input.executionId, operationId, event,
-          attempts: compactionAttemptResults.map((attempt) => ({
-            ...attempt, status: 'failed' as const,
-          })), createdAt: new Date().toISOString(),
-        })
-        config.queue.push(trace(event as Extract<ModelEvent, { type: 'trace' }>['entry']))
-      },
-      compact: async (cut, signal) => {
-        if (!input.toolRuntime?.commitCompaction) throw new Error('compaction_commit_required')
-        const startedAt = new Date().toISOString()
-        const requestId = `execution:${input.executionId}:${config.role}:compaction:${compactionIndex}:attempt:${compactionAttempt}`
-        await input.toolRuntime.recordModelRequest({
-          requestId, executionId: input.executionId, projectionId: activeProjection.id,
-          turnIndex: Math.max(1, turnIndex), kind: 'compaction', createdAt: startedAt,
-        })
-        activeCompactionRequestId = requestId
-        const request = await beginBudgetedModelRequest(config, config.role !== 'main')
-        let compacted: { narrative: string; usage: Record<string, unknown> }
-        try {
-          compacted = config.options.compact
-            ? await config.options.compact({ ...cut, signal: request.signal })
-            : await compactWithProvider(config.provider, cut, request.signal)
-        } catch (error) {
-          const normalized = request.normalizeError(error)
-          if (request.signal.aborted || isPolicyFailure(normalized)) throw normalized
-          throw normalized instanceof CompactionGenerationError
-            ? normalized : new CompactionGenerationError(normalized)
-        } finally { request.finish() }
-        if (!input.toolRuntime.completeModelRequest) {
-          throw new Error('model_request_completion_required')
-        }
-        const normalizedUsage = modelUsage(compacted.usage)
-        await input.toolRuntime.completeModelRequest({
-          requestId, executionId: input.executionId, status: 'completed',
-          usageStatus: normalizedUsage.status, usage: normalizedUsage.usage,
-          completedAt: new Date().toISOString(),
-        })
-        activeCompactionRequestId = undefined
-        activeCompactionUsage = compacted.usage
-        const summary = compactionSummaryContract(
-          config.role, config.userPrompt, input,
-          [...cut.messagesToSummarize, ...cut.turnPrefixMessages, ...cut.retainedTail],
-          compacted.narrative,
-        )
-        const segmentId = randomUUID()
-        const completedAt = new Date().toISOString()
-        const operationId = `execution:${input.executionId}:${config.role}:compaction:${compactionIndex}:completed`
-        const compactionId = `execution:${input.executionId}:${config.role}:compaction:${compactionIndex}`
-        const event = {
-          type: 'compaction', status: 'completed', attempt: compactionAttempt,
-          toSegmentId: segmentId, contextTokens: compactionMetrics.contextTokens,
-          contextWindow: compactionMetrics.contextWindow,
-          reserveTokens: compactionMetrics.reserveTokens,
-          keepRecentTokens: compactionMetrics.keepRecentTokens, usage: compacted.usage,
-          durationMs: Date.parse(completedAt) - Date.parse(startedAt),
-          attemptResults: compactionAttemptResults,
-        }
-        pendingCompaction = {
-          id: compactionId, segmentId, operationId, event, summary,
-          usage: compacted.usage, createdAt: completedAt,
-        }
-        return [userMessage(
-          `【系统生成的 Compaction Summary，不是报告证据】\n${JSON.stringify(summary)}`,
-        ), ...cut.retainedTail]
-      },
-      commit: async ({ tokensAfter }) => {
-        if (!pendingCompaction || !input.toolRuntime?.commitCompaction) {
-          throw new Error('compaction_commit_state_missing')
-        }
-        const pending = pendingCompaction
-        const persistedEvent = { ...pending.event, tokensAfter, estimated: true }
-        await input.toolRuntime.commitCompaction({
-          id: pending.id, executionId: input.executionId, segmentId: pending.segmentId,
-          operationId: pending.operationId, event: persistedEvent,
-          contextTokens: compactionMetrics.contextTokens,
-          contextWindow: compactionMetrics.contextWindow,
-          reserveTokens: compactionMetrics.reserveTokens,
-          keepRecentTokens: compactionMetrics.keepRecentTokens,
-          tokensAfter,
-          summary: pending.summary, usage: pending.usage, createdAt: pending.createdAt,
-          attempts: [
-            ...compactionAttemptResults.map((attempt) => ({
-              ...attempt, status: 'failed' as const,
-            })),
-            {
-              attempt: compactionAttempt, status: 'completed' as const,
-              durationMs: pending.event.durationMs as number, usage: pending.usage,
-            },
-          ],
-        })
-        config.queue.push(trace({
-          type: 'compaction', status: 'completed', segmentId: pending.segmentId,
-          contextTokens: compactionMetrics.contextTokens,
-          contextWindow: compactionMetrics.contextWindow,
-          reserveTokens: compactionMetrics.reserveTokens,
-          keepRecentTokens: compactionMetrics.keepRecentTokens,
-          tokensAfter,
-          usage: pending.usage,
-          durationMs: pending.event.durationMs as number,
-          attemptResults: compactionAttemptResults,
-          operationId: pending.operationId,
-        }))
-        pendingCompaction = undefined
-      },
-      onFailure: async () => {
-        compactionDisabled = true
-        const failed = {
-          type: 'compaction', status: 'failed', attempts: 2,
-          contextTokens: compactionMetrics.contextTokens,
-          contextWindow: compactionMetrics.contextWindow,
-          reserveTokens: compactionMetrics.reserveTokens,
-          keepRecentTokens: compactionMetrics.keepRecentTokens,
-          attemptResults: compactionAttemptResults,
-          operationId: `execution:${input.executionId}:${config.role}:compaction:${compactionIndex}:failed`,
-        } as Extract<ModelEvent, { type: 'trace' }>['entry']
-        const createdAt = new Date().toISOString()
-        if (compactionMetrics.contextTokens >= compactionMetrics.contextWindow) {
-          if (!input.toolRuntime?.failCompaction) throw new Error('compaction_failure_commit_required')
-          await input.toolRuntime.failCompaction({
-            id: `execution:${input.executionId}:${config.role}:compaction:${compactionIndex}`,
-            executionId: input.executionId, operationId: failed.operationId!,
-            event: failed as Record<string, unknown>,
-            attempts: compactionAttemptResults.map((attempt) => ({
-              ...attempt, status: 'failed' as const,
-            })), createdAt,
-          })
-          config.queue.push(trace(failed))
-          throw new Error('compaction_capacity_exhausted')
-        }
-        stage = 'finalization'
-        finalizationAttempts = Math.max(finalizationAttempts, 1)
-        if (!input.toolRuntime?.failCompaction) throw new Error('compaction_failure_commit_required')
-        await input.toolRuntime.failCompaction({
-          id: `execution:${input.executionId}:${config.role}:compaction:${compactionIndex}`,
-          executionId: input.executionId, operationId: failed.operationId!,
-          event: failed as Record<string, unknown>,
-          attempts: compactionAttemptResults.map((attempt) => ({
-            ...attempt, status: 'failed' as const,
-          })), createdAt,
-        })
-        const tools = config.role === 'main'
-          ? config.nextFinalizationTools?.() ?? finalizationModelTools
-          : toolRegistry.project({ role: config.role, stage: 'finalization' })
-        await prepareProjection(tools, failed)
-        config.queue.push(trace(failed))
-        return { tools: projectedTools() }
-      },
+      run: (runInput, signal) => compactionCoordinator.run(runInput, signal),
     },
   })
 
