@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import type {
-  AgentEvent, AgentEventRepository, AnalysisRepository, RuntimeSettingsRepository,
+  AgentEvent, AgentEventRepository, AgentSession, AnalysisRepository, RuntimeSettingsRepository,
   ToolProjectionRepository,
 } from '@vibe-invest/product-dao'
 import {
@@ -81,6 +81,8 @@ export function createAnalysisService(options: {
   const listeners = new Map<string, Set<(entry: AgentEvent) => void>>()
   const tasks = new Set<Promise<void>>()
   const analysisTasks = new Map<string, Promise<void>>()
+  const stoppingTasks = new Map<string, Promise<boolean>>()
+  const deletionTasks = new Map<string, Promise<boolean>>()
   const toolGate = createConcurrencyGate()
   const modelGate = createConcurrencyGate()
   let running = 0
@@ -1121,42 +1123,91 @@ export function createAnalysisService(options: {
       controllers.delete(analysisId)
     }
   }
+  async function stopRuntimeTree(analysisId: string) {
+    const inFlight = stoppingTasks.get(analysisId)
+    if (inFlight) return inFlight
+    let task: Promise<boolean>
+    task = (async () => {
+      const racedStates = new Map<string, Error>()
+      while (true) {
+        const job = await get(analysisId)
+        if (!job) return false
+        const sessions = await options.eventRepository.listSessions(analysisId)
+        const activeSessions: AgentSession[] = []
+        for (const session of sessions) {
+          const lifecycle = await options.eventRepository.sessionLifecycle(session.id)
+          if (lifecycle && !isTerminalAgentExecutionStatus(
+            lifecycle.execution.status, lifecycle.execution.terminal,
+          )) activeSessions.push({
+            ...session, executionId: lifecycle.execution.id, status: lifecycle.execution.status,
+          })
+        }
+        if (!activeSessions.length) return true
+        const activeKey = activeSessions.map(({ id, executionId }) => `${id}:${executionId}`)
+          .sort().join('|')
+        const repeatedRace = racedStates.get(activeKey)
+        if (repeatedRace) throw repeatedRace
+        try {
+          if (job.status === 'stopping') {
+            controllers.get(analysisId)?.abort()
+            await analysisTasks.get(analysisId)
+            for (const session of activeSessions) await setStatus(
+              session.id, session.executionId, `session:${session.id}:stopped`, 'stopped',
+            )
+            return true
+          }
+          const session = activeSessions.find(({ isPrimary }) => isPrimary) ?? activeSessions[0]
+          if (!session) return false
+          const fenceExecutionId = randomUUID()
+          const createdAt = new Date().toISOString()
+          const waitReason = waitReasonForStatus('stopping', '运行时停止确认', createdAt)
+          const event = await options.eventRepository.fenceForStopping({
+            sessionId: session.id, executionId: session.executionId, fenceExecutionId,
+            operationId: `session:${session.id}:stopping`,
+            event: {
+              type: 'status', status: 'stopping', terminal: false,
+              previousExecutionId: session.executionId, waitReason, at: createdAt,
+            },
+            createdAt,
+          })
+          for (const cancelled of event.cancelledToolEvents ?? []) {
+            for (const listener of listeners.get(cancelled.sessionId) ?? []) listener(cancelled)
+          }
+          for (const fenced of event.fencedSessions ?? [event]) {
+            for (const listener of listeners.get(fenced.sessionId) ?? []) listener(fenced)
+          }
+          controllers.get(analysisId)?.abort()
+          await analysisTasks.get(analysisId)
+          for (const fenced of event.fencedSessions ?? [{
+            sessionId: session.id, executionId: fenceExecutionId,
+          }]) {
+            await setStatus(
+              fenced.sessionId, fenced.executionId, `session:${fenced.sessionId}:stopped`, 'stopped',
+            )
+          }
+          return true
+        } catch (error) {
+          if (!(error instanceof Error) || ![
+            'agent_execution_terminal', 'agent_execution_fenced', 'agent_session_not_found',
+          ].includes(error.message)) throw error
+          racedStates.set(activeKey, error)
+        }
+      }
+    })().finally(() => {
+      if (stoppingTasks.get(analysisId) === task) stoppingTasks.delete(analysisId)
+    })
+    stoppingTasks.set(analysisId, task)
+    return task
+  }
   async function cancel(analysisId: string) {
     const job = await get(analysisId)
-    if (!job || ['completed', 'partial', 'failed', 'stopping', 'stopped', 'interrupted', 'budget_exhausted']
-      .includes(job.status)) return false
-    const session = await options.eventRepository.findPrimarySession(analysisId)
-    if (!session) return false
-    const fenceExecutionId = randomUUID()
-    const createdAt = new Date().toISOString()
-    const waitReason = waitReasonForStatus('stopping', '运行时停止确认', createdAt)
-    const event = await options.eventRepository.fenceForStopping({
-      sessionId: session.id, executionId: session.executionId, fenceExecutionId,
-      operationId: `session:${session.id}:stopping`,
-      event: {
-        type: 'status', status: 'stopping', terminal: false,
-        previousExecutionId: session.executionId, waitReason, at: createdAt,
-      },
-      createdAt,
-    })
-    for (const cancelled of event.cancelledToolEvents ?? []) {
-      for (const listener of listeners.get(cancelled.sessionId) ?? []) listener(cancelled)
-    }
-    for (const fenced of event.fencedSessions ?? [event]) {
-      for (const listener of listeners.get(fenced.sessionId) ?? []) listener(fenced)
-    }
-    const controller = controllers.get(analysisId)
-    controller?.abort()
-    await analysisTasks.get(analysisId)
-    for (const fenced of event.fencedSessions ?? [{ sessionId: session.id, executionId: fenceExecutionId }]) {
-      await setStatus(
-        fenced.sessionId, fenced.executionId, `session:${fenced.sessionId}:stopped`, 'stopped',
-      )
-    }
-    return true
+    if (!job || job.status === 'stopping'
+      || isTerminalAgentExecutionStatus(job.status, job.terminal)) return false
+    return stopRuntimeTree(analysisId)
   }
   async function resume(analysisId: string) {
     await initialized
+    if (deletionTasks.has(analysisId)) throw new Error('analysis_deleting')
     const job = await repository.get(analysisId)
     if (!job || !['stopped', 'interrupted'].includes(job.status)) return null
     const lifecycle = await options.eventRepository.primaryLifecycle(analysisId)
@@ -1204,6 +1255,7 @@ export function createAnalysisService(options: {
     requestedBaseReportVersion?: number,
   ) {
     await initialized
+    if (deletionTasks.has(analysisId)) throw new Error('analysis_deleting')
     const message = messageInput.trim()
     const messageId = messageIdInput.trim()
     if (!messageId || messageId.length > 200) throw new Error('follow_up_message_id_required')
@@ -1333,8 +1385,27 @@ export function createAnalysisService(options: {
     return repository.updateResearch(analysisId, values, new Date().toISOString())
   }
   async function removeResearch(analysisId: string) {
-    await initialized
-    return repository.removeResearch(analysisId)
+    const inFlight = deletionTasks.get(analysisId)
+    if (inFlight) return inFlight
+    let task: Promise<boolean>
+    task = (async () => {
+      await initialized
+      const job = await repository.get(analysisId)
+      if (!job) return false
+      if (!isTerminalAgentExecutionStatus(job.status, job.terminal)
+        && !await stopRuntimeTree(analysisId)) return false
+      try {
+        return await repository.removeResearch(analysisId)
+      } catch (error) {
+        if (!(error instanceof Error) || error.message !== 'analysis_not_stopped') throw error
+        if (!await stopRuntimeTree(analysisId)) return false
+        return repository.removeResearch(analysisId)
+      }
+    })().finally(() => {
+      if (deletionTasks.get(analysisId) === task) deletionTasks.delete(analysisId)
+    })
+    deletionTasks.set(analysisId, task)
+    return task
   }
   async function *streamEvents(sessionId: string, afterSequence: number, signal?: AbortSignal) {
     await initialized

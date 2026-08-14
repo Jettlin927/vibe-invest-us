@@ -327,7 +327,8 @@ export function buildApp(dependencies: AppDependencies) {
       if (!resumed) return reply.status(409).send({ error: 'analysis_not_resumable' })
       return reply.status(202).send(resumed)
     } catch (error) {
-      if (error instanceof Error && error.message === 'analysis_not_resumable') {
+      if (error instanceof Error && ['analysis_not_resumable', 'analysis_deleting']
+        .includes(error.message)) {
         return reply.status(409).send({ error: error.message })
       }
       throw error
@@ -366,7 +367,7 @@ export function buildApp(dependencies: AppDependencies) {
     } catch (error) {
       if (error instanceof Error && [
         'analysis_follow_up_not_available', 'agent_operation_conflict',
-        'base_report_version_not_found', 'analysis_resume_required',
+        'base_report_version_not_found', 'analysis_resume_required', 'analysis_deleting',
       ].includes(error.message)) {
         return reply.status(409).send({ error: error.message })
       }

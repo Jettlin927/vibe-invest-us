@@ -1163,6 +1163,46 @@ test('刚生成报告即使引用历史财报也不显示 freshness 过期提示
   assert.equal(view.queryByText(/此报告已超过当前/), null)
 })
 
+test('研究同步硬删除期间保留当前记录并禁用重复操作，204 后再从界面移除', async () => {
+  setupDom()
+  const record = {
+    id: 'delete-record', symbol: 'NVDA', status: 'completed', terminal: true,
+    createdAt: new Date().toISOString(), reportCreatedAt: new Date().toISOString(),
+    report: { title: '等待同步硬删除', trend: '中性', limitations: [] }, facts: [], trace: [],
+  }
+  let deleted = false
+  let finishDeletion!: (response: Response) => void
+  const deletion = new Promise<Response>((resolve) => { finishDeletion = resolve })
+  globalThis.fetch = async (input, init) => {
+    const url = String(input)
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok', engine: 'postgresql', schemaVersion: 24 }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/settings') return Response.json(settingsResponse())
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+    if (url === '/api/portfolio') return Response.json(portfolioResponse([]))
+    if (url === '/api/research') return Response.json({ records: deleted ? [] : [record] })
+    if (url === '/api/research/delete-record' && init?.method === 'DELETE') {
+      const response = await deletion
+      deleted = response.ok
+      return response
+    }
+    if (url === '/api/research/delete-record') return Response.json(record)
+    throw new Error(`unexpected_fetch:${url}`)
+  }
+  const view = render(React.createElement(App))
+  const user = userEvent.setup({ document: window.document })
+  await user.click(await view.findByRole('button', { name: '研究记录' }))
+  await view.findByRole('heading', { name: '等待同步硬删除' })
+  const deleting = user.click(view.getByRole('button', { name: '删除记录' }))
+  const pending = await view.findByRole('button', { name: '正在删除…' })
+  assert.equal((pending as HTMLButtonElement).disabled, true)
+  assert.ok(view.getByRole('heading', { name: '等待同步硬删除' }))
+
+  finishDeletion(new Response(null, { status: 204 }))
+  await deleting
+  await waitFor(() => assert.equal(view.queryByRole('heading', { name: '等待同步硬删除' }), null))
+  assert.match(view.getByText('全部记录 · 0').textContent ?? '', /0/)
+})
+
 test('备注更新不改变报告 freshness 年龄', async () => {
   setupDom()
   const reportCreatedAt = new Date(Date.now() - 10 * 86_400_000).toISOString()

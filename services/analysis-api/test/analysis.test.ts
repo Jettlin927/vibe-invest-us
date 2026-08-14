@@ -2006,6 +2006,234 @@ test('取消运行任务会以 stopping → stopped 统一收敛模型与生命�
   await app.close()
 })
 
+test('删除运行中研究会先 Abort 并等待本地 Agent 收口，再级联删除且拒绝旧 execution 迟到写', async () => {
+  const database = createTestProductDatabase()
+  let modelStarted!: () => void
+  let releaseAfterAbort!: () => void
+  const started = new Promise<void>((resolve) => { modelStarted = resolve })
+  const afterAbort = new Promise<void>((resolve) => { releaseAfterAbort = resolve })
+  let aborted = false
+  let settled = false
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [] }),
+    model: {
+      async *analyze(input) {
+        modelStarted()
+        await Promise.race([
+          new Promise<void>((resolve) => input.signal?.addEventListener('abort', () => {
+            aborted = true
+            resolve()
+          }, { once: true })),
+          new Promise<void>((resolve) => setTimeout(resolve, 50)),
+        ])
+        if (aborted) await afterAbort
+        settled = true
+        yield { type: 'cancelled' as const }
+      },
+    },
+  })
+  await app.ready()
+  try {
+    const created = (await app.inject({
+      method: 'POST', url: '/api/analyses', payload: { symbol: 'DELETERUN' },
+    })).json()
+    await started
+
+    let deletionSettled = false
+    const deletion = app.inject({
+      method: 'DELETE', url: `/api/research/${created.analysisId}`,
+    }).then((response) => {
+      deletionSettled = true
+      return response
+    })
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    assert.equal(aborted, true)
+    assert.equal(deletionSettled, false)
+
+    releaseAfterAbort()
+    const response = await deletion
+    assert.equal(response.statusCode, 204, response.body)
+    assert.equal(settled, true)
+    assert.equal((await app.inject({
+      method: 'GET', url: `/api/research/${created.analysisId}`,
+    })).statusCode, 404)
+    assert.equal(await database.agentEventRepository.getSession(created.sessionId), null)
+    await assert.rejects(database.agentEventRepository.append({
+      sessionId: created.sessionId,
+      executionId: created.executionId,
+      operationId: `execution:${created.executionId}:late-after-delete`,
+      event: { type: 'model_event', event: { type: 'text_delta', text: 'late' } },
+      createdAt: new Date().toISOString(),
+    }), /agent_execution_fenced|agent_session_not_found/)
+  } finally {
+    releaseAfterAbort()
+    await app.close()
+  }
+})
+
+test('同步硬删除事务进行中拒绝在同一研究上创建新的追问 execution', async () => {
+  const database = createTestProductDatabase()
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [] }),
+    model: fakeModel(),
+  })
+  await app.ready()
+  let releaseDeletion!: () => void
+  let deletionStarted!: () => void
+  const release = new Promise<void>((resolve) => { releaseDeletion = resolve })
+  const started = new Promise<void>((resolve) => { deletionStarted = resolve })
+  try {
+    const created = (await app.inject({
+      method: 'POST', url: '/api/analyses', payload: { symbol: 'DELETECHAT' },
+    })).json()
+    await waitForStatus(app as any, created.analysisId, 'completed')
+    const originalRemove = database.analysisRepository.removeResearch
+    database.analysisRepository.removeResearch = async (analysisId) => {
+      deletionStarted()
+      await release
+      return originalRemove(analysisId)
+    }
+    const deletion = app.inject({
+      method: 'DELETE', url: `/api/research/${created.analysisId}`,
+    })
+    await started
+    const followUp = await app.inject({
+      method: 'POST', url: `/api/analyses/${created.analysisId}/messages`,
+      payload: { messageId: 'late-question', message: '删除时不得创建新 execution。' },
+    })
+    assert.equal(followUp.statusCode, 409)
+    assert.deepEqual(followUp.json(), { error: 'analysis_deleting' })
+    releaseDeletion()
+    assert.equal((await deletion).statusCode, 204)
+  } finally {
+    releaseDeletion()
+    await app.close()
+  }
+})
+
+test('删除 terminal=false 的 budget_exhausted 收口研究仍先 fence 与 Abort', async () => {
+  const database = createTestProductDatabase()
+  let closureStarted!: () => void
+  const closing = new Promise<void>((resolve) => { closureStarted = resolve })
+  let aborted = false
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [] }),
+    model: {
+      async *analyze(input) {
+        yield {
+          type: 'lifecycle' as const, status: 'budget_exhausted' as const,
+          operationId: `execution:${input.executionId}:budget-exhausted`,
+        }
+        closureStarted()
+        await new Promise<void>((resolve) => input.signal?.addEventListener('abort', () => {
+          aborted = true
+          resolve()
+        }, { once: true }))
+        yield { type: 'cancelled' as const }
+      },
+    },
+  })
+  await app.ready()
+  try {
+    const created = (await app.inject({
+      method: 'POST', url: '/api/analyses', payload: { symbol: 'DELBUDG' },
+    })).json()
+    await closing
+    const budgetState = await waitForStatus(app as any, created.analysisId, 'budget_exhausted')
+    assert.equal(budgetState.terminal, false)
+
+    const response = await app.inject({
+      method: 'DELETE', url: `/api/research/${created.analysisId}`,
+    })
+    assert.equal(response.statusCode, 204, response.body)
+    assert.equal(aborted, true)
+    assert.equal(await database.agentEventRepository.getSession(created.sessionId), null)
+  } finally {
+    await app.close()
+  }
+})
+
+test('主研究已终态但专项仍运行时删除会以活跃专项为根先 fence 整棵树', async () => {
+  const database = createTestProductDatabase()
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [] }),
+    model: fakeModel(),
+  })
+  await app.ready()
+  try {
+    const created = (await app.inject({
+      method: 'POST', url: '/api/analyses', payload: { symbol: 'DELCHILD' },
+    })).json()
+    await waitForStatus(app as any, created.analysisId, 'completed')
+    const specialistSessionId = `${created.sessionId}:late-news`
+    const specialistExecutionId = `${specialistSessionId}:execution`
+    await database.agentEventRepository.createSpecialistSession({
+      id: specialistSessionId, analysisId: created.analysisId, domain: 'news',
+      executionId: specialistExecutionId, status: 'planning',
+      operationId: 'late-news-created',
+      event: { type: 'specialist_context', domain: 'news' },
+      createdAt: new Date().toISOString(),
+    })
+
+    const response = await app.inject({
+      method: 'DELETE', url: `/api/research/${created.analysisId}`,
+    })
+    assert.equal(response.statusCode, 204, response.body)
+    assert.equal(await database.agentEventRepository.getSession(created.sessionId), null)
+    assert.equal(await database.agentEventRepository.getSession(specialistSessionId), null)
+  } finally {
+    await app.close()
+  }
+})
+
+test('execution 在枚举后自然完成时删除会重读权威树而不是返回 500', async () => {
+  const database = createTestProductDatabase()
+  const originalFence = database.agentEventRepository.fenceForStopping
+  let raced = false
+  database.agentEventRepository.fenceForStopping = async (input) => {
+    if (!raced) {
+      raced = true
+      await database.agentEventRepository.append({
+        sessionId: input.sessionId, executionId: input.executionId,
+        operationId: `execution:${input.executionId}:naturally-completed`,
+        event: { type: 'status', status: 'completed', terminal: true },
+        projection: { status: 'completed', executionStatus: 'completed', terminal: true },
+        createdAt: new Date().toISOString(),
+      })
+      throw new Error('agent_execution_terminal')
+    }
+    return originalFence(input)
+  }
+  const app = buildProductionApp({
+    ...database, modelConfigured: false,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [] }),
+    model: fakeModel(),
+  })
+  await app.ready()
+  try {
+    const created = (await app.inject({
+      method: 'POST', url: '/api/analyses', payload: { symbol: 'DELRACE' },
+    })).json()
+    const response = await app.inject({
+      method: 'DELETE', url: `/api/research/${created.analysisId}`,
+    })
+    assert.equal(response.statusCode, 204, response.body)
+    assert.equal(raced, true)
+    assert.equal(await database.agentEventRepository.getSession(created.sessionId), null)
+  } finally {
+    await app.close()
+  }
+})
+
 test('外部 HTTP 工具不响应 Abort 时停止仍立即收口且不启动模型', async () => {
   const database = createTestProductDatabase()
   await database.runtimeSettingsRepository.save({

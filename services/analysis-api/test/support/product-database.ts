@@ -5,7 +5,8 @@ import type {
   ProductPosition,
 } from '@vibe-invest/product-dao'
 import {
-  aggregateModelTokenUsage, defaultRuntimeSettings, parseRuntimeSettingsUpdate,
+  aggregateModelTokenUsage, defaultRuntimeSettings, isTerminalAgentExecutionStatus,
+  parseRuntimeSettingsUpdate,
 } from '@vibe-invest/contracts'
 
 export function createTestProductDatabase() {
@@ -13,6 +14,7 @@ export function createTestProductDatabase() {
   const snapshots = new Map<string, ProductEquitySnapshot>()
   let cash = 0
   const analyses = new Map<string, AnalysisRecord>()
+  const analysisTombstones = new Set<string>()
   const facts = new Map<string, Record<string, unknown>>()
   const analysisFacts = new Map<string, Set<string>>()
   const traces = new Map<string, unknown[]>()
@@ -23,7 +25,10 @@ export function createTestProductDatabase() {
     kind: 'integrated' | 'specialist'; payloadHash: string; report: unknown; createdAt: string
   }>>()
   const lifecycles = new Map<string, {
-    execution: { id: string; generation: number; status: string; createdAt: string; updatedAt: string }
+    execution: {
+      id: string; generation: number; status: string; terminal: boolean
+      createdAt: string; updatedAt: string
+    }
     waitReason: { kind: 'database'; target: string; startedAt: string }
     segments: Array<{
       id: string; ordinal: number; parentSegmentId?: string | null; createdAt: string
@@ -144,6 +149,7 @@ export function createTestProductDatabase() {
     },
     async get(id) { return analyses.get(id) ?? null },
     async createOrReturn(record) {
+      if (analysisTombstones.has(record.id)) throw new Error('analysis_deleted')
       const existing = [...analyses.values()]
         .filter((candidate) => candidate.symbol === record.symbol && ['queued', 'running'].includes(candidate.status))
         .sort((left, right) => left.createdAt.localeCompare(right.createdAt))[0]
@@ -186,9 +192,45 @@ export function createTestProductDatabase() {
       return updated
     },
     async removeResearch(id) {
+      const running = [...agentSessions.values()].some((session) => (
+        session.analysisId === id
+        && !['completed', 'partial', 'failed', 'stopped', 'interrupted', 'budget_exhausted']
+          .includes(session.status)
+      ))
+      if (running) throw new Error('analysis_not_stopped')
       if (!analyses.delete(id)) return false
+      analysisTombstones.add(id)
       analysisFacts.delete(id)
       traces.delete(id)
+      const removedSessions = [...agentSessions.values()].filter((session) => session.analysisId === id)
+      const sessionIds = new Set(removedSessions.map(({ id: sessionId }) => sessionId))
+      const executionIds = new Set(removedSessions.map(({ executionId }) => executionId))
+      for (const versions of reportVersions.values()) {
+        for (const version of versions) {
+          if (version.analysisId === id) executionIds.add(version.executionId)
+        }
+      }
+      for (const [sessionId, versions] of reportVersions) {
+        if (versions.some((version) => version.analysisId === id)) reportVersions.delete(sessionId)
+      }
+      for (const sessionId of sessionIds) {
+        agentSessions.delete(sessionId)
+        agentEvents.delete(sessionId)
+        lifecycles.delete(sessionId)
+      }
+      for (const [executionId, projections] of toolProjections) {
+        if (projections.some((projection) => executionIds.has(projection.executionId))) {
+          executionIds.add(executionId)
+          toolProjections.delete(executionId)
+        }
+      }
+      for (const executionId of executionIds) executionSettingsSnapshots.delete(executionId)
+      for (let index = modelRequests.length - 1; index >= 0; index -= 1) {
+        if (executionIds.has(modelRequests[index]!.executionId)) modelRequests.splice(index, 1)
+      }
+      for (const [batchId, batch] of toolBatches) {
+        if (executionIds.has(batch.executionId)) toolBatches.delete(batchId)
+      }
       const referenced = new Set([...analysisFacts.values()].flatMap((ids) => [...ids]))
       for (const factId of facts.keys()) if (!referenced.has(factId)) facts.delete(factId)
       return true
@@ -276,7 +318,7 @@ export function createTestProductDatabase() {
       })
       lifecycles.set(session.id, {
         execution: {
-          id: input.executionId, generation, status: 'planning',
+          id: input.executionId, generation, status: 'planning', terminal: false,
           createdAt: input.createdAt, updatedAt: input.createdAt,
         },
         waitReason: { kind: 'database', target: '恢复研究上下文', startedAt: input.createdAt },
@@ -394,7 +436,8 @@ export function createTestProductDatabase() {
           ...candidateLifecycle,
           execution: {
             id: fenceExecutionId, generation: candidateLifecycle.execution.generation + 1,
-            status: 'stopping', createdAt: input.createdAt, updatedAt: input.createdAt,
+            status: 'stopping', terminal: false,
+            createdAt: input.createdAt, updatedAt: input.createdAt,
           },
           waitReason: input.event.waitReason as never,
         })
@@ -408,6 +451,7 @@ export function createTestProductDatabase() {
       return { ...event, cancelledToolEvents: [], fencedSessions }
     },
     async createResearch(input) {
+      if (analysisTombstones.has(input.analysisId)) throw new Error('analysis_deleted')
       const existing = [...analyses.values()]
         .find((record) => record.symbol === input.symbol && ['queued', 'running'].includes(record.status))
       if (existing) {
@@ -432,7 +476,10 @@ export function createTestProductDatabase() {
       })
       agentEvents.set(input.sessionId, [event])
       lifecycles.set(input.sessionId, {
-        execution: { id: input.executionId, generation: 1, status: 'planning', createdAt: input.createdAt, updatedAt: input.createdAt },
+        execution: {
+          id: input.executionId, generation: 1, status: 'planning', terminal: false,
+          createdAt: input.createdAt, updatedAt: input.createdAt,
+        },
         waitReason: { kind: 'database', target: '首次研究初始化', startedAt: input.createdAt },
         segments: [{ id: input.segmentId ?? `${input.sessionId}:segment:1`, ordinal: 1, createdAt: input.createdAt }],
       })
@@ -483,7 +530,8 @@ export function createTestProductDatabase() {
         })
         lifecycles.set(existing.id, {
           execution: { id: input.executionId, generation: lifecycle.execution.generation + 1,
-            status: 'planning', createdAt: input.createdAt, updatedAt: input.createdAt },
+            status: 'planning', terminal: false,
+            createdAt: input.createdAt, updatedAt: input.createdAt },
           waitReason: { kind: 'database', target: '专项研究规划', startedAt: input.createdAt },
           segments: [...lifecycle.segments, {
             id: input.segmentId ?? `${existing.id}:segment:${lifecycle.segments.length + 1}`,
@@ -515,7 +563,11 @@ export function createTestProductDatabase() {
       const executionStatus = input.status === 'queued' ? 'planning'
         : input.status === 'running' ? 'running_model' : input.status
       lifecycles.set(input.id, {
-        execution: { id: input.executionId, generation: 1, status: executionStatus, createdAt: input.createdAt, updatedAt: input.createdAt },
+        execution: {
+          id: input.executionId, generation: 1, status: executionStatus,
+          terminal: isTerminalAgentExecutionStatus(executionStatus),
+          createdAt: input.createdAt, updatedAt: input.createdAt,
+        },
         waitReason: executionStatus === 'planning'
           ? { kind: 'database', target: '研究规划', startedAt: input.createdAt }
           : { kind: 'database', target: '模型响应', startedAt: input.createdAt },
@@ -552,7 +604,11 @@ export function createTestProductDatabase() {
         const waitKind = ({ planning: 'database', running_model: 'model', running_tools: 'tools', waiting_for_specialists: 'specialists', finalizing: 'finalizing' } as const)[status as 'planning']
         lifecycles.set(input.sessionId, {
           ...lifecycle,
-          execution: { ...lifecycle.execution, status, updatedAt: input.createdAt },
+          execution: {
+            ...lifecycle.execution, status,
+            terminal: input.projection.terminal ?? isTerminalAgentExecutionStatus(status),
+            updatedAt: input.createdAt,
+          },
           waitReason: waitKind ? { kind: waitKind as 'database', target: input.projection.waitTarget ?? ({ planning: '研究规划', running_model: '主模型响应', running_tools: '工具结果', waiting_for_specialists: '专项分析', finalizing: '报告收口' } as Record<string, string>)[status], startedAt: input.createdAt } : null as never,
         })
       }
@@ -657,7 +713,9 @@ export function createTestProductDatabase() {
         })
         lifecycles.set(id, {
           ...lifecycle,
-          execution: { ...lifecycle.execution, status: 'interrupted', updatedAt: createdAt },
+          execution: {
+            ...lifecycle.execution, status: 'interrupted', terminal: true, updatedAt: createdAt,
+          },
           waitReason: null as never,
         })
         if (session.isPrimary) {
@@ -878,7 +936,7 @@ export function createTestProductDatabase() {
 
   return {
     productDatabase: {
-      checkSchema: async () => ({ status: 'ok' as const, version: 22 }),
+      checkSchema: async () => ({ status: 'ok' as const, version: 24 }),
       close: async () => {},
     },
     portfolioRepository,

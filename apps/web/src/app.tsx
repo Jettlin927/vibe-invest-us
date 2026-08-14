@@ -114,6 +114,7 @@ export function App() {
   const [analysisStatus, setAnalysisStatus] = useState('')
   const [analysisStages, setAnalysisStages] = useState<string[]>([])
   const [activeAnalysisId, setActiveAnalysisId] = useState<string | null>(null)
+  const [deletingResearchId, setDeletingResearchId] = useState<string | null>(null)
   const [error, setError] = useState('')
 
   async function loadPortfolio() {
@@ -347,10 +348,21 @@ export function App() {
     await loadResearch()
   }
   async function removeResearch() {
-    if (!selectedResearch) return
-    await fetch(`/api/research/${selectedResearch.id}`, { method: 'DELETE' })
-    setSelectedResearch(null)
-    await loadResearch()
+    if (!selectedResearch || deletingResearchId) return
+    const id = selectedResearch.id
+    setError('')
+    setDeletingResearchId(id)
+    try {
+      const response = await fetch(`/api/research/${id}`, { method: 'DELETE' })
+      if (!response.ok) {
+        setError(`研究删除失败：HTTP ${response.status}`)
+        return
+      }
+      setSelectedResearch(null)
+      await loadResearch()
+    } finally {
+      setDeletingResearchId(null)
+    }
   }
   function navigate(next: Page) { setPage(next); window.scrollTo({ top: 0, behavior: 'smooth' }) }
 
@@ -364,7 +376,7 @@ export function App() {
       {error && <p role="alert" className="error-banner">{error}</p>}
       {page === 'overview' && <Overview records={records} selected={selectedResearch} positions={positions} health={health} modelConfigured={modelConfigured} onNavigate={navigate} onOpen={async (id) => { await openResearch(id); navigate('research') }} />}
       {page === 'analysis' && <AnalysisPage symbol={analysisSymbol} setSymbol={setAnalysisSymbol} status={analysisStatus} stages={analysisStages} active={Boolean(activeAnalysisId)} onStart={startAnalysis} onCancel={cancelAnalysis} health={health} modelConfigured={modelConfigured} records={records} onOpen={async (id) => { await openResearch(id); navigate('research') }} />}
-      {page === 'research' && <ResearchPage records={records} record={selectedResearch} onOpen={openResearch} onUpdate={updateResearch} onDelete={removeResearch} onResume={resumeResearch} onFollowUp={sendFollowUp} onReanalyze={reanalyzeResearch} freshnessDays={runtimeSettings?.current.values.reportFreshnessDays ?? null} />}
+      {page === 'research' && <ResearchPage records={records} record={selectedResearch} onOpen={openResearch} onUpdate={updateResearch} onDelete={removeResearch} deleting={deletingResearchId === selectedResearch?.id} onResume={resumeResearch} onFollowUp={sendFollowUp} onReanalyze={reanalyzeResearch} freshnessDays={runtimeSettings?.current.values.reportFreshnessDays ?? null} />}
       {page === 'portfolio' && <PortfolioPage portfolio={portfolio} history={portfolioHistory} onSave={savePosition} onSaveCash={saveCash} onReduce={reducePosition} onDelete={removePosition} />}
       {page === 'settings' && <SettingsPage health={health} modelConfigured={modelConfigured} settings={runtimeSettings} onReload={loadSettings} />}
     </main>
@@ -412,9 +424,10 @@ function AnalysisPage({ symbol, setSymbol, status, stages, active, onStart, onCa
   </>
 }
 
-function ResearchPage({ records, record, onOpen, onUpdate, onDelete, onResume, onFollowUp, onReanalyze, freshnessDays }: {
+function ResearchPage({ records, record, onOpen, onUpdate, onDelete, deleting, onResume, onFollowUp, onReanalyze, freshnessDays }: {
   records: ResearchSummary[]; record: ResearchRecord | null; onOpen: (id: string) => Promise<void>
   onUpdate: (event: React.FormEvent<HTMLFormElement>) => Promise<void>; onDelete: () => Promise<void>
+  deleting: boolean
   onResume: () => Promise<void>
   onFollowUp: (event: React.FormEvent<HTMLFormElement>) => Promise<void>
   onReanalyze: () => Promise<void>
@@ -424,7 +437,7 @@ function ResearchPage({ records, record, onOpen, onUpdate, onDelete, onResume, o
     <PageHeader eyebrow="RESEARCH ARCHIVE" title="研究记录" description="每份报告都绑定当时的数据快照、来源和分析轨迹，结论变化也有迹可循。" />
     <div className="research-layout">
       <aside className="research-index"><p className="micro">全部记录 · {records.length}</p>{records.map((item) => <button className={record?.id === item.id ? 'active' : ''} key={item.id} onClick={() => void onOpen(item.id)}><strong>{item.symbol}</strong><span>{item.report?.title ?? statusLabel(item.status)}</span><small>{item.starred ? `已标记 · ${statusLabel(item.status)}` : statusLabel(item.status)}</small></button>)}</aside>
-      <ResearchReport record={record} onUpdate={onUpdate} onDelete={onDelete} onResume={onResume} onFollowUp={onFollowUp} onReanalyze={onReanalyze} freshnessDays={freshnessDays} />
+      <ResearchReport record={record} onUpdate={onUpdate} onDelete={onDelete} deleting={deleting} onResume={onResume} onFollowUp={onFollowUp} onReanalyze={onReanalyze} freshnessDays={freshnessDays} />
       <div><TokenUsageDashboard record={record} /><AgentRuntime agent={record?.mainAgent} /><SpecialistAgents agents={record?.specialistAgents} /><TraceSummary trace={record?.trace ?? []} /></div>
     </div>
   </>
@@ -658,8 +671,9 @@ function CompactionAttempts({ attempts = [] }: {
   </li>)}</ol>
 }
 
-function ResearchReport({ record, onUpdate, onDelete, onResume, onFollowUp, onReanalyze, freshnessDays }: {
+function ResearchReport({ record, onUpdate, onDelete, deleting, onResume, onFollowUp, onReanalyze, freshnessDays }: {
   record: ResearchRecord | null; onUpdate: (event: React.FormEvent<HTMLFormElement>) => Promise<void>; onDelete: () => Promise<void>
+  deleting: boolean
   onResume: () => Promise<void>
   onFollowUp: (event: React.FormEvent<HTMLFormElement>) => Promise<void>
   onReanalyze: () => Promise<void>
@@ -734,7 +748,7 @@ function ResearchReport({ record, onUpdate, onDelete, onResume, onFollowUp, onRe
       {stale && <p className="data-warning">当前报告可能过期，追问会同时提供报告时与当前持仓语境。</p>}
       <button type="submit">发送追问</button>
     </form>
-    <form className="research-meta" onSubmit={(event) => void onUpdate(event)}><label><input type="checkbox" name="starred" defaultChecked={record.starred} /> 标记这份研究</label><label>个人备注<textarea name="note" defaultValue={record.note ?? ''} /></label><div><button type="submit">保存备注</button>{isTerminalAgentExecutionStatus(record.status, record.terminal) && <button type="button" className="quiet" onClick={() => void onReanalyze()}>重新分析 {record.symbol}</button>}{['stopped', 'interrupted'].includes(record.status) && <button type="button" className="quiet" onClick={() => void onResume()}>恢复研究</button>}<button type="button" className="quiet danger" onClick={() => void onDelete()}>删除记录</button></div></form>
+    <form className="research-meta" onSubmit={(event) => void onUpdate(event)}><label><input type="checkbox" name="starred" defaultChecked={record.starred} /> 标记这份研究</label><label>个人备注<textarea name="note" defaultValue={record.note ?? ''} /></label><div><button type="submit">保存备注</button>{isTerminalAgentExecutionStatus(record.status, record.terminal) && <button type="button" className="quiet" onClick={() => void onReanalyze()}>重新分析 {record.symbol}</button>}{['stopped', 'interrupted'].includes(record.status) && <button type="button" className="quiet" onClick={() => void onResume()}>恢复研究</button>}<button type="button" className="quiet danger" disabled={deleting} onClick={() => void onDelete()}>{deleting ? '正在删除…' : '删除记录'}</button></div></form>
   </article>
 }
 

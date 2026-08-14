@@ -77,7 +77,7 @@ function specialistResults(context: { messages: Array<{
   })
 }
 
-test('真实 v12 历史 Tool 事件升级到 v23 后经 DAO、HTTP 与 SSE 原样读取', {
+test('真实 v12 历史 Tool 事件升级到 v24 后经 DAO、HTTP 与 SSE 原样读取', {
   skip: !databaseUrl || !migrationDatabaseUrl,
   concurrency: false,
 }, async () => {
@@ -217,6 +217,11 @@ test('真实 PostgreSQL 在模型槽等待取消时不留下 phantom model reque
     assert.equal(providerCalls, 0)
     assert.deepEqual((await projections.replay(executionId)).modelRequests, [])
   } finally {
+    await pool.query(
+      `UPDATE agent_executions SET status = 'stopped', terminal = true, updated_at = now()
+       WHERE id = $1`,
+      [executionId],
+    )
     await analyses.removeResearch(analysisId)
     await pool.end()
   }
@@ -2385,6 +2390,76 @@ test('同一主 execution 跨 Turn 复用长期专项 Session 并生成精确 V2
     assert.equal((await events.list(created.sessionId, 0)).filter(
       ({ operationId }) => operationId === replay.operationId,
     ).length, 1)
+  } finally {
+    await app.close()
+  }
+})
+
+test('运行中研究经真实 PostgreSQL、HTTP 与 SSE 先停止整树再同步硬删除', {
+  skip: !databaseUrl || !migrationDatabaseUrl,
+  concurrency: false,
+}, async () => {
+  await migrate(migrationDatabaseUrl!)
+  const pool = createPool(databaseUrl!)
+  const events = createAgentEventRepository(pool)
+  const analyses = createAnalysisRepository(pool)
+  let modelStarted!: () => void
+  const started = new Promise<void>((resolve) => { modelStarted = resolve })
+  let aborted = false
+  let settled = false
+  const app = buildApp({
+    productDatabase: { checkSchema: () => checkSchema(pool), close: () => pool.end() },
+    portfolioRepository: createPortfolioRepository(pool), analysisRepository: analyses,
+    agentEventRepository: events, runtimeSettingsRepository: createRuntimeSettingsRepository(pool),
+    toolProjectionRepository: createToolProjectionRepository(pool),
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, gaps: [], facts: [] }),
+    model: {
+      async *analyze(input: { signal?: AbortSignal }): AsyncGenerator<ModelEvent> {
+        modelStarted()
+        await new Promise<void>((resolve) => input.signal?.addEventListener('abort', () => {
+          aborted = true
+          resolve()
+        }, { once: true }))
+        await new Promise((resolve) => setTimeout(resolve, 10))
+        settled = true
+        yield { type: 'cancelled' }
+      },
+    },
+  })
+  await app.listen({ host: '127.0.0.1', port: 0 })
+  const address = app.server.address()
+  assert.ok(address && typeof address === 'object')
+  const baseUrl = `http://127.0.0.1:${address.port}`
+  const created = await fetch(`${baseUrl}/api/analyses`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ symbol: 'PGDELETE' }),
+  }).then((response) => response.json()) as {
+    analysisId: string; sessionId: string; executionId: string
+  }
+  try {
+    await started
+    const stream = await fetch(`${baseUrl}/api/agent-sessions/${created.sessionId}/events`)
+    const reader = stream.body!.getReader()
+    const deletion = fetch(`${baseUrl}/api/research/${created.analysisId}`, { method: 'DELETE' })
+    const replay = await readThroughReader(reader, 'event: stopped')
+    const response = await deletion
+    assert.equal(response.status, 204)
+    assert.equal(aborted, true)
+    assert.equal(settled, true)
+    assertSubsequence(eventTypes(replay), ['stopping', 'stopped'])
+    assert.equal((await fetch(`${baseUrl}/api/research/${created.analysisId}`)).status, 404)
+    assert.equal(await events.getSession(created.sessionId), null)
+    assert.deepEqual((await pool.query<{ count: number }>(
+      'SELECT count(*)::integer AS count FROM analysis_deletion_tombstones WHERE analysis_id = $1',
+      [created.analysisId],
+    )).rows, [{ count: 1 }])
+    await assert.rejects(events.append({
+      sessionId: created.sessionId, executionId: created.executionId,
+      operationId: 'late-after-http-delete', event: { type: 'model_event' },
+      createdAt: new Date().toISOString(),
+    }), /agent_execution_fenced|agent_session_not_found/)
+    await reader.cancel()
   } finally {
     await app.close()
   }

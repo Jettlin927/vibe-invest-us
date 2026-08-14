@@ -12,6 +12,23 @@ import {
 const migrationUrl = process.env.TEST_MIGRATION_DATABASE_URL
 const applicationUrl = process.env.TEST_DATABASE_URL
 
+async function removeResearchFixture(pool: Pool, analysisId: string) {
+  await pool.query(
+    `UPDATE agent_executions execution
+     SET status = 'stopped', terminal = true, updated_at = now()
+     FROM agent_sessions session
+     WHERE execution.session_id = session.id
+       AND session.analysis_id = $1 AND execution.terminal = false`,
+    [analysisId],
+  )
+  await pool.query(
+    `UPDATE agent_sessions SET status = 'stopped', updated_at = now()
+     WHERE analysis_id = $1`,
+    [analysisId],
+  )
+  return createAnalysisRepository(pool).removeResearch(analysisId)
+}
+
 test('真实 PostgreSQL 持久化 Tool Projection 版本、模型请求与批次边界并可重放', {
   skip: !migrationUrl || !applicationUrl,
   concurrency: false,
@@ -293,8 +310,8 @@ test('真实 PostgreSQL 持久化 Tool Projection 版本、模型请求与批次
       turnIndex: 1, calls: [], createdAt: '2026-08-13T04:00:11.000Z',
     }), /foreign key constraint/)
   } finally {
-    await createAnalysisRepository(pool).removeResearch(otherAnalysisId)
-    await createAnalysisRepository(pool).removeResearch(analysisId)
+    await removeResearchFixture(pool, otherAnalysisId)
+    await removeResearchFixture(pool, analysisId)
     await pool.end()
   }
 })
@@ -374,7 +391,7 @@ test('真实 PostgreSQL 保存 Provider attempt 四类 Token、状态和 coverag
       input: 110, cacheRead: 22, cacheWrite: 6, output: 13, total: 234,
     })
   } finally {
-    await createAnalysisRepository(pool).removeResearch(analysisId)
+    await removeResearchFixture(pool, analysisId)
     await pool.end()
   }
 })
@@ -425,7 +442,7 @@ test('真实 PostgreSQL 模型 attempt 在 execution 终态后仍可精确重放
       ...completion, usage: { ...completion.usage, output: 4, total: 17 },
     }), /model_request_conflict/)
   } finally {
-    await createAnalysisRepository(pool).removeResearch(analysisId)
+    await removeResearchFixture(pool, analysisId)
     await pool.end()
   }
 })
@@ -468,11 +485,11 @@ test('真实 PostgreSQL v21 经当前迁移将未终态模型请求封存为 out
     assert.deepEqual(lifecycle?.modelAttempts[0]?.usage, {
       input: null, cacheRead: null, cacheWrite: null, output: null, total: null,
     })
-    assert.deepEqual(await checkSchema(appPool), { status: 'ok', version: 23 })
+    assert.deepEqual(await checkSchema(appPool), { status: 'ok', version: 24 })
   } finally {
-    await createAnalysisRepository(appPool).removeResearch(analysisId)
+    await removeResearchFixture(appPool, analysisId)
     await migrationPool.query(
-      `INSERT INTO product_schema_migrations (version) VALUES (22), (23)
+      `INSERT INTO product_schema_migrations (version) VALUES (22), (23), (24)
        ON CONFLICT DO NOTHING`,
     )
     await appPool.end()
@@ -506,7 +523,7 @@ test('真实 PostgreSQL v22 接受技术面 Tool Projection 角色', {
       createdAt: '2026-08-14T00:00:01.000Z',
     })
     assert.equal(projection.role, 'technical')
-    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 23 })
+    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 24 })
   } finally {
     const cleanup = createPool(migrationUrl!)
     await cleanup.query('DELETE FROM analyses WHERE id = $1', [analysisId])
@@ -594,7 +611,7 @@ test('真实 PostgreSQL execution 终态事务会取消未完成 Tool Batch', {
       completedAt: '2026-08-13T04:10:04.000Z',
     }), /tool_batch_completion_conflict/)
   } finally {
-    await createAnalysisRepository(pool).removeResearch(analysisId)
+    await removeResearchFixture(pool, analysisId)
     await pool.end()
   }
 })
@@ -712,7 +729,7 @@ test('真实 PostgreSQL 主与专项 execution 创建时原子冻结 settings sn
     assert.equal(await settings.getExecutionSnapshot('settings-snapshot-rollback-execution'), null)
   } finally {
     await migrationPool.query('GRANT INSERT ON execution_settings_snapshots TO vibe_invest_app')
-    await createAnalysisRepository(pool).removeResearch(analysisId)
+    await removeResearchFixture(pool, analysisId)
     await migrationPool.end()
     await pool.end()
   }
@@ -794,7 +811,7 @@ test('真实 PostgreSQL 原子创建主 Session、execution generation、初始 
       [`budget-terminal-${crypto.randomUUID()}`, sessionId, createdAt],
     )
   } finally {
-    await createAnalysisRepository(pool).removeResearch(analysisId)
+    await removeResearchFixture(pool, analysisId)
     await pool.end()
   }
 })
@@ -877,7 +894,7 @@ test('真实 PostgreSQL 原子保存 Compaction 事件、usage 与链接的新 s
     assert.deepEqual(row.rows[0]?.summary_json, input.summary)
     assert.deepEqual(row.rows[0]?.usage_json, input.usage)
   } finally {
-    await createAnalysisRepository(pool).removeResearch(analysisId)
+    await removeResearchFixture(pool, analysisId)
     await pool.end()
   }
 })
@@ -930,7 +947,7 @@ test('真实 PostgreSQL tree fence 原子封存进行中的 Compaction attempt �
       createdAt: '2026-08-14T02:00:02.250Z',
     }), /agent_execution_fenced/)
   } finally {
-    await createAnalysisRepository(pool).removeResearch(analysisId)
+    await removeResearchFixture(pool, analysisId)
     await pool.end()
   }
 })
@@ -976,7 +993,7 @@ test('真实 PostgreSQL tree fence 与启动中断分别封存模型 attempt 为
     }])
     assert.equal(stopped?.tokenUsage.coverage, 0)
   } finally {
-    await createAnalysisRepository(pool).removeResearch(analysisId)
+    await removeResearchFixture(pool, analysisId)
     await pool.end()
   }
 })
@@ -1035,7 +1052,7 @@ test('真实 PostgreSQL 手动恢复复用主 Session 并原子创建新 generat
       createdAt: '2026-08-13T03:30:03.000Z',
     }), /analysis_not_resumable/)
   } finally {
-    await createAnalysisRepository(pool).removeResearch(analysisId)
+    await removeResearchFixture(pool, analysisId)
     await pool.end()
   }
 })
@@ -1108,7 +1125,7 @@ test('真实 PostgreSQL primaryLifecycle 在并发状态写入期间只返回同
     assert.equal(lastStatus, 'planning')
   } finally {
     continueRead()
-    await createAnalysisRepository(pool).removeResearch(analysisId)
+    await removeResearchFixture(pool, analysisId)
     await pool.end()
   }
 })
@@ -1213,7 +1230,7 @@ test('真实 PostgreSQL execution fence 先于既有 operationId 幂等判定', 
     assert.deepEqual(await events.list(sessionId, 0), before)
     assert.deepEqual(await events.primaryLifecycle(analysisId), lifecycleBefore)
   } finally {
-    await analyses.removeResearch(analysisId)
+    await removeResearchFixture(pool, analysisId)
     await pool.end()
   }
 })
@@ -1318,7 +1335,7 @@ test('真实 PostgreSQL 停止主 Session 时原子 fence 整棵专项树', {
     }), { sessionId: specialistSessionId, executionId: specialistExecutionId, created: false })
     assert.equal((await events.listSessions(analysisId)).length, 2)
   } finally {
-    await analyses.removeResearch(analysisId)
+    await removeResearchFixture(pool, analysisId)
     await pool.end()
   }
 })
@@ -1369,7 +1386,7 @@ test('真实 PostgreSQL 树级 fence 与并发专项创建按 analysis 行锁串
   } finally {
     await blocker.query('ROLLBACK').catch(() => undefined)
     blocker.release()
-    await analyses.removeResearch(analysisId)
+    await removeResearchFixture(pool, analysisId)
     await pool.end()
   }
 })
@@ -1415,7 +1432,7 @@ test('真实 PostgreSQL 树级 fence 与主 Session append 使用同一锁序', 
   } finally {
     await blocker.query('ROLLBACK').catch(() => undefined)
     blocker.release()
-    await analyses.removeResearch(analysisId)
+    await removeResearchFixture(pool, analysisId)
     await pool.end()
   }
 })
@@ -1488,7 +1505,7 @@ test('真实 PostgreSQL 树级 fence 与带事实的 Tool Batch 完成使用同�
   } finally {
     await blocker.query('ROLLBACK').catch(() => undefined)
     blocker.release()
-    await analyses.removeResearch(analysisId)
+    await removeResearchFixture(pool, analysisId)
     await pool.end()
   }
 })
@@ -1544,7 +1561,7 @@ test('真实 PostgreSQL 树级 fence 与无批次因果 Projection 使用同一�
   } finally {
     await blocker.query('ROLLBACK').catch(() => undefined)
     blocker.release()
-    await analyses.removeResearch(analysisId)
+    await removeResearchFixture(pool, analysisId)
     await pool.end()
   }
 })
@@ -1612,7 +1629,7 @@ test('真实 PostgreSQL migration 幂等且 application role 没有 DDL 权限',
   await migrate(migrationUrl!)
 
   const pool = createPool(applicationUrl!)
-  assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 23 })
+  assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 24 })
   const privileges = await pool.query<{ can_create: boolean; can_temp: boolean }>(
     `SELECT has_schema_privilege(current_user, 'public', 'CREATE') AS can_create,
             has_database_privilege(current_user, current_database(), 'TEMP') AS can_temp`,
@@ -1669,7 +1686,7 @@ test('真实 PostgreSQL migration receipt 为空时按 max=0 升级', {
     )
     await pool.query('DELETE FROM product_schema_migrations')
     await migrate(migrationUrl!)
-    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 23 })
+    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 24 })
     assert.deepEqual((await pool.query<{ sequence: number; provenance: string }>(
       `SELECT sequence, provenance FROM tool_event_migration_provenance WHERE session_id = $1`,
       [sessionId],
@@ -1736,23 +1753,23 @@ test('真实 PostgreSQL 拒绝未来 schema 且不修改数据库', {
   })
   try {
     await pool.query('DROP TABLE tool_event_migration_provenance')
-    await pool.query('INSERT INTO product_schema_migrations (version) VALUES (24)')
+    await pool.query('INSERT INTO product_schema_migrations (version) VALUES (25)')
     const before = await fingerprint()
 
     await assert.rejects(
       migrate(migrationUrl!),
-      /product_schema_future_version_unsupported:24/,
+      /product_schema_future_version_unsupported:25/,
     )
 
     assert.deepEqual(await fingerprint(), before)
   } finally {
-    await pool.query('DELETE FROM product_schema_migrations WHERE version = 24')
+    await pool.query('DELETE FROM product_schema_migrations WHERE version = 25')
     await migrate(migrationUrl!)
     await pool.end()
   }
 })
 
-test('真实 PostgreSQL v12 无 Tool Batch 的历史工具事件原样升级到 v23', {
+test('真实 PostgreSQL v12 无 Tool Batch 的历史工具事件原样升级到 v24', {
   skip: !migrationUrl,
   concurrency: false,
 }, async () => {
@@ -1796,7 +1813,7 @@ test('真实 PostgreSQL v12 无 Tool Batch 的历史工具事件原样升级到 
 
     await migrate(migrationUrl!)
 
-    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 23 })
+    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 24 })
     assert.deepEqual((await pool.query<{ sequence: number; provenance: string }>(
       `SELECT sequence, provenance FROM tool_event_migration_provenance
        WHERE session_id = $1 ORDER BY sequence`, [sessionId],
@@ -1947,6 +1964,170 @@ test('真实 PostgreSQL 研究 DAO 保存任务、事实、轨迹并安全删除
   }
 })
 
+test('真实 PostgreSQL 硬删除完整研究树、保留共享事实并以 tombstone 拒绝复活', {
+  skip: !migrationUrl || !applicationUrl,
+  concurrency: false,
+}, async () => {
+  await migrate(migrationUrl!)
+  const pool = createPool(applicationUrl!)
+  const analyses = createAnalysisRepository(pool)
+  const events = createAgentEventRepository(pool)
+  const projections = createToolProjectionRepository(pool)
+  const suffix = crypto.randomUUID()
+  const analysisId = `hard-delete-${suffix}`
+  const sharedAnalysisId = `hard-delete-shared-${suffix}`
+  const sessionId = `${analysisId}:main`
+  const specialistSessionId = `${analysisId}:news`
+  const executionId = `${sessionId}:execution`
+  const specialistExecutionId = `${specialistSessionId}:execution`
+  const sharedFactId = `${analysisId}:shared-fact`
+  const exclusiveFactId = `${analysisId}:exclusive-fact`
+  const createdAt = '2026-08-14T14:00:00.000Z'
+  try {
+    await analyses.createOrReturn({
+      id: sharedAnalysisId, symbol: `S${suffix.slice(0, 8)}`, status: 'completed',
+      createdAt, updatedAt: createdAt,
+    })
+    await events.createResearch({
+      analysisId, sessionId, executionId, segmentId: `${sessionId}:segment:1`,
+      symbol: `D${suffix.slice(0, 8)}`, status: 'planning', analysisStatus: 'running',
+      operationId: 'hard-delete-runtime-context',
+      event: { type: 'runtime_context', privateContext: '不得保留' }, createdAt,
+    })
+    await events.createSpecialistSession({
+      id: specialistSessionId, analysisId, domain: 'news', executionId: specialistExecutionId,
+      status: 'planning', operationId: 'hard-delete-news-context',
+      event: { type: 'specialist_context', domain: 'news' }, createdAt,
+    })
+    await analyses.saveFact(analysisId, { id: sharedFactId, type: 'quote', value: 100 })
+    await analyses.saveFact(sharedAnalysisId, { id: sharedFactId, type: 'quote', value: 100 })
+    await analyses.saveFact(analysisId, { id: exclusiveFactId, type: 'quote', value: 101 })
+    await analyses.appendTrace(analysisId, { type: 'runtime_context', privateContext: '不得保留' })
+    await analyses.saveSnapshot(analysisId, { symbol: 'DELETE', privateContext: '不得保留' })
+
+    const projection = await projections.ensureVersion({
+      executionId, role: 'main', stage: 'research', schemaHash: 'hard-delete-tools',
+      projectedTools: [{ name: 'fetch_financial_context' }],
+      visibleToolNames: ['fetch_financial_context'], reasons: { stage: 'research' }, createdAt,
+    })
+    await projections.recordModelRequest({
+      id: `${executionId}:request:1`, executionId, projectionId: projection.id,
+      turnIndex: 1, createdAt,
+    })
+    await projections.completeModelRequest({
+      id: `${executionId}:request:1`, executionId, status: 'completed',
+      usageStatus: 'complete',
+      usage: { input: 10, cacheRead: 0, cacheWrite: 0, output: 5, total: 15 },
+      completedAt: '2026-08-14T14:00:01.000Z',
+    })
+    const batchId = `${executionId}:batch:1`
+    await projections.beginToolBatch({
+      id: batchId, executionId, projectionId: projection.id, turnIndex: 1,
+      calls: [{ toolCallId: 'hard-delete-call', toolName: 'fetch_financial_context', position: 1 }],
+      createdAt,
+    })
+    await projections.startToolCall({
+      batchId, executionId, toolCallId: 'hard-delete-call',
+      operationId: 'hard-delete-call-start',
+      eventPayload: { type: 'tool_call', name: 'fetch_financial_context' }, startedAt: createdAt,
+    })
+    await projections.completeToolBatch({
+      id: batchId, executionId, completedAt: '2026-08-14T14:00:01.000Z', results: [{
+        toolCallId: 'hard-delete-call', status: 'completed', startedAt: createdAt,
+        completedAt: '2026-08-14T14:00:01.000Z', completionOrder: 1,
+        resultPayload: { facts: [{ id: exclusiveFactId, type: 'quote', value: 101 }] },
+        operationId: 'hard-delete-call-result',
+        eventPayload: { type: 'tool_result', name: 'fetch_financial_context' },
+      }],
+    })
+    await events.commitCompaction({
+      id: `${executionId}:compaction:1`, executionId,
+      segmentId: `${sessionId}:segment:2`, operationId: 'hard-delete-compaction',
+      event: { type: 'compaction', status: 'completed' },
+      contextTokens: 100, contextWindow: 1000, reserveTokens: 100,
+      keepRecentTokens: 100, tokensAfter: 50,
+      summary: { goal: '硬删除验证' }, usage: { totalTokens: 3 },
+      attempts: [{ attempt: 1, status: 'completed', durationMs: 5, usage: { totalTokens: 3 } }],
+      createdAt: '2026-08-14T14:00:02.000Z',
+    })
+    await assert.rejects(analyses.removeResearch(analysisId), /analysis_not_stopped/)
+    assert.deepEqual((await pool.query<{ count: number }>(
+      'SELECT count(*)::integer AS count FROM analysis_deletion_tombstones WHERE analysis_id = $1',
+      [analysisId],
+    )).rows, [{ count: 0 }])
+    await events.append({
+      sessionId: specialistSessionId, executionId: specialistExecutionId,
+      operationId: 'hard-delete-news-completed',
+      event: { type: 'status', status: 'completed', terminal: true },
+      projection: { status: 'completed', executionStatus: 'completed', terminal: true },
+      createdAt: '2026-08-14T14:00:02.500Z',
+    })
+    const report = { kind: 'integrated', title: '待硬删除报告' }
+    await events.append({
+      sessionId, executionId, operationId: 'hard-delete-completed',
+      event: { type: 'status', status: 'completed', terminal: true },
+      projection: {
+        status: 'completed', executionStatus: 'completed', terminal: true,
+        report, snapshot: { symbol: 'DELETE', privateContext: '不得保留' },
+        reportVersion: {
+          id: `${executionId}:report:1`, kind: 'integrated', payloadHash: 'd'.repeat(64),
+          report, snapshot: { symbol: 'DELETE', privateContext: '不得保留' },
+        },
+      },
+      createdAt: '2026-08-14T14:00:03.000Z',
+    })
+
+    assert.equal(await analyses.removeResearch(analysisId), true)
+    const counts = await pool.query<Record<string, number>>(
+      `SELECT
+         (SELECT count(*)::integer FROM analyses WHERE id = $1) AS analyses,
+         (SELECT count(*)::integer FROM analysis_facts WHERE analysis_id = $1) AS facts,
+         (SELECT count(*)::integer FROM analysis_trace WHERE analysis_id = $1) AS trace,
+         (SELECT count(*)::integer FROM agent_sessions WHERE analysis_id = $1) AS sessions,
+         (SELECT count(*)::integer FROM agent_executions WHERE id = ANY($2::text[])) AS executions,
+         (SELECT count(*)::integer FROM conversation_segments WHERE session_id = ANY($3::text[])) AS segments,
+         (SELECT count(*)::integer FROM agent_events WHERE session_id = ANY($3::text[])) AS events,
+         (SELECT count(*)::integer FROM execution_settings_snapshots WHERE execution_id = ANY($2::text[])) AS settings,
+         (SELECT count(*)::integer FROM tool_projection_versions WHERE execution_id = ANY($2::text[])) AS projections,
+         (SELECT count(*)::integer FROM model_requests WHERE execution_id = ANY($2::text[])) AS requests,
+         (SELECT count(*)::integer FROM tool_call_batches WHERE execution_id = ANY($2::text[])) AS batches,
+         (SELECT count(*)::integer FROM tool_batch_calls WHERE batch_id = $4) AS calls,
+         (SELECT count(*)::integer FROM agent_compactions WHERE session_id = ANY($3::text[])) AS compactions,
+         (SELECT count(*)::integer FROM agent_compaction_attempts WHERE session_id = ANY($3::text[])) AS attempts,
+         (SELECT count(*)::integer FROM report_versions WHERE analysis_id = $1) AS reports,
+         (SELECT count(*)::integer FROM analysis_deletion_tombstones WHERE analysis_id = $1) AS tombstones`,
+      [analysisId, [executionId, specialistExecutionId], [sessionId, specialistSessionId], batchId],
+    )
+    assert.deepEqual(counts.rows[0], {
+      analyses: 0, facts: 0, trace: 0, sessions: 0, executions: 0, segments: 0, events: 0,
+      settings: 0, projections: 0, requests: 0, batches: 0, calls: 0,
+      compactions: 0, attempts: 0,
+      reports: 0, tombstones: 1,
+    })
+    assert.deepEqual((await pool.query<{ id: string }>(
+      'SELECT id FROM atomic_facts WHERE id = ANY($1::text[]) ORDER BY id',
+      [[sharedFactId, exclusiveFactId]],
+    )).rows, [{ id: sharedFactId }])
+    await assert.rejects(
+      pool.query('DELETE FROM analysis_deletion_tombstones WHERE analysis_id = $1', [analysisId]),
+      /permission denied/,
+    )
+    await assert.rejects(events.append({
+      sessionId, executionId, operationId: 'hard-delete-late-write',
+      event: { type: 'model_event' }, createdAt: '2026-08-14T14:00:04.000Z',
+    }), /agent_execution_fenced|agent_session_not_found/)
+    await assert.rejects(events.createResearch({
+      analysisId, sessionId: `${sessionId}:recreated`, executionId: `${executionId}:recreated`,
+      symbol: `D${suffix.slice(0, 8)}`, status: 'planning',
+      operationId: 'hard-delete-recreated', event: { type: 'runtime_context' }, createdAt,
+    }), /analysis_deleted/)
+  } finally {
+    await removeResearchFixture(pool, analysisId)
+    await removeResearchFixture(pool, sharedAnalysisId)
+    await pool.end()
+  }
+})
+
 test('真实 PostgreSQL v9 按报告完成事件回填 reportCreatedAt 且无事件时回退更新时间', {
   skip: !migrationUrl || !applicationUrl,
   concurrency: false,
@@ -2088,7 +2269,7 @@ test('真实 PostgreSQL Agent Session 事件 sequence 严格递增且 operationI
   const events = createAgentEventRepository(pool)
   const sessionId = 'agent-event-ledger-session'
   try {
-    await analyses.removeResearch(sessionId)
+    await removeResearchFixture(pool, sessionId)
     const now = '2026-08-13T00:00:00.000Z'
     const created = await events.createResearch({
       analysisId: sessionId,
@@ -2150,7 +2331,7 @@ test('真实 PostgreSQL Agent Session 事件 sequence 严格递增且 operationI
       /permission denied/,
     )
   } finally {
-    await analyses.removeResearch(sessionId)
+    await removeResearchFixture(pool, sessionId)
     await pool.end()
   }
 })
@@ -2210,11 +2391,11 @@ test('真实 PostgreSQL 仅为通过校验的报告原子生成不可变版本',
     await migrationPool.query(
       'UPDATE report_versions SET snapshot_json = NULL WHERE analysis_id = $1', [analysisId],
     )
-    await migrationPool.query('DELETE FROM product_schema_migrations WHERE version = 23')
+    await migrationPool.query('DELETE FROM product_schema_migrations WHERE version >= 23')
     await migrate(migrationUrl!)
     assert.deepEqual((await events.listReportVersions(analysisId))[0]?.snapshot, snapshot)
   } finally {
-    await analyses.removeResearch(analysisId)
+    await removeResearchFixture(pool, analysisId)
     await pool.end()
     await migrationPool.end()
   }
@@ -2296,7 +2477,7 @@ test('真实 PostgreSQL 原子创建主 Agent 追问 execution 并按消息 ID �
       createdAt: '2026-08-14T12:03:00.000Z',
     }), /analysis_resume_required/)
   } finally {
-    await analyses.removeResearch(analysisId)
+    await removeResearchFixture(pool, analysisId)
     await pool.end()
   }
 })
@@ -2336,7 +2517,7 @@ test('真实 PostgreSQL 事件与 Session 读取投影在投影失败时一起�
     assert.equal((await analyses.get(sessionId))?.status, 'queued')
     assert.deepEqual((await analyses.research(sessionId))?.facts, [])
   } finally {
-    await analyses.removeResearch(sessionId)
+    await removeResearchFixture(pool, sessionId)
     await pool.end()
   }
 })
@@ -2391,7 +2572,7 @@ test('真实 PostgreSQL 同一 analysis 可拥有多个独立 Agent Session 账�
         session.isPrimary ? [1] : [1, 2])
     }
   } finally {
-    await analyses.removeResearch(analysisId)
+    await removeResearchFixture(pool, analysisId)
     await pool.end()
   }
 })
@@ -2462,7 +2643,7 @@ test('真实 PostgreSQL 每个研究只允许一个长期消息面 Session', {
     assert.equal((await events.sessionLifecycle(first.sessionId))?.execution.generation, 2)
     assert.equal((await events.listSessions(analysisId)).filter(({ isPrimary }) => !isPrimary).length, 1)
   } finally {
-    await analyses.removeResearch(analysisId)
+    await removeResearchFixture(pool, analysisId)
     await pool.end()
   }
 })
@@ -2551,9 +2732,9 @@ test('真实 PostgreSQL 启动恢复在一个事务内中断全部活跃 Session
       createdAt: '2026-08-13T00:00:02.000Z',
     })
     assert.equal(replacement.created, true)
-    await analyses.removeResearch(replacement.analysisId)
+    await removeResearchFixture(pool, replacement.analysisId)
   } finally {
-    await analyses.removeResearch(analysisId)
+    await removeResearchFixture(pool, analysisId)
     await pool.end()
   }
 })

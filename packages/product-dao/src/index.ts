@@ -6,7 +6,7 @@ import {
   type ExecutionSettingsSnapshot, type RuntimeSettings, type RuntimeSettingsRevision,
 } from '@vibe-invest/contracts'
 
-export const schemaVersion = 23
+export const schemaVersion = 24
 
 const migrationSql = `
 CREATE TABLE IF NOT EXISTS product_schema_migrations (
@@ -60,6 +60,11 @@ CREATE TABLE IF NOT EXISTS analyses (
   error text,
   starred boolean NOT NULL DEFAULT false,
   note text NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS analysis_deletion_tombstones (
+  analysis_id text PRIMARY KEY,
+  deleted_at timestamptz NOT NULL
 );
 
 ALTER TABLE analyses ADD COLUMN IF NOT EXISTS report_created_at timestamptz;
@@ -571,19 +576,25 @@ INSERT INTO product_schema_migrations (version)
 VALUES (23)
 ON CONFLICT (version) DO NOTHING;
 
+INSERT INTO product_schema_migrations (version)
+VALUES (24)
+ON CONFLICT (version) DO NOTHING;
+
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM vibe_invest_app;
 REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM vibe_invest_app;
 GRANT SELECT ON product_schema_migrations TO vibe_invest_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON positions, portfolio_settings, portfolio_equity_snapshots TO vibe_invest_app;
 GRANT SELECT, INSERT ON legacy_portfolio_migrations TO vibe_invest_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON analyses, atomic_facts, analysis_facts, analysis_trace TO vibe_invest_app;
+GRANT SELECT, INSERT ON analysis_deletion_tombstones TO vibe_invest_app;
 GRANT SELECT, INSERT, UPDATE ON agent_sessions TO vibe_invest_app;
 GRANT SELECT, INSERT ON agent_events TO vibe_invest_app;
 GRANT SELECT, INSERT, UPDATE ON agent_executions TO vibe_invest_app;
 GRANT SELECT, INSERT ON conversation_segments TO vibe_invest_app;
 GRANT SELECT, INSERT ON agent_compactions TO vibe_invest_app;
 GRANT SELECT, INSERT ON agent_compaction_attempts TO vibe_invest_app;
-GRANT SELECT, INSERT ON runtime_settings_revisions, execution_settings_snapshots TO vibe_invest_app;
+GRANT SELECT, INSERT ON runtime_settings_revisions TO vibe_invest_app;
+GRANT SELECT, INSERT, DELETE ON execution_settings_snapshots TO vibe_invest_app;
 GRANT SELECT, INSERT ON tool_projection_versions, model_requests, tool_call_batches, tool_batch_calls TO vibe_invest_app;
 GRANT UPDATE (
   status, usage_status, input_tokens, cache_read_tokens, cache_write_tokens,
@@ -1174,15 +1185,30 @@ export function createAnalysisRepository(pool: Pool) {
     },
     async createOrReturn(record: { id: string; symbol: string; status: string; createdAt: string; updatedAt: string }) {
       const active = ['queued', 'running'].includes(record.status)
-      const result = await pool.query<{ id: string; created: boolean }>(
-        `INSERT INTO analyses (id, symbol, status, active, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6)
-         ON CONFLICT (symbol) WHERE active
-         DO UPDATE SET symbol = excluded.symbol
-         RETURNING id, id = $1 AS created`,
-        [record.id, record.symbol, record.status, active, record.createdAt, record.updatedAt],
-      )
-      return { analysisId: result.rows[0]!.id, created: result.rows[0]!.created }
+      const client = await pool.connect()
+      try {
+        await client.query('BEGIN')
+        await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [record.id])
+        const deleted = await client.query(
+          'SELECT 1 FROM analysis_deletion_tombstones WHERE analysis_id = $1', [record.id],
+        )
+        if (deleted.rowCount) throw new Error('analysis_deleted')
+        const result = await client.query<{ id: string; created: boolean }>(
+          `INSERT INTO analyses (id, symbol, status, active, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6)
+           ON CONFLICT (symbol) WHERE active
+           DO UPDATE SET symbol = excluded.symbol
+           RETURNING id, id = $1 AS created`,
+          [record.id, record.symbol, record.status, active, record.createdAt, record.updatedAt],
+        )
+        await client.query('COMMIT')
+        return { analysisId: result.rows[0]!.id, created: result.rows[0]!.created }
+      } catch (error) {
+        await client.query('ROLLBACK')
+        throw error
+      } finally {
+        client.release()
+      }
     },
     async claimNextQueued(updatedAt: string) {
       const result = await pool.query<{ id: string }>(
@@ -1241,8 +1267,26 @@ export function createAnalysisRepository(pool: Pool) {
       const client = await pool.connect()
       try {
         await client.query('BEGIN')
-        const removed = await client.query('DELETE FROM analyses WHERE id = $1', [id])
-        if (!removed.rowCount) { await client.query('ROLLBACK'); return false }
+        await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [id])
+        const analysis = await client.query('SELECT id FROM analyses WHERE id = $1 FOR UPDATE', [id])
+        if (!analysis.rowCount) { await client.query('ROLLBACK'); return false }
+        const running = await client.query(
+          `SELECT 1 FROM agent_sessions session
+           JOIN agent_executions execution ON execution.id = session.execution_id
+           WHERE session.analysis_id = $1 AND execution.terminal = false LIMIT 1`, [id],
+        )
+        if (running.rowCount) throw new Error('analysis_not_stopped')
+        await client.query(
+          `INSERT INTO analysis_deletion_tombstones (analysis_id, deleted_at)
+           VALUES ($1, now()) ON CONFLICT (analysis_id) DO NOTHING`, [id],
+        )
+        await client.query(
+          `DELETE FROM execution_settings_snapshots snapshot
+           USING agent_executions execution, agent_sessions session
+           WHERE snapshot.execution_id = execution.id
+             AND execution.session_id = session.id AND session.analysis_id = $1`, [id],
+        )
+        await client.query('DELETE FROM analyses WHERE id = $1', [id])
         await client.query('DELETE FROM atomic_facts WHERE id NOT IN (SELECT fact_id FROM analysis_facts)')
         await client.query('COMMIT')
         return true
@@ -1444,6 +1488,13 @@ export function createAgentEventRepository(pool: Pool) {
       const client = await pool.connect()
       try {
         await client.query('BEGIN')
+        await client.query(
+          'SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [input.analysisId],
+        )
+        const deleted = await client.query(
+          'SELECT 1 FROM analysis_deletion_tombstones WHERE analysis_id = $1', [input.analysisId],
+        )
+        if (deleted.rowCount) throw new Error('analysis_deleted')
         const analysis = await client.query<{ id: string; created: boolean }>(
           `INSERT INTO analyses (id, symbol, status, active, created_at, updated_at)
            VALUES ($1, $2, $3, true, $4, $4)
