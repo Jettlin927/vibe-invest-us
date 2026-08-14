@@ -112,7 +112,13 @@ export function createAnalysisService(options: {
     async recordModelRequest(input) {
       await options.toolProjectionRepository.recordModelRequest({
         id: input.requestId, executionId: input.executionId, projectionId: input.projectionId,
-        turnIndex: input.turnIndex, createdAt: input.createdAt,
+        turnIndex: input.turnIndex, kind: input.kind, createdAt: input.createdAt,
+      })
+    },
+    async completeModelRequest(input) {
+      await options.toolProjectionRepository.completeModelRequest({
+        id: input.requestId, executionId: input.executionId, status: input.status,
+        usageStatus: input.usageStatus, usage: input.usage, completedAt: input.completedAt,
       })
     },
     async beginModelRequest(input) {

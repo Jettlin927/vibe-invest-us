@@ -282,7 +282,18 @@ export type ToolRuntime = {
     executionId: string
     projectionId: string
     turnIndex: number
+    kind?: 'turn' | 'compaction'
     createdAt: string
+  }): Promise<void>
+  completeModelRequest?(input: {
+    requestId: string; executionId: string
+    status: 'completed' | 'failed' | 'cancelled' | 'outcome_unknown'
+    usageStatus: 'complete' | 'partial' | 'unknown'
+    usage: {
+      input: number | null; cacheRead: number | null; cacheWrite: number | null
+      output: number | null; total: number | null
+    }
+    completedAt: string
   }): Promise<void>
   beginModelRequest(input: {
     requestId: string

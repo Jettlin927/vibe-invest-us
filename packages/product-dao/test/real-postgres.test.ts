@@ -299,7 +299,187 @@ test('真实 PostgreSQL 持久化 Tool Projection 版本、模型请求与批次
   }
 })
 
-test('真实 PostgreSQL v21 接受技术面 Tool Projection 角色', {
+test('真实 PostgreSQL 保存 Provider attempt 四类 Token、状态和 coverage 且重放不重复', {
+  skip: !migrationUrl || !applicationUrl,
+  concurrency: false,
+}, async () => {
+  await migrate(migrationUrl!)
+  const pool = createPool(applicationUrl!)
+  const events = createAgentEventRepository(pool)
+  const projections = createToolProjectionRepository(pool)
+  const analysisId = `model-usage-${crypto.randomUUID()}`
+  const sessionId = `model-usage-session-${crypto.randomUUID()}`
+  const executionId = `model-usage-execution-${crypto.randomUUID()}`
+  try {
+    await events.createResearch({
+      analysisId, sessionId, executionId, segmentId: `segment-${crypto.randomUUID()}`,
+      symbol: `U${crypto.randomUUID().replaceAll('-', '').slice(0, 8)}`,
+      status: 'planning', analysisStatus: 'queued', operationId: 'runtime-context',
+      event: { type: 'runtime_context' }, createdAt: '2026-08-14T03:00:00.000Z',
+    })
+    const projection = await projections.ensureVersion({
+      executionId, role: 'main', stage: 'research', schemaHash: 'model-usage',
+      projectedTools: [], visibleToolNames: [], reasons: { stage: 'research' },
+      createdAt: '2026-08-14T03:00:00.100Z',
+    })
+    const request = {
+      id: `${executionId}:model-attempt:1`, executionId, projectionId: projection.id,
+      turnIndex: 1, kind: 'turn' as const, createdAt: '2026-08-14T03:00:01.000Z',
+    }
+    await projections.recordModelRequest(request)
+    const completion = {
+      id: request.id, executionId, status: 'completed' as const,
+      usageStatus: 'complete' as const,
+      usage: { input: 100, cacheRead: 20, cacheWrite: 5, output: 10, total: 135 },
+      completedAt: '2026-08-14T03:00:01.250Z',
+    }
+    await projections.completeModelRequest(completion)
+    await projections.completeModelRequest(completion)
+    await assert.rejects(projections.completeModelRequest({
+      ...completion, usage: { ...completion.usage, output: 11, total: 136 },
+    }), /model_request_conflict/)
+    const inconsistentRequest = {
+      id: `${executionId}:model-attempt:2`, executionId, projectionId: projection.id,
+      turnIndex: 2, kind: 'turn' as const, createdAt: '2026-08-14T03:00:02.000Z',
+    }
+    await projections.recordModelRequest(inconsistentRequest)
+    await assert.rejects(projections.completeModelRequest({
+      id: inconsistentRequest.id, executionId, status: 'completed', usageStatus: 'complete',
+      usage: { input: 10, cacheRead: 2, cacheWrite: 1, output: 3, total: 99 },
+      completedAt: '2026-08-14T03:00:02.100Z',
+    }), /model_requests_usage_consistency_check/)
+    await projections.completeModelRequest({
+      id: inconsistentRequest.id, executionId, status: 'completed', usageStatus: 'partial',
+      usage: { input: 10, cacheRead: 2, cacheWrite: 1, output: 3, total: 99 },
+      completedAt: '2026-08-14T03:00:02.100Z',
+    })
+
+    const lifecycle = await events.primaryLifecycle(analysisId)
+    assert.deepEqual(lifecycle?.modelAttempts, [{
+      id: request.id, executionId, kind: 'turn', turnIndex: 1, status: 'completed',
+      usageStatus: 'complete',
+      usage: { input: 100, cacheRead: 20, cacheWrite: 5, output: 10, total: 135 },
+      durationMs: 250,
+      createdAt: '2026-08-14T03:00:01.000Z',
+      completedAt: '2026-08-14T03:00:01.250Z',
+    }, {
+      id: inconsistentRequest.id, executionId, kind: 'turn', turnIndex: 2,
+      status: 'completed', usageStatus: 'partial',
+      usage: { input: 10, cacheRead: 2, cacheWrite: 1, output: 3, total: 99 },
+      durationMs: 100, createdAt: '2026-08-14T03:00:02.000Z',
+      completedAt: '2026-08-14T03:00:02.100Z',
+    }])
+    assert.deepEqual(lifecycle?.tokenUsage, {
+      attempts: 2, reportedAttempts: 2, coverage: 1,
+      input: 110, cacheRead: 22, cacheWrite: 6, output: 13, total: 234,
+    })
+  } finally {
+    await createAnalysisRepository(pool).removeResearch(analysisId)
+    await pool.end()
+  }
+})
+
+test('真实 PostgreSQL 模型 attempt 在 execution 终态后仍可精确重放且冲突 fail closed', {
+  skip: !migrationUrl || !applicationUrl,
+  concurrency: false,
+}, async () => {
+  await migrate(migrationUrl!)
+  const pool = createPool(applicationUrl!)
+  const events = createAgentEventRepository(pool)
+  const projections = createToolProjectionRepository(pool)
+  const analysisId = `model-replay-${crypto.randomUUID()}`
+  const sessionId = `model-replay-session-${crypto.randomUUID()}`
+  const executionId = `model-replay-execution-${crypto.randomUUID()}`
+  try {
+    await events.createResearch({
+      analysisId, sessionId, executionId, segmentId: `segment-${crypto.randomUUID()}`,
+      symbol: `R${crypto.randomUUID().replaceAll('-', '').slice(0, 8)}`,
+      status: 'planning', analysisStatus: 'queued', operationId: 'runtime-context',
+      event: { type: 'runtime_context' }, createdAt: '2026-08-14T03:15:00.000Z',
+    })
+    const projection = await projections.ensureVersion({
+      executionId, role: 'main', stage: 'research', schemaHash: 'model-replay',
+      projectedTools: [], visibleToolNames: [], reasons: { stage: 'research' },
+      createdAt: '2026-08-14T03:15:00.100Z',
+    })
+    const requestId = `${executionId}:model-attempt:1`
+    await projections.recordModelRequest({
+      id: requestId, executionId, projectionId: projection.id, turnIndex: 1,
+      createdAt: '2026-08-14T03:15:01.000Z',
+    })
+    const completion = {
+      id: requestId, executionId, status: 'completed' as const,
+      usageStatus: 'complete' as const,
+      usage: { input: 10, cacheRead: 2, cacheWrite: 1, output: 3, total: 16 },
+      completedAt: '2026-08-14T03:15:01.100Z',
+    }
+    await projections.completeModelRequest(completion)
+    await events.append({
+      sessionId, executionId, operationId: 'model-replay-completed',
+      event: { type: 'status', status: 'completed' },
+      projection: { status: 'completed', executionStatus: 'completed', terminal: true },
+      createdAt: '2026-08-14T03:15:02.000Z',
+    })
+    assert.equal((await projections.completeModelRequest(completion)).created, false)
+    await assert.rejects(projections.completeModelRequest({
+      ...completion, usage: { ...completion.usage, output: 4, total: 17 },
+    }), /model_request_conflict/)
+  } finally {
+    await createAnalysisRepository(pool).removeResearch(analysisId)
+    await pool.end()
+  }
+})
+
+test('真实 PostgreSQL v21 升级到 v22 时将未终态模型请求封存为 outcome_unknown', {
+  skip: !migrationUrl || !applicationUrl,
+  concurrency: false,
+}, async () => {
+  await migrate(migrationUrl!)
+  const appPool = createPool(applicationUrl!)
+  const migrationPool = createPool(migrationUrl!)
+  const events = createAgentEventRepository(appPool)
+  const projections = createToolProjectionRepository(appPool)
+  const analysisId = `v21-model-request-${crypto.randomUUID()}`
+  const sessionId = `v21-model-session-${crypto.randomUUID()}`
+  const executionId = `v21-model-execution-${crypto.randomUUID()}`
+  try {
+    await events.createResearch({
+      analysisId, sessionId, executionId, segmentId: `segment-${crypto.randomUUID()}`,
+      symbol: `M${crypto.randomUUID().replaceAll('-', '').slice(0, 8)}`,
+      status: 'planning', analysisStatus: 'queued', operationId: 'runtime-context',
+      event: { type: 'runtime_context' }, createdAt: '2026-08-14T03:30:00.000Z',
+    })
+    const projection = await projections.ensureVersion({
+      executionId, role: 'main', stage: 'research', schemaHash: 'v21-model-request',
+      projectedTools: [], visibleToolNames: [], reasons: { stage: 'research' },
+      createdAt: '2026-08-14T03:30:00.100Z',
+    })
+    await projections.recordModelRequest({
+      id: `execution:${executionId}:main:compaction:1:attempt:1`, executionId,
+      projectionId: projection.id, turnIndex: 1,
+      createdAt: '2026-08-14T03:30:01.000Z',
+    })
+    await migrationPool.query('DELETE FROM product_schema_migrations WHERE version = 22')
+    await migrate(migrationUrl!)
+    const lifecycle = await events.primaryLifecycle(analysisId)
+    assert.equal(lifecycle?.modelAttempts[0]?.status, 'outcome_unknown')
+    assert.equal(lifecycle?.modelAttempts[0]?.kind, 'compaction')
+    assert.equal(lifecycle?.modelAttempts[0]?.usageStatus, 'unknown')
+    assert.deepEqual(lifecycle?.modelAttempts[0]?.usage, {
+      input: null, cacheRead: null, cacheWrite: null, output: null, total: null,
+    })
+    assert.deepEqual(await checkSchema(appPool), { status: 'ok', version: 22 })
+  } finally {
+    await createAnalysisRepository(appPool).removeResearch(analysisId)
+    await migrationPool.query(
+      'INSERT INTO product_schema_migrations (version) VALUES (22) ON CONFLICT DO NOTHING',
+    )
+    await appPool.end()
+    await migrationPool.end()
+  }
+})
+
+test('真实 PostgreSQL v22 接受技术面 Tool Projection 角色', {
   skip: !migrationUrl || !applicationUrl,
   concurrency: false,
 }, async () => {
@@ -325,7 +505,7 @@ test('真实 PostgreSQL v21 接受技术面 Tool Projection 角色', {
       createdAt: '2026-08-14T00:00:01.000Z',
     })
     assert.equal(projection.role, 'technical')
-    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 21 })
+    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 22 })
   } finally {
     const cleanup = createPool(migrationUrl!)
     await cleanup.query('DELETE FROM analyses WHERE id = $1', [analysisId])
@@ -369,6 +549,10 @@ test('真实 PostgreSQL execution 终态事务会取消未完成 Tool Batch', {
       eventPayload: { type: 'tool_call', name: 'fetch_financial_context', startedAt: '2026-08-13T04:10:02.500Z' },
     }
     const terminalStartEvent = await projections.startToolCall(terminalStart)
+    await projections.recordModelRequest({
+      id: `${executionId}:model-attempt:1`, executionId, projectionId: projection.id,
+      turnIndex: 1, createdAt: '2026-08-13T04:10:02.600Z',
+    })
     await events.append({
       sessionId, executionId, operationId: 'execution-failed',
       event: { type: 'status', status: 'failed', terminal: true },
@@ -391,6 +575,9 @@ test('真实 PostgreSQL execution 终态事务会取消未完成 Tool Batch', {
         result: { error: 'tool_execution_interrupted', facts: [] }, isError: true,
       },
     }])
+    const lifecycle = await events.primaryLifecycle(analysisId)
+    assert.equal(lifecycle?.modelAttempts[0]?.status, 'outcome_unknown')
+    assert.equal(lifecycle?.modelAttempts[0]?.completedAt, '2026-08-13T04:10:03.000Z')
     await assert.rejects(projections.recordModelRequest({
       id: 'late-request', executionId, projectionId: projection.id, turnIndex: 2,
       createdAt: '2026-08-13T04:10:04.000Z',
@@ -741,6 +928,52 @@ test('真实 PostgreSQL tree fence 原子封存进行中的 Compaction attempt �
       status: 'cancelled', durationMs: 1250, usage: null,
       createdAt: '2026-08-14T02:00:02.250Z',
     }), /agent_execution_fenced/)
+  } finally {
+    await createAnalysisRepository(pool).removeResearch(analysisId)
+    await pool.end()
+  }
+})
+
+test('真实 PostgreSQL tree fence 与启动中断分别封存模型 attempt 为 cancelled 和 outcome_unknown', {
+  skip: !migrationUrl || !applicationUrl,
+  concurrency: false,
+}, async () => {
+  await migrate(migrationUrl!)
+  const pool = createPool(applicationUrl!)
+  const events = createAgentEventRepository(pool)
+  const projections = createToolProjectionRepository(pool)
+  const analysisId = `model-fence-${crypto.randomUUID()}`
+  const sessionId = `model-fence-session-${crypto.randomUUID()}`
+  const executionId = `model-fence-execution-${crypto.randomUUID()}`
+  try {
+    await events.createResearch({
+      analysisId, sessionId, executionId, segmentId: `segment-${crypto.randomUUID()}`,
+      symbol: `F${crypto.randomUUID().replaceAll('-', '').slice(0, 8)}`,
+      status: 'planning', analysisStatus: 'queued', operationId: 'runtime-context',
+      event: { type: 'runtime_context' }, createdAt: '2026-08-14T04:00:00.000Z',
+    })
+    const projection = await projections.ensureVersion({
+      executionId, role: 'main', stage: 'research', schemaHash: 'model-fence',
+      projectedTools: [], visibleToolNames: [], reasons: { stage: 'research' },
+      createdAt: '2026-08-14T04:00:00.100Z',
+    })
+    await projections.recordModelRequest({
+      id: `${executionId}:model-attempt:1`, executionId, projectionId: projection.id,
+      turnIndex: 1, createdAt: '2026-08-14T04:00:01.000Z',
+    })
+    await events.fenceForStopping({
+      sessionId, executionId, fenceExecutionId: `fence-${crypto.randomUUID()}`,
+      operationId: 'model-fence-stopping', event: { type: 'status', status: 'stopping' },
+      createdAt: '2026-08-14T04:00:02.250Z',
+    })
+    const stopped = await events.primaryLifecycle(analysisId)
+    assert.deepEqual(stopped?.modelAttempts.map(({ status, usageStatus, durationMs, usage }) => ({
+      status, usageStatus, durationMs, usage,
+    })), [{
+      status: 'cancelled', usageStatus: 'unknown', durationMs: 1250,
+      usage: { input: null, cacheRead: null, cacheWrite: null, output: null, total: null },
+    }])
+    assert.equal(stopped?.tokenUsage.coverage, 0)
   } finally {
     await createAnalysisRepository(pool).removeResearch(analysisId)
     await pool.end()
@@ -1378,7 +1611,7 @@ test('真实 PostgreSQL migration 幂等且 application role 没有 DDL 权限',
   await migrate(migrationUrl!)
 
   const pool = createPool(applicationUrl!)
-  assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 21 })
+  assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 22 })
   const privileges = await pool.query<{ can_create: boolean; can_temp: boolean }>(
     `SELECT has_schema_privilege(current_user, 'public', 'CREATE') AS can_create,
             has_database_privilege(current_user, current_database(), 'TEMP') AS can_temp`,
@@ -1435,7 +1668,7 @@ test('真实 PostgreSQL migration receipt 为空时按 max=0 升级', {
     )
     await pool.query('DELETE FROM product_schema_migrations')
     await migrate(migrationUrl!)
-    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 21 })
+    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 22 })
     assert.deepEqual((await pool.query<{ sequence: number; provenance: string }>(
       `SELECT sequence, provenance FROM tool_event_migration_provenance WHERE session_id = $1`,
       [sessionId],
@@ -1502,23 +1735,23 @@ test('真实 PostgreSQL 拒绝未来 schema 且不修改数据库', {
   })
   try {
     await pool.query('DROP TABLE tool_event_migration_provenance')
-    await pool.query('INSERT INTO product_schema_migrations (version) VALUES (22)')
+    await pool.query('INSERT INTO product_schema_migrations (version) VALUES (23)')
     const before = await fingerprint()
 
     await assert.rejects(
       migrate(migrationUrl!),
-      /product_schema_future_version_unsupported:22/,
+      /product_schema_future_version_unsupported:23/,
     )
 
     assert.deepEqual(await fingerprint(), before)
   } finally {
-    await pool.query('DELETE FROM product_schema_migrations WHERE version = 22')
+    await pool.query('DELETE FROM product_schema_migrations WHERE version = 23')
     await migrate(migrationUrl!)
     await pool.end()
   }
 })
 
-test('真实 PostgreSQL v12 无 Tool Batch 的历史工具事件原样升级到 v21', {
+test('真实 PostgreSQL v12 无 Tool Batch 的历史工具事件原样升级到 v22', {
   skip: !migrationUrl,
   concurrency: false,
 }, async () => {
@@ -1562,7 +1795,7 @@ test('真实 PostgreSQL v12 无 Tool Batch 的历史工具事件原样升级到 
 
     await migrate(migrationUrl!)
 
-    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 21 })
+    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 22 })
     assert.deepEqual((await pool.query<{ sequence: number; provenance: string }>(
       `SELECT sequence, provenance FROM tool_event_migration_provenance
        WHERE session_id = $1 ORDER BY sequence`, [sessionId],

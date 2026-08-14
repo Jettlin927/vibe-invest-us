@@ -40,6 +40,7 @@ function createTestToolRuntime(): ToolRuntime {
       return { id: `${input.executionId}:test-projection:${++version}`, version }
     },
     async recordModelRequest() {},
+    async completeModelRequest() {},
     async beginModelRequest(input) {
       return { id: `${input.requestId}:test-projection`, version: ++version }
     },
@@ -1092,6 +1093,150 @@ test('Pi Model 通过只读工具流式生成结构化报告和完整轨迹', as
   assert.equal(JSON.stringify(logs).includes('217.5'), false)
 })
 
+test('Runtime 为每个完成的 Provider attempt 保存四类 Token 与 complete usage 状态', async () => {
+  const completions: Array<Record<string, unknown>> = []
+  const runtime = createTestToolRuntime()
+  runtime.completeModelRequest = async (input) => { completions.push(input) }
+  const model = createPiModel({
+    fauxResponses: [
+      fauxAssistantMessage(fauxToolCall('submit_analysis_report', validReport), {
+        stopReason: 'toolUse', usage: {
+          input: 101, cacheRead: 23, cacheWrite: 7, output: 11, totalTokens: 142,
+          cost: { input: 0, cacheRead: 0, cacheWrite: 0, output: 0, total: 0 },
+        },
+      }),
+    ],
+  })
+  const events = []
+  for await (const _event of model.analyze({
+    executionId: 'provider-usage-complete', runtimeSettings: runtimeSettings(),
+    symbol: 'NVDA', systemPrompt: 'system', userPrompt: '形成综合报告', knownFacts: facts,
+    fetchFinancialContext: async () => ({ facts }), toolRuntime: runtime,
+  })) events.push(_event)
+  const completed = events.find((event) => event.type === 'completed')
+  assert.equal(completed?.type, 'completed')
+  const providerUsage = completed?.type === 'completed'
+    ? completed.usage as { input: number; cacheRead: number; cacheWrite: number; output: number; totalTokens: number }
+    : undefined
+  assert.equal(completions.length, 1)
+  assert.deepEqual(completions[0], {
+    requestId: 'execution:provider-usage-complete:main:model-attempt:1',
+    executionId: 'provider-usage-complete', status: 'completed', usageStatus: 'complete',
+    usage: {
+      input: providerUsage?.input, cacheRead: providerUsage?.cacheRead,
+      cacheWrite: providerUsage?.cacheWrite, output: providerUsage?.output,
+      total: providerUsage?.totalTokens,
+    },
+    completedAt: completions[0]?.completedAt,
+  })
+  assert.match(String(completions[0]?.completedAt), /^\d{4}-\d{2}-\d{2}T/)
+})
+
+test('Runtime 将 Provider total 与四类 Token 不一致的 usage 降为 partial', async () => {
+  const completions: Array<Record<string, unknown>> = []
+  const runtime = createTestToolRuntime()
+  runtime.completeModelRequest = async (input) => { completions.push(input) }
+  const response = fauxAssistantMessage(fauxToolCall('submit_analysis_report', validReport), {
+    stopReason: 'toolUse',
+  })
+  const inconsistent = {
+    ...response, usage: {
+      input: 10, cacheRead: 2, cacheWrite: 1, output: 3, totalTokens: 99,
+      cost: { input: 0, cacheRead: 0, cacheWrite: 0, output: 0, total: 0 },
+    },
+  }
+  const models = createModels()
+  models.stream = (() => ({
+    async *[Symbol.asyncIterator]() {
+      yield { type: 'done', reason: 'toolUse', message: inconsistent }
+    },
+    async result() { return inconsistent },
+  })) as typeof models.stream
+  const model = createPiModel({ modelsFactory: () => models, fauxResponses: [response] })
+  for await (const _event of model.analyze({
+    executionId: 'provider-usage-inconsistent', runtimeSettings: runtimeSettings(),
+    symbol: 'NVDA', systemPrompt: 'system', userPrompt: '形成综合报告', knownFacts: facts,
+    fetchFinancialContext: async () => ({ facts }), toolRuntime: runtime,
+  })) { /* consume */ }
+  assert.equal(completions[0]?.usageStatus, 'partial')
+  assert.deepEqual(completions[0]?.usage, {
+    input: 10, cacheRead: 2, cacheWrite: 1, output: 3, total: 99,
+  })
+})
+
+test('Runtime 保存 Provider error 消息已有 usage 并标记失败 attempt', async () => {
+  const completions: Array<Record<string, unknown>> = []
+  const runtime = createTestToolRuntime()
+  runtime.completeModelRequest = async (input) => { completions.push(input) }
+  const failedResponse = {
+    ...fauxAssistantMessage(fauxText('provider failed'), { stopReason: 'error' }),
+    errorMessage: 'provider_failed',
+    usage: {
+      input: 20, cacheRead: 4, cacheWrite: 2, output: 1, totalTokens: 27,
+      cost: { input: 0, cacheRead: 0, cacheWrite: 0, output: 0, total: 0 },
+    },
+  }
+  const models = createModels()
+  models.stream = (() => ({
+    async *[Symbol.asyncIterator]() {
+      yield { type: 'done', reason: 'error', message: failedResponse }
+    },
+    async result() { return failedResponse },
+  })) as typeof models.stream
+  const model = createPiModel({
+    modelsFactory: () => models,
+    fauxResponses: [fauxAssistantMessage(fauxText('unused'), { stopReason: 'stop' })],
+  })
+  await assert.rejects(async () => {
+    for await (const _event of model.analyze({
+      executionId: 'provider-usage-failed', runtimeSettings: runtimeSettings(),
+      symbol: 'NVDA', systemPrompt: 'system', userPrompt: '形成综合报告', knownFacts: facts,
+      fetchFinancialContext: async () => ({ facts }), toolRuntime: runtime,
+    })) { /* consume */ }
+  }, /provider_failed/)
+  assert.equal(completions.length, 1)
+  assert.deepEqual({
+    status: completions[0]?.status,
+    usageStatus: completions[0]?.usageStatus,
+    usage: completions[0]?.usage,
+  }, {
+    status: 'failed', usageStatus: 'complete',
+    usage: { input: 20, cacheRead: 4, cacheWrite: 2, output: 1, total: 27 },
+  })
+})
+
+test('Runtime 将 Compaction Provider attempt 分类并保存失败终态 usage', async () => {
+  const requests: Array<Record<string, unknown>> = []
+  const completions: Array<Record<string, unknown>> = []
+  const runtime = createTestToolRuntime()
+  runtime.recordModelRequest = async (input) => { requests.push(input) }
+  runtime.completeModelRequest = async (input) => { completions.push(input) }
+  const model = createPiModel({
+    fauxResponses: [
+      fauxAssistantMessage(fauxToolCall('fetch_financial_context', {}), { stopReason: 'toolUse' }),
+      fauxAssistantMessage(fauxToolCall('submit_analysis_report', validReport), { stopReason: 'toolUse' }),
+    ],
+    compact: async () => {
+      throw new Error('summary_failed_without_usage')
+    },
+  })
+  for await (const _event of model.analyze({
+    executionId: 'compaction-usage-failed',
+    runtimeSettings: runtimeSettings({ compactionReserveTokens: 1_000_000 }),
+    symbol: 'NVDA', systemPrompt: 'system', userPrompt: '形成综合报告', knownFacts: facts,
+    fetchFinancialContext: async () => ({ facts }), toolRuntime: runtime,
+  })) { /* consume */ }
+  assert.equal(requests.filter(({ kind }) => kind === 'compaction').length, 2)
+  const compactionCompletions = completions.filter(({ requestId }) => String(requestId).includes(':compaction:'))
+  assert.equal(compactionCompletions.length, 2)
+  assert.deepEqual(compactionCompletions.map(({ status, usageStatus, usage }) => ({
+    status, usageStatus, usage,
+  })), [1, 2].map(() => ({
+    status: 'failed', usageStatus: 'unknown',
+    usage: { input: null, cacheRead: null, cacheWrite: null, output: null, total: null },
+  })))
+})
+
 test('完整工具结果保留在审计事件而模型只收到 Registry 声明的受控投影', async () => {
   let providerToolResult = ''
   const model = createPiModel({ fauxResponses: [
@@ -1904,8 +2049,10 @@ for (const failure of ['stream', 'iterator', 'next'] as const) {
     let acquired = 0
     let released = 0
     let recorded = 0
+    const completions: Array<Record<string, unknown>> = []
     const toolRuntime = createTestToolRuntime()
     toolRuntime.recordModelRequest = async () => { recorded += 1 }
+    toolRuntime.completeModelRequest = async (input) => { completions.push(input) }
     const run = async (executionId: string) => {
       for await (const _event of model.analyze({
         executionId, runtimeSettings: runtimeSettings(), symbol: 'NVDA',
@@ -1920,7 +2067,13 @@ for (const failure of ['stream', 'iterator', 'next'] as const) {
     }
     await assert.rejects(run(`${failure}-first`), new RegExp(`${failure}_construction_failed`))
     assert.equal(recorded, 1)
+    assert.equal(completions[0]?.status, 'failed')
+    assert.equal(completions[0]?.usageStatus, 'unknown')
+    assert.deepEqual(completions[0]?.usage, {
+      input: null, cacheRead: null, cacheWrite: null, output: null, total: null,
+    })
     await run(`${failure}-second`)
+    assert.equal(completions[1]?.status, 'completed')
     assert.equal(acquired, 2)
     assert.equal(released, 2)
     if (failure === 'next') assert.equal(iteratorClosed, 1)

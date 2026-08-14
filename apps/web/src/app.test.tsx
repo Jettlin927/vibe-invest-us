@@ -322,9 +322,177 @@ test('研究页展示 Compaction token usage 耗时与链接的新 Segment', asy
   assert.match(runtime.textContent ?? '', /Compaction.*120,000.*128,000/)
   assert.match(runtime.textContent ?? '', /保留 16,384.*近期 20,000/)
   assert.match(runtime.textContent ?? '', /1,100 Token.*压缩后 18,000.*1\.25 秒/)
-  assert.match(runtime.textContent ?? '', /上下文 ≈14\.1%.*距 Compaction 93,616 Token.*绿色.*Segment 2/)
+  assert.match(runtime.textContent ?? '', /上下文 ≈14\.1%.*当前 18,000 Token.*阈值 111,616 Token.*距 Compaction 93,616 Token.*绿色.*Segment 2.*已 Compaction 1 次/)
   assert.match(runtime.textContent ?? '', /Compaction 尝试 1.*失败.*520 Token.*0\.50 秒/)
   assert.match(runtime.textContent ?? '', /Compaction 尝试 2.*完成.*1,100 Token.*0\.75 秒/)
+})
+
+test('研究页按 Agent 展示四类 Token 堆叠、coverage 与累计趋势', async () => {
+  setupDom()
+  const attempt = (
+    id: string, input: number | null, cacheRead: number | null,
+    cacheWrite: number | null, output: number | null, total: number | null,
+    usageStatus: 'complete' | 'partial' | 'unknown' = 'complete',
+  ) => ({
+    id, executionId: 'execution-usage', kind: 'turn', turnIndex: 1,
+    status: 'completed', usageStatus,
+    usage: { input, cacheRead, cacheWrite, output, total }, durationMs: 100,
+    createdAt: '2026-08-14T01:00:00Z', completedAt: '2026-08-14T01:00:00.100Z',
+  })
+  const record = {
+    id: 'usage-ui', symbol: 'NVDA', status: 'completed', report: null, facts: [], trace: [],
+    mainAgent: {
+      id: 'main-usage', status: 'completed', waitReason: null,
+      execution: { id: 'main-execution', generation: 1, status: 'completed' },
+      segments: [{ id: 'main-segment', ordinal: 1, createdAt: '2026-08-14T01:00:00Z' }],
+      events: [{
+        sequence: 1, type: 'context_usage', createdAt: '2026-08-14T01:00:01Z',
+        contextTokens: 50000, contextWindow: 128000, reserveTokens: 16384,
+        keepRecentTokens: 20000, estimated: false,
+      }],
+      modelAttempts: [
+        attempt('main-1', 1000, 200, 50, 100, 1350),
+        attempt('main-2', 500, 100, 25, 50, 675),
+        attempt('main-3', null, null, null, null, null, 'unknown'),
+      ],
+      tokenUsage: {
+        attempts: 3, reportedAttempts: 2, coverage: 2 / 3,
+        input: 1500, cacheRead: 300, cacheWrite: 75, output: 150, total: 2025,
+      },
+      compactionAttempts: [],
+    },
+    specialistAgents: [{
+      id: 'news-usage', domain: 'news', status: 'completed',
+      execution: { id: 'news-execution', generation: 1, status: 'completed' },
+      segments: [{ id: 'news-segment', ordinal: 1, createdAt: '2026-08-14T01:00:00Z' }],
+      events: [], compactionAttempts: [],
+      modelAttempts: [attempt('news-1', 400, 80, 20, 40, 540)],
+      tokenUsage: {
+        attempts: 1, reportedAttempts: 1, coverage: 1,
+        input: 400, cacheRead: 80, cacheWrite: 20, output: 40, total: 540,
+      },
+    }],
+  }
+  globalThis.fetch = async (input) => {
+    const url = String(input)
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok' }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/settings') return Response.json({ ...settingsResponse(), model: { configured: true } })
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+    if (url === '/api/portfolio') return Response.json(portfolioResponse([]))
+    if (url === '/api/research') return Response.json({ records: [{ id: record.id, symbol: record.symbol, status: record.status }] })
+    if (url === '/api/research/usage-ui') return Response.json(record)
+    throw new Error(`unexpected_fetch:${url}`)
+  }
+  const view = render(React.createElement(App))
+  const user = userEvent.setup({ document: window.document })
+  await user.click(await view.findByRole('button', { name: '新建分析' }))
+  await user.click(await view.findByRole('button', { name: /打开 NVDA/ }))
+  const dashboard = await view.findByRole('region', { name: 'Agent Token 用量' })
+  assert.match(dashboard.textContent ?? '', /主 Agent.*Input 1,500.*Cache Read 300.*Cache Write 75.*Output 150.*Total 2,025.*Coverage 66\.7%/)
+  assert.match(dashboard.textContent ?? '', /消息面专项.*Input 400.*Cache Read 80.*Cache Write 20.*Output 40.*Total 540.*Coverage 100\.0%/)
+  assert.match(dashboard.textContent ?? '', /主 Agent.*缓存命中率 16\.0%/)
+  assert.equal(view.getAllByRole('img', { name: /Token 构成/ }).length, 2)
+  await user.click(view.getByRole('button', { name: '展开 Token 累计趋势' }))
+  assert.equal(view.getAllByRole('img', { name: /Token 累计趋势/ }).length, 2)
+  assert.match(dashboard.textContent ?? '', /请求 1.*1,350.*请求 2.*2,025.*请求 3.*usage 未返回/)
+})
+
+test('研究页将 Compaction Token 独立分组且字段不完整时不计算缓存命中率', async () => {
+  setupDom()
+  const record = {
+    id: 'compaction-token-ui', symbol: 'NVDA', status: 'completed', report: null, facts: [], trace: [],
+    mainAgent: {
+      id: 'main-compaction-usage', status: 'completed', waitReason: null,
+      execution: { id: 'main-execution', generation: 1, status: 'completed' },
+      segments: [], events: [], compactionAttempts: [],
+      modelAttempts: [{
+        id: 'compact-usage', executionId: 'main-execution', kind: 'compaction', turnIndex: 1,
+        status: 'completed', usageStatus: 'partial',
+        usage: { input: 800, cacheRead: 200, cacheWrite: null, output: 100, total: 1100 },
+        durationMs: 100, createdAt: '2026-08-14T01:00:00Z',
+        completedAt: '2026-08-14T01:00:00.100Z',
+      }],
+    }, specialistAgents: [],
+  }
+  globalThis.fetch = async (input) => {
+    const url = String(input)
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok' }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/settings') return Response.json({ ...settingsResponse(), model: { configured: true } })
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+    if (url === '/api/portfolio') return Response.json(portfolioResponse([]))
+    if (url === '/api/research') return Response.json({ records: [{ id: record.id, symbol: record.symbol, status: record.status }] })
+    if (url === '/api/research/compaction-token-ui') return Response.json(record)
+    throw new Error(`unexpected_fetch:${url}`)
+  }
+  const view = render(React.createElement(App))
+  const user = userEvent.setup({ document: window.document })
+  await user.click(await view.findByRole('button', { name: '新建分析' }))
+  await user.click(await view.findByRole('button', { name: /打开 NVDA/ }))
+  const dashboard = await view.findByRole('region', { name: 'Agent Token 用量' })
+  assert.match(dashboard.textContent ?? '', /Compaction.*Input 800.*Cache Read 200.*Output 100.*Coverage 100\.0%/)
+  assert.match(dashboard.textContent ?? '', /Token 构成 N\/A/)
+  assert.match(dashboard.textContent ?? '', /缓存命中率 N\/A/)
+})
+
+test('研究页在 Compaction 进行中显示蓝色且失败后显示红色错误', async () => {
+  setupDom()
+  type ContextEventFixture = {
+    sequence: number; type: string; status?: string; createdAt: string
+    contextTokens: number; contextWindow: number; reserveTokens: number
+    keepRecentTokens: number; estimated: boolean
+  }
+  const contextEvents: ContextEventFixture[] = [{
+    sequence: 1, type: 'context_usage', createdAt: '2026-08-14T01:00:01Z',
+    contextTokens: 100000, contextWindow: 128000, reserveTokens: 16384,
+    keepRecentTokens: 20000, estimated: false,
+  }]
+  const record = {
+    id: 'compaction-state-ui', symbol: 'NVDA', status: 'running', report: null, facts: [], trace: [],
+    mainAgent: {
+      id: 'main-compacting', status: 'running_model', waitReason: null,
+      execution: { id: 'main-execution', generation: 1, status: 'running_model' },
+      segments: [{ id: 'segment-1', ordinal: 1, createdAt: '2026-08-14T01:00:00Z' }],
+      events: contextEvents,
+      modelAttempts: [{
+        id: 'compacting-attempt', executionId: 'main-execution', kind: 'compaction', turnIndex: 1,
+        status: 'started', usageStatus: 'unknown',
+        usage: { input: null, cacheRead: null, cacheWrite: null, output: null, total: null },
+        durationMs: null, createdAt: '2026-08-14T01:00:01Z',
+        completedAt: null as string | null,
+      }],
+      tokenUsage: { attempts: 1, reportedAttempts: 0, coverage: 0, input: 0, cacheRead: 0, cacheWrite: 0, output: 0, total: 0 },
+      compactionAttempts: [],
+    }, specialistAgents: [],
+  }
+  globalThis.fetch = async (input) => {
+    const url = String(input)
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok' }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/settings') return Response.json({ ...settingsResponse(), model: { configured: true } })
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+    if (url === '/api/portfolio') return Response.json(portfolioResponse([]))
+    if (url === '/api/research') return Response.json({ records: [{ id: record.id, symbol: record.symbol, status: record.status }] })
+    if (url === '/api/research/compaction-state-ui') return Response.json(record)
+    throw new Error(`unexpected_fetch:${url}`)
+  }
+  const view = render(React.createElement(App))
+  const user = userEvent.setup({ document: window.document })
+  await user.click(await view.findByRole('button', { name: '新建分析' }))
+  await user.click(await view.findByRole('button', { name: /打开 NVDA/ }))
+  const runtime = await view.findByRole('region', { name: '主 Agent Runtime' })
+  assert.match(runtime.textContent ?? '', /蓝色 · Compaction 进行中/)
+  assert.ok(runtime.querySelector('.context-usage-blue'))
+  record.mainAgent.modelAttempts[0].status = 'failed'
+  record.mainAgent.modelAttempts[0].completedAt = '2026-08-14T01:00:02Z'
+  record.mainAgent.events.push({
+    sequence: 2, type: 'compaction', status: 'failed', createdAt: '2026-08-14T01:00:02Z',
+    contextTokens: 100000, contextWindow: 128000, reserveTokens: 16384,
+    keepRecentTokens: 20000, estimated: false,
+  })
+  await user.click(view.getByRole('button', { name: '新建分析' }))
+  await user.click(view.getByRole('button', { name: /打开 NVDA/ }))
+  const failedRuntime = await view.findByRole('region', { name: '主 Agent Runtime' })
+  assert.match(failedRuntime.textContent ?? '', /红色 · Compaction 失败/)
+  assert.ok(failedRuntime.querySelector('.context-usage-red'))
 })
 
 test('研究页只允许手动恢复 stopped 或 interrupted 记录', async () => {

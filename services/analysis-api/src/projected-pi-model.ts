@@ -10,6 +10,7 @@ import type { RuntimeSettings } from '@vibe-invest/contracts'
 import {
   createPiAgentAdapter, type PiAgentAdapterMessage, type PiAgentAdapterStream,
   type PiAgentAdapterStreamFn, type PiAgentAdapterTool,
+  type PiAgentAdapterUsage,
 } from './agent-runtime/pi-agent-adapter.js'
 import type {
   AnalysisReport, AnalyzeFundamentalInput, AnalyzeInput, AnalyzeNewsInput, AnalyzeTechnicalInput,
@@ -750,9 +751,11 @@ async function runProjectedAgent(config: {
   let lastAssistantHadCalls = false
   let modelEventIndex = 0
   let textDeltaIndex = 0
+  let activeModelRequestId: string | undefined
   let compactionIndex = 0
   let compactionDisabled = false
   let compactionAttempt: 1 | 2 = 1
+  let activeCompactionRequestId: string | undefined
   let compactionAttemptResults: Array<{ attempt: number; durationMs: number; usage: unknown }> = []
   let pendingCompaction: {
     id: string
@@ -768,6 +771,27 @@ async function runProjectedAgent(config: {
     reserveTokens: config.settings.compactionReserveTokens, keepRecentTokens: 20_000,
   }
   let visibleTools = [...config.initialTools]
+  const completeActiveModelRequest = async (
+    status: 'completed' | 'failed' | 'cancelled', usage: unknown,
+  ) => {
+    const requestId = activeModelRequestId
+    if (!requestId) return
+    if (!input.toolRuntime?.completeModelRequest) {
+      throw new Error('model_request_completion_required')
+    }
+    const normalizedUsage = modelUsage(usage)
+    try {
+      await input.toolRuntime.completeModelRequest({
+        requestId, executionId: input.executionId, status,
+        usageStatus: normalizedUsage.status, usage: normalizedUsage.usage,
+        completedAt: new Date().toISOString(),
+      })
+    } catch (error) {
+      if (!(config.executionSignal.aborted && error instanceof Error
+        && error.message === 'agent_execution_fenced')) throw error
+    }
+    activeModelRequestId = undefined
+  }
   const callStartedAt = new Map<string, string>()
   let adapter: ReturnType<typeof createPiAgentAdapter>
 
@@ -959,6 +983,7 @@ async function runProjectedAgent(config: {
           requestId, executionId: input.executionId, projectionId: activeProjection.id,
           turnIndex, createdAt: new Date().toISOString(),
         })
+        activeModelRequestId = requestId
         config.queue.push(trace({
           type: 'tool_projection', projectionId: activeProjection.id, version: activeProjection.version,
           visibleToolNames: visibleTools.map(({ name }) => name),
@@ -978,8 +1003,19 @@ async function runProjectedAgent(config: {
             config.onPolicyFailure(normalized)
           }
           return normalized
+        }, async (error) => {
+          const usage = error instanceof CompactionGenerationError ? error.usage : null
+          await completeActiveModelRequest(
+            config.executionSignal.aborted ? 'cancelled' : 'failed', usage,
+          )
         })
-      } catch (error) { request.finish(); throw error }
+      } catch (error) {
+        request.finish()
+        await completeActiveModelRequest(
+          config.executionSignal.aborted ? 'cancelled' : 'failed', null,
+        )
+        throw error
+      }
     },
     afterToolCall: async ({ result, isError }) => ({
       isError: Boolean((result.details as { audit?: ToolAudit } | undefined)?.audit?.isError ?? isError),
@@ -1060,6 +1096,27 @@ async function runProjectedAgent(config: {
           usage: error instanceof CompactionGenerationError ? error.usage : null,
         }
         compactionAttemptResults.push(result)
+        const requestId = activeCompactionRequestId
+        if (requestId) {
+          if (!input.toolRuntime?.completeModelRequest) {
+            throw new Error('model_request_completion_required')
+          }
+          const normalizedUsage = modelUsage(
+            error instanceof CompactionGenerationError ? error.usage : null,
+          )
+          try {
+            await input.toolRuntime.completeModelRequest({
+              requestId, executionId: input.executionId,
+              status: config.executionSignal.aborted ? 'cancelled' : 'failed',
+              usageStatus: normalizedUsage.status, usage: normalizedUsage.usage,
+              completedAt: new Date().toISOString(),
+            })
+          } catch (auditError) {
+            if (!(config.executionSignal.aborted && auditError instanceof Error
+              && auditError.message === 'agent_execution_fenced')) throw auditError
+          }
+          activeCompactionRequestId = undefined
+        }
         if (!input.toolRuntime?.recordCompactionAttempt) {
           throw new Error('compaction_attempt_commit_required')
         }
@@ -1101,8 +1158,9 @@ async function runProjectedAgent(config: {
         const requestId = `execution:${input.executionId}:${config.role}:compaction:${compactionIndex}:attempt:${compactionAttempt}`
         await input.toolRuntime.recordModelRequest({
           requestId, executionId: input.executionId, projectionId: activeProjection.id,
-          turnIndex: Math.max(1, turnIndex), createdAt: startedAt,
+          turnIndex: Math.max(1, turnIndex), kind: 'compaction', createdAt: startedAt,
         })
+        activeCompactionRequestId = requestId
         const request = await beginBudgetedModelRequest(config, config.role !== 'main')
         let compacted: { narrative: string; usage: Record<string, unknown> }
         try {
@@ -1115,6 +1173,16 @@ async function runProjectedAgent(config: {
           throw normalized instanceof CompactionGenerationError
             ? normalized : new CompactionGenerationError(normalized)
         } finally { request.finish() }
+        if (!input.toolRuntime.completeModelRequest) {
+          throw new Error('model_request_completion_required')
+        }
+        const normalizedUsage = modelUsage(compacted.usage)
+        await input.toolRuntime.completeModelRequest({
+          requestId, executionId: input.executionId, status: 'completed',
+          usageStatus: normalizedUsage.status, usage: normalizedUsage.usage,
+          completedAt: new Date().toISOString(),
+        })
+        activeCompactionRequestId = undefined
         const summary = compactionSummaryContract(
           config.role, config.userPrompt, input,
           [...cut.messagesToSummarize, ...cut.turnPrefixMessages, ...cut.retainedTail],
@@ -1239,6 +1307,9 @@ async function runProjectedAgent(config: {
       })
     }
     if (event.type === 'message_end' && event.message.role === 'assistant') {
+      const requestStatus = event.message.stopReason === 'aborted'
+        ? 'cancelled' : event.message.stopReason === 'error' ? 'failed' : 'completed'
+      await completeActiveModelRequest(requestStatus, event.message.usage)
       finalUsage = event.message.usage
       finalStopReason = event.message.stopReason
       const calls = event.message.content.filter((content) => content.type === 'toolCall')
@@ -1528,6 +1599,7 @@ async function beginBudgetedModelRequest(config: {
 function finishableStream(
   stream: PiAgentAdapterStream, signal: AbortSignal, finish: () => void,
   normalizeError: (error: unknown) => unknown,
+  onFailure: (error: unknown) => Promise<void> = async () => {},
 ): PiAgentAdapterStream {
   let iterator: AsyncIterator<Awaited<ReturnType<AsyncIterator<unknown>['next']>>['value']> | undefined
   let iteratorClosed = false
@@ -1538,11 +1610,10 @@ function finishableStream(
   }
   return {
     [Symbol.asyncIterator]() {
-      try { iterator = stream[Symbol.asyncIterator]() }
-      catch (error) { finish(); throw error }
       return {
         async next() {
           try {
+            iterator ??= stream[Symbol.asyncIterator]()
             const item = await nextOrAbort(iterator!, signal, closeIterator)
             if (item.done) finish()
             return item as never
@@ -1550,7 +1621,10 @@ function finishableStream(
           catch (error) {
             try {
               await closeIterator()
-            } finally { finish() }
+            } finally {
+              finish()
+              await onFailure(error)
+            }
             throw normalizeError(error)
           }
         },
@@ -1561,7 +1635,10 @@ function finishableStream(
       try {
         if (typeof stream.result === 'function') return await stream.result()
         throw new Error('provider_stream_result_unavailable')
-      } catch (error) { throw normalizeError(error) } finally { finish() }
+      } catch (error) {
+        await onFailure(error)
+        throw normalizeError(error)
+      } finally { finish() }
     },
   }
 }
@@ -1588,6 +1665,27 @@ async function nextOrAbort<T>(
 function compactAdapterEvent(event: { type: string; delta?: string }) {
   if (event.type.endsWith('_delta')) return { type: event.type, delta: event.delta }
   return { type: event.type }
+}
+
+function modelUsage(value: unknown) {
+  const token = (input: unknown) => typeof input === 'number' && Number.isFinite(input) && input >= 0
+    ? input : null
+  const raw = value !== null && typeof value === 'object'
+    ? value as Record<string, unknown> : {}
+  const usage = {
+    input: token(raw.input), cacheRead: token(raw.cacheRead),
+    cacheWrite: token(raw.cacheWrite), output: token(raw.output),
+    total: token(raw.totalTokens),
+  }
+  const reported = Object.values(usage).filter((item) => item !== null).length
+  const complete = reported === 5 && usage.total === (
+    usage.input! + usage.cacheRead! + usage.cacheWrite! + usage.output!
+  )
+  return {
+    usage,
+    status: complete ? 'complete' as const
+      : reported === 0 ? 'unknown' as const : 'partial' as const,
+  }
 }
 
 function isPolicyFailure(error: Error) {

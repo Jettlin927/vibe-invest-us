@@ -4,7 +4,9 @@ import type {
   ToolProjectionRepository,
   ProductPosition,
 } from '@vibe-invest/product-dao'
-import { defaultRuntimeSettings, parseRuntimeSettingsUpdate } from '@vibe-invest/contracts'
+import {
+  aggregateModelTokenUsage, defaultRuntimeSettings, parseRuntimeSettingsUpdate,
+} from '@vibe-invest/contracts'
 
 export function createTestProductDatabase() {
   const positions = new Map<string, ProductPosition>()
@@ -41,7 +43,23 @@ export function createTestProductDatabase() {
     projectedTools: unknown[]; visibleToolNames: string[]
     reasons: Record<string, unknown>; createdAt: string
   }>>()
-  const modelRequests: Array<{ id: string; executionId: string; projectionId: string; turnIndex: number; createdAt: string }> = []
+  const modelRequests: Array<{
+    id: string; sessionId: string; executionId: string; projectionId: string; turnIndex: number
+    kind: 'turn' | 'compaction'; status: string; usageStatus: string
+    usage: { input: number | null; cacheRead: number | null; cacheWrite: number | null; output: number | null; total: number | null }
+    createdAt: string; completedAt: string | null
+  }> = []
+  const modelUsage = (sessionId: string) => {
+    const attempts = modelRequests.filter((request) => request.sessionId === sessionId)
+    return {
+      modelAttempts: attempts.map((attempt) => ({
+        ...structuredClone(attempt),
+        durationMs: attempt.completedAt
+          ? Math.max(0, Date.parse(attempt.completedAt) - Date.parse(attempt.createdAt)) : null,
+      })),
+      tokenUsage: aggregateModelTokenUsage(attempts),
+    }
+  }
   const toolBatches = new Map<string, {
     id: string; executionId: string; projectionId: string; turnIndex: number; status: string
     calls: Array<{ toolCallId: string; toolName: string; position: number }>
@@ -535,6 +553,7 @@ export function createTestProductDatabase() {
         events: (agentEvents.get(sessionId) ?? []).map((event) => ({
           sequence: event.sequence, createdAt: event.createdAt, ...event.payload,
         })),
+        ...modelUsage(sessionId),
       }
     },
     async primaryLifecycle(analysisId) {
@@ -549,6 +568,7 @@ export function createTestProductDatabase() {
         events: (agentEvents.get(session.id) ?? []).map((event) => ({
           sequence: event.sequence, createdAt: event.createdAt, ...event.payload,
         })),
+        ...modelUsage(session.id),
       }
     },
     async interruptActiveSessions(createdAt) {
@@ -658,7 +678,25 @@ export function createTestProductDatabase() {
       return { ...structuredClone(projection), event }
     },
     async recordModelRequest(input) {
-      if (!modelRequests.some(({ id }) => id === input.id)) modelRequests.push(structuredClone(input))
+      if (!modelRequests.some(({ id }) => id === input.id)) modelRequests.push({
+        ...structuredClone(input),
+        sessionId: [...agentSessions.values()].find(({ executionId }) => (
+          executionId === input.executionId
+        ))?.id ?? (() => { throw new Error('agent_execution_fenced') })(),
+        kind: input.kind ?? 'turn', status: 'started', usageStatus: 'unknown',
+        usage: { input: null, cacheRead: null, cacheWrite: null, output: null, total: null },
+        completedAt: null,
+      })
+    },
+    async completeModelRequest(input) {
+      const request = modelRequests.find(({ id }) => id === input.id)
+      if (!request) throw new Error('model_request_not_found')
+      if (request.status !== 'started') return { created: false }
+      request.status = input.status
+      request.usageStatus = input.usageStatus
+      request.usage = structuredClone(input.usage)
+      request.completedAt = input.completedAt
+      return { created: true }
     },
     async beginToolBatch(input) {
       toolBatches.set(input.id, { ...structuredClone(input), status: 'running', results: [] })
@@ -772,7 +810,7 @@ export function createTestProductDatabase() {
 
   return {
     productDatabase: {
-      checkSchema: async () => ({ status: 'ok' as const, version: 21 }),
+      checkSchema: async () => ({ status: 'ok' as const, version: 22 }),
       close: async () => {},
     },
     portfolioRepository,

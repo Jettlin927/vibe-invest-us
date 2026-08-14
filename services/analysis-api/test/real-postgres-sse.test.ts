@@ -77,7 +77,7 @@ function specialistResults(context: { messages: Array<{
   })
 }
 
-test('真实 v12 历史 Tool 事件升级到 v21 后经 DAO、HTTP 与 SSE 原样读取', {
+test('真实 v12 历史 Tool 事件升级到 v22 后经 DAO、HTTP 与 SSE 原样读取', {
   skip: !databaseUrl || !migrationDatabaseUrl,
   concurrency: false,
 }, async () => {
@@ -1677,6 +1677,19 @@ test('真实 PostgreSQL 与 HTTP SSE 原子展示 Compaction usage 和链接 Seg
       (event: { type?: string }) => event.type === 'context_usage',
     )
     assert.equal(usageEvent.contextWindow, 128_000)
+    const compactionModelAttempt = research.mainAgent.modelAttempts.find(
+      (attempt: { kind?: string }) => attempt.kind === 'compaction',
+    )
+    assert.deepEqual({
+      status: compactionModelAttempt.status,
+      usageStatus: compactionModelAttempt.usageStatus,
+      usage: compactionModelAttempt.usage,
+    }, {
+      status: 'completed', usageStatus: 'partial',
+      usage: { input: 800, cacheRead: null, cacheWrite: null, output: 80, total: 880 },
+    })
+    assert.equal(research.mainAgent.tokenUsage.attempts, research.mainAgent.modelAttempts.length)
+    assert.equal(research.mainAgent.tokenUsage.coverage, 1)
     const replay = await fetch(`${baseUrl}/api/agent-sessions/${created.sessionId}/events`)
       .then((response) => response.text())
     assert.match(replay, /event: compaction/)
@@ -1690,6 +1703,21 @@ test('真实 PostgreSQL 与 HTTP SSE 原子展示 Compaction usage 和链接 Seg
     assert.equal(row.rows.length, 1)
     assert.equal(row.rows[0]?.summary_json.isReportEvidence, false)
     assert.equal(row.rows[0]?.usage_json.totalTokens, 880)
+    const modelRequest = await pool.query<{
+      kind: string; status: string; usage_status: string
+      input_tokens: number | null; cache_read_tokens: number | null
+      cache_write_tokens: number | null; output_tokens: number | null; total_tokens: number | null
+    }>(
+      `SELECT kind, status, usage_status, input_tokens, cache_read_tokens,
+         cache_write_tokens, output_tokens, total_tokens
+       FROM model_requests WHERE execution_id = $1 AND kind = 'compaction'`,
+      [research.mainAgent.execution.id],
+    )
+    assert.deepEqual(modelRequest.rows, [{
+      kind: 'compaction', status: 'completed', usage_status: 'partial',
+      input_tokens: 800, cache_read_tokens: null, cache_write_tokens: null,
+      output_tokens: 80, total_tokens: 880,
+    }])
   } finally {
     await settings.save(previousSettings.values, new Date().toISOString())
     await app.close()

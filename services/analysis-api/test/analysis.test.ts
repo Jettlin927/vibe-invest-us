@@ -195,6 +195,41 @@ test('主 Agent 启动的消息面 Agent 拥有独立 Session、轨迹和不可�
     event.status === 'waiting_for_specialists'
   )))
 
+  const saveUsage = async (
+    executionId: string, role: 'main' | 'news', input: number, cacheRead: number,
+  ) => {
+    const projection = await database.toolProjectionRepository.ensureVersion({
+      executionId, role, stage: 'research', schemaHash: `usage-${role}`,
+      projectedTools: [], visibleToolNames: [], reasons: { role },
+      createdAt: '2026-08-14T05:00:00.000Z',
+    })
+    const id = `${executionId}:usage-attempt`
+    await database.toolProjectionRepository.recordModelRequest({
+      id, executionId, projectionId: projection.id, turnIndex: 1,
+      createdAt: '2026-08-14T05:00:01.000Z',
+    })
+    await database.toolProjectionRepository.completeModelRequest({
+      id, executionId, status: 'completed', usageStatus: 'complete',
+      usage: { input, cacheRead, cacheWrite: 3, output: 4, total: input + cacheRead + 7 },
+      completedAt: '2026-08-14T05:00:01.100Z',
+    })
+  }
+  await saveUsage(research.mainAgent.execution.id, 'main', 100, 20)
+  await saveUsage(newsAgent.execution.id, 'news', 40, 10)
+  const usageResearch = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  assert.deepEqual(usageResearch.mainAgent.tokenUsage, {
+    attempts: 1, reportedAttempts: 1, coverage: 1,
+    input: 100, cacheRead: 20, cacheWrite: 3, output: 4, total: 127,
+  })
+  const usageNews = usageResearch.specialistAgents.find((agent: any) => agent.domain === 'news')
+  assert.deepEqual(usageNews.tokenUsage, {
+    attempts: 1, reportedAttempts: 1, coverage: 1,
+    input: 40, cacheRead: 10, cacheWrite: 3, output: 4, total: 57,
+  })
+  assert.equal(usageNews.modelAttempts[0].usageStatus, 'complete')
+
   const versions = (await app.inject({
     method: 'GET', url: `/api/research/${created.analysisId}/report-versions`,
   })).json().items

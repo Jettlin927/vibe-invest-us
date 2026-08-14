@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  aggregateModelTokenUsage,
   agentExecutionStatuses,
   defaultRuntimeSettings,
   isTerminalAgentExecutionStatus,
@@ -10,6 +11,22 @@ import {
   terminalAgentExecutionStatuses,
   waitReasonForStatus,
 } from '../src/index.js'
+
+test('Token 聚合对 partial 缺失字段传播 null 且不把 unknown 计入 coverage', () => {
+  assert.deepEqual(aggregateModelTokenUsage([{
+    usageStatus: 'complete',
+    usage: { input: 10, cacheRead: 2, cacheWrite: 1, output: 3, total: 16 },
+  }, {
+    usageStatus: 'partial',
+    usage: { input: 4, cacheRead: 1, cacheWrite: null, output: 2, total: 7 },
+  }, {
+    usageStatus: 'unknown',
+    usage: { input: null, cacheRead: null, cacheWrite: null, output: null, total: null },
+  }]), {
+    attempts: 3, reportedAttempts: 2, coverage: 2 / 3,
+    input: 14, cacheRead: 3, cacheWrite: null, output: 5, total: 23,
+  })
+})
 
 test('Runtime 设置默认值符合产品预算与安全上限', () => {
   assert.deepEqual(defaultRuntimeSettings, {

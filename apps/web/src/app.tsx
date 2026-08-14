@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 
 import {
-  isRuntimeSettingsResponse, isSystemHealth, isTerminalAgentExecutionStatus, runtimeSettingLimits,
+  aggregateModelTokenUsage, isRuntimeSettingsResponse, isSystemHealth,
+  isTerminalAgentExecutionStatus, runtimeSettingLimits,
   type RuntimeSettings, type RuntimeSettingsResponse, type SystemHealth,
+  type TokenUsageAggregate,
 } from '@vibe-invest/contracts'
 
 type Page = 'overview' | 'analysis' | 'research' | 'portfolio' | 'settings'
@@ -32,6 +34,16 @@ type Report = {
   personalImpact?: string | null; conditionalSuggestion?: string | null
   limitations?: string[]
 }
+type ModelAttempt = {
+  id: string; executionId: string; kind: 'turn' | 'compaction'; turnIndex: number
+  status: string; usageStatus: 'complete' | 'partial' | 'unknown'
+  usage: {
+    input: number | null; cacheRead: number | null; cacheWrite: number | null
+    output: number | null; total: number | null
+  }
+  durationMs: number | null; createdAt: string; completedAt: string | null
+}
+type TokenUsage = TokenUsageAggregate
 type ResearchRecord = ResearchSummary & {
   report?: Report
   facts: Fact[]
@@ -58,6 +70,8 @@ type ResearchRecord = ResearchSummary & {
       compactionId: string; attempt: number; status: string; durationMs: number
       usage: { input?: number; cacheRead?: number; cacheWrite?: number; output?: number; totalTokens?: number } | null
     }>
+    modelAttempts?: ModelAttempt[]
+    tokenUsage?: TokenUsage
   }
   specialistAgents?: Array<{
     id?: string; domain: string; status?: string
@@ -66,6 +80,8 @@ type ResearchRecord = ResearchSummary & {
     segments?: NonNullable<ResearchRecord['mainAgent']>['segments']
     events?: Array<NonNullable<ResearchRecord['mainAgent']>['events'][number] & { name?: string }>
     compactionAttempts?: NonNullable<ResearchRecord['mainAgent']>['compactionAttempts']
+    modelAttempts?: ModelAttempt[]
+    tokenUsage?: TokenUsage
     reportVersion?: { version: number; report: {
       gaps?: Array<{ capability?: string; reason?: string; impact?: string }>
       keyJudgments?: Array<{ statement?: string; direction?: string; confidence?: string }>
@@ -346,7 +362,7 @@ function ResearchPage({ records, record, onOpen, onUpdate, onDelete, onResume, f
     <div className="research-layout">
       <aside className="research-index"><p className="micro">全部记录 · {records.length}</p>{records.map((item) => <button className={record?.id === item.id ? 'active' : ''} key={item.id} onClick={() => void onOpen(item.id)}><strong>{item.symbol}</strong><span>{item.report?.title ?? statusLabel(item.status)}</span><small>{item.starred ? `已标记 · ${statusLabel(item.status)}` : statusLabel(item.status)}</small></button>)}</aside>
       <ResearchReport record={record} onUpdate={onUpdate} onDelete={onDelete} onResume={onResume} freshnessDays={freshnessDays} />
-      <div><AgentRuntime agent={record?.mainAgent} /><SpecialistAgents agents={record?.specialistAgents} /><TraceSummary trace={record?.trace ?? []} /></div>
+      <div><TokenUsageDashboard record={record} /><AgentRuntime agent={record?.mainAgent} /><SpecialistAgents agents={record?.specialistAgents} /><TraceSummary trace={record?.trace ?? []} /></div>
     </div>
   </>
 }
@@ -389,6 +405,108 @@ function SpecialistAgents({ agents = [] }: { agents?: ResearchRecord['specialist
   )})}</>
 }
 
+function TokenUsageDashboard({ record }: { record: ResearchRecord | null }) {
+  const [expanded, setExpanded] = useState(false)
+  type TokenAgentView = { label: string; tokenUsage: TokenUsage; modelAttempts: ModelAttempt[] }
+  const agents: TokenAgentView[] = []
+  const addAgent = (label: string, attempts: ModelAttempt[]) => {
+    const turns = attempts.filter(({ kind }) => kind === 'turn')
+    if (turns.length) agents.push({
+      label, tokenUsage: aggregateModelTokenUsage(turns), modelAttempts: turns,
+    })
+  }
+  addAgent('主 Agent', record?.mainAgent?.modelAttempts ?? [])
+  for (const agent of record?.specialistAgents ?? []) addAgent(
+    agent.domain === 'news' ? '消息面专项'
+      : agent.domain === 'technical' ? '技术面专项' : '基本面专项',
+    agent.modelAttempts ?? [],
+  )
+  const compactions = [
+    ...(record?.mainAgent?.modelAttempts ?? []),
+    ...(record?.specialistAgents ?? []).flatMap(({ modelAttempts }) => modelAttempts ?? []),
+  ].filter(({ kind }) => kind === 'compaction')
+  if (compactions.length) agents.push({
+    label: 'Compaction', tokenUsage: aggregateModelTokenUsage(compactions),
+    modelAttempts: compactions,
+  })
+  if (!agents.length) return null
+  const researchUsage = aggregateModelTokenUsage(agents.flatMap(({ modelAttempts }) => modelAttempts))
+  return <section className="token-dashboard" role="region" aria-label="Agent Token 用量">
+    <header><p className="micro">Agent Token 用量</p><button className="text-button" onClick={() => setExpanded((value) => !value)}>
+      {expanded ? '收起 Token 累计趋势' : '展开 Token 累计趋势'}
+    </button></header>
+    <p>研究合计 {researchUsage.attempts} 次 attempt · 已上报 {researchUsage.reportedAttempts}
+      {' · '}Coverage {(researchUsage.coverage * 100).toFixed(1)}%
+      {' · '}Input {formatOptionalNumber(researchUsage.input)}
+      {' · '}Cache Read {formatOptionalNumber(researchUsage.cacheRead)}
+      {' · '}Cache Write {formatOptionalNumber(researchUsage.cacheWrite)}
+      {' · '}Output {formatOptionalNumber(researchUsage.output)}
+      {' · '}Total {formatOptionalNumber(researchUsage.total)}
+    </p>
+    {agents.map(({ label, tokenUsage: usage, modelAttempts: attempts }) => {
+      const reported = attempts.filter(({ usageStatus }) => usageStatus !== 'unknown')
+      const cacheRateReady = reported.length > 0 && reported.every(({ usage: attemptUsage }) => (
+        attemptUsage.input !== null && attemptUsage.cacheRead !== null
+          && attemptUsage.cacheWrite !== null
+      ))
+      const cacheBase = cacheRateReady
+        ? usage.input! + usage.cacheRead! + usage.cacheWrite! : 0
+      return <article className="token-agent" key={label}>
+        <strong>{label}</strong>
+        <p>Input {formatOptionalNumber(usage.input)} · Cache Read {formatOptionalNumber(usage.cacheRead)}
+          {' · '}Cache Write {formatOptionalNumber(usage.cacheWrite)} · Output {formatOptionalNumber(usage.output)}
+          {' · '}Total {formatOptionalNumber(usage.total)} · Coverage {(usage.coverage * 100).toFixed(1)}%
+          {cacheRateReady && cacheBase > 0
+            ? ` · 缓存命中率 ${(usage.cacheRead! / cacheBase * 100).toFixed(1)}%`
+            : ' · 缓存命中率 N/A'}
+        </p>
+        <TokenStack label={label} usage={usage} />
+        {expanded && <TokenTrend label={label} attempts={attempts} />}
+      </article>
+    })}
+  </section>
+}
+
+function TokenStack({ label, usage }: { label: string; usage: TokenUsage }) {
+  const fields = [usage.input, usage.cacheRead, usage.cacheWrite, usage.output]
+  if (fields.some((value) => value === null)) return <p>{label} Token 构成 N/A（字段未完整上报）</p>
+  const total = fields.reduce<number>((sum, value) => sum + (value ?? 0), 0) || 1
+  const colors = ['#494139', '#3a7c49', '#2f6f8f', '#e25132']
+  let x = 0
+  return <svg viewBox="0 0 240 18" role="img" aria-label={`${label} Token 构成`}>
+    {fields.map((value, index) => {
+      const width = (value ?? 0) / total * 240
+      const rect = <rect key={index} x={x} y="2" width={width} height="14" fill={colors[index]} />
+      x += width
+      return rect
+    })}
+  </svg>
+}
+
+function TokenTrend({ label, attempts }: { label: string; attempts: ModelAttempt[] }) {
+  let total = 0
+  const points = attempts.map((attempt, index) => {
+    const reportedTotal = attempt.usageStatus !== 'unknown' ? attempt.usage.total : null
+    if (reportedTotal !== null) total += reportedTotal
+    return {
+      x: attempts.length === 1 ? 0 : index / (attempts.length - 1) * 240,
+      total, attempt, reportedTotal,
+    }
+  })
+  const maximum = Math.max(1, ...points.map((point) => point.total))
+  const path = points.filter(({ reportedTotal }) => reportedTotal !== null)
+    .map(({ x, total: value }) => `${x},${38 - value / maximum * 34}`).join(' ')
+  return <div className="token-trend">
+    <svg viewBox="0 0 240 42" role="img" aria-label={`${label} Token 累计趋势`}>
+      <polyline points={path} fill="none" stroke="#e25132" strokeWidth="2" />
+    </svg>
+    <p>{points.map(({ total: value, attempt, reportedTotal }, index) => (
+      `请求 ${index + 1} ${attempt.usageStatus === 'unknown' ? 'usage 未返回'
+        : reportedTotal === null ? 'Total N/A' : formatNumber(value)}`
+    )).join(' · ')}</p>
+  </div>
+}
+
 function AgentRuntime({ agent }: { agent?: ResearchRecord['mainAgent'] }) {
   if (!agent) return null
   return <section className="agent-runtime" role="region" aria-label="主 Agent Runtime">
@@ -427,6 +545,7 @@ function ContextUsage({ agent }: {
   agent?: {
     segments?: NonNullable<ResearchRecord['mainAgent']>['segments']
     events?: NonNullable<ResearchRecord['mainAgent']>['events']
+    modelAttempts?: ModelAttempt[]
   }
 }) {
   const raw = agent?.events?.filter(
@@ -439,13 +558,29 @@ function ContextUsage({ agent }: {
   }
   const trigger = raw.contextWindow - raw.reserveTokens
   const progress = trigger > 0 ? contextTokens / trigger : 1
-  const state = progress < .7 ? '绿色' : progress < .85 ? '黄色'
+  const compacting = agent?.modelAttempts?.some(({ kind, status }) => (
+    kind === 'compaction' && status === 'started'
+  )) ?? false
+  const lastCompaction = agent?.events?.filter(({ type }) => type === 'compaction').at(-1)
+  const failed = lastCompaction?.status === 'failed'
+  const progressState = progress < .7 ? '绿色' : progress < .85 ? '黄色'
     : progress < .95 ? '橙色' : '红色'
+  const tone = compacting ? 'blue' : failed ? 'red'
+    : progress < .7 ? 'green' : progress < .85 ? 'yellow'
+      : progress < .95 ? 'orange' : 'red'
+  const state = compacting ? '蓝色 · Compaction 进行中'
+    : failed ? '红色 · Compaction 失败' : progressState
   const currentSegment = agent?.segments?.at(-1)?.ordinal
-  return <p>
+  const compactCount = agent?.events?.filter(({ type, status }) => (
+    type === 'compaction' && status === 'completed'
+  )).length ?? 0
+  return <p className={`context-usage context-usage-${tone}`}>
     上下文 {raw.estimated ? '≈' : ''}{(contextTokens / raw.contextWindow * 100).toFixed(1)}% / {raw.contextWindow.toLocaleString('zh-CN')}
+    {' · '}当前 {contextTokens.toLocaleString('zh-CN')} Token
+    {' · '}阈值 {trigger.toLocaleString('zh-CN')} Token
     {' · '}距 Compaction {Math.max(0, trigger - contextTokens).toLocaleString('zh-CN')} Token
     {' · '}{state}{currentSegment ? ` · Segment ${currentSegment}` : ''}
+    {' · '}已 Compaction {compactCount} 次
   </p>
 }
 
@@ -778,6 +913,7 @@ function formatNullableMoney(value: number | null) { return value === null ? '�
 function formatSignedMoney(value: number | null) { if (value === null || !Number.isFinite(value)) return '不可用'; return `${value > 0 ? '+' : ''}${formatMoney(value)}` }
 function formatSignedMoneyOrDash(value: number | null) { return value === null ? '—' : formatSignedMoney(value) }
 function formatNumber(value: number) { return new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 4 }).format(value) }
+function formatOptionalNumber(value: number | null) { return value === null ? 'N/A' : formatNumber(value) }
 function formatCompact(value: number) { return Number.isFinite(value) ? new Intl.NumberFormat('zh-CN', { notation: 'compact', maximumFractionDigits: 2 }).format(value) : '—' }
 function formatMaybeMoney(value: unknown) { return formatMoney(Number(value)) }
 function formatMaybeNumber(value: unknown) { const number = Number(value); return Number.isFinite(number) ? number.toFixed(2) : '—' }

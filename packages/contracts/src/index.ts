@@ -3,6 +3,29 @@ export type FinancialDataHealth = {
   status: 'ok'
 }
 
+export type ModelTokenUsage = {
+  input: number | null; cacheRead: number | null; cacheWrite: number | null
+  output: number | null; total: number | null
+}
+export type TokenUsageAggregate = ModelTokenUsage & {
+  attempts: number; reportedAttempts: number; coverage: number
+}
+export function aggregateModelTokenUsage(
+  attempts: Array<{ usageStatus: string; usage: ModelTokenUsage }>,
+): TokenUsageAggregate {
+  const reported = attempts.filter(({ usageStatus }) => usageStatus !== 'unknown')
+  const sum = (field: keyof ModelTokenUsage) => (
+    reported.length && reported.every((attempt) => attempt.usage[field] !== null)
+      ? reported.reduce((total, attempt) => total + attempt.usage[field]!, 0) : null
+  )
+  return {
+    attempts: attempts.length, reportedAttempts: reported.length,
+    coverage: attempts.length ? reported.length / attempts.length : 0,
+    input: sum('input'), cacheRead: sum('cacheRead'), cacheWrite: sum('cacheWrite'),
+    output: sum('output'), total: sum('total'),
+  }
+}
+
 export const agentExecutionStatuses = [
   'planning', 'running_model', 'running_tools', 'waiting_for_specialists',
   'finalizing', 'completed', 'partial', 'failed', 'stopping', 'stopped',

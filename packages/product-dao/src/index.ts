@@ -1,12 +1,12 @@
 import { Pool, type PoolClient } from 'pg'
 import {
-  agentExecutionStatuses, defaultRuntimeSettings, parseRuntimeSettingsUpdate,
+  agentExecutionStatuses, aggregateModelTokenUsage, defaultRuntimeSettings, parseRuntimeSettingsUpdate,
   terminalAgentExecutionStatuses,
   type AgentExecutionStatus,
   type ExecutionSettingsSnapshot, type RuntimeSettings, type RuntimeSettingsRevision,
 } from '@vibe-invest/contracts'
 
-export const schemaVersion = 21
+export const schemaVersion = 22
 
 const migrationSql = `
 CREATE TABLE IF NOT EXISTS product_schema_migrations (
@@ -301,9 +301,48 @@ CREATE TABLE IF NOT EXISTS model_requests (
   execution_id text NOT NULL REFERENCES agent_executions(id) ON DELETE CASCADE,
   projection_id text NOT NULL,
   turn_index integer NOT NULL CHECK (turn_index > 0),
+  kind text NOT NULL DEFAULT 'turn' CHECK (kind IN ('turn', 'compaction')),
+  status text NOT NULL DEFAULT 'started'
+    CHECK (status IN ('started', 'completed', 'failed', 'cancelled', 'outcome_unknown')),
+  usage_status text NOT NULL DEFAULT 'unknown'
+    CHECK (usage_status IN ('complete', 'partial', 'unknown')),
+  input_tokens integer CHECK (input_tokens >= 0),
+  cache_read_tokens integer CHECK (cache_read_tokens >= 0),
+  cache_write_tokens integer CHECK (cache_write_tokens >= 0),
+  output_tokens integer CHECK (output_tokens >= 0),
+  total_tokens integer CHECK (total_tokens >= 0),
+  completed_at timestamptz,
   created_at timestamptz NOT NULL,
   CONSTRAINT model_requests_projection_id_execution_id_fkey FOREIGN KEY (projection_id, execution_id)
     REFERENCES tool_projection_versions(id, execution_id)
+);
+ALTER TABLE model_requests ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'turn'
+  CHECK (kind IN ('turn', 'compaction'));
+ALTER TABLE model_requests ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'started'
+  CHECK (status IN ('started', 'completed', 'failed', 'cancelled', 'outcome_unknown'));
+ALTER TABLE model_requests ADD COLUMN IF NOT EXISTS usage_status text NOT NULL DEFAULT 'unknown'
+  CHECK (usage_status IN ('complete', 'partial', 'unknown'));
+ALTER TABLE model_requests ADD COLUMN IF NOT EXISTS input_tokens integer CHECK (input_tokens >= 0);
+ALTER TABLE model_requests ADD COLUMN IF NOT EXISTS cache_read_tokens integer CHECK (cache_read_tokens >= 0);
+ALTER TABLE model_requests ADD COLUMN IF NOT EXISTS cache_write_tokens integer CHECK (cache_write_tokens >= 0);
+ALTER TABLE model_requests ADD COLUMN IF NOT EXISTS output_tokens integer CHECK (output_tokens >= 0);
+ALTER TABLE model_requests ADD COLUMN IF NOT EXISTS total_tokens integer CHECK (total_tokens >= 0);
+ALTER TABLE model_requests ADD COLUMN IF NOT EXISTS completed_at timestamptz;
+ALTER TABLE model_requests DROP CONSTRAINT IF EXISTS model_requests_usage_consistency_check;
+ALTER TABLE model_requests ADD CONSTRAINT model_requests_usage_consistency_check CHECK (
+  (usage_status = 'unknown' AND input_tokens IS NULL AND cache_read_tokens IS NULL
+    AND cache_write_tokens IS NULL AND output_tokens IS NULL AND total_tokens IS NULL)
+  OR (usage_status = 'complete' AND input_tokens IS NOT NULL AND cache_read_tokens IS NOT NULL
+    AND cache_write_tokens IS NOT NULL AND output_tokens IS NOT NULL AND total_tokens IS NOT NULL
+    AND total_tokens = input_tokens + cache_read_tokens + cache_write_tokens + output_tokens)
+  OR (usage_status = 'partial' AND num_nonnulls(
+    input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, total_tokens
+  ) BETWEEN 1 AND 5 AND NOT (
+    input_tokens IS NOT NULL AND cache_read_tokens IS NOT NULL
+    AND cache_write_tokens IS NOT NULL AND output_tokens IS NOT NULL
+    AND total_tokens IS NOT NULL
+    AND total_tokens = input_tokens + cache_read_tokens + cache_write_tokens + output_tokens
+  ))
 );
 
 CREATE TABLE IF NOT EXISTS tool_call_batches (
@@ -495,6 +534,24 @@ INSERT INTO product_schema_migrations (version)
 VALUES (21)
 ON CONFLICT (version) DO NOTHING;
 
+UPDATE model_requests SET status = 'outcome_unknown', completed_at = created_at
+WHERE status = 'started' AND EXISTS (
+  SELECT 1 FROM product_schema_migrations WHERE version = 21
+) AND NOT EXISTS (
+  SELECT 1 FROM product_schema_migrations WHERE version = 22
+);
+
+UPDATE model_requests SET kind = 'compaction'
+WHERE id ~ ':compaction:[^:]+:attempt:[0-9]+$' AND EXISTS (
+  SELECT 1 FROM product_schema_migrations WHERE version = 21
+) AND NOT EXISTS (
+  SELECT 1 FROM product_schema_migrations WHERE version = 22
+);
+
+INSERT INTO product_schema_migrations (version)
+VALUES (22)
+ON CONFLICT (version) DO NOTHING;
+
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM vibe_invest_app;
 REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM vibe_invest_app;
 GRANT SELECT ON product_schema_migrations TO vibe_invest_app;
@@ -509,6 +566,10 @@ GRANT SELECT, INSERT ON agent_compactions TO vibe_invest_app;
 GRANT SELECT, INSERT ON agent_compaction_attempts TO vibe_invest_app;
 GRANT SELECT, INSERT ON runtime_settings_revisions, execution_settings_snapshots TO vibe_invest_app;
 GRANT SELECT, INSERT ON tool_projection_versions, model_requests, tool_call_batches, tool_batch_calls TO vibe_invest_app;
+GRANT UPDATE (
+  status, usage_status, input_tokens, cache_read_tokens, cache_write_tokens,
+  output_tokens, total_tokens, completed_at
+) ON model_requests TO vibe_invest_app;
 GRANT SELECT, INSERT ON report_versions TO vibe_invest_app;
 GRANT UPDATE (status, started_at, completed_at, completion_order, result_payload_json)
   ON tool_batch_calls TO vibe_invest_app;
@@ -1297,6 +1358,9 @@ export function createAgentEventRepository(pool: Pool) {
           await cancelRunningCompactionAttempts(
             client, currentSession.id, currentSession.execution_id, input.createdAt,
           )
+          await finalizeRunningModelRequests(
+            client, currentSession.execution_id, 'cancelled', input.createdAt,
+          )
           const sequence = cancelled.latestSequence + 1
           const waitReason = input.event.waitReason ?? null
           const fenceExecutionId = currentSession.id === input.sessionId
@@ -1790,6 +1854,9 @@ export function createAgentEventRepository(pool: Pool) {
           )
           cancelledToolEvents = cancelled.events
           sequence = cancelled.latestSequence + 1
+          await finalizeRunningModelRequests(
+            client, current.id, 'outcome_unknown', input.createdAt,
+          )
         }
         await client.query(
           `INSERT INTO agent_events (
@@ -2136,6 +2203,9 @@ export function createAgentEventRepository(pool: Pool) {
           const cancelled = await cancelRunningToolBatches(
             client, session.id, session.execution_id, session.latest_sequence, createdAt,
           )
+          await finalizeRunningModelRequests(
+            client, session.execution_id, 'outcome_unknown', createdAt,
+          )
           const sequence = cancelled.latestSequence + 1
           const operationId = `startup:interrupt:${session.id}:${sequence}`
           const payload = {
@@ -2258,6 +2328,7 @@ export function createAgentEventRepository(pool: Pool) {
         )
         const compactions = await readCompactions(client, session.id)
         const compactionAttempts = await readCompactionAttempts(client, session.id)
+        const { modelAttempts, tokenUsage } = await readModelUsage(client, session.id)
         const current = execution.rows[0]
         if (!current) { await client.query('COMMIT'); return null }
         const lifecycle = {
@@ -2278,6 +2349,8 @@ export function createAgentEventRepository(pool: Pool) {
           })),
           compactions,
           compactionAttempts,
+          modelAttempts,
+          tokenUsage,
         }
         await client.query('COMMIT')
         return lifecycle
@@ -2375,6 +2448,41 @@ async function readCompactionAttempts(client: PoolClient, sessionId: string) {
   }))
 }
 
+async function readModelUsage(client: PoolClient, sessionId: string) {
+  const result = await client.query<{
+    id: string; execution_id: string; turn_index: number; kind: string; status: string
+    usage_status: string; input_tokens: number | null; cache_read_tokens: number | null
+    cache_write_tokens: number | null; output_tokens: number | null; total_tokens: number | null
+    created_at: string; completed_at: string | null
+  }>(
+    `SELECT request.id, request.execution_id, request.turn_index, request.kind, request.status,
+       request.usage_status, request.input_tokens, request.cache_read_tokens,
+       request.cache_write_tokens, request.output_tokens, request.total_tokens,
+       request.created_at::text, request.completed_at::text
+     FROM model_requests request
+     JOIN agent_executions execution ON execution.id = request.execution_id
+     WHERE execution.session_id = $1
+     ORDER BY request.created_at, request.id`,
+    [sessionId],
+  )
+  const modelAttempts = result.rows.map((row) => ({
+    id: row.id, executionId: row.execution_id, kind: row.kind, turnIndex: row.turn_index,
+    status: row.status, usageStatus: row.usage_status,
+    usage: {
+      input: row.input_tokens, cacheRead: row.cache_read_tokens,
+      cacheWrite: row.cache_write_tokens, output: row.output_tokens, total: row.total_tokens,
+    },
+    durationMs: row.completed_at === null
+      ? null : Math.max(0, Date.parse(row.completed_at) - Date.parse(row.created_at)),
+    createdAt: new Date(row.created_at).toISOString(),
+    completedAt: row.completed_at === null ? null : new Date(row.completed_at).toISOString(),
+  }))
+  return {
+    modelAttempts,
+    tokenUsage: aggregateModelTokenUsage(modelAttempts),
+  }
+}
+
 async function readSessionLifecycle(pool: Pool, sessionId: string) {
   const client = await pool.connect()
   try {
@@ -2408,6 +2516,7 @@ async function readSessionLifecycle(pool: Pool, sessionId: string) {
     )
     const compactions = await readCompactions(client, sessionId)
     const compactionAttempts = await readCompactionAttempts(client, sessionId)
+    const { modelAttempts, tokenUsage } = await readModelUsage(client, sessionId)
     const current = execution.rows[0]
     if (!current) { await client.query('COMMIT'); return null }
     const lifecycle = {
@@ -2427,6 +2536,8 @@ async function readSessionLifecycle(pool: Pool, sessionId: string) {
       })),
       compactions,
       compactionAttempts,
+      modelAttempts,
+      tokenUsage,
     }
     await client.query('COMMIT')
     return lifecycle
@@ -2539,7 +2650,8 @@ export function createToolProjectionRepository(pool: Pool) {
       } finally { client.release() }
     },
     async recordModelRequest(input: {
-      id: string; executionId: string; projectionId: string; turnIndex: number; createdAt: string
+      id: string; executionId: string; projectionId: string; turnIndex: number
+      kind?: 'turn' | 'compaction'; createdAt: string
     }) {
       const client = await pool.connect()
       try {
@@ -2552,15 +2664,17 @@ export function createToolProjectionRepository(pool: Pool) {
         )
         if (!projection.rowCount) throw new Error('tool_projection_not_available')
         const existing = await client.query<{
-          execution_id: string; projection_id: string; turn_index: number; created_at: string
+          execution_id: string; projection_id: string; turn_index: number
+          kind: string; created_at: string
         }>(
-          `SELECT execution_id, projection_id, turn_index, created_at::text
+          `SELECT execution_id, projection_id, turn_index, kind, created_at::text
            FROM model_requests WHERE id = $1`, [input.id],
         )
         if (existing.rows[0]) {
           const row = existing.rows[0]
           if (row.execution_id !== input.executionId || row.projection_id !== input.projectionId
             || row.turn_index !== input.turnIndex
+            || row.kind !== (input.kind ?? 'turn')
             || new Date(row.created_at).toISOString() !== new Date(input.createdAt).toISOString()) {
             throw new Error('model_request_conflict')
           }
@@ -2568,12 +2682,87 @@ export function createToolProjectionRepository(pool: Pool) {
           return
         }
         await client.query(
-          `INSERT INTO model_requests (id, execution_id, projection_id, turn_index, created_at)
-           VALUES ($1, $2, $3, $4, $5)`,
-          [input.id, input.executionId, input.projectionId, input.turnIndex, input.createdAt],
+          `INSERT INTO model_requests (id, execution_id, projection_id, turn_index, kind, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [input.id, input.executionId, input.projectionId, input.turnIndex,
+            input.kind ?? 'turn', input.createdAt],
         )
         await client.query('COMMIT')
       } catch (error) { await client.query('ROLLBACK'); throw error } finally { client.release() }
+    },
+    async completeModelRequest(input: {
+      id: string; executionId: string
+      status: 'completed' | 'failed' | 'cancelled' | 'outcome_unknown'
+      usageStatus: 'complete' | 'partial' | 'unknown'
+      usage: {
+        input: number | null; cacheRead: number | null; cacheWrite: number | null
+        output: number | null; total: number | null
+      }
+      completedAt: string
+    }) {
+      const client = await pool.connect()
+      try {
+        await client.query('BEGIN')
+        const identity = await client.query<{ analysis_id: string; session_id: string }>(
+          `SELECT session.analysis_id, session.id AS session_id
+           FROM agent_executions execution
+           JOIN agent_sessions session ON session.id = execution.session_id
+           WHERE execution.id = $1`, [input.executionId],
+        )
+        if (!identity.rows[0]) throw new Error('agent_execution_fenced')
+        await client.query(
+          'SELECT id FROM analyses WHERE id = $1 FOR UPDATE', [identity.rows[0].analysis_id],
+        )
+        const execution = await client.query<{
+          current_execution_id: string; terminal: boolean
+        }>(
+          `SELECT session.execution_id AS current_execution_id, execution.terminal
+           FROM agent_executions execution
+           JOIN agent_sessions session ON session.id = execution.session_id
+           WHERE execution.id = $1 FOR UPDATE OF session, execution`, [input.executionId],
+        )
+        const request = await client.query<{
+          execution_id: string; status: string; usage_status: string
+          input_tokens: number | null; cache_read_tokens: number | null
+          cache_write_tokens: number | null; output_tokens: number | null
+          total_tokens: number | null; completed_at: string | null
+        }>(
+          `SELECT execution_id, status, usage_status, input_tokens, cache_read_tokens,
+             cache_write_tokens, output_tokens, total_tokens, completed_at::text
+           FROM model_requests WHERE id = $1 FOR UPDATE`, [input.id],
+        )
+        const row = request.rows[0]
+        if (!row || row.execution_id !== input.executionId) throw new Error('model_request_not_found')
+        if (row.status !== 'started') {
+          if (row.status !== input.status || row.usage_status !== input.usageStatus
+            || row.input_tokens !== input.usage.input
+            || row.cache_read_tokens !== input.usage.cacheRead
+            || row.cache_write_tokens !== input.usage.cacheWrite
+            || row.output_tokens !== input.usage.output
+            || row.total_tokens !== input.usage.total
+            || !sameInstant(row.completed_at, input.completedAt)) {
+            throw new Error('model_request_conflict')
+          }
+          await client.query('COMMIT')
+          return { created: false }
+        }
+        if (execution.rows[0]?.current_execution_id !== input.executionId
+          || execution.rows[0].terminal) throw new Error('agent_execution_fenced')
+        await client.query(
+          `UPDATE model_requests SET status = $1, usage_status = $2,
+             input_tokens = $3, cache_read_tokens = $4, cache_write_tokens = $5,
+             output_tokens = $6, total_tokens = $7, completed_at = $8
+           WHERE id = $9`,
+          [input.status, input.usageStatus, input.usage.input, input.usage.cacheRead,
+            input.usage.cacheWrite, input.usage.output, input.usage.total,
+            input.completedAt, input.id],
+        )
+        await client.query('COMMIT')
+        return { created: true }
+      } catch (error) {
+        await client.query('ROLLBACK')
+        throw error
+      } finally { client.release() }
     },
     async beginToolBatch(input: {
       id: string; executionId: string; projectionId: string; turnIndex: number
@@ -3154,6 +3343,17 @@ async function cancelRunningCompactionAttempts(
       }], cancelledAt,
     )
   }
+}
+
+async function finalizeRunningModelRequests(
+  database: PoolClient, executionId: string,
+  status: 'cancelled' | 'outcome_unknown', completedAt: string,
+) {
+  await database.query(
+    `UPDATE model_requests SET status = $1, usage_status = 'unknown', completed_at = $2
+     WHERE execution_id = $3 AND status = 'started'`,
+    [status, completedAt, executionId],
+  )
 }
 
 async function assertCurrentExecution(database: PoolClient, executionId: string) {
