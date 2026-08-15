@@ -1413,6 +1413,7 @@ export function createAgentEventRepository(pool: Pool) {
       createdAt: string
     }) {
       const client = await pool.connect()
+      let conflictedAnalysisId: string | undefined
       try {
         await client.query('BEGIN')
         await client.query(
@@ -1433,50 +1434,60 @@ export function createAgentEventRepository(pool: Pool) {
         const analysisId = analysis.rows[0]!.id
         if (!analysis.rows[0]!.created) {
           await client.query('COMMIT')
-          const existing = await this.findPrimarySession(analysisId)
-          if (!existing) throw new Error('agent_session_not_found')
-          const event = (await this.list(existing.id, 0))[0]!
-          return { analysisId, sessionId: existing.id, sequence: event.sequence, created: false, event }
+          conflictedAnalysisId = analysisId
+        } else {
+          await client.query(
+            `INSERT INTO agent_sessions (
+               id, analysis_id, is_primary, execution_id, status, latest_sequence, created_at, updated_at
+             ) VALUES ($1, $2, true, $3, $4, 1, $5, $5)`,
+            [input.sessionId, analysisId, input.executionId, input.status, input.createdAt],
+          )
+          const segmentId = input.segmentId ?? `${input.sessionId}:segment:1`
+          const waitReason = {
+            kind: 'database', target: '首次研究初始化', startedAt: input.createdAt,
+          }
+          await client.query(
+            `INSERT INTO agent_executions (
+               id, session_id, generation, status, wait_reason_json, terminal, created_at, updated_at
+             ) VALUES ($1, $2, 1, 'planning', $3, false, $4, $4)`,
+            [input.executionId, input.sessionId, JSON.stringify(waitReason), input.createdAt],
+          )
+          await client.query(
+            `INSERT INTO conversation_segments (id, session_id, ordinal, created_at)
+             VALUES ($1, $2, 1, $3)`,
+            [segmentId, input.sessionId, input.createdAt],
+          )
+          await client.query(
+            `INSERT INTO agent_events (
+               session_id, sequence, operation_id, payload_json, created_at
+             ) VALUES ($1, 1, $2, $3, $4)`,
+            [input.sessionId, input.operationId, JSON.stringify(input.event), input.createdAt],
+          )
+          await freezeExecutionSettings(client, input.executionId, input.createdAt)
+          await client.query('COMMIT')
+          return { analysisId, sessionId: input.sessionId, sequence: 1, created: true, event: {
+            sessionId: input.sessionId, sequence: 1, operationId: input.operationId,
+            payload: input.event, createdAt: input.createdAt,
+          } }
         }
-        await client.query(
-          `INSERT INTO agent_sessions (
-             id, analysis_id, is_primary, execution_id, status, latest_sequence, created_at, updated_at
-           ) VALUES ($1, $2, true, $3, $4, 1, $5, $5)`,
-          [input.sessionId, analysisId, input.executionId, input.status, input.createdAt],
-        )
-        const segmentId = input.segmentId ?? `${input.sessionId}:segment:1`
-        const waitReason = {
-          kind: 'database', target: '首次研究初始化', startedAt: input.createdAt,
-        }
-        await client.query(
-          `INSERT INTO agent_executions (
-             id, session_id, generation, status, wait_reason_json, terminal, created_at, updated_at
-           ) VALUES ($1, $2, 1, 'planning', $3, false, $4, $4)`,
-          [input.executionId, input.sessionId, JSON.stringify(waitReason), input.createdAt],
-        )
-        await client.query(
-          `INSERT INTO conversation_segments (id, session_id, ordinal, created_at)
-           VALUES ($1, $2, 1, $3)`,
-          [segmentId, input.sessionId, input.createdAt],
-        )
-        await client.query(
-          `INSERT INTO agent_events (
-             session_id, sequence, operation_id, payload_json, created_at
-           ) VALUES ($1, 1, $2, $3, $4)`,
-          [input.sessionId, input.operationId, JSON.stringify(input.event), input.createdAt],
-        )
-        await freezeExecutionSettings(client, input.executionId, input.createdAt)
-        await client.query('COMMIT')
-        return { analysisId, sessionId: input.sessionId, sequence: 1, created: true, event: {
-          sessionId: input.sessionId, sequence: 1, operationId: input.operationId,
-          payload: input.event, createdAt: input.createdAt,
-        } }
       } catch (error) {
         await client.query('ROLLBACK')
         throw error
       } finally {
         client.release()
       }
+      // 冲突路径的后续读取必须在释放连接之后进行：
+      // 持有连接时再经 pool 读取会在连接耗尽时互相等待（并发重复创建场景）。
+      if (conflictedAnalysisId) {
+        const existing = await this.findPrimarySession(conflictedAnalysisId)
+        if (!existing) throw new Error('agent_session_not_found')
+        const event = (await this.list(existing.id, 0))[0]!
+        return {
+          analysisId: conflictedAnalysisId, sessionId: existing.id,
+          sequence: event.sequence, created: false, event,
+        }
+      }
+      throw new Error('agent_research_create_state_missing')
     },
     async resumeResearch(input: {
       analysisId: string; executionId: string; segmentId?: string

@@ -2207,21 +2207,18 @@ test('真实 PostgreSQL 并发创建同一标的只产生一个首次研究', {
 }, async () => {
   const pool = createPool(applicationUrl!)
   const events = createAgentEventRepository(pool)
-  const symbol = 'CONCURRENT-CREATE'
+  const suffix = crypto.randomUUID().slice(0, 8)
+  const symbol = `CONCURRENT-CREATE-${suffix}`
+  const prefix = `concurrent-create-${suffix}-`
   let winner: string | undefined
   try {
-    for (const stale of await pool.query<{ id: string }>(
-      'SELECT id FROM analyses WHERE symbol = $1', [symbol],
-    ).then(({ rows }) => rows)) {
-      await removeResearchFixture(pool, stale.id)
-    }
     const now = '2026-08-13T00:00:00.000Z'
     const results = await Promise.all(Array.from({ length: 24 }, (_, index) => (
       events.createResearch({
-        analysisId: `concurrent-create-${index}`, sessionId: `concurrent-create-${index}:main`,
-        executionId: `concurrent-create-${index}:main:execution`, symbol,
+        analysisId: `${prefix}${index}`, sessionId: `${prefix}${index}:main`,
+        executionId: `${prefix}${index}:main:execution`, symbol,
         status: 'planning', analysisStatus: 'queued',
-        operationId: `concurrent-create-${index}:context`,
+        operationId: `${prefix}${index}:context`,
         event: { type: 'runtime_context' }, createdAt: now,
       })
     )))
@@ -2246,13 +2243,8 @@ test('真实 PostgreSQL 并发队列 claim 每个任务只会被领取一次', {
   const pool = createPool(applicationUrl!)
   const repository = createAnalysisRepository(pool)
   const events = createAgentEventRepository(pool)
-  const prefix = 'concurrent-claim-'
+  const prefix = `concurrent-claim-${crypto.randomUUID().slice(0, 8)}-`
   try {
-    for (const stale of await pool.query<{ id: string }>(
-      'SELECT id FROM analyses WHERE id LIKE $1', [`${prefix}%`],
-    ).then(({ rows }) => rows)) {
-      await removeResearchFixture(pool, stale.id)
-    }
     const now = '2026-08-13T00:00:00.000Z'
     for (let index = 0; index < 8; index += 1) {
       await events.createResearch({
