@@ -433,47 +433,125 @@ function ResearchPage({ records, record, onOpen, onUpdate, onDelete, deleting, o
   onReanalyze: () => Promise<void>
   freshnessDays: number | null
 }) {
+  const [researchTab, setResearchTab] = useState<'report' | 'trace'>('report')
+  useEffect(() => { setResearchTab('report') }, [record?.id])
   return <>
     <PageHeader eyebrow="RESEARCH ARCHIVE" title="研究记录" description="每份报告都绑定当时的数据快照、来源和分析轨迹，结论变化也有迹可循。" />
     <div className="research-layout">
       <aside className="research-index"><p className="micro">全部记录 · {records.length}</p>{records.map((item) => <button className={record?.id === item.id ? 'active' : ''} key={item.id} onClick={() => void onOpen(item.id)}><strong>{item.symbol}</strong><span>{item.report?.title ?? statusLabel(item.status)}</span><small>{item.starred ? `已标记 · ${statusLabel(item.status)}` : statusLabel(item.status)}</small></button>)}</aside>
-      <ResearchReport record={record} onUpdate={onUpdate} onDelete={onDelete} deleting={deleting} onResume={onResume} onFollowUp={onFollowUp} onReanalyze={onReanalyze} freshnessDays={freshnessDays} />
-      <div><TokenUsageDashboard record={record} /><AgentRuntime agent={record?.mainAgent} /><SpecialistAgents agents={record?.specialistAgents} /><TraceSummary trace={record?.trace ?? []} /></div>
+      <div className="research-tabcol">
+        <div className="research-tabs" role="tablist" aria-label="研究记录视图切换">
+          <button role="tab" aria-selected={researchTab === 'report'} className={researchTab === 'report' ? 'active' : ''} onClick={() => setResearchTab('report')}>研究</button>
+          <button role="tab" aria-selected={researchTab === 'trace'} className={researchTab === 'trace' ? 'active' : ''} onClick={() => setResearchTab('trace')}>轨迹</button>
+        </div>
+        {researchTab === 'report'
+          ? <ResearchReport record={record} onUpdate={onUpdate} onDelete={onDelete} deleting={deleting} onResume={onResume} onFollowUp={onFollowUp} onReanalyze={onReanalyze} freshnessDays={freshnessDays} />
+          : <article className="research-report"><ResearchTraceView record={record} /></article>}
+      </div>
+      <div className="research-rail"><IncidentPanel record={record} /><SpecialistDecisions agents={record?.specialistAgents} /><SpecialistFindings agents={record?.specialistAgents} /></div>
     </div>
   </>
 }
 
-function SpecialistAgents({ agents = [] }: { agents?: ResearchRecord['specialistAgents'] }) {
+function specialistLabel(domain: string) {
+  return domain === 'news' ? '消息面' : domain === 'technical' ? '技术面'
+    : domain === 'fundamental_valuation' ? '基本面' : domain
+}
+
+function SpecialistDecisions({ agents = [] }: { agents?: ResearchRecord['specialistAgents'] }) {
+  if (!agents.length) return null
+  return <section className="agent-runtime specialist-decisions" role="region" aria-label="专项规划决策">
+    <p className="micro">专项规划决策</p>
+    <ul>{agents.map((agent) => {
+      const launched = Boolean(agent.id) || (agent.status !== undefined && agent.status !== 'not_started')
+      return <li key={agent.domain}>
+        <header><strong>{specialistLabel(agent.domain)}专项</strong><span className={'tool-state tool-state-' + (launched ? 'ok' : 'muted')}>{launched ? '已启动' : '未启动'}</span></header>
+        {agent.researchQuestion && <p>研究问题：{agent.researchQuestion}</p>}
+        {agent.reason && <p>决策理由：{agent.reason}</p>}
+      </li>
+    })}</ul>
+  </section>
+}
+
+function IncidentPanel({ record }: { record: ResearchRecord | null }) {
+  if (!record) return null
+  const incidents: Array<{ tone: 'error' | 'warn'; text: string }> = []
+  const trace = record.trace ?? []
+  const abnormal = ['failed', 'interrupted', 'budget_exhausted', 'stopped']
+  const mainStatus = record.mainAgent?.execution.status ?? record.mainAgent?.status
+  const lastError = [...trace].reverse().find((entry) => (
+    entry.type === 'status' && typeof entry.error === 'string'
+  ))
+  if (mainStatus && abnormal.includes(mainStatus)) {
+    incidents.push({ tone: 'error', text: '主 Agent 执行' + statusLabel(mainStatus) + (typeof lastError?.error === 'string' ? '：' + String(lastError.error) : '') })
+  }
+  for (const entry of trace) {
+    if (entry.type === 'tool_result' && entry.isError === true) {
+      incidents.push({ tone: 'error', text: '工具 ' + String(entry.name ?? '未知') + ' 返回错误' })
+    } else if (entry.type === 'tool_result' && entry.notStarted === true) {
+      incidents.push({ tone: 'warn', text: '工具 ' + String(entry.name ?? '未知') + ' 未开始即取消' })
+    } else if (entry.type === 'web_search_eligibility' && entry.eligible === false) {
+      incidents.push({ tone: 'warn', text: 'Web 搜索未开放：' + String(entry.query ?? '') })
+    }
+  }
+  const financialContext = trace.find((entry) => entry.type === 'financial_context')
+  const capabilities = Array.isArray(financialContext?.capabilities)
+    ? financialContext.capabilities.map(asRecord) : []
+  for (const capability of capabilities) {
+    const sources = Array.isArray(capability.sources) ? capability.sources.map(asRecord) : []
+    for (const source of sources) {
+      if (source.status === 'failed') {
+        incidents.push({ tone: 'warn', text: '数据源失败：' + capabilityLabel(String(capability.capability)) + ' · ' + String(source.source ?? '未知来源') + (typeof source.error === 'string' ? '（' + source.error + '）' : '') })
+      }
+    }
+  }
+  if (record.mainAgent?.events?.some((event) => event.type === 'compaction' && event.status === 'failed')) {
+    incidents.push({ tone: 'warn', text: '主 Agent 上下文 Compaction 曾失败，长研究可能受上下文上限影响' })
+  }
+  for (const agent of record.specialistAgents ?? []) {
+    const status = agent.execution?.status ?? agent.status
+    if (status === 'failed' || status === 'budget_exhausted') {
+      incidents.push({ tone: 'error', text: specialistLabel(agent.domain) + '专项' + statusLabel(status) + '，综合报告将说明对应缺口' })
+    } else if (status === 'stopped' || status === 'interrupted') {
+      incidents.push({ tone: 'warn', text: specialistLabel(agent.domain) + '专项' + statusLabel(status) })
+    }
+  }
+  for (const gap of record.snapshot?.gaps ?? []) {
+    incidents.push({ tone: 'warn', text: '数据缺口：' + String(gap.reason ?? gap.capability ?? '未知') })
+  }
+  if (!incidents.length) return null
+  return <section className="incident-panel" role="alert" aria-label="异常与降级">
+    <p className="micro">异常与降级 · {incidents.length}</p>
+    <ul>{incidents.map((incident, index) => (
+      <li key={index} className={'incident incident-' + incident.tone}>{incident.text}</li>
+    ))}</ul>
+  </section>
+}
+
+function SpecialistFindings({ agents = [] }: { agents?: ResearchRecord['specialistAgents'] }) {
   return <>{agents?.filter(({ domain }) => (
     ['news', 'fundamental_valuation', 'technical'].includes(domain)
   )).map((agent) => {
-    const label = agent.domain === 'news' ? '消息面专项 Agent'
-      : agent.domain === 'technical' ? '技术面专项 Agent' : '基本面专项 Agent'
+    const label = specialistLabel(agent.domain) + '专项'
+    const report = agent.reportVersion?.report
     return (
-    <section className="agent-runtime" role="region" aria-label={label} key={agent.id ?? agent.domain}>
+    <section className="agent-runtime specialist-findings" role="region" aria-label={`${label} Agent`} key={agent.id ?? agent.domain}>
       <p className="micro">{label}</p>
       <h2>{statusLabel(agent.execution?.status ?? agent.status ?? 'not_started')}</h2>
       {agent.researchQuestion && <p>研究问题：{agent.researchQuestion}</p>}
       {agent.reason && <p>理由：{agent.reason}</p>}
-      {agent.id && <p>Session {agent.id}</p>}
-      {agent.execution && <p>Execution {agent.execution.id} · Generation {agent.execution.generation}</p>}
-      <ContextUsage agent={agent} />
-      <CompactionAttempts attempts={agent.compactionAttempts} />
-      {agent.events?.some(({ type }) => type === 'tool_call') && <ol>{agent.events.filter(({ type }) => type === 'tool_call').map((event) => (
-        <li key={event.sequence}>#{event.sequence} {event.name} · {formatTime(event.createdAt)}</li>
-      ))}</ol>}
       {agent.reportVersion && <div>
         <h3>报告版本 {agent.reportVersion.version}</h3>
-        {agent.reportVersion.report.keyJudgments?.map((judgment, index) => (
+        {report?.keyJudgments?.map((judgment, index) => (
           <p key={index}>{judgment.statement} · {directionLabel(judgment.direction)} · {confidenceLabel(judgment.confidence)}</p>
         ))}
-        {agent.reportVersion.report.targetPrice && <p>
-          估值区间：{agent.reportVersion.report.targetPrice.range?.low}
-          {' – '}{agent.reportVersion.report.targetPrice.range?.high}
-          {' · '}{agent.reportVersion.report.targetPrice.method}
-          {' · '}{agent.reportVersion.report.targetPrice.asOf}
+        {report?.targetPrice && <p>
+          估值区间：{report.targetPrice.range?.low}
+          {' – '}{report.targetPrice.range?.high}
+          {' · '}{report.targetPrice.method}
+          {' · '}{report.targetPrice.asOf}
         </p>}
-        {agent.reportVersion.report.gaps?.map((gap, index) => (
+        {report?.gaps?.map((gap, index) => (
           <p key={index}>证据缺口：{gap.reason}{gap.impact ? ` · ${gap.impact}` : ''}</p>
         ))}
       </div>}
@@ -481,149 +559,151 @@ function SpecialistAgents({ agents = [] }: { agents?: ResearchRecord['specialist
   )})}</>
 }
 
-function TokenUsageDashboard({ record }: { record: ResearchRecord | null }) {
-  const [expanded, setExpanded] = useState(false)
-  type TokenAgentView = { label: string; tokenUsage: TokenUsage; modelAttempts: ModelAttempt[] }
-  const agents: TokenAgentView[] = []
-  const addAgent = (label: string, attempts: ModelAttempt[]) => {
-    const turns = attempts.filter(({ kind }) => kind === 'turn')
-    if (turns.length) agents.push({
-      label, tokenUsage: aggregateModelTokenUsage(turns), modelAttempts: turns,
+// ===== 研究轨迹（「轨迹」tab）=====
+// 面向用户的运行时视图：泳道时间轴给时间感，分层事件流给顺序感。
+// 默认只呈现主 Agent 主干；专项轨迹折叠嵌在启动它们的工具调用之后。
+// Token 明细与 Session/Execution 标识收进折叠区，不直接铺开。
+
+const traceEventTitle: Record<string, string> = {
+  runtime_context: '载入运行上下文', runtime_resume: '恢复执行', planning: '开始规划',
+  running_model: '模型分析中', running_tools: '工具执行中',
+  waiting_for_specialists: '等待专项分析', finalizing: '报告收口',
+  financial_context: '冻结金融上下文', model_completed: '模型返回结构化结果',
+  completed: '研究完成', partial: '部分完成', failed: '执行失败',
+  stopped: '已停止', interrupted: '服务中断', budget_exhausted: '预算耗尽',
+}
+const traceFeedSkip = new Set([
+  'text_delta', 'chat_completed', 'runtime_follow_up', 'model_event', 'context_usage',
+])
+// 主 Agent 启动各专项的工具名 → 专项 domain（轨迹分组的嵌入锚点）。
+const launchToolDomain: Record<string, string> = {
+  run_news_analysis: 'news',
+  run_fundamental_analysis: 'fundamental_valuation',
+  run_technical_analysis: 'technical',
+}
+
+type TraceToolPayload = {
+  call: Record<string, unknown>; result: Record<string, unknown> | null
+  durationMs: number | null
+}
+type TraceFeedItem = {
+  at: string; actor: string; kind: '模型' | '工具' | '系统' | '压缩'
+  text: string; tone: 'ok' | 'warn' | 'error' | 'muted'
+  anchorDomain?: string; tool?: TraceToolPayload
+}
+type MainAgent = NonNullable<ResearchRecord['mainAgent']>
+type SpecialistAgent = NonNullable<ResearchRecord['specialistAgents']>[number]
+
+function pairToolEvents(events: Array<Record<string, unknown>>) {
+  const results = new Map(
+    events.filter((entry) => entry.type === 'tool_result')
+      .map((entry) => [String(entry.toolCallId ?? ''), entry]),
+  )
+  return events.filter((entry) => entry.type === 'tool_call').map((call) => {
+    const result = results.get(String(call.toolCallId ?? '')) ?? null
+    const startedAt = typeof call.startedAt === 'string' ? call.startedAt : null
+    const completedAt = result && typeof result.completedAt === 'string' ? result.completedAt : null
+    const durationMs = startedAt && completedAt
+      ? Math.max(0, Date.parse(completedAt) - Date.parse(startedAt)) : null
+    return { call, result, durationMs }
+  })
+}
+
+function toolStateOf(result: Record<string, unknown> | null) {
+  if (!result) return { tone: 'pending', label: '等待结果' }
+  if (result.notStarted === true) return { tone: 'warn', label: '未开始即取消' }
+  if (result.isError === true) return { tone: 'error', label: '返回错误' }
+  return { tone: 'ok', label: '成功' }
+}
+
+function buildAgentFeed(actor: string, agent: MainAgent | SpecialistAgent): TraceFeedItem[] {
+  const feed: TraceFeedItem[] = []
+  const events = (agent.events ?? []) as Array<Record<string, unknown>>
+  for (const { call, result, durationMs } of pairToolEvents(events)) {
+    const name = String(call.name ?? '工具')
+    const state = toolStateOf(result)
+    feed.push({
+      at: String(call.startedAt ?? call.createdAt ?? ''), actor, kind: '工具',
+      text: `调用 ${name}`,
+      tone: state.tone === 'error' ? 'error' : result ? 'ok' : 'muted',
+      ...(launchToolDomain[name] ? { anchorDomain: launchToolDomain[name] } : {}),
+      tool: { call, result, durationMs },
     })
   }
-  addAgent('主 Agent', record?.mainAgent?.modelAttempts ?? [])
-  for (const agent of record?.specialistAgents ?? []) addAgent(
-    agent.domain === 'news' ? '消息面专项'
-      : agent.domain === 'technical' ? '技术面专项' : '基本面专项',
-    agent.modelAttempts ?? [],
-  )
-  const compactions = [
-    ...(record?.mainAgent?.modelAttempts ?? []),
-    ...(record?.specialistAgents ?? []).flatMap(({ modelAttempts }) => modelAttempts ?? []),
-  ].filter(({ kind }) => kind === 'compaction')
-  if (compactions.length) agents.push({
-    label: 'Compaction', tokenUsage: aggregateModelTokenUsage(compactions),
-    modelAttempts: compactions,
-  })
-  if (!agents.length) return null
-  const researchUsage = aggregateModelTokenUsage(agents.flatMap(({ modelAttempts }) => modelAttempts))
-  return <section className="token-dashboard" role="region" aria-label="Agent Token 用量">
-    <header><p className="micro">Agent Token 用量</p><button className="text-button" onClick={() => setExpanded((value) => !value)}>
-      {expanded ? '收起 Token 累计趋势' : '展开 Token 累计趋势'}
-    </button></header>
-    <p>研究合计 {researchUsage.attempts} 次 attempt · 已上报 {researchUsage.reportedAttempts}
-      {' · '}Coverage {(researchUsage.coverage * 100).toFixed(1)}%
-      {' · '}Input {formatOptionalNumber(researchUsage.input)}
-      {' · '}Cache Read {formatOptionalNumber(researchUsage.cacheRead)}
-      {' · '}Cache Write {formatOptionalNumber(researchUsage.cacheWrite)}
-      {' · '}Output {formatOptionalNumber(researchUsage.output)}
-      {' · '}Total {formatOptionalNumber(researchUsage.total)}
-    </p>
-    {agents.map(({ label, tokenUsage: usage, modelAttempts: attempts }) => {
-      const reported = attempts.filter(({ usageStatus }) => usageStatus !== 'unknown')
-      const cacheRateReady = reported.length > 0 && reported.every(({ usage: attemptUsage }) => (
-        attemptUsage.input !== null && attemptUsage.cacheRead !== null
-          && attemptUsage.cacheWrite !== null
-      ))
-      const cacheBase = cacheRateReady
-        ? usage.input! + usage.cacheRead! + usage.cacheWrite! : 0
-      return <article className="token-agent" key={label}>
-        <strong>{label}</strong>
-        <p>Input {formatOptionalNumber(usage.input)} · Cache Read {formatOptionalNumber(usage.cacheRead)}
-          {' · '}Cache Write {formatOptionalNumber(usage.cacheWrite)} · Output {formatOptionalNumber(usage.output)}
-          {' · '}Total {formatOptionalNumber(usage.total)} · Coverage {(usage.coverage * 100).toFixed(1)}%
-          {cacheRateReady && cacheBase > 0
-            ? ` · 缓存命中率 ${(usage.cacheRead! / cacheBase * 100).toFixed(1)}%`
-            : ' · 缓存命中率 N/A'}
-        </p>
-        <TokenStack label={label} usage={usage} />
-        {expanded && <TokenTrend label={label} attempts={attempts} />}
-      </article>
-    })}
-  </section>
-}
-
-function TokenStack({ label, usage }: { label: string; usage: TokenUsage }) {
-  const fields = [usage.input, usage.cacheRead, usage.cacheWrite, usage.output]
-  if (fields.some((value) => value === null)) return <p>{label} Token 构成 N/A（字段未完整上报）</p>
-  const total = fields.reduce<number>((sum, value) => sum + (value ?? 0), 0) || 1
-  const colors = ['#494139', '#3a7c49', '#2f6f8f', '#e25132']
-  let x = 0
-  return <svg viewBox="0 0 240 18" role="img" aria-label={`${label} Token 构成`}>
-    {fields.map((value, index) => {
-      const width = (value ?? 0) / total * 240
-      const rect = <rect key={index} x={x} y="2" width={width} height="14" fill={colors[index]} />
-      x += width
-      return rect
-    })}
-  </svg>
-}
-
-function TokenTrend({ label, attempts }: { label: string; attempts: ModelAttempt[] }) {
-  let total = 0
-  const points = attempts.map((attempt, index) => {
-    const reportedTotal = attempt.usageStatus !== 'unknown' ? attempt.usage.total : null
-    if (reportedTotal !== null) total += reportedTotal
-    return {
-      x: attempts.length === 1 ? 0 : index / (attempts.length - 1) * 240,
-      total, attempt, reportedTotal,
+  for (const event of agent.events ?? []) {
+    const type = String(event.type ?? '')
+    if (!type || traceFeedSkip.has(type) || type === 'tool_result' || type === 'tool_call') continue
+    const at = String(event.createdAt ?? '')
+    if (type === 'compaction') {
+      feed.push({
+        at, actor, kind: '压缩',
+        text: `上下文压缩${statusLabel(event.status ?? '')}`
+          + (typeof event.contextTokens === 'number'
+            ? ` · ${event.contextTokens.toLocaleString('zh-CN')} / ${event.contextWindow?.toLocaleString('zh-CN')} Token` : '')
+          + (typeof event.reserveTokens === 'number'
+            ? ` · 保留 ${event.reserveTokens.toLocaleString('zh-CN')} · 近期 ${event.keepRecentTokens?.toLocaleString('zh-CN')}` : '')
+          + (typeof event.usage?.totalTokens === 'number'
+            ? ` · ${event.usage.totalTokens.toLocaleString('zh-CN')} Token` : '')
+          + (typeof event.tokensAfter === 'number'
+            ? ` · 压缩后 ${event.tokensAfter.toLocaleString('zh-CN')}` : '')
+          + (typeof event.durationMs === 'number' ? ` · ${(event.durationMs / 1000).toFixed(2)} 秒` : ''),
+        tone: event.status === 'failed' ? 'error' : 'warn',
+      })
+      continue
     }
-  })
-  const maximum = Math.max(1, ...points.map((point) => point.total))
-  const path = points.filter(({ reportedTotal }) => reportedTotal !== null)
-    .map(({ x, total: value }) => `${x},${38 - value / maximum * 34}`).join(' ')
-  return <div className="token-trend">
-    <svg viewBox="0 0 240 42" role="img" aria-label={`${label} Token 累计趋势`}>
-      <polyline points={path} fill="none" stroke="#e25132" strokeWidth="2" />
-    </svg>
-    <p>{points.map(({ total: value, attempt, reportedTotal }, index) => (
-      `请求 ${index + 1} ${attempt.usageStatus === 'unknown' ? 'usage 未返回'
-        : reportedTotal === null ? 'Total N/A' : formatNumber(value)}`
-    )).join(' · ')}</p>
-  </div>
+    feed.push({
+      at, actor, kind: '系统',
+      text: (traceEventTitle[type] ?? statusLabel(event.status ?? type))
+        + (type === 'runtime_resume' && event.previousExecutionId
+          ? ` · 从 ${event.previousExecutionId} 恢复到 ${event.executionId}` : '')
+        + (event.waitReason
+          ? ` · 等待 ${event.waitReason.target}（始于 ${formatTime(event.waitReason.startedAt)}）` : ''),
+      tone: ['failed', 'interrupted', 'budget_exhausted'].includes(type) ? 'error'
+        : ['completed', 'partial'].includes(type) ? 'ok' : 'muted',
+    })
+  }
+  for (const attempt of agent.modelAttempts ?? []) {
+    if (attempt.kind !== 'turn') continue
+    feed.push({
+      at: attempt.completedAt ?? attempt.createdAt, actor, kind: '模型',
+      text: `第 ${attempt.turnIndex + 1} 轮模型请求 · ${formatOptionalNumber(attempt.usage.total)} Token`
+        + (attempt.durationMs !== null ? ` · ${(attempt.durationMs / 1000).toFixed(1)} 秒` : ''),
+      tone: attempt.status === 'failed' ? 'error' : 'muted',
+    })
+  }
+  return feed.sort((a, b) => a.at.localeCompare(b.at))
 }
 
-function AgentRuntime({ agent }: { agent?: ResearchRecord['mainAgent'] }) {
-  if (!agent) return null
-  return <section className="agent-runtime" role="region" aria-label="主 Agent Runtime">
-    <p className="micro">主 Agent</p>
-    <h2>{statusLabel(agent.status)}</h2>
-    <p>Session {agent.id}</p>
-    <p>Execution {agent.execution.id} · Generation {agent.execution.generation}</p>
-    <ContextUsage agent={agent} />
-    <CompactionAttempts attempts={agent.compactionAttempts} />
-    {agent.waitReason && <p>等待：{agent.waitReason.target} · {formatTime(agent.waitReason.startedAt)}</p>}
-    <div>{agent.segments.map((segment) => <span key={segment.id}>Segment {segment.ordinal}
-      {segment.parentSegmentId && <> · 源自 Segment {agent.segments.find(
-        ({ id }) => id === segment.parentSegmentId,
-      )?.ordinal ?? '?'}</>}
-    </span>)}</div>
-    <ol>{agent.events.map((event) => <li key={event.sequence}>
-      #{event.sequence} {event.type === 'runtime_context' ? 'Runtime Context'
-        : event.type === 'runtime_resume' ? 'Runtime Resume'
-          : event.type === 'compaction' ? `Compaction ${statusLabel(event.status ?? '')}`
-            : statusLabel(event.status ?? event.type ?? '')}
-      {' · '}{formatTime(event.createdAt)}
-      {event.type === 'runtime_resume' && <> · 从 {event.previousExecutionId} 恢复到 {event.executionId}</>}
-      {event.type === 'compaction' && <>
-        {' · '}{event.contextTokens?.toLocaleString('zh-CN')} / {event.contextWindow?.toLocaleString('zh-CN')} Token
-        {' · '}保留 {event.reserveTokens?.toLocaleString('zh-CN')} · 近期 {event.keepRecentTokens?.toLocaleString('zh-CN')}
-        {' · '}{event.usage?.totalTokens?.toLocaleString('zh-CN')} Token
-        {typeof event.tokensAfter === 'number' && <> · 压缩后 {event.tokensAfter.toLocaleString('zh-CN')}</>}
-        {' · '}{typeof event.durationMs === 'number' ? `${(event.durationMs / 1000).toFixed(2)} 秒` : ''}
-      </>}
-      {event.waitReason && <> · 等待 {event.waitReason.target}（始于 {formatTime(event.waitReason.startedAt)}）</>}
-    </li>)}</ol>
+function ResearchTraceView({ record }: { record: ResearchRecord | null }) {
+  const main = record?.mainAgent
+  const allAttempts = [
+    ...(main?.modelAttempts ?? []),
+    ...(record?.specialistAgents ?? []).flatMap((agent) => agent.modelAttempts ?? []),
+  ]
+  const usage = aggregateModelTokenUsage(allAttempts)
+  return <section className="trace-view" role="region" aria-label="研究轨迹">
+    <header className="trace-view-header">
+      <p className="micro">研究轨迹 · 时间轴与事件流</p>
+      {allAttempts.length > 0 && <p>
+        研究合计 {usage.attempts} 次 attempt · 已上报 {usage.reportedAttempts}
+        {' · '}Coverage {(usage.coverage * 100).toFixed(1)}%
+        {' · '}Input {formatOptionalNumber(usage.input)}
+        {' · '}Cache Read {formatOptionalNumber(usage.cacheRead)}
+        {' · '}Cache Write {formatOptionalNumber(usage.cacheWrite)}
+        {' · '}Output {formatOptionalNumber(usage.output)}
+        {' · '}Total {formatOptionalNumber(usage.total)}
+      </p>}
+    </header>
+    <TraceContextLine agent={main} />
+    <TraceTimeline record={record} />
+    <FinancialContextTrace trace={record?.trace ?? []} />
+    <TraceFeed record={record} />
+    <TokenUsageTable record={record} />
+    <TraceDeveloperInfo record={record} />
   </section>
 }
 
-function ContextUsage({ agent }: {
-  agent?: {
-    segments?: NonNullable<ResearchRecord['mainAgent']>['segments']
-    events?: NonNullable<ResearchRecord['mainAgent']>['events']
-    modelAttempts?: ModelAttempt[]
-  }
-}) {
+function TraceContextLine({ agent }: { agent?: MainAgent }) {
   const raw = agent?.events?.filter(
     ({ type }) => type === 'context_usage' || type === 'compaction',
   ).at(-1)
@@ -639,13 +719,10 @@ function ContextUsage({ agent }: {
   )) ?? false
   const lastCompaction = agent?.events?.filter(({ type }) => type === 'compaction').at(-1)
   const failed = lastCompaction?.status === 'failed'
-  const progressState = progress < .7 ? '绿色' : progress < .85 ? '黄色'
-    : progress < .95 ? '橙色' : '红色'
   const tone = compacting ? 'blue' : failed ? 'red'
     : progress < .7 ? 'green' : progress < .85 ? 'yellow'
       : progress < .95 ? 'orange' : 'red'
-  const state = compacting ? '蓝色 · Compaction 进行中'
-    : failed ? '红色 · Compaction 失败' : progressState
+  const state = compacting ? ' · 压缩进行中' : failed ? ' · 上次压缩失败' : ''
   const currentSegment = agent?.segments?.at(-1)?.ordinal
   const compactCount = agent?.events?.filter(({ type, status }) => (
     type === 'compaction' && status === 'completed'
@@ -654,21 +731,315 @@ function ContextUsage({ agent }: {
     上下文 {raw.estimated ? '≈' : ''}{(contextTokens / raw.contextWindow * 100).toFixed(1)}% / {raw.contextWindow.toLocaleString('zh-CN')}
     {' · '}当前 {contextTokens.toLocaleString('zh-CN')} Token
     {' · '}阈值 {trigger.toLocaleString('zh-CN')} Token
-    {' · '}距 Compaction {Math.max(0, trigger - contextTokens).toLocaleString('zh-CN')} Token
-    {' · '}{state}{currentSegment ? ` · Segment ${currentSegment}` : ''}
-    {' · '}已 Compaction {compactCount} 次
+    {' · '}距压缩 {Math.max(0, trigger - contextTokens).toLocaleString('zh-CN')} Token
+    {state}{currentSegment ? ` · Segment ${currentSegment}` : ''}
+    {' · '}已压缩 {compactCount} 次
   </p>
 }
 
-function CompactionAttempts({ attempts = [] }: {
-  attempts?: NonNullable<ResearchRecord['mainAgent']>['compactionAttempts']
-}) {
-  if (!attempts.length) return null
-  return <ol>{attempts.map((attempt) => <li key={`${attempt.compactionId}:${attempt.attempt}`}>
-    Compaction 尝试 {attempt.attempt} · {statusLabel(attempt.status)}
-    {' · '}{attempt.usage?.totalTokens?.toLocaleString('zh-CN') ?? 'usage 未返回'} Token
-    {' · '}{(attempt.durationMs / 1000).toFixed(2)} 秒
-  </li>)}</ol>
+// 泳道时间轴：模型 / 工具 / 压缩 三行执行跨度。
+type TraceSpan = { start: number; end: number; label: string; failed: boolean }
+function TraceTimeline({ record }: { record: ResearchRecord | null }) {
+  const lanes: Array<{ label: string; className: string; spans: TraceSpan[] }> = [
+    { label: '模型', className: 'lane-model', spans: [] },
+    { label: '工具', className: 'lane-tool', spans: [] },
+    { label: '压缩', className: 'lane-compaction', spans: [] },
+  ]
+  const agents: Array<MainAgent | SpecialistAgent> = [
+    ...(record?.mainAgent ? [record.mainAgent] : []),
+    ...(record?.specialistAgents ?? []),
+  ]
+  for (const agent of agents) {
+    for (const attempt of agent.modelAttempts ?? []) {
+      const start = Date.parse(attempt.createdAt)
+      const end = attempt.completedAt ? Date.parse(attempt.completedAt)
+        : attempt.durationMs !== null ? start + attempt.durationMs : Number.NaN
+      if (Number.isFinite(start) && Number.isFinite(end)) {
+        lanes[attempt.kind === 'compaction' ? 2 : 0].spans.push({
+          start, end, label: `${formatOptionalNumber(attempt.usage.total)} Token`,
+          failed: attempt.status === 'failed',
+        })
+      }
+    }
+    for (const { call, result } of pairToolEvents((agent.events ?? []) as Array<Record<string, unknown>>)) {
+      const start = Date.parse(String(call.startedAt ?? call.createdAt ?? ''))
+      const end = Date.parse(String(result?.completedAt ?? ''))
+      if (Number.isFinite(start) && Number.isFinite(end)) {
+        lanes[1].spans.push({
+          start, end, label: String(call.name ?? '工具'), failed: result?.isError === true,
+        })
+      }
+    }
+  }
+  for (const { call, result } of pairToolEvents(record?.trace ?? [])) {
+    const start = Date.parse(String(call.startedAt ?? ''))
+    const end = Date.parse(String(result?.completedAt ?? ''))
+    if (Number.isFinite(start) && Number.isFinite(end)) {
+      lanes[1].spans.push({
+        start, end, label: String(call.name ?? '工具'), failed: result?.isError === true,
+      })
+    }
+  }
+  const all = lanes.flatMap((lane) => lane.spans)
+  if (!all.length) return null
+  const min = Math.min(...all.map((span) => span.start))
+  const max = Math.max(...all.map((span) => span.end), min + 1)
+  const width = 960, laneHeight = 30, padLeft = 44
+  const x = (time: number) => padLeft + (time - min) / (max - min) * (width - padLeft - 8)
+  return <figure className="trace-timeline">
+    <svg viewBox={`0 0 ${width} ${lanes.length * laneHeight + 22}`} role="img"
+      aria-label="研究过程时间轴：模型、工具与压缩的执行跨度">
+      {lanes.map((lane, laneIndex) => <g key={lane.label}>
+        <text x={0} y={laneIndex * laneHeight + 18} className="lane-label">{lane.label}</text>
+        <line x1={padLeft} x2={width - 8} y1={laneIndex * laneHeight + 15}
+          y2={laneIndex * laneHeight + 15} className="lane-baseline" />
+        {lane.spans.map((span, index) => {
+          const left = x(span.start), spanWidth = Math.max(2.5, x(span.end) - left)
+          return <rect key={index} x={left} y={laneIndex * laneHeight + 8} width={spanWidth}
+            height={13} rx={2} className={`lane-span ${lane.className}${span.failed ? ' failed' : ''}`}>
+            <title>{span.label}</title>
+          </rect>
+        })}
+      </g>)}
+      <text x={padLeft} y={lanes.length * laneHeight + 14} className="lane-axis">{formatTime(new Date(min).toISOString())}</text>
+      <text x={width - 8} y={lanes.length * laneHeight + 14} className="lane-axis" textAnchor="end">{formatTime(new Date(max).toISOString())}</text>
+    </svg>
+  </figure>
+}
+
+const traceActorMeta: Record<string, { label: string; className: string }> = {
+  main: { label: '主 Agent', className: 'actor-main' },
+  news: { label: '消息面', className: 'actor-news' },
+  technical: { label: '技术面', className: 'actor-technical' },
+  fundamental_valuation: { label: '基本面', className: 'actor-fundamental' },
+}
+
+function TraceRow({ item }: { item: TraceFeedItem }) {
+  const actor = traceActorMeta[item.actor] ?? { label: item.actor, className: 'actor-main' }
+  const chips = <>
+    <i className={`feed-dot ${actor.className}`} />
+    <span className={`feed-chip ${actor.className}`}>{actor.label}</span>
+    <span className={`feed-kind kind-${item.kind}`}>{item.kind}</span>
+  </>
+  if (!item.tool) {
+    return <>
+      {chips}
+      <span className="feed-text">{item.text}</span>
+      <time>{item.at ? formatTime(item.at) : ''}</time>
+    </>
+  }
+  const { call, result, durationMs } = item.tool
+  const state = toolStateOf(result)
+  return <details className="trace-tool" data-tool-call-id={String(call.toolCallId ?? '')}>
+    <summary>
+      {chips}
+      <strong className="feed-text">{String(call.name ?? '工具')}</strong>
+      <span className={'tool-state tool-state-' + state.tone}>{state.label}</span>
+      <small>{durationMs !== null ? `耗时 ${durationMs.toLocaleString('zh-CN')} 毫秒`
+        : typeof call.startedAt === 'string' && call.startedAt ? `开始 ${formatTime(String(call.startedAt))}` : '未开始'}</small>
+    </summary>
+    <div className="tool-detail">
+      <p className="micro">输入参数</p>
+      <JsonBlock value={call.input} />
+      {result && <>
+        <p className="micro">{state.tone === 'error' ? '错误信息' : '返回结果（用户视图）'}</p>
+        <ToolResultSummary result={result} />
+        <JsonBlock value={result.result} />
+      </>}
+    </div>
+  </details>
+}
+
+type TraceFeedNode =
+  | { kind: 'item'; item: TraceFeedItem }
+  | { kind: 'group'; domain: string; at: string; status: string; items: TraceFeedItem[] }
+
+function TraceFeed({ record }: { record: ResearchRecord | null }) {
+  const mainItems: TraceFeedItem[] = []
+  const main = record?.mainAgent
+  if (main) {
+    if (main.waitReason) {
+      mainItems.push({
+        at: main.waitReason.startedAt, actor: 'main', kind: '系统',
+        text: `等待：${main.waitReason.target} · ${formatTime(main.waitReason.startedAt)}`,
+        tone: 'muted',
+      })
+    }
+    mainItems.push(...buildAgentFeed('main', main))
+  }
+  // 主 Agent 的工具调用（含专项启动）保存在研究 trace 中。
+  for (const { call, result, durationMs } of pairToolEvents(record?.trace ?? [])) {
+    const name = String(call.name ?? '工具')
+    const state = toolStateOf(result)
+    mainItems.push({
+      at: String(call.startedAt ?? ''), actor: 'main', kind: '工具',
+      text: `调用 ${name}`,
+      tone: state.tone === 'error' ? 'error' : result ? 'ok' : 'muted',
+      ...(launchToolDomain[name] ? { anchorDomain: launchToolDomain[name] } : {}),
+      tool: { call, result, durationMs },
+    })
+  }
+  mainItems.sort((a, b) => a.at.localeCompare(b.at))
+  const groups = (record?.specialistAgents ?? []).flatMap((agent) => {
+    if (!agent.domain) return []
+    return [{
+      domain: agent.domain,
+      at: String(agent.events?.[0]?.createdAt ?? ''),
+      status: agent.execution?.status ?? agent.status ?? 'not_started',
+      items: buildAgentFeed(agent.domain, agent),
+    }]
+  })
+  const nodes: TraceFeedNode[] = []
+  const placed = new Set<string>()
+  for (const item of mainItems) {
+    nodes.push({ kind: 'item', item })
+    const group = item.anchorDomain ? groups.find(({ domain }) => domain === item.anchorDomain) : undefined
+    if (group && !placed.has(group.domain)) {
+      nodes.push({ kind: 'group', ...group })
+      placed.add(group.domain)
+    }
+  }
+  for (const group of groups.filter(({ domain }) => !placed.has(domain))) {
+    const index = nodes.findIndex((node) => (
+      (node.kind === 'item' ? node.item.at : node.at) > group.at
+    ))
+    const node: TraceFeedNode = { kind: 'group', ...group }
+    if (index === -1) nodes.push(node)
+    else nodes.splice(index, 0, node)
+  }
+  if (!nodes.length) return <p className="trace-feed-empty">还没有轨迹事件。</p>
+  return <ol className="trace-feed">
+    {nodes.map((node, index) => {
+      if (node.kind === 'item') {
+        return <li key={index} className={`trace-row tone-${node.item.tone}`}>
+          <TraceRow item={node.item} />
+        </li>
+      }
+      const actor = traceActorMeta[node.domain] ?? { label: node.domain, className: 'actor-main' }
+      const tone = ['failed', 'budget_exhausted'].includes(node.status) ? 'error'
+        : node.status === 'not_started' ? 'muted' : 'ok'
+      if (!node.items.length) {
+        return <li key={index} className={`trace-row tone-${tone}`}>
+          <i className={`feed-dot ${actor.className}`} />
+          <span className={`feed-chip ${actor.className}`}>{actor.label}</span>
+          <span className="feed-kind kind-专项">专项</span>
+          <span className="feed-text">{statusLabel(node.status)}，无轨迹事件</span>
+          <time>{node.at ? formatTime(node.at) : ''}</time>
+        </li>
+      }
+      return <li key={index} className={`trace-group tone-${tone}`}>
+        <details>
+          <summary>
+            <i className={`feed-dot ${actor.className}`} />
+            <span className={`feed-chip ${actor.className}`}>{actor.label}</span>
+            <span className="feed-kind kind-专项">专项</span>
+            <span className="feed-text">{node.items.length} 条轨迹事件 · {statusLabel(node.status)}</span>
+            <time>{node.at ? formatTime(node.at) : ''}</time>
+          </summary>
+          <ol className="trace-feed trace-sub">
+            {node.items.map((item, subIndex) => (
+              <li key={subIndex} className={`trace-row tone-${item.tone}`}>
+                <TraceRow item={item} />
+              </li>
+            ))}
+          </ol>
+        </details>
+      </li>
+    })}
+  </ol>
+}
+
+function specialistCacheRate(attempts: ModelAttempt[]): string {
+  const reported = attempts.filter(({ usageStatus }) => usageStatus !== 'unknown')
+  const ready = reported.length > 0 && reported.every(({ usage }) => (
+    usage.input !== null && usage.cacheRead !== null && usage.cacheWrite !== null
+  ))
+  if (!ready) return 'N/A'
+  const base = reported.reduce((sum, { usage }) => (
+    sum + usage.input! + usage.cacheRead! + usage.cacheWrite!
+  ), 0)
+  if (base <= 0) return 'N/A'
+  return `${(reported.reduce((sum, { usage }) => sum + usage.cacheRead!, 0) / base * 100).toFixed(1)}%`
+}
+
+function TokenUsageTable({ record }: { record: ResearchRecord | null }) {
+  const rows: Array<{ label: string; usage: TokenUsage; rate: string }> = []
+  const addAgent = (label: string, attempts: ModelAttempt[]) => {
+    const turns = attempts.filter(({ kind }) => kind === 'turn')
+    if (turns.length) rows.push({
+      label, usage: aggregateModelTokenUsage(turns), rate: specialistCacheRate(turns),
+    })
+  }
+  addAgent('主 Agent', record?.mainAgent?.modelAttempts ?? [])
+  for (const agent of record?.specialistAgents ?? []) addAgent(
+    specialistLabel(agent.domain) + '专项', agent.modelAttempts ?? [],
+  )
+  const compactions = [
+    ...(record?.mainAgent?.modelAttempts ?? []),
+    ...(record?.specialistAgents ?? []).flatMap((agent) => agent.modelAttempts ?? []),
+  ].filter(({ kind }) => kind === 'compaction')
+  if (compactions.length) rows.push({
+    label: 'Compaction', usage: aggregateModelTokenUsage(compactions),
+    rate: specialistCacheRate(compactions),
+  })
+  if (!rows.length) return null
+  return <details className="trace-tokens">
+    <summary>Token 用量明细</summary>
+    <table aria-label="Token 用量明细">
+      <thead><tr>
+        <th>Agent</th><th>请求</th><th>Input</th><th>Cache Read</th><th>Cache Write</th>
+        <th>Output</th><th>Total</th><th>Coverage</th><th>缓存命中率</th>
+      </tr></thead>
+      <tbody>{rows.map((row) => <tr key={row.label}>
+        <td>{row.label}</td>
+        <td>{row.usage.attempts}</td>
+        <td>{formatOptionalNumber(row.usage.input)}</td>
+        <td>{formatOptionalNumber(row.usage.cacheRead)}</td>
+        <td>{formatOptionalNumber(row.usage.cacheWrite)}</td>
+        <td>{formatOptionalNumber(row.usage.output)}</td>
+        <td>{formatOptionalNumber(row.usage.total)}</td>
+        <td>{(row.usage.coverage * 100).toFixed(1)}%</td>
+        <td>{row.rate}</td>
+      </tr>)}</tbody>
+    </table>
+  </details>
+}
+
+function TraceDeveloperInfo({ record }: { record: ResearchRecord | null }) {
+  const main = record?.mainAgent
+  return <details className="trace-dev">
+    <summary>开发者信息</summary>
+    {main && <p>Session {main.id} · Execution {main.execution.id} · Generation {main.execution.generation}</p>}
+    {!!main?.segments?.length && <p>{main.segments.map((segment) => (
+      `Segment ${segment.ordinal}${segment.parentSegmentId
+        ? `（源自 Segment ${main.segments.find(({ id }) => id === segment.parentSegmentId)?.ordinal ?? '?'}）` : ''}`
+    )).join(' · ')}</p>}
+    {!!main?.compactionAttempts?.length && <ol>{main.compactionAttempts.map((attempt) => (
+      <li key={`${attempt.compactionId}:${attempt.attempt}`}>
+        Compaction 尝试 {attempt.attempt} · {statusLabel(attempt.status)}
+        {' · '}{attempt.usage?.totalTokens?.toLocaleString('zh-CN') ?? 'usage 未返回'} Token
+        {' · '}{(attempt.durationMs / 1000).toFixed(2)} 秒
+      </li>
+    ))}</ol>}
+    {(record?.specialistAgents ?? []).filter((agent) => agent.id).map((agent) => (
+      <p key={agent.id}>{specialistLabel(agent.domain)}专项 · Session {agent.id}
+        {agent.execution ? ` · Execution ${agent.execution.id}` : ''}</p>
+    ))}
+    <p>底层共保存 {record?.trace.length ?? 0} 条原始事件，用于排查和审计；此处不逐条渲染模型 token。完整工具输入与结果请使用研究导出。</p>
+  </details>
+}
+
+function FinancialContextTrace({ trace }: { trace: Array<Record<string, unknown>> }) {
+  const financialContext = trace.find((entry) => entry.type === 'financial_context')
+  const capabilities = Array.isArray(financialContext?.capabilities)
+    ? financialContext.capabilities.map(asRecord) : []
+  if (!capabilities.length) return null
+  return <details className="trace-financial-context">
+    <summary>冻结金融上下文</summary>
+    <div className="source-diagnostics">{capabilities.map((capability) => (
+      <CapabilityTrace key={String(capability.capability)} capability={capability} />
+    ))}</div>
+  </details>
 }
 
 function ResearchReport({ record, onUpdate, onDelete, deleting, onResume, onFollowUp, onReanalyze, freshnessDays }: {
@@ -876,7 +1247,7 @@ function SettingsPage({ health, modelConfigured, settings, onReload }: {
       setSubmitting(false)
     }
   }
-  return <><PageHeader eyebrow="INSTANCE SETTINGS" title="系统设置" description="普通 Runtime 设置保存在 PostgreSQL；密钥值永远不会返回浏览器。" /><div className="settings-grid"><Setting title="Analysis API" description="分析任务、研究记录与持仓管理" ready={health?.status === 'ok'} /><Setting title="Financial Data" description="行情、新闻、财报与确定性计算" ready={health?.dependencies.financialData.status === 'ok'} /><Setting title="AI Model" description="由 .env 指定的兼容模型端点" ready={modelConfigured} /><Setting title="PostgreSQL" description="持仓、权益历史、事实与研究轨迹" ready={health?.dependencies.productDatabase.status === 'ok'} /></div>{settings?.current && settings.defaults && <section className="runtime-settings" aria-busy={submitting}><header><div><p className="micro">AGENT RUNTIME</p><h2>当前 revision #{settings.current.id}</h2><p>上次修改：{formatTime(settings.current.createdAt)}</p></div><button type="button" className="quiet" disabled={submitting} onClick={() => void restoreDefaults()}>恢复全部默认值</button></header>{writeError && <p role="alert" className="error-banner">{writeError}</p>}<form key={settings.current.id} onSubmit={(event) => void save(event)}>{fields.map(({ key, label }) => <label key={key}>{label}<input aria-label={label} name={key} type="number" min={runtimeSettingLimits[key][0]} max={runtimeSettingLimits[key][1]} defaultValue={settings.current!.values[key]} disabled={submitting} required /><small>默认 {settings.defaults![key].toLocaleString('zh-CN')} <button type="button" className="text-button" disabled={submitting} onClick={() => void restoreField(key)}>恢复此项</button></small></label>)}<button type="submit" disabled={submitting}>{submitting ? '保存中…' : '保存 Runtime 设置'}</button></form>{settings.activeExecutions.length > 0 && <div className="frozen-settings"><h3>运行中的冻结值</h3>{settings.activeExecutions.map((snapshot) => <article key={snapshot.executionId}><strong>运行 execution {snapshot.executionId}</strong><span>{formatFrozenSettings(snapshot.values)}</span></article>)}</div>}</section>}</>
+  return <><PageHeader eyebrow="INSTANCE SETTINGS" title="系统设置" description="普通 Runtime 设置保存在 PostgreSQL；密钥值永远不会返回浏览器。" /><div className="settings-grid"><Setting title="Analysis API" description="分析任务、研究记录与持仓管理" ready={health?.status === 'ok'} /><Setting title="Financial Data" description="行情、新闻、财报与确定性计算" readyLabel="在线" ready={health?.dependencies.financialData.status === 'ok'} /><Setting title="AI Model" description="由 .env 指定的兼容模型端点；这里只检查配置完整性" readyLabel="已配置" ready={modelConfigured} /><Setting title="PostgreSQL" description="持仓、权益历史、事实与研究轨迹" ready={health?.dependencies.productDatabase.status === 'ok'} /></div>{settings?.current && settings.defaults && <section className="runtime-settings" aria-busy={submitting}><header><div><p className="micro">AGENT RUNTIME</p><h2>当前 revision #{settings.current.id}</h2><p>上次修改：{formatTime(settings.current.createdAt)}</p></div><button type="button" className="quiet" disabled={submitting} onClick={() => void restoreDefaults()}>恢复全部默认值</button></header>{writeError && <p role="alert" className="error-banner">{writeError}</p>}<form key={settings.current.id} onSubmit={(event) => void save(event)}>{fields.map(({ key, label }) => <label key={key}>{label}<input aria-label={label} name={key} type="number" min={runtimeSettingLimits[key][0]} max={runtimeSettingLimits[key][1]} defaultValue={settings.current!.values[key]} disabled={submitting} required /><small>默认 {settings.defaults![key].toLocaleString('zh-CN')} <button type="button" className="text-button" disabled={submitting} onClick={() => void restoreField(key)}>恢复此项</button></small></label>)}<button type="submit" disabled={submitting}>{submitting ? '保存中…' : '保存 Runtime 设置'}</button></form>{settings.activeExecutions.length > 0 && <div className="frozen-settings"><h3>运行中的冻结值</h3>{settings.activeExecutions.map((snapshot) => <article key={snapshot.executionId}><strong>运行 execution {snapshot.executionId}</strong><span>{formatFrozenSettings(snapshot.values)}</span></article>)}</div>}</section>}</>
 }
 
 function formatFrozenSettings(settings: RuntimeSettings) {
@@ -911,29 +1282,26 @@ function FactCard({ fact }: { fact: Fact }) {
   return href ? <a className="fact-card" href={href} target="_blank" rel="noreferrer">{content}</a> : <div className="fact-card">{content}</div>
 }
 
-function TraceSummary({ trace }: { trace: Array<Record<string, unknown>> }) {
-  const stages = [
-    ['system_prompt', '载入分析规则'], ['financial_context', '冻结金融上下文'], ['tool_call', '调用只读工具'],
-    ['tool_result', '工具返回事实'], ['model_completed', '生成结构化报告'], ['status', '保存任务状态'],
-  ] as const
-  const financialContext = trace.find((entry) => entry.type === 'financial_context')
-  const capabilities = Array.isArray(financialContext?.capabilities)
-    ? financialContext.capabilities.map(asRecord)
-    : []
-  return <aside className="trace-panel"><p className="micro">分析轨迹</p>{stages.map(([type, label], index) => { const entries = trace.filter((entry) => entry.type === type); const count = entries.length; const expandable = (type === 'financial_context' && capabilities.length > 0) || ((type === 'tool_call' || type === 'tool_result') && count > 0); return expandable ? <details className="trace-stage" key={type}><summary><i>{index + 1}</i><span>{label}</span><small>{count} 次</small></summary>{type === 'financial_context' ? <div className="source-diagnostics">{capabilities.map((capability) => <CapabilityTrace key={String(capability.capability)} capability={capability} />)}</div> : <ToolTrace entries={entries} />}</details> : <div key={type}><i>{index + 1}</i><span>{label}</span><small>{count ? `${count} 次` : '无'}</small></div> })}<details><summary>开发者信息</summary><p>底层共保存 {trace.length} 条原始事件，用于排查和审计；此处不逐条渲染模型 token。</p></details></aside>
+function ToolResultSummary({ result }: { result: Record<string, unknown> }) {
+  const payload = result.result && typeof result.result === 'object'
+    ? result.result as Record<string, unknown>
+    : null
+  const summary = typeof payload?.summary === 'string' ? payload.summary : null
+  const factCount = Array.isArray(payload?.facts) ? payload.facts.length : null
+  const launched = typeof payload?.launched === 'boolean' ? payload.launched : null
+  const parts = [
+    launched === true ? '专项已启动' : launched === false ? '专项未启动' : null,
+    summary, factCount !== null ? '产生 ' + factCount + ' 条原子事实' : null,
+  ].filter((part) => part !== null)
+  return parts.length ? <p className="tool-result-summary">{parts.join(' · ')}</p> : null
 }
 
-function ToolTrace({ entries }: { entries: Array<Record<string, unknown>> }) {
-  return <ol className="tool-timing-list">{entries.map((entry, index) => {
-    const startedAt = typeof entry.startedAt === 'string' ? entry.startedAt : null
-    const completedAt = typeof entry.completedAt === 'string' ? entry.completedAt : null
-    const duration = startedAt && completedAt ? Math.max(0, new Date(completedAt).getTime() - new Date(startedAt).getTime()) : null
-    const notStarted = entry.notStarted === true
-    const timingLabel = notStarted
-      ? <span>{entry.type === 'tool_result' ? '未开始即取消' : '未开始'}</span>
-      : startedAt && <span>开始 {formatTime(startedAt)}</span>
-    return <li key={`${String(entry.toolCallId ?? entry.name)}-${String(entry.completionOrder ?? index)}`} data-tool-call-id={String(entry.toolCallId ?? '')}><strong>{String(entry.name ?? '工具')}</strong>{timingLabel}{completedAt && <span>完成 {formatTime(completedAt)}</span>}{duration !== null && <small>耗时 {duration.toLocaleString('zh-CN')} 毫秒 · 完成序 #{String(entry.completionOrder)}</small>}</li>
-  })}</ol>
+function JsonBlock({ value, limit = 8000 }: { value: unknown; limit?: number }) {
+  if (value === undefined || value === null) return <p className="tool-detail-empty">无</p>
+  let text = ''
+  try { text = JSON.stringify(value, null, 2) ?? '' } catch { text = String(value) }
+  const truncated = text.length > limit
+  return <pre className="json-block">{truncated ? text.slice(0, limit) + '\n…（已截断，完整内容请使用研究导出）' : text}</pre>
 }
 
 function CapabilityTrace({ capability }: { capability: Record<string, unknown> }) {
@@ -958,7 +1326,7 @@ function BulletList({ values }: { values: string[] }) { return <ul className="pl
 function Metric({ label, value }: { label: string; value: string }) { return <div><span>{label}</span><strong>{value}</strong></div> }
 function StatusRow({ label, ready }: { label: string; ready: boolean }) { return <div className="status-row"><i className={ready ? 'live-dot' : 'live-dot off'} /><span>{label}</span><small>{ready ? '正常' : '不可用'}</small></div> }
 function SystemBadge({ health, modelConfigured }: { health: SystemHealth | null; modelConfigured: boolean }) { const ready = health?.status === 'ok' && modelConfigured; return <div className="system-badge"><i className={ready ? 'live-dot' : 'live-dot off'} /><span>本地实例</span><small>{ready ? '全部正常' : '能力受限'}</small></div> }
-function Setting({ title, description, ready }: { title: string; description: string; ready: boolean }) { return <section><div><p className="micro">INSTANCE CAPABILITY</p><h2>{title}</h2><p>{description}</p></div><span className={ready ? 'ready-chip' : 'ready-chip off'}><i />{ready ? '正常' : '不可用'}</span></section> }
+function Setting({ title, description, ready, readyLabel = '正常' }: { title: string; description: string; ready: boolean; readyLabel?: string }) { return <section><div><p className="micro">INSTANCE CAPABILITY</p><h2>{title}</h2><p>{description}</p></div><span className={ready ? 'ready-chip' : 'ready-chip off'}><i />{ready ? readyLabel : '不可用'}</span></section> }
 
 function normalizedBars(facts: Fact[]) {
   const map = new Map<string, { date: string; close: number; volume: number }>()
@@ -1050,7 +1418,7 @@ function formatSignedPercent(value: number) { return `${value > 0 ? '+' : ''}${(
 function formatSignedPercentOrDash(value: number | null) { return value === null ? '—' : formatSignedPercent(value) }
 function valueTone(value?: number | null) { return value === undefined || value === null || value === 0 ? '' : value > 0 ? 'positive' : 'negative' }
 function emptyPortfolio(): PortfolioOverview { return { cash: 0, totalCost: 0, totalMarketValue: 0, totalEquity: 0, totalUnrealizedProfitLoss: 0, totalUnrealizedReturn: null, pricedPositionCount: 0, unpricedPositionCount: 0, positions: [] } }
-function friendlyError(value: string) { if (value.startsWith('unknown_evidence:')) return 'AI 引用了一条不存在的报告依据，本次报告已被拒绝。'; if (value.includes('report_tool_required')) return 'AI 没有返回规定格式的报告，本次分析未保存为完成报告。'; if (value.includes('model_not_configured')) return '尚未配置 AI 模型，暂时不能创建新分析。'; if (value.includes('model_')) return 'AI 模型调用失败，请检查模型配置后重试。'; if (value.includes('financial_context')) return '金融数据格式不完整，本次分析已停止以避免生成错误结论。'; return `分析没有完成：${value}` }
+function friendlyError(value: string) { if (value.startsWith('unknown_evidence:')) return 'AI 引用了一条不存在的报告依据，本次报告已被拒绝。'; if (value.includes('report_tool_required')) return 'AI 没有返回规定格式的报告，本次分析未保存为完成报告。'; if (value.includes('model_not_configured')) return '尚未配置 AI 模型，暂时不能创建新分析。'; if (value.includes('model_request_conflict')) return '模型请求审计发生冲突，请重新发起分析；这不表示 API Key 缺失。'; if (value.includes('model_')) return 'AI 模型调用失败，请检查模型配置后重试。'; if (value.includes('financial_context')) return '金融数据格式不完整，本次分析已停止以避免生成错误结论。'; return `分析没有完成：${value}` }
 
 function isReportOlderThan(createdAt: string | null | undefined, freshnessDays: number) {
   if (!createdAt) return false

@@ -177,11 +177,16 @@ test('用户创建分析并打开研究记录后能看到报告依据', async ()
         { id: 'valuation-1', type: 'valuation', value: { current_multiples: { pe: 70.28 }, historical_ranges: { pe: [30.74, 56.58] }, comparable_symbols: ['AMD', 'AVGO'] }, observedAt: '2026-08-12T13:48:38Z', source: 'yahoo-timeseries', sourceReference: 'https://example.com' },
       ],
       trace: [
-        { type: 'tool_call', name: 'search_news_by_keyword', toolCallId: 'news-call', startedAt: '2026-08-12T13:48:38.000Z' },
-        { type: 'tool_result', name: 'search_news_by_keyword', toolCallId: 'news-call', startedAt: '2026-08-12T13:48:38.000Z', completedAt: '2026-08-12T13:48:38.125Z', completionOrder: 1 },
+        { type: 'tool_call', name: 'search_news_by_keyword', toolCallId: 'news-call', input: { keyword: 'NVDA 财报' }, startedAt: '2026-08-12T13:48:38.000Z' },
+        { type: 'tool_result', name: 'search_news_by_keyword', toolCallId: 'news-call', result: { summary: '找到 3 条候选新闻', facts: [{ id: 'fact-1' }] }, startedAt: '2026-08-12T13:48:38.000Z', completedAt: '2026-08-12T13:48:38.125Z', completionOrder: 1 },
         { type: 'tool_call', name: 'get_technical_indicators', toolCallId: 'cancelled-call', input: {}, startedAt: null, notStarted: true },
         { type: 'tool_result', name: 'get_technical_indicators', toolCallId: 'cancelled-call', startedAt: null, notStarted: true, completedAt: '2026-08-12T13:48:38.125Z', completionOrder: 2, isError: true },
         { type: 'status', status: 'completed' },
+      ],
+      specialistAgents: [
+        { id: 'session-news', domain: 'news', status: 'completed', researchQuestion: '近期新闻是否改变 NVDA 叙事？', reason: '财报临近，消息面权重上升' },
+        { domain: 'fundamental_valuation', status: 'not_started', reason: '主 Agent 判断现有估值材料足够。' },
+        { domain: 'technical', status: 'not_started', reason: '主 Agent 尚未作出技术面专项启动决定。' },
       ],
     })
     throw new Error(`unexpected_fetch:${url}`)
@@ -201,14 +206,25 @@ test('用户创建分析并打开研究记录后能看到报告依据', async ()
   await view.findByText('70.3×')
   assert.ok(view.getByRole('img', { name: '当前 PE 70.3 倍，历史区间 30.7 至 56.6 倍' }))
   await waitFor(() => assert.ok(view.getByText('偏强震荡')))
-  await user.click(view.getByText('调用只读工具'))
-  assert.ok(view.getAllByText(/开始/).some((item) => /2026/.test(item.textContent ?? '')))
-  await view.findByText('未开始')
-  await user.click(view.getByText('工具返回事实'))
-  await view.findByText('耗时 125 毫秒 · 完成序 #1')
+  await user.click(view.getByRole('tab', { name: '轨迹' }))
+  const trace = await view.findByRole('region', { name: '研究轨迹' })
+  assert.equal(trace.querySelector('[data-tool-call-id="news-call"]') !== null, true)
+  assert.equal(trace.querySelector('[data-tool-call-id="cancelled-call"]') !== null, true)
+  await view.findByText('耗时 125 毫秒')
   await view.findByText('未开始即取消')
-  assert.equal(document.querySelector('[data-tool-call-id="news-call"]') !== null, true)
-  assert.equal(document.querySelector('[data-tool-call-id="cancelled-call"]') !== null, true)
+  await user.click(trace.querySelector('[data-tool-call-id="news-call"] summary strong') as HTMLElement)
+  await view.findAllByText('输入参数')
+  await view.findByText(/NVDA 财报/)
+  await view.findAllByText('返回结果（用户视图）')
+  await view.findByText(/找到 3 条候选新闻 · 产生 1 条原子事实/)
+  const decisions = await view.findByRole('region', { name: '专项规划决策' })
+  assert.match(decisions.textContent ?? '', /消息面专项已启动/)
+  assert.match(decisions.textContent ?? '', /近期新闻是否改变 NVDA 叙事？/)
+  assert.match(decisions.textContent ?? '', /基本面专项未启动/)
+  assert.match(decisions.textContent ?? '', /主 Agent 判断现有估值材料足够。/)
+  const incidents = await view.findByRole('alert', { name: '异常与降级' })
+  assert.match(incidents.textContent ?? '', /工具 get_technical_indicators 返回错误/)
+  await user.click(view.getByRole('tab', { name: '研究' }))
   const exportLink = await view.findByRole('link', { name: '导出研究 JSON' })
   assert.equal(exportLink.getAttribute('href'), '/api/research/analysis-1/export')
   assert.equal(exportLink.hasAttribute('download'), true)
@@ -262,10 +278,11 @@ test('无有效报告的研究页仍可向原主 Agent 发送追问', async () =
   await user.type(await view.findByLabelText('追问主 Agent'), '继续补充研究')
   await user.click(view.getByRole('button', { name: '发送追问' }))
   await waitFor(() => assert.equal(sent, '继续补充研究'))
-  await waitFor(() => assert.match(view.getByRole('region', { name: '主 Agent Runtime' }).textContent ?? '', /Generation 2/))
   const conversation = await view.findByRole('region', { name: '与主 Agent 的对话' })
   assert.match(conversation.textContent ?? '', /你继续补充研究/)
   assert.match(conversation.textContent ?? '', /主 Agent这是主 Agent 的可回放回答/)
+  await user.click(view.getByRole('tab', { name: '轨迹' }))
+  await waitFor(() => assert.match(view.getByRole('region', { name: '研究轨迹' }).textContent ?? '', /Execution follow-up-execution · Generation 2/))
 })
 
 test('追问通过 SSE 实时展示用户消息、文本增量与最终回答', async (t) => {
@@ -386,8 +403,9 @@ test('研究页重新分析同一标的时创建全新研究而不是更新旧�
   await user.click(await view.findByRole('button', { name: /打开 NVDA/ }))
   await user.click(await view.findByRole('button', { name: '重新分析 NVDA' }))
   await waitFor(() => assert.equal(requestedSymbol, 'NVDA'))
+  await user.click(await view.findByRole('tab', { name: '轨迹' }))
   await waitFor(() => assert.match(
-    view.getByRole('region', { name: '主 Agent Runtime' }).textContent ?? '', /new-session/,
+    view.getByRole('region', { name: '研究轨迹' }).textContent ?? '', /Session new-session/,
   ))
 })
 
@@ -520,13 +538,13 @@ test('研究页展示主 Agent、execution、conversation segment、waitReason �
   const user = userEvent.setup({ document: window.document })
   await user.click(await view.findByRole('button', { name: '新建分析' }))
   await user.click(await view.findByRole('button', { name: /打开 NVDA/ }))
-  const runtime = await view.findByRole('region', { name: '主 Agent Runtime' })
-  assert.match(runtime.textContent ?? '', /session-1/)
-  assert.match(runtime.textContent ?? '', /execution-1.*Generation 1/)
-  assert.match(runtime.textContent ?? '', /Segment 1/)
-  assert.match(runtime.textContent ?? '', /首次研究初始化/)
-  assert.match(runtime.textContent ?? '', /Runtime Context/)
-  assert.match(runtime.textContent ?? '', /等待 首次研究初始化/)
+  await user.click(await view.findByRole('tab', { name: '轨迹' }))
+  const trace = await view.findByRole('region', { name: '研究轨迹' })
+  assert.match(trace.textContent ?? '', /Session session-1 · Execution execution-1 · Generation 1/)
+  assert.match(trace.textContent ?? '', /Segment 1/)
+  assert.match(trace.textContent ?? '', /载入运行上下文/)
+  assert.match(trace.textContent ?? '', /等待：首次研究初始化/)
+  assert.match(trace.textContent ?? '', /等待 首次研究初始化（始于/)
 })
 
 test('研究页展示 Compaction token usage 耗时与链接的新 Segment', async () => {
@@ -574,14 +592,13 @@ test('研究页展示 Compaction token usage 耗时与链接的新 Segment', asy
   const user = userEvent.setup({ document: window.document })
   await user.click(await view.findByRole('button', { name: '新建分析' }))
   await user.click(await view.findByRole('button', { name: /打开 NVDA/ }))
-  const runtime = await view.findByRole('region', { name: '主 Agent Runtime' })
-  assert.match(runtime.textContent ?? '', /Segment 2.*源自 Segment 1/)
-  assert.match(runtime.textContent ?? '', /Compaction.*120,000.*128,000/)
-  assert.match(runtime.textContent ?? '', /保留 16,384.*近期 20,000/)
-  assert.match(runtime.textContent ?? '', /1,100 Token.*压缩后 18,000.*1\.25 秒/)
-  assert.match(runtime.textContent ?? '', /上下文 ≈14\.1%.*当前 18,000 Token.*阈值 111,616 Token.*距 Compaction 93,616 Token.*绿色.*Segment 2.*已 Compaction 1 次/)
-  assert.match(runtime.textContent ?? '', /Compaction 尝试 1.*失败.*520 Token.*0\.50 秒/)
-  assert.match(runtime.textContent ?? '', /Compaction 尝试 2.*完成.*1,100 Token.*0\.75 秒/)
+  await user.click(await view.findByRole('tab', { name: '轨迹' }))
+  const trace = await view.findByRole('region', { name: '研究轨迹' })
+  assert.match(trace.textContent ?? '', /上下文压缩已完成 · 120,000 \/ 128,000 Token · 保留 16,384 · 近期 20,000 · 1,100 Token · 压缩后 18,000 · 1\.25 秒/)
+  assert.match(trace.textContent ?? '', /上下文 ≈14\.1% \/ 128,000 · 当前 18,000 Token · 阈值 111,616 Token · 距压缩 93,616 Token · Segment 2 · 已压缩 1 次/)
+  assert.match(trace.textContent ?? '', /Segment 1 · Segment 2（源自 Segment 1）/)
+  assert.match(trace.textContent ?? '', /Compaction 尝试 1 · 失败 · 520 Token · 0\.50 秒/)
+  assert.match(trace.textContent ?? '', /Compaction 尝试 2 · 已完成 · 1,100 Token · 0\.75 秒/)
 })
 
 test('研究页按 Agent 展示四类 Token 堆叠、coverage 与累计趋势', async () => {
@@ -644,14 +661,13 @@ test('研究页按 Agent 展示四类 Token 堆叠、coverage 与累计趋势', 
   const user = userEvent.setup({ document: window.document })
   await user.click(await view.findByRole('button', { name: '新建分析' }))
   await user.click(await view.findByRole('button', { name: /打开 NVDA/ }))
-  const dashboard = await view.findByRole('region', { name: 'Agent Token 用量' })
-  assert.match(dashboard.textContent ?? '', /主 Agent.*Input 1,500.*Cache Read 300.*Cache Write 75.*Output 150.*Total 2,025.*Coverage 66\.7%/)
-  assert.match(dashboard.textContent ?? '', /消息面专项.*Input 400.*Cache Read 80.*Cache Write 20.*Output 40.*Total 540.*Coverage 100\.0%/)
-  assert.match(dashboard.textContent ?? '', /主 Agent.*缓存命中率 16\.0%/)
-  assert.equal(view.getAllByRole('img', { name: /Token 构成/ }).length, 2)
-  await user.click(view.getByRole('button', { name: '展开 Token 累计趋势' }))
-  assert.equal(view.getAllByRole('img', { name: /Token 累计趋势/ }).length, 2)
-  assert.match(dashboard.textContent ?? '', /请求 1.*1,350.*请求 2.*2,025.*请求 3.*usage 未返回/)
+  await user.click(await view.findByRole('tab', { name: '轨迹' }))
+  const trace = await view.findByRole('region', { name: '研究轨迹' })
+  assert.match(trace.textContent ?? '', /研究合计 4 次 attempt · 已上报 3 · Coverage 75\.0% · Input 1,900 · Cache Read 380 · Cache Write 95 · Output 190 · Total 2,565/)
+  await user.click(view.getByText('Token 用量明细'))
+  const table = await view.findByRole('table', { name: 'Token 用量明细' })
+  assert.match(table.textContent ?? '', /主 Agent.*3.*1,500.*300.*75.*150.*2,025.*66\.7%.*16\.0%/)
+  assert.match(table.textContent ?? '', /消息面专项.*1.*400.*80.*20.*40.*540.*100\.0%.*16\.0%/)
 })
 
 test('研究页将 Compaction Token 独立分组且字段不完整时不计算缓存命中率', async () => {
@@ -685,10 +701,11 @@ test('研究页将 Compaction Token 独立分组且字段不完整时不计算�
   const user = userEvent.setup({ document: window.document })
   await user.click(await view.findByRole('button', { name: '新建分析' }))
   await user.click(await view.findByRole('button', { name: /打开 NVDA/ }))
-  const dashboard = await view.findByRole('region', { name: 'Agent Token 用量' })
-  assert.match(dashboard.textContent ?? '', /Compaction.*Input 800.*Cache Read 200.*Output 100.*Coverage 100\.0%/)
-  assert.match(dashboard.textContent ?? '', /Token 构成 N\/A/)
-  assert.match(dashboard.textContent ?? '', /缓存命中率 N\/A/)
+  await user.click(await view.findByRole('tab', { name: '轨迹' }))
+  await view.findByRole('region', { name: '研究轨迹' })
+  await user.click(view.getByText('Token 用量明细'))
+  const table = await view.findByRole('table', { name: 'Token 用量明细' })
+  assert.match(table.textContent ?? '', /Compaction.*1.*800.*200.*N\/A.*100.*1,100.*100\.0%.*N\/A/)
 })
 
 test('研究页在 Compaction 进行中显示蓝色且失败后显示红色错误', async () => {
@@ -735,9 +752,10 @@ test('研究页在 Compaction 进行中显示蓝色且失败后显示红色错�
   const user = userEvent.setup({ document: window.document })
   await user.click(await view.findByRole('button', { name: '新建分析' }))
   await user.click(await view.findByRole('button', { name: /打开 NVDA/ }))
-  const runtime = await view.findByRole('region', { name: '主 Agent Runtime' })
-  assert.match(runtime.textContent ?? '', /蓝色 · Compaction 进行中/)
-  assert.ok(runtime.querySelector('.context-usage-blue'))
+  await user.click(await view.findByRole('tab', { name: '轨迹' }))
+  const trace = await view.findByRole('region', { name: '研究轨迹' })
+  assert.match(trace.textContent ?? '', /压缩进行中/)
+  assert.ok(trace.querySelector('.context-usage-blue'))
   record.mainAgent.modelAttempts[0].status = 'failed'
   record.mainAgent.modelAttempts[0].completedAt = '2026-08-14T01:00:02Z'
   record.mainAgent.events.push({
@@ -747,9 +765,10 @@ test('研究页在 Compaction 进行中显示蓝色且失败后显示红色错�
   })
   await user.click(view.getByRole('button', { name: '新建分析' }))
   await user.click(view.getByRole('button', { name: /打开 NVDA/ }))
-  const failedRuntime = await view.findByRole('region', { name: '主 Agent Runtime' })
-  assert.match(failedRuntime.textContent ?? '', /红色 · Compaction 失败/)
-  assert.ok(failedRuntime.querySelector('.context-usage-red'))
+  await user.click(await view.findByRole('tab', { name: '轨迹' }))
+  const failedTrace = await view.findByRole('region', { name: '研究轨迹' })
+  assert.match(failedTrace.textContent ?? '', /上次压缩失败/)
+  assert.ok(failedTrace.querySelector('.context-usage-red'))
 })
 
 test('研究页只允许手动恢复 stopped 或 interrupted 记录', async () => {
@@ -859,11 +878,14 @@ test('研究页独立展示消息面专项的工具轨迹、证据缺口和版�
   await user.click(await view.findByRole('button', { name: /打开 NVDA/ }))
 
   const specialist = await view.findByRole('region', { name: '消息面专项 Agent' })
-  assert.match(specialist.textContent ?? '', /search_news_candidates/)
-  assert.match(specialist.textContent ?? '', /read_news_document/)
   assert.match(specialist.textContent ?? '', /报告版本 1/)
   assert.match(specialist.textContent ?? '', /未找到独立反方来源.*置信度受限/)
   assert.match(specialist.textContent ?? '', /产品事件对近期预期偏正面.*中等/)
+  await user.click(view.getByRole('tab', { name: '轨迹' }))
+  const trace = await view.findByRole('region', { name: '研究轨迹' })
+  assert.match(trace.textContent ?? '', /2 条轨迹事件 · 已完成/)
+  assert.match(trace.textContent ?? '', /search_news_candidates/)
+  assert.match(trace.textContent ?? '', /read_news_document/)
 })
 
 test('研究页固定展示基本面专项，并独立展示工具轨迹和不可变版本', async () => {
@@ -903,12 +925,15 @@ test('研究页固定展示基本面专项，并独立展示工具轨迹和不�
   await user.click(await view.findByRole('button', { name: /打开 NVDA/ }))
 
   const specialist = await view.findByRole('region', { name: '基本面专项 Agent' })
-  assert.match(specialist.textContent ?? '', /get_financial_overview/)
-  assert.match(specialist.textContent ?? '', /read_filing_document/)
   assert.match(specialist.textContent ?? '', /报告版本 1/)
   assert.match(specialist.textContent ?? '', /未发现正式指引.*置信度受限/)
   assert.match(specialist.textContent ?? '', /正式财务事实支持基本面偏强.*中等/)
   assert.match(specialist.textContent ?? '', /估值区间.*80.*128.*pe.*2026-08-12T14:30:00Z/)
+  await user.click(view.getByRole('tab', { name: '轨迹' }))
+  const trace = await view.findByRole('region', { name: '研究轨迹' })
+  assert.match(trace.textContent ?? '', /2 条轨迹事件 · 已完成/)
+  assert.match(trace.textContent ?? '', /get_financial_overview/)
+  assert.match(trace.textContent ?? '', /read_filing_document/)
 })
 
 test('研究页独立展示技术面专项的多周期报告与工具轨迹', async () => {
@@ -945,10 +970,13 @@ test('研究页独立展示技术面专项的多周期报告与工具轨迹', as
   await user.click(await view.findByRole('button', { name: /打开 NVDA/ }))
 
   const specialist = await view.findByRole('region', { name: '技术面专项 Agent' })
-  assert.match(specialist.textContent ?? '', /get_technical_evidence/)
-  assert.match(specialist.textContent ?? '', /get_price_window/)
   assert.match(specialist.textContent ?? '', /短周期偏强但中周期冲突.*中性.*中等/)
   assert.match(specialist.textContent ?? '', /长期历史不足.*长期置信度受限/)
+  await user.click(view.getByRole('tab', { name: '轨迹' }))
+  const trace = await view.findByRole('region', { name: '研究轨迹' })
+  assert.match(trace.textContent ?? '', /2 条轨迹事件 · 已完成/)
+  assert.match(trace.textContent ?? '', /get_technical_evidence/)
+  assert.match(trace.textContent ?? '', /get_price_window/)
 })
 
 test('研究页同时展示主 Agent 等待目标和完整三专项树', async () => {
@@ -995,8 +1023,10 @@ test('研究页同时展示主 Agent 等待目标和完整三专项树', async (
   for (const name of ['消息面专项 Agent', '基本面专项 Agent', '技术面专项 Agent']) {
     assert.ok(await view.findByRole('region', { name }))
   }
-  const main = await view.findByRole('region', { name: '主 Agent Runtime' })
-  for (const [, id] of sessions) assert.match(main.textContent ?? '', new RegExp(id))
+  await user.click(view.getByRole('tab', { name: '轨迹' }))
+  const trace = await view.findByRole('region', { name: '研究轨迹' })
+  assert.match(trace.textContent ?? '', /等待：专项 Session：news-session、fundamental-session、technical-session/)
+  for (const [, id] of sessions) assert.match(trace.textContent ?? '', new RegExp(id))
 })
 
 test('模型未配置时首次研究创建后立即打开主 Agent 生命周期', async () => {
@@ -1021,7 +1051,8 @@ test('模型未配置时首次研究创建后立即打开主 Agent 生命周期'
   await user.click(await view.findByRole('button', { name: '新建分析' }))
   await user.type(await view.findByLabelText('分析标的'), 'NVDA')
   await user.click(view.getByRole('button', { name: '开始分析' }))
-  assert.match((await view.findByRole('region', { name: '主 Agent Runtime' })).textContent ?? '', /首次研究初始化/)
+  await user.click(await view.findByRole('tab', { name: '轨迹' }))
+  assert.match((await view.findByRole('region', { name: '研究轨迹' })).textContent ?? '', /等待：首次研究初始化/)
 })
 
 for (const terminal of ['stopped', 'budget_exhausted']) {
@@ -1293,6 +1324,9 @@ test('研究报告把结构化事实翻译成人话且不渲染原始事件流',
   await user.click(await view.findByRole('button', { name: '研究记录' }))
   await view.findAllByText('MA5 US$219.44 · MA20 US$207.80 · RSI 54.26')
   assert.equal(view.container.textContent?.includes('{"raw":"token"}'), false)
+  await user.click(view.getByRole('tab', { name: '轨迹' }))
+  await view.findByRole('region', { name: '研究轨迹' })
+  await user.click(view.getByText('开发者信息'))
   await view.findByText(/底层共保存 121 条原始事件/)
 })
 
@@ -1329,6 +1363,7 @@ test('分析轨迹可展开查看各能力的数据源状态与错误', async ()
   const view = render(React.createElement(App))
   const user = userEvent.setup({ document: window.document })
   await user.click(await view.findByRole('button', { name: '研究记录' }))
+  await user.click(await view.findByRole('tab', { name: '轨迹' }))
   await user.click(await view.findByText('冻结金融上下文'))
   await user.click(await view.findByText('财报基本面'))
   await view.findByText('UnicodeDecodeError')
