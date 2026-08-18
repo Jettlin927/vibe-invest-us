@@ -43,6 +43,8 @@ export type PriceWindowQueryResult = PaginatedFactQueryResult & {
   sampling: 'daily' | 'weekly'
 }
 
+export const MARKET_PRICE_REQUEST_TIMEOUT_MS = 30_000
+
 export function createFinancialDataClient(baseUrl: string) {
   return {
     async health(): Promise<FinancialDataHealth> {
@@ -186,7 +188,9 @@ export function createFinancialDataClient(baseUrl: string) {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(symbols),
-        signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(10_000)]) : AbortSignal.timeout(10_000),
+        signal: signal
+          ? AbortSignal.any([signal, AbortSignal.timeout(MARKET_PRICE_REQUEST_TIMEOUT_MS)])
+          : AbortSignal.timeout(MARKET_PRICE_REQUEST_TIMEOUT_MS),
       })
       if (!response.ok) throw new Error(`financial_data_quotes_http_${response.status}`)
       const value = await response.json() as { quotes?: Array<{ symbol?: unknown; price?: unknown }> }

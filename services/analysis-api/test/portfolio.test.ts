@@ -117,6 +117,28 @@ test('用户可以维护现金并查看组合总值、仓位和未实现盈亏',
   await app.close()
 })
 
+test('组合行情请求超时不会把仍在请求中的价格误报为已获取', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'vibe-invest-portfolio-timeout-'))
+  const app = buildApp({
+    ...productDatabaseFor(join(dataDir, 'storage')),
+    financialDataHealth: healthyFinancialData,
+    marketPriceTimeoutMs: 20,
+    fetchMarketPrices: async (_symbols, signal) => {
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      return signal.aborted ? {} : { NVDA: 120 }
+    },
+  })
+  await app.ready()
+  await app.inject({ method: 'PUT', url: '/api/positions/NVDA', payload: { quantity: 10, averageCost: 100 } })
+
+  const response = await app.inject({ method: 'GET', url: '/api/portfolio' })
+
+  assert.equal(response.statusCode, 200)
+  assert.equal(response.json().pricedPositionCount, 0)
+  assert.equal(response.json().positions[0].marketPrice, null)
+  await app.close()
+})
+
 test('减仓按成交价增加现金并保留平均成本', async () => {
   const dataDir = await mkdtemp(join(tmpdir(), 'vibe-invest-reduce-'))
   const app = await createPricedTestApp(join(dataDir, 'storage'), { NVDA: 120 })

@@ -11,6 +11,7 @@
   "scripts": {
     "dev": "npm run dev:web",
     "prototype": "npm run dev --workspace @vibe-invest/web -- --open '/prototype/workbench?variant=A'",
+    "prototype:interface": "npm run dev --workspace @vibe-invest/web -- --open '/prototype/interface?variant=A'",
     "dev:web": "npm run dev --workspace @vibe-invest/web",
     "dev:api": "npm run dev --workspace @vibe-invest/analysis-api",
     "dev:data": "services/market-data/.venv/bin/uvicorn app.main:app --app-dir services/market-data --reload --port 8000 --no-access-log",

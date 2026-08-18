@@ -11,8 +11,9 @@ import type {
 
 import { createAnalysisService } from './analysis.js'
 import type { ModelEvent } from './model.js'
-import type {
-  FactQueryResult, FinancialContext, PaginatedFactQueryResult,
+import {
+  MARKET_PRICE_REQUEST_TIMEOUT_MS,
+  type FactQueryResult, type FinancialContext, type PaginatedFactQueryResult,
 } from './financial-data-client.js'
 import { createPortfolio, isValidSymbol, normalizeSymbol } from './portfolio.js'
 import { projectResearchExport, projectResearchView } from './research-export.js'
@@ -61,6 +62,7 @@ type AppDependencies = {
     symbol: string, startDate: string, endDate: string, signal: AbortSignal,
   ) => Promise<FactQueryResult>
   fetchMarketPrices?: (symbols: string[], signal: AbortSignal) => Promise<Record<string, number>>
+  marketPriceTimeoutMs?: number
   model?: {
     analyze(input: any): AsyncIterable<ModelEvent>
     analyzeNews?: (input: any) => AsyncIterable<ModelEvent>
@@ -163,7 +165,7 @@ export function buildApp(dependencies: AppDependencies) {
     try {
       const prices = await dependencies.fetchMarketPrices(
         positions.map((position) => position.symbol),
-        AbortSignal.timeout(10_000),
+        AbortSignal.timeout(dependencies.marketPriceTimeoutMs ?? MARKET_PRICE_REQUEST_TIMEOUT_MS),
       )
       const overview = await portfolio.overview(prices)
       await portfolio.recordSnapshot(overview, dependencies.now?.() ?? new Date())
