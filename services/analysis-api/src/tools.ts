@@ -1,72 +1,47 @@
-import { Type } from '@earendil-works/pi-ai'
+import { toolRegistry } from './tool-registry.js'
 
-const fetchFinancialContextTool = {
-  name: 'fetch_financial_context',
-  description: '读取指定美股的标准化、只读金融上下文',
-  parameters: Type.Object({ symbol: Type.Optional(Type.String({ minLength: 1 })) }),
-} as const
+export const analysisModelTools = toolRegistry.project({ role: 'main', stage: 'research' })
+export const financialSpecialistTools = toolRegistry.project({ role: 'fundamental', stage: 'research' })
+export const newsSpecialistTools = toolRegistry.project({ role: 'news', stage: 'research' })
+  .filter(({ name }) => name !== 'search_web_evidence')
+export const technicalSpecialistTools = toolRegistry.project({ role: 'technical', stage: 'research' })
+export const finalizationModelTools = toolRegistry.project({ role: 'main', stage: 'finalization' })
 
-const analyzeFinancialsTool = {
-  name: 'analyze_financials',
-  description: '按需委托独立财报专家；专家可解释冻结财报，并通过受控工具补查新闻和技术指标',
-  parameters: Type.Object({ symbol: Type.Optional(Type.String({ minLength: 1 })) }),
-} as const
+// ---- 扁平模式（实验开关 agentModeFlat=1）：单 Agent 直接持有全部领域工具 ----
 
-const submitAnalysisReportTool = {
-  name: 'submit_analysis_report',
-  description: '提交最终结构化综合分析报告',
-  parameters: Type.Object({
-    title: Type.Optional(Type.String()),
-    marketState: Type.Optional(Type.String()),
-    trend: Type.Optional(Type.String()),
-    drivers: Type.Optional(Type.Array(Type.String())),
-    supportingEvidence: Type.Optional(Type.Array(Type.String(), {
-      description: '只填写工具结果中完整、原样的事实 ID，不要填写解释句子',
-    })),
-    contraryEvidence: Type.Optional(Type.Array(Type.String(), {
-      description: '只填写工具结果中完整、原样的事实 ID，不要填写解释句子',
-    })),
-    scenarios: Type.Optional(Type.Array(Type.Object({
-      name: Type.Optional(Type.String()),
-      condition: Type.Optional(Type.String()),
-      outcome: Type.Optional(Type.String()),
-    }))),
-    invalidationConditions: Type.Optional(Type.Array(Type.String())),
-    valuation: Type.Optional(Type.Union([Type.String(), Type.Null()])),
-    personalImpact: Type.Optional(Type.Union([Type.String(), Type.Null()])),
-    conditionalSuggestion: Type.Optional(Type.Union([Type.String(), Type.Null()])),
-    limitations: Type.Optional(Type.Array(Type.String())),
-    keyJudgments: Type.Optional(Type.Array(Type.Object({
-      judgment: Type.Optional(Type.String()),
-      evidence: Type.Optional(Type.Array(Type.String(), {
-        description: '只填写工具结果中完整、原样的事实 ID，不要填写解释句子',
-      })),
-    }))),
-  }),
-} as const
+const submitAnalysisReport = toolRegistry.definition('submit_analysis_report')!.model
+const submitParameters = submitAnalysisReport.parameters as { required?: string[] }
 
-export const analysisModelTools = [
-  fetchFinancialContextTool,
-  analyzeFinancialsTool,
-  submitAnalysisReportTool,
-] as const
+// 扁平变体：specialistStatuses / specialistReferences 不再必填
+export const flatSubmitAnalysisReportTool = {
+  ...submitAnalysisReport,
+  description: '提交最终结构化综合分析报告（扁平模式：无专项引用）',
+  parameters: {
+    ...submitParameters,
+    required: (submitParameters.required ?? [])
+      .filter((key) => !['specialistStatuses', 'specialistReferences'].includes(key)),
+  },
+}
 
-const searchNewsByKeywordTool = {
-  name: 'search_news_by_keyword',
-  description: '按关键词查询新闻源，返回带来源、发布时间和事实 ID 的新闻事实',
-  parameters: Type.Object({
-    keyword: Type.Optional(Type.String({ minLength: 1 })),
-  }),
-} as const
+const SPECIALIST_LAUNCH_TOOLS = [
+  'run_news_analysis', 'run_fundamental_analysis', 'run_technical_analysis',
+]
 
-const getTechnicalIndicatorsTool = {
-  name: 'get_technical_indicators',
-  description: '按股票编号和日期范围查询日线并计算确定性技术指标',
-  parameters: Type.Object({
-    symbol: Type.Optional(Type.String({ minLength: 1 })),
-    startDate: Type.Optional(Type.String({ format: 'date' })),
-    endDate: Type.Optional(Type.String({ format: 'date' })),
-  }),
-} as const
+function dedupeByName<T extends { name: string }>(tools: T[]): T[] {
+  const seen = new Set<string>()
+  return tools.filter((tool) => (seen.has(tool.name) ? false : (seen.add(tool.name), true)))
+}
 
-export const financialSpecialistTools = [searchNewsByKeywordTool, getTechnicalIndicatorsTool] as const
+export const flatResearchTools = dedupeByName([
+  ...analysisModelTools.filter(({ name }) => (
+    !SPECIALIST_LAUNCH_TOOLS.includes(name) && name !== 'submit_analysis_report'
+  )),
+  ...newsSpecialistTools,
+  ...financialSpecialistTools,
+  ...technicalSpecialistTools,
+  flatSubmitAnalysisReportTool,
+].filter(({ name }) => name !== 'submit_specialist_report'))
+
+export const flatFinalizationTools = [flatSubmitAnalysisReportTool]
+
+export const webSearchEvidenceTool = toolRegistry.definition('search_web_evidence')!.model

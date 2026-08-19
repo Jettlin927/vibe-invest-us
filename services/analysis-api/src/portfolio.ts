@@ -1,16 +1,4 @@
-import type { DatabaseSync } from 'node:sqlite'
-
-type Position = {
-  symbol: string
-  quantity: number
-  averageCost: number
-}
-
-type PositionRow = {
-  symbol: string
-  quantity: number
-  average_cost: number
-}
+import type { PortfolioRepository, ProductPosition } from '@vibe-invest/product-dao'
 
 export type PortfolioOverview = {
   cash: number
@@ -21,7 +9,7 @@ export type PortfolioOverview = {
   totalUnrealizedReturn: number | null
   pricedPositionCount: number
   unpricedPositionCount: number
-  positions: Array<Position & {
+  positions: Array<ProductPosition & {
     costAmount: number
     marketPrice: number | null
     marketValue: number | null
@@ -44,179 +32,83 @@ export type PortfolioEquitySnapshot = {
   dailyReturn: number | null
 }
 
-type SnapshotRow = {
-  market_day: string
-  total_equity: number
-  total_market_value: number
-  cash: number
-  holdings_count: number
-  priced_count: number
-  observed_at: string
-  after_close: number
-}
-
-export function createPortfolio(database: DatabaseSync) {
-  const listStatement = database.prepare(
-    'SELECT symbol, quantity, average_cost FROM positions ORDER BY symbol',
-  )
-  const saveStatement = database.prepare(`
-    INSERT INTO positions (symbol, quantity, average_cost, updated_at)
-    VALUES (?, ?, ?, ?)
-    ON CONFLICT(symbol) DO UPDATE SET
-      quantity = excluded.quantity,
-      average_cost = excluded.average_cost,
-      updated_at = excluded.updated_at
-  `)
-  const removeStatement = database.prepare('DELETE FROM positions WHERE symbol = ?')
-  const readCashStatement = database.prepare('SELECT cash FROM portfolio_settings WHERE id = 1')
-  const saveCashStatement = database.prepare('UPDATE portfolio_settings SET cash = ?, updated_at = ? WHERE id = 1')
-  const readPositionStatement = database.prepare('SELECT symbol, quantity, average_cost FROM positions WHERE symbol = ?')
-  const saveSnapshotStatement = database.prepare(`
-    INSERT INTO portfolio_equity_snapshots (
-      market_day, total_equity, total_market_value, cash,
-      holdings_count, priced_count, observed_at, after_close
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(market_day) DO UPDATE SET
-      total_equity = excluded.total_equity,
-      total_market_value = excluded.total_market_value,
-      cash = excluded.cash,
-      holdings_count = excluded.holdings_count,
-      priced_count = excluded.priced_count,
-      observed_at = excluded.observed_at,
-      after_close = excluded.after_close
-    WHERE portfolio_equity_snapshots.after_close = 0 OR excluded.after_close = 1
-  `)
-  const listSnapshotsStatement = database.prepare(`
-    SELECT market_day, total_equity, total_market_value, cash,
-           holdings_count, priced_count, observed_at, after_close
-    FROM portfolio_equity_snapshots
-    ORDER BY market_day DESC
-    LIMIT ?
-  `)
-
-  function list(): Position[] {
-    return (listStatement.all() as PositionRow[]).map(toPosition)
+export function createPortfolio(repository: PortfolioRepository) {
+  async function overview(marketPrices: Record<string, number>): Promise<PortfolioOverview> {
+    const [positions, cash] = await Promise.all([repository.list(), repository.cash()])
+    const values = positions.map((position) => {
+      const observedPrice = marketPrices[position.symbol]
+      const marketPrice = Number.isFinite(observedPrice) && observedPrice! >= 0 ? observedPrice! : null
+      const costAmount = position.quantity * position.averageCost
+      const marketValue = marketPrice === null ? null : position.quantity * marketPrice
+      const unrealizedProfitLoss = marketValue === null ? null : marketValue - costAmount
+      return {
+        ...position, costAmount, marketPrice, marketValue, unrealizedProfitLoss,
+        unrealizedReturn: unrealizedProfitLoss === null || costAmount === 0 ? null : unrealizedProfitLoss / costAmount,
+        portfolioWeight: null,
+      }
+    })
+    const priced = values.filter((position) => position.marketValue !== null)
+    const totalCost = values.reduce((total, position) => total + position.costAmount, 0)
+    const pricedCost = priced.reduce((total, position) => total + position.costAmount, 0)
+    const pricedMarketValue = priced.reduce((total, position) => total + position.marketValue!, 0)
+    const complete = priced.length === values.length
+    const totalMarketValue = complete ? pricedMarketValue : null
+    const totalEquity = complete ? pricedMarketValue + cash : null
+    const totalUnrealizedProfitLoss = complete
+      ? priced.reduce((total, position) => total + position.unrealizedProfitLoss!, 0)
+      : null
+    return {
+      cash, totalCost, totalMarketValue, totalEquity, totalUnrealizedProfitLoss,
+      totalUnrealizedReturn: totalUnrealizedProfitLoss === null || pricedCost === 0 ? null : totalUnrealizedProfitLoss / pricedCost,
+      pricedPositionCount: priced.length,
+      unpricedPositionCount: values.length - priced.length,
+      positions: values.map((position) => ({
+        ...position,
+        portfolioWeight: totalEquity && position.marketValue !== null ? position.marketValue / totalEquity : null,
+      })),
+    }
   }
 
   return {
-    list,
-    save(position: Position) {
-      saveStatement.run(
-        position.symbol,
-        position.quantity,
-        position.averageCost,
-        new Date().toISOString(),
-      )
-      return position
-    },
-    remove(symbol: string) {
-      removeStatement.run(symbol)
-    },
-    cash() {
-      return Number((readCashStatement.get() as { cash: number }).cash)
-    },
-    setCash(cash: number) {
-      saveCashStatement.run(cash, new Date().toISOString())
-      return cash
-    },
-    reduce(symbol: string, quantity: number, price: number) {
-      const row = readPositionStatement.get(symbol) as PositionRow | undefined
-      if (!row || quantity > row.quantity) return null
-      const remaining = row.quantity - quantity
-      const cash = Number((readCashStatement.get() as { cash: number }).cash) + quantity * price
-      database.exec('BEGIN IMMEDIATE')
-      try {
-        if (remaining === 0) removeStatement.run(symbol)
-        else saveStatement.run(symbol, remaining, row.average_cost, new Date().toISOString())
-        saveCashStatement.run(cash, new Date().toISOString())
-        database.exec('COMMIT')
-      } catch (error) {
-        database.exec('ROLLBACK')
-        throw error
-      }
-      return {
-        position: remaining === 0 ? null : toPosition({ ...row, quantity: remaining }),
-        cash,
-        proceeds: quantity * price,
-        realizedProfitLoss: (price - row.average_cost) * quantity,
-      }
-    },
-    overview(marketPrices: Record<string, number>): PortfolioOverview {
-      const positions = list()
-      const cash = Number((readCashStatement.get() as { cash: number }).cash)
-      const values = positions.map((position) => {
-        const observedPrice = marketPrices[position.symbol]
-        const marketPrice = Number.isFinite(observedPrice) && observedPrice! >= 0 ? observedPrice! : null
-        const costAmount = position.quantity * position.averageCost
-        const marketValue = marketPrice === null ? null : position.quantity * marketPrice
-        const unrealizedProfitLoss = marketValue === null ? null : marketValue - costAmount
-        return {
-          ...position, costAmount,
-          marketPrice,
-          marketValue,
-          unrealizedProfitLoss,
-          unrealizedReturn: unrealizedProfitLoss === null || costAmount === 0 ? null : unrealizedProfitLoss / costAmount,
-          portfolioWeight: null,
-        }
-      })
-      const priced = values.filter((position) => position.marketValue !== null)
-      const totalCost = values.reduce((total, position) => total + position.costAmount, 0)
-      const pricedCost = priced.reduce((total, position) => total + position.costAmount, 0)
-      const pricedMarketValue = priced.reduce((total, position) => total + position.marketValue!, 0)
-      const complete = priced.length === values.length
-      const totalMarketValue = complete ? pricedMarketValue : null
-      const totalEquity = complete ? pricedMarketValue + cash : null
-      const totalUnrealizedProfitLoss = complete
-        ? priced.reduce((total, position) => total + position.unrealizedProfitLoss!, 0)
-        : null
-      return {
-        cash, totalCost, totalMarketValue, totalEquity, totalUnrealizedProfitLoss,
-        totalUnrealizedReturn: totalUnrealizedProfitLoss === null || pricedCost === 0 ? null : totalUnrealizedProfitLoss / pricedCost,
-        pricedPositionCount: priced.length,
-        unpricedPositionCount: values.length - priced.length,
-        positions: values.map((position) => ({
-          ...position,
-          portfolioWeight: totalEquity && position.marketValue !== null ? position.marketValue / totalEquity : null,
-        })),
-      }
-    },
-    recordSnapshot(overview: PortfolioOverview, observedAt = new Date()) {
-      if (overview.totalEquity === null || overview.totalMarketValue === null || overview.positions.length === 0) return false
+    list: () => repository.list(),
+    recordBuy: (symbol: string, quantity: number, price: number) => repository.recordBuy(symbol, quantity, price),
+    recordSell: (symbol: string, quantity: number, price: number) => repository.recordSell(symbol, quantity, price),
+    adjustCash: (cash: number) => repository.recordCashAdjustment(cash),
+    reconcile: (position: ProductPosition) => repository.recordReconcile(
+      position.symbol, position.quantity, position.averageCost,
+    ),
+    remove: (symbol: string) => repository.recordReconcile(symbol, 0, 0),
+    listEvents: (limit?: number) => repository.listEvents(limit),
+    overview,
+    async recordSnapshot(value: PortfolioOverview, observedAt = new Date()) {
+      if (value.totalEquity === null || value.totalMarketValue === null || value.positions.length === 0) return false
       const { marketDay, afterClose } = marketTime(observedAt)
-      saveSnapshotStatement.run(
+      return repository.saveSnapshot({
         marketDay,
-        overview.totalEquity,
-        overview.totalMarketValue,
-        overview.cash,
-        overview.positions.length,
-        overview.pricedPositionCount,
-        observedAt.toISOString(),
-        afterClose ? 1 : 0,
-      )
-      return true
+        totalEquity: value.totalEquity,
+        totalMarketValue: value.totalMarketValue,
+        cash: value.cash,
+        holdingsCount: value.positions.length,
+        pricedCount: value.pricedPositionCount,
+        observedAt: observedAt.toISOString(),
+        afterClose,
+      })
     },
-    history(limit = 30): PortfolioEquitySnapshot[] {
+    async history(limit = 30): Promise<PortfolioEquitySnapshot[]> {
       const safeLimit = Number.isInteger(limit) ? Math.max(1, Math.min(limit, 365)) : 30
-      const rows = (listSnapshotsStatement.all(safeLimit) as SnapshotRow[]).reverse()
+      const rows = (await repository.listSnapshots(safeLimit)).reverse()
       return rows.map((row, index) => {
         const previous = rows[index - 1]
-        const dailyChange = previous ? row.total_equity - previous.total_equity : null
+        const dailyChange = previous ? row.totalEquity - previous.totalEquity : null
         return {
-          marketDay: row.market_day,
-          totalEquity: row.total_equity,
-          totalMarketValue: row.total_market_value,
-          cash: row.cash,
-          holdingsCount: row.holdings_count,
-          pricedCount: row.priced_count,
-          observedAt: row.observed_at,
-          afterClose: row.after_close === 1,
+          ...row,
           dailyChange,
-          dailyReturn: previous && previous.total_equity !== 0 ? dailyChange! / previous.total_equity : null,
+          dailyReturn: previous && previous.totalEquity !== 0 ? dailyChange! / previous.totalEquity : null,
         }
       }).reverse()
     },
-    context(symbol: string, marketPrices: Record<string, number>) {
-      const positions = list()
+    async context(symbol: string, marketPrices: Record<string, number>) {
+      const positions = await repository.list()
       const valuedPositions = positions.flatMap((position) => {
         const marketPrice = marketPrices[position.symbol]
         if (!Number.isFinite(marketPrice) || marketPrice! < 0) return []
@@ -228,7 +120,6 @@ export function createPortfolio(database: DatabaseSync) {
         .map((position) => totalMarketValue === 0 ? 0 : position.marketValue / totalMarketValue)
         .sort((left, right) => right - left)
       const current = valuedPositions.find((position) => position.symbol === symbol)
-
       return {
         position: current ? {
           symbol: current.symbol,
@@ -265,14 +156,6 @@ function marketTime(value: Date) {
   return {
     marketDay: `${read('year')}-${read('month')}-${read('day')}`,
     afterClose: Number(read('hour')) * 60 + Number(read('minute')) >= 16 * 60,
-  }
-}
-
-function toPosition(row: PositionRow): Position {
-  return {
-    symbol: row.symbol,
-    quantity: row.quantity,
-    averageCost: row.average_cost,
   }
 }
 

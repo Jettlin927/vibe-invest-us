@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any, List, Literal, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class Quote(BaseModel):
@@ -79,11 +79,118 @@ class AtomicFact(BaseModel):
     fetchedAt: str
     source: str
     sourceReference: str
+    evidenceLevel: Optional[str] = None
 
 
 class FactQueryResult(BaseModel):
     facts: List[AtomicFact]
     sources: List[SourceStatus] = []
+    eligibility: Optional[Any] = None
+
+
+class FinancialOverviewResult(FactQueryResult):
+    overview: Any
+
+
+class PaginatedFactResult(FactQueryResult):
+    returnedCount: int
+    totalCount: int
+    nextCursor: Optional[str] = None
+    truncated: bool
+
+
+class FilingDocumentResult(PaginatedFactResult):
+    items: List[Any]
+
+
+class TechnicalWindowStructure(BaseModel):
+    status: Literal["available", "unavailable"]
+    barCount: int
+    reason: Optional[str] = None
+    returnPct: Optional[float] = None
+    high: Optional[float] = None
+    low: Optional[float] = None
+
+
+class TechnicalVolatility(BaseModel):
+    annualized: float
+
+
+class TechnicalDrawdown(BaseModel):
+    maximum: float
+
+
+class TechnicalVolumePrice(BaseModel):
+    volumeRatio5To20: float
+
+
+class TechnicalKeyLevels(BaseModel):
+    support: float
+    resistance: float
+
+
+class TechnicalEvidenceResult(FactQueryResult):
+    symbol: str
+    actualStart: str
+    actualEnd: str
+    totalBarCount: int
+    structures: dict[str, TechnicalWindowStructure]
+    indicators: Indicators
+    volatility: TechnicalVolatility
+    drawdown: TechnicalDrawdown
+    volumePrice: TechnicalVolumePrice
+    keyLevels: TechnicalKeyLevels
+    conflicts: List[str]
+
+
+class PriceWindowResult(PaginatedFactResult):
+    symbol: str
+    actualStart: str
+    actualEnd: str
+    totalBarCount: int
+    sampling: Literal["daily", "weekly"]
+
+
+class ValuationComparable(BaseModel):
+    symbol: str
+    pe: Optional[float] = None
+    evToEbitda: Optional[float] = None
+    evToRevenue: Optional[float] = None
+
+
+class ValuationMethodView(BaseModel):
+    status: Literal["available", "unavailable"]
+    reason: Optional[str] = None
+    anchor: Optional[str] = None
+    multiple: Optional[float] = None
+    targetPrice: Optional[float] = None
+    range: Optional[dict[str, float]] = None
+    multiplePercentile: Optional[float] = None
+
+
+class ValuationExcludedComparable(BaseModel):
+    symbol: Optional[str] = None
+    method: str
+    value: float
+    reason: str
+
+
+class ValuationEvidenceResult(BaseModel):
+    symbol: str
+    authorizedComparables: List[str]
+    comparables: List[ValuationComparable]
+    excludedComparables: List[ValuationExcludedComparable] = []
+    currentMultiples: dict[str, float]
+    historicalRanges: dict[str, List[float]]
+    methods: dict[str, ValuationMethodView]
+    facts: List[AtomicFact]
+    sources: List[SourceStatus] = []
+
+    model_config = {"exclude_none": True}
+
+
+class NewsDocumentResult(FactQueryResult):
+    excerpt: str
 
 
 class FinancialContext(BaseModel):

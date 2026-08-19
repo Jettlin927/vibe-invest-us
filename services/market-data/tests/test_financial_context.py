@@ -1,6 +1,9 @@
 from datetime import datetime, timezone
 
-from app.context import build_financial_context, search_news_facts, technical_indicator_facts
+from app.context import (
+    build_financial_context, company_event_facts, read_news_document_fact, search_news_facts,
+    official_company_event_facts, technical_indicator_facts, web_search_lead_facts,
+)
 from app.models import DailyBar, NewsItem, Quote
 
 
@@ -126,7 +129,176 @@ def test_keyword_news_query_returns_traceable_facts_without_symbol_filter():
     assert len(facts) == 1
     assert facts[0].value["keyword"] == "NAND pricing"
     assert facts[0].sourceReference == item.url
+    assert facts[0].evidenceLevel == "title_only"
     assert sources[0].status == "ok"
+
+
+def test_official_company_events_are_qualified_and_do_not_use_news_titles():
+    facts, sources = official_company_event_facts("NVDA", NOW, Source("sec", [{
+        "filingId": "0001045810-26-000123", "form": "10-Q", "filedAt": "2026-07-31",
+        "eventType": "earnings", "sourceReference": "https://www.sec.gov/Archives/event.htm",
+    }]))
+
+    assert len(facts) == 1
+    assert facts[0].type == "company_event"
+    assert facts[0].evidenceLevel == "official_company_event"
+    assert facts[0].sourceReference == "https://www.sec.gov/Archives/event.htm"
+    assert facts[0].value == {
+        "symbol": "NVDA", "filingId": "0001045810-26-000123", "form": "10-Q",
+        "filedAt": "2026-07-31", "eventType": "earnings",
+    }
+    assert sources[0].status == "ok"
+
+
+def test_three_news_sources_must_all_fail_qualification_before_web_search_eligibility():
+    irrelevant = NewsItem(title="Unrelated macro update", source="Yahoo", published_at=NOW,
+                          fetched_at=NOW, url="https://example.com/macro", summary="Rates", symbols=[])
+    title_only = NewsItem(title="NVDA event", source="Google", published_at=NOW,
+                          fetched_at=NOW, url="https://example.com/nvda", summary="Event", symbols=[])
+    facts, sources, eligibility = search_news_facts(
+        "  NVDA   event ", NOW, [
+            Source("yahoo", [irrelevant]), Source("google-news", [title_only]),
+            Source("alpaca", error=RuntimeError("down")),
+        ], include_eligibility=True,
+    )
+    assert eligibility == {
+        "eligible": True, "normalizedQuery": "NVDA event", "reasons": [
+            {"source": "yahoo", "reason": "irrelevant"},
+            {"source": "google-news", "reason": "title_only"},
+            {"source": "alpaca", "reason": "unavailable"},
+        ],
+    }
+    assert "NVDA event" in [fact.value["title"] for fact in facts]
+    assert len(sources) == 3
+
+
+def test_any_qualified_regular_news_revokes_web_search_eligibility():
+    qualified = NewsItem(title="NVDA event details", source="IR", published_at=NOW,
+                         fetched_at=NOW, url="https://example.com/ir", summary="NVDA event details", symbols=[])
+    facts, _sources, eligibility = search_news_facts(
+        "NVDA event", NOW, [Source("yahoo", []), Source("google-news", [qualified]), Source("alpaca", [])],
+        include_eligibility=True, qualified_urls={qualified.url},
+    )
+    assert len(facts) == 1
+    assert eligibility["eligible"] is False
+    assert eligibility["reasons"][1] == {"source": "google-news", "reason": "qualified"}
+
+
+def test_web_search_results_are_leads_until_document_read_verifies_them():
+    leads = web_search_lead_facts("NVDA event", NOW, lambda query: [{
+        "title": "NVDA event details", "summary": "Search snippet",
+        "url": "https://example.com/event",
+    }])
+    assert len(leads) == 1
+    assert leads[0].type == "web_search_lead"
+    assert leads[0].evidenceLevel == "lead"
+    verified = read_news_document_fact(leads[0], NOW, lambda url, max_bytes: (
+        b"<p>Verified event details</p>", "text/html", False, url,
+    ))
+    assert verified.evidenceLevel == "verified_news"
+    assert verified.value["candidateFactId"] == leads[0].id
+
+
+def test_web_search_leads_reject_non_http_results_and_oversized_query():
+    leads = web_search_lead_facts("NVDA", NOW, lambda query: [
+        {"title": "unsafe", "summary": "unsafe", "url": "file:///etc/passwd"},
+        {"title": "safe", "summary": "safe", "url": "https://example.com/news"},
+    ])
+    assert [fact.value["title"] for fact in leads] == ["safe"]
+    try:
+        web_search_lead_facts("x" * 501, NOW, lambda query: [])
+    except ValueError as error:
+        assert str(error) == "web_search_query_invalid"
+    else:
+        raise AssertionError("oversized_query_accepted")
+
+
+def test_news_document_read_preserves_bounded_excerpt_summary_hash_and_metadata():
+    candidate = search_news_facts("NAND pricing", NOW, [Source("google", [NewsItem(
+        title="NAND pricing improves", source="Google", published_at=NOW,
+        fetched_at=NOW, url="https://example.com/nand", summary="Candidate summary", symbols=[],
+    )])])[0][0]
+    html = ("<html><body><h1>NAND pricing improves</h1><p>Verified detail "
+            + "x" * 2000 + "</p></body></html>").encode()
+
+    fact = read_news_document_fact(candidate, NOW, lambda url, max_bytes: (
+        html[:max_bytes], "text/html", False, "https://example.com/nand",
+    ), max_bytes=512)
+
+    assert fact.type == "news_document"
+    assert fact.evidenceLevel == "verified_news"
+    assert fact.value["candidateFactId"] == candidate.id
+    assert fact.value["url"] == "https://example.com/nand"
+    assert 0 < len(fact.value["summary"].encode()) <= 500
+    assert "excerpt" not in fact.value
+    assert len(fact.value["contentHash"]) == 64
+    assert fact.value["metadata"] == {
+        "contentType": "text/html", "excerptBytes": len(fact.value["summary"].encode()),
+        "truncated": False,
+    }
+
+
+def test_company_events_are_distinct_title_only_candidates_with_source_status():
+    item = NewsItem(title="NVDA schedules product event", source="IR", published_at=NOW,
+                    fetched_at=NOW, url="https://example.com/event", summary="Event scheduled", symbols=["NVDA"])
+    facts, sources = company_event_facts("NVDA", NOW, [Source("ir-news", [item])])
+
+    assert len(facts) == 1
+    assert facts[0].type == "company_event"
+    assert facts[0].evidenceLevel == "title_only"
+    assert facts[0].value == {
+        "symbol": "NVDA", "title": item.title, "summary": item.summary, "url": item.url,
+    }
+    assert sources[0].status == "ok"
+
+
+def test_financial_metric_series_pages_normalized_periods_without_xbrl_fields():
+    from app.context import financial_metric_series
+    normalized = {
+        "derived_metrics": [
+            {"fact_id": f"fact:revenue:{index}", "metric": "revenue_yoy", "scope": "quarter",
+             "period": f"202{index}-Q1", "value": index / 10, "input_fact_ids": [f"input:{index}"]}
+            for index in range(5)
+        ],
+        "sourceReference": "https://www.sec.gov/Archives/example",
+    }
+
+    result = financial_metric_series("NVDA", "revenue_yoy", "2", normalized, NOW, page_size=2)
+
+    assert result.returnedCount == 2
+    assert result.totalCount == 5
+    assert result.nextCursor == "4"
+    assert result.truncated is True
+    assert [fact.value["period"] for fact in result.facts] == ["2022-Q1", "2023-Q1"]
+    assert all(field not in result.model_dump_json() for field in ["concept", "unit", "form", "frame"])
+
+
+def test_filing_document_page_binds_fact_to_read_byte_range_without_retaining_full_text():
+    from app.context import filing_document_page
+    filing = {
+        "filingId": "0001045810-26-000123", "form": "10-Q", "filedAt": "2026-07-31",
+        "sourceReference": "https://www.sec.gov/Archives/edgar/data/example.htm",
+        "summary": "Management raised guidance.", "contentHash": "a" * 64,
+        "startByte": 65536, "endByte": 66035, "totalBytes": 200000,
+        "nextCursor": "66036", "truncated": True,
+    }
+
+    result = filing_document_page("NVDA", filing["filingId"], "65536", filing, NOW)
+
+    assert result.returnedCount == 500
+    assert result.totalCount == 200000
+    assert result.nextCursor == "66036"
+    assert result.truncated is True
+    assert result.items == [{
+        "startByte": 65536, "endByte": 66035, "summary": "Management raised guidance.",
+        "contentHash": "a" * 64,
+    }]
+    assert result.facts[0].evidenceLevel == "official_filing"
+    assert result.facts[0].id.endswith(":bytes:65536-66035:" + "a" * 16)
+    assert result.facts[0].value["summary"] == "Management raised guidance."
+    assert result.facts[0].value["contentHash"] == "a" * 64
+    assert "payload" not in result.model_dump_json()
+    assert "fullText" not in result.model_dump_json()
 
 
 def test_technical_query_filters_requested_range_and_returns_indicator_fact():

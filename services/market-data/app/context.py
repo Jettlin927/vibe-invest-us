@@ -1,7 +1,9 @@
+import json
 import re
 from datetime import datetime, timedelta
 from hashlib import sha256
 from typing import Any, Iterable, List, Optional
+from urllib.parse import urlsplit
 
 from app.indicators import calculate_indicators
 from app.models import (
@@ -14,7 +16,18 @@ from app.models import (
     Quote,
     SourceObservation,
     SourceStatus,
+    PaginatedFactResult,
+    FilingDocumentResult,
+    ValuationEvidenceResult,
+    TechnicalEvidenceResult,
+    TechnicalWindowStructure,
+    TechnicalVolatility,
+    TechnicalDrawdown,
+    TechnicalVolumePrice,
+    TechnicalKeyLevels,
+    PriceWindowResult,
 )
+from app.valuation import valuation_evidence
 
 
 def build_financial_context(
@@ -82,23 +95,160 @@ def build_financial_context(
             source=valuation.source, sourceReference="https://finance.yahoo.com/",
         ))
     return FinancialContext(
-        symbol=normalized_symbol,
-        fetched_at=now,
-        quote=quote,
-        history=history,
-        news=news,
-        fundamentals=fundamentals,
-        indicators=indicators,
-        valuation=valuation,
-        valuation_sources=valuation_sources,
-        facts=facts,
-        gaps=gaps,
+        symbol=normalized_symbol, fetched_at=now, quote=quote, history=history, news=news,
+        fundamentals=fundamentals, indicators=indicators, valuation=valuation,
+        valuation_sources=valuation_sources, facts=facts, gaps=gaps,
     )
 
 
-def search_news_facts(keyword: str, now: datetime, news_sources: Iterable[Any]):
+def financial_overview_facts(symbol: str, now: datetime, fundamentals_source: Optional[Any]):
+    normalized_symbol = symbol.strip().upper()
+    result = _first_available(
+        [] if fundamentals_source is None else [fundamentals_source], normalized_symbol,
+    )
+    facts: List[AtomicFact] = []
+    if isinstance(result.value, dict):
+        _append_financial_facts(facts, normalized_symbol, now, result)
+    value = result.value if isinstance(result.value, dict) else {}
+    periods = [*value.get("quarters", []), *value.get("annuals", [])]
+    overview = {
+        "symbol": normalized_symbol,
+        "latestPeriod": periods[0].get("period") if periods else None,
+        "qualityFlags": [
+            {key: flag.get(key) for key in ("flag_type", "severity", "period")}
+            for flag in value.get("quality_flags", [])
+        ],
+    }
+    return overview, facts, result.sources
+
+
+def financial_metric_series(symbol: str, metric: str, cursor: Optional[str],
+                            normalized: Any, now: datetime, page_size: int = 20) -> PaginatedFactResult:
+    normalized_symbol = symbol.strip().upper()
+    try:
+        offset = int(cursor or "0")
+    except ValueError as error:
+        raise ValueError("financial_metric_cursor_invalid") from error
+    if offset < 0 or page_size < 1:
+        raise ValueError("financial_metric_cursor_invalid")
+    records = [
+        record for record in normalized.get("derived_metrics", [])
+        if record.get("metric") == metric
+    ] if isinstance(normalized, dict) else []
+    page = records[offset:offset + page_size]
+    facts = [AtomicFact(
+        id=record["fact_id"], type="derived_financial_metric",
+        value={
+            "classification": "derived", "metric": record["metric"],
+            "scope": record["scope"], "period": record["period"], "value": record["value"],
+            "inputFactIds": record.get("input_fact_ids", []),
+        },
+        observedAt=record["period"], fetchedAt=now.isoformat(),
+        source="deterministic-calculation",
+        sourceReference=normalized.get("sourceReference", "https://www.sec.gov/"),
+        evidenceLevel="deterministic_financial_metric",
+    ) for record in page]
+    next_offset = offset + len(page)
+    return PaginatedFactResult(
+        facts=facts, returnedCount=len(facts), totalCount=len(records),
+        nextCursor=str(next_offset) if next_offset < len(records) else None,
+        truncated=next_offset < len(records),
+    )
+
+
+def financial_metric_series_result(symbol: str, metric: str, cursor: Optional[str],
+                                   fundamentals_source: Optional[Any], now: datetime) -> PaginatedFactResult:
+    if fundamentals_source is None:
+        raise ValueError("fundamentals_source_unavailable")
+    normalized = fundamentals_source.fetch(symbol.strip().upper())
+    return financial_metric_series(symbol, metric, cursor, normalized, now)
+
+
+def valuation_evidence_result(symbol: str, now: datetime, quote_sources: Iterable[Any],
+                              valuation_source: Optional[Any]) -> ValuationEvidenceResult:
+    normalized_symbol = symbol.strip().upper()
+    if valuation_source is None:
+        raise ValueError("valuation_source_unavailable")
+    quote = _first_available(quote_sources, normalized_symbol)
+    quote_value = quote.value if isinstance(quote.value, Quote) else None
+    result = valuation_source.fetch_with_market_price(
+        normalized_symbol,
+        quote_value.price if quote_value else None,
+        quote_value.observed_at.isoformat() if quote_value else None,
+    )
+    snapshot_value = {
+        "symbol": result.symbol, "industry": result.industry,
+        "authorizedComparables": result.comparable_symbols,
+        "comparables": result.comparables,
+        "inputs": result.inputs,
+        "inputObservedAt": result.input_observed_at,
+        "currentMultiples": result.current_multiples,
+        "historicalRanges": result.historical_ranges,
+        "methods": {name: value.model_dump(exclude_none=True) for name, value in result.methods.items()},
+        "asOf": result.as_of,
+    }
+    fingerprint = sha256(json.dumps(
+        snapshot_value, sort_keys=True, separators=(",", ":"),
+    ).encode()).hexdigest()[:16]
+    snapshot = AtomicFact(
+        id=f"fact:{normalized_symbol}:valuation-inputs:{fingerprint}",
+        type="valuation_inputs", value=snapshot_value,
+        observedAt=max(result.input_observed_at.values(), default=result.as_of or now.isoformat()),
+        fetchedAt=now.isoformat(),
+        source=result.source, sourceReference="https://finance.yahoo.com/",
+        evidenceLevel="verified_valuation_input",
+    )
+    evidence = valuation_evidence(result, now, [snapshot.id])
+    method_facts = evidence.pop("facts")
+    return ValuationEvidenceResult(
+        **evidence, facts=[snapshot, *method_facts],
+        sources=[SourceStatus(source=result.source, status="ok", item_count=len(method_facts))],
+    )
+
+
+def filing_document_page(symbol: str, filing_id: str, cursor: Optional[str],
+                         filing: Any, now: datetime) -> FilingDocumentResult:
+    normalized_symbol = symbol.strip().upper()
+    if not isinstance(filing, dict) or filing.get("filingId") != filing_id:
+        raise ValueError("filing_not_found")
+    source_reference = str(filing.get("sourceReference", ""))
+    if not source_reference.startswith("https://www.sec.gov/") \
+            and not source_reference.startswith("https://sec.gov/"):
+        raise ValueError("filing_source_not_official")
+    offset = int(cursor or "0")
+    if offset < 0 or filing.get("startByte") != offset:
+        raise ValueError("filing_cursor_invalid")
+    end_byte = int(filing.get("endByte", offset - 1))
+    total_bytes = filing.get("totalBytes")
+    summary = str(filing.get("summary", ""))[:500]
+    content_hash = str(filing.get("contentHash", ""))
+    if not summary or not re.fullmatch(r"[a-f0-9]{64}", content_hash):
+        raise ValueError("filing_page_not_qualifiable")
+    page = [{
+        "startByte": offset, "endByte": end_byte,
+        "summary": summary, "contentHash": content_hash,
+    }]
+    fact = AtomicFact(
+        id=(f"fact:{normalized_symbol}:filing:{filing_id}:bytes:{offset}-{end_byte}:"
+            f"{content_hash[:16]}"), type="filing_document",
+        value={
+            "symbol": normalized_symbol, "filingId": filing_id,
+            "form": filing.get("form"), "filedAt": filing.get("filedAt"),
+            "startByte": offset, "endByte": end_byte,
+            "summary": summary, "contentHash": content_hash,
+        },
+        observedAt=str(filing.get("filedAt") or now.isoformat()), fetchedAt=now.isoformat(),
+        source="sec", sourceReference=source_reference, evidenceLevel="official_filing",
+    )
+    return FilingDocumentResult(
+        facts=[fact], items=page, returnedCount=max(0, end_byte - offset + 1),
+        totalCount=total_bytes if isinstance(total_bytes, int) else max(0, end_byte + 1),
+        nextCursor=filing.get("nextCursor"), truncated=bool(filing.get("truncated")),
+    )
+def search_news_facts(keyword: str, now: datetime, news_sources: Iterable[Any],
+                      include_eligibility: bool = False, qualified_urls=None):
     normalized_keyword = " ".join(keyword.strip().split())
-    statuses, collected = [], []
+    statuses, collected, source_items = [], [], []
     for source in news_sources:
         try:
             items = source.fetch(normalized_keyword)
@@ -106,8 +256,10 @@ def search_news_facts(keyword: str, now: datetime, news_sources: Iterable[Any]):
                 source=source.name, status="ok" if items else "empty", item_count=len(items or []),
             ))
             collected.extend(items or [])
+            source_items.append((source.name, items or [], None))
         except Exception as error:
             statuses.append(SourceStatus(source=source.name, status="failed", error=_safe_error(error), item_count=0))
+            source_items.append((source.name, [], "unavailable"))
     facts, seen = [], set()
     for candidate in sorted(collected, key=lambda item: item.published_at, reverse=True):
         item = candidate if isinstance(candidate, NewsItem) else NewsItem(**candidate)
@@ -120,8 +272,123 @@ def search_news_facts(keyword: str, now: datetime, news_sources: Iterable[Any]):
             type="news", value={"keyword": normalized_keyword, "title": item.title, "summary": item.summary, "url": item.url},
             observedAt=item.published_at.isoformat(), fetchedAt=now.isoformat(),
             source=item.source, sourceReference=item.url,
+            evidenceLevel="title_only",
         ))
-    return facts[:30], statuses
+    if not include_eligibility:
+        return facts[:30], statuses
+    if len(source_items) != 3:
+        eligibility = {"eligible": False, "normalizedQuery": normalized_keyword, "reasons": [
+            {"source": name, "reason": error or ("empty" if not items else "title_only")}
+            for name, items, error in source_items
+        ]}
+        return facts[:30], statuses, eligibility
+    query_terms = {term.lower() for term in normalized_keyword.split() if len(term) > 1}
+    qualified_urls = set(qualified_urls or [])
+    reasons = []
+    for name, items, error in source_items:
+        if error:
+            reason = error
+        elif not items:
+            reason = "empty"
+        elif any(getattr(item, "url", None) in qualified_urls for item in items):
+            reason = "qualified"
+        else:
+            relevant = any(query_terms & set((item.title + " " + item.summary).lower().split()) for item in items)
+            reason = "title_only" if relevant else "irrelevant"
+        reasons.append({"source": name, "reason": reason})
+    eligibility = {
+        "eligible": all(item["reason"] in {"unavailable", "empty", "irrelevant", "title_only"} for item in reasons),
+        "normalizedQuery": normalized_keyword, "reasons": reasons,
+    }
+    return facts[:30], statuses, eligibility
+
+
+def read_news_document_fact(candidate: AtomicFact, now: datetime, reader, max_bytes: int = 65536):
+    read_result = reader(candidate.sourceReference, max_bytes)
+    payload, content_type = read_result[:2]
+    truncated = bool(read_result[2]) if len(read_result) > 2 else False
+    final_url = read_result[3] if len(read_result) > 3 else candidate.sourceReference
+    bounded = bytes(payload[:max_bytes])
+    text = re.sub(r"<[^>]+>", " ", bounded.decode("utf-8", errors="replace"))
+    excerpt = " ".join(text.split())[:max_bytes]
+    return AtomicFact(
+        id=f"fact:news-document:{sha256(candidate.id.encode()).hexdigest()[:16]}:{sha256(bounded).hexdigest()[:16]}",
+        type="news_document",
+        value={
+            "candidateFactId": candidate.id,
+            "url": final_url,
+            "summary": excerpt[:500],
+            "contentHash": sha256(bounded).hexdigest(),
+            "metadata": {
+                "contentType": content_type, "excerptBytes": len(excerpt.encode()),
+                "truncated": truncated,
+            },
+        },
+        observedAt=candidate.observedAt,
+        fetchedAt=now.isoformat(),
+        source=candidate.source,
+        sourceReference=final_url,
+        evidenceLevel="verified_news",
+    )
+
+
+def company_event_facts(symbol: str, now: datetime, news_sources: Iterable[Any]):
+    normalized_symbol = symbol.strip().upper()
+    news_facts, statuses = search_news_facts(normalized_symbol, now, news_sources)
+    facts = [fact.model_copy(update={
+        "id": fact.id.replace("fact:news-search:", "fact:company-event:"),
+        "type": "company_event",
+        "value": {
+            "symbol": normalized_symbol,
+            "title": fact.value["title"], "summary": fact.value["summary"],
+            "url": fact.value["url"],
+        },
+    }) for fact in news_facts]
+    return facts, statuses
+
+
+def official_company_event_facts(symbol: str, now: datetime, source: Any):
+    normalized_symbol = symbol.strip().upper()
+    try:
+        events = source.list_events(normalized_symbol) if hasattr(source, "list_events") \
+            else source.fetch(normalized_symbol)
+        facts = [AtomicFact(
+            id=f"fact:{normalized_symbol}:official-event:{event['filingId']}",
+            type="company_event",
+            value={
+                "symbol": normalized_symbol, "filingId": event["filingId"],
+                "form": event["form"], "filedAt": event["filedAt"],
+                "eventType": event["eventType"],
+            },
+            observedAt=event["filedAt"], fetchedAt=now.isoformat(), source=source.name,
+            sourceReference=event["sourceReference"], evidenceLevel="official_company_event",
+        ) for event in events[:20]]
+        return facts, [SourceStatus(
+            source=source.name, status="ok" if facts else "empty", item_count=len(facts),
+        )]
+    except Exception as error:
+        return [], [SourceStatus(
+            source=source.name, status="failed", error=_safe_error(error), item_count=0,
+        )]
+
+
+def web_search_lead_facts(query: str, now: datetime, searcher):
+    normalized_query = " ".join(query.strip().split())
+    if not normalized_query or len(normalized_query) > 500:
+        raise ValueError("web_search_query_invalid")
+    facts = []
+    for item in searcher(normalized_query)[:10]:
+        parsed = urlsplit(item["url"])
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+            continue
+        facts.append(AtomicFact(
+            id=f"fact:web-search-lead:{sha256(normalized_query.lower().encode()).hexdigest()[:12]}:{sha256(item['url'].encode()).hexdigest()[:16]}",
+            type="web_search_lead",
+            value={"query": normalized_query, "title": item["title"], "summary": item["summary"], "url": item["url"]},
+            observedAt=now.isoformat(), fetchedAt=now.isoformat(), source="bing-web-search",
+            sourceReference=item["url"], evidenceLevel="lead",
+        ))
+    return facts
 
 
 def technical_indicator_facts(symbol: str, start_date: str, end_date: str, now: datetime, history_sources: Iterable[Any]):
@@ -148,6 +415,136 @@ def technical_indicator_facts(symbol: str, start_date: str, end_date: str, now: 
         sourceReference=f"source://{source}/{normalized_symbol}/history?start={start_date}&end={end_date}",
     )
     return [fact], history.sources
+
+
+def technical_evidence_result(symbol: str, start_date: str, end_date: str, now: datetime,
+                              history_sources: Iterable[Any]) -> TechnicalEvidenceResult:
+    normalized_symbol = symbol.strip().upper()
+    history = _first_available_history_range(history_sources, normalized_symbol, start_date, end_date)
+    bars = sorted([
+        bar if isinstance(bar, DailyBar) else DailyBar(**bar)
+        for bar in (history.value or [])
+    ], key=lambda bar: bar.date)
+    if len(bars) < 20:
+        raise ValueError("technical_history_insufficient")
+    indicators = calculate_indicators(bars)
+    structures = {}
+    directions = []
+    for size in (20, 60, 120, 252):
+        key = f"{size}d"
+        if len(bars) < size:
+            structures[key] = TechnicalWindowStructure(
+                status="unavailable", barCount=len(bars), reason="insufficient_history",
+            )
+            continue
+        window = bars[-size:]
+        change = round(window[-1].close / window[0].close - 1, 4)
+        directions.append((key, change))
+        structures[key] = TechnicalWindowStructure(
+            status="available", barCount=size, returnPct=change,
+            high=max(bar.high for bar in window), low=min(bar.low for bar in window),
+        )
+    conflicts = [
+        f"{left}_vs_{right}"
+        for index, (left, left_change) in enumerate(directions)
+        for right, right_change in directions[index + 1:]
+        if left_change * right_change < 0
+    ]
+    support = min(bar.low for bar in bars[-20:])
+    resistance = max(bar.high for bar in bars[-20:])
+    value = {
+        "symbol": normalized_symbol, "actualStart": bars[0].date, "actualEnd": bars[-1].date,
+        "totalBarCount": len(bars),
+        "structures": {key: item.model_dump(exclude_none=True) for key, item in structures.items()},
+        "indicators": indicators.model_dump(),
+        "volatility": {"annualized": indicators.annualized_volatility},
+        "drawdown": {"maximum": indicators.max_drawdown},
+        "volumePrice": {"volumeRatio5To20": indicators.volume_ratio_5_to_20},
+        "keyLevels": {"support": support, "resistance": resistance},
+        "conflicts": conflicts,
+    }
+    fingerprint = sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
+    fact = AtomicFact(
+        id=f"fact:{normalized_symbol}:technical-evidence:{fingerprint}",
+        type="technical_evidence", value=value, observedAt=bars[-1].date,
+        fetchedAt=now.isoformat(), source="deterministic-calculation",
+        sourceReference=f"source://{history.adopted_source or 'unknown'}/{normalized_symbol}/history",
+        evidenceLevel="deterministic_technical",
+    )
+    return TechnicalEvidenceResult(
+        symbol=normalized_symbol, actualStart=bars[0].date, actualEnd=bars[-1].date,
+        totalBarCount=len(bars), structures=structures, indicators=indicators,
+        volatility=TechnicalVolatility(annualized=indicators.annualized_volatility),
+        drawdown=TechnicalDrawdown(maximum=indicators.max_drawdown),
+        volumePrice=TechnicalVolumePrice(volumeRatio5To20=indicators.volume_ratio_5_to_20),
+        keyLevels=TechnicalKeyLevels(support=support, resistance=resistance),
+        conflicts=conflicts, facts=[fact], sources=history.sources,
+    )
+
+
+def price_window_result(symbol: str, start_date: str, end_date: str, cursor: Optional[str],
+                        page_size: int, now: datetime,
+                        history_sources: Iterable[Any]) -> PriceWindowResult:
+    normalized_symbol = symbol.strip().upper()
+    if page_size < 1 or page_size > 100:
+        raise ValueError("price_window_page_size_invalid")
+    try:
+        offset = int(cursor or "0")
+    except ValueError as error:
+        raise ValueError("price_window_cursor_invalid") from error
+    if offset < 0:
+        raise ValueError("price_window_cursor_invalid")
+    history = _first_available_history_range(history_sources, normalized_symbol, start_date, end_date)
+    bars = sorted([
+        bar if isinstance(bar, DailyBar) else DailyBar(**bar)
+        for bar in (history.value or [])
+    ], key=lambda bar: bar.date)
+    if not bars:
+        raise ValueError("price_window_empty")
+    sampling = "weekly" if len(bars) > 120 else "daily"
+    sampled = _weekly_bars(bars) if sampling == "weekly" else bars
+    page = sampled[offset:offset + page_size]
+    source = history.adopted_source or "unknown"
+    facts = [AtomicFact(
+        id=f"fact:{normalized_symbol}:price-window:{sampling}:{bar.date}",
+        type="price_window_bar", value=bar.model_dump(), observedAt=bar.date,
+        fetchedAt=now.isoformat(), source=source,
+        sourceReference=f"source://{source}/{normalized_symbol}/history",
+        evidenceLevel="market_observation",
+    ) for bar in page]
+    next_offset = offset + len(page)
+    return PriceWindowResult(
+        symbol=normalized_symbol, actualStart=bars[0].date, actualEnd=bars[-1].date,
+        totalBarCount=len(bars), sampling=sampling, facts=facts, sources=history.sources,
+        returnedCount=len(facts), totalCount=len(sampled),
+        nextCursor=str(next_offset) if next_offset < len(sampled) else None,
+        truncated=next_offset < len(sampled),
+    )
+
+
+def _weekly_bars(bars: List[DailyBar]) -> List[DailyBar]:
+    weeks = []
+    current_key = None
+    current = []
+    for bar in bars:
+        calendar = datetime.fromisoformat(bar.date).isocalendar()
+        key = (calendar.year, calendar.week)
+        if current and key != current_key:
+            weeks.append(_aggregate_week(current))
+            current = []
+        current_key = key
+        current.append(bar)
+    if current:
+        weeks.append(_aggregate_week(current))
+    return weeks
+
+
+def _aggregate_week(bars: List[DailyBar]) -> DailyBar:
+    return DailyBar(
+        date=bars[-1].date, open=bars[0].open,
+        high=max(bar.high for bar in bars), low=min(bar.low for bar in bars),
+        close=bars[-1].close, volume=sum(bar.volume for bar in bars),
+    )
 
 
 def _first_available_history_range(sources: Iterable[Any], symbol: str, start_date: str, end_date: str):
@@ -220,7 +617,7 @@ def _append_financial_facts(facts, symbol, now, fundamentals):
                 "scope": reported["scope"], "period": reported["period"], "value": reported["value"],
             },
             observedAt=reported.get("observed_at") or reported["period"], fetchedAt=now.isoformat(),
-            source=source, sourceReference=source_reference,
+            source=source, sourceReference=source_reference, evidenceLevel="reported_financial",
         ))
         reported_fact_ids.add(reported["fact_id"])
     emitted_fact_ids = set(reported_fact_ids)
@@ -236,6 +633,7 @@ def _append_financial_facts(facts, symbol, now, fundamentals):
                 },
                 observedAt=cell.get("observed_at") or period.get("observed_at") or now.isoformat(),
                 fetchedAt=now.isoformat(), source="deterministic-calculation", sourceReference=source_reference,
+                evidenceLevel="deterministic_financial_metric",
             ))
             emitted_fact_ids.add(cell["fact_id"])
     for metric in value.get("derived_metrics", []):
@@ -249,7 +647,7 @@ def _append_financial_facts(facts, symbol, now, fundamentals):
                 "inputFactIds": metric["input_fact_ids"],
             },
             observedAt=metric["period"], fetchedAt=now.isoformat(), source="deterministic-calculation",
-            sourceReference=source_reference,
+            sourceReference=source_reference, evidenceLevel="deterministic_financial_metric",
         ))
         emitted_fact_ids.add(metric["fact_id"])
     for flag in value.get("quality_flags", []):
@@ -260,7 +658,7 @@ def _append_financial_facts(facts, symbol, now, fundamentals):
                 "period": flag["period"], "evidenceFactIds": flag["evidence_fact_ids"],
             },
             observedAt=flag["period"], fetchedAt=now.isoformat(), source="deterministic-calculation",
-            sourceReference=source_reference,
+            sourceReference=source_reference, evidenceLevel="deterministic_financial_metric",
         ))
 
     # Preserve the four original annual fact types for stored-report and UI compatibility.

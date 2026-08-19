@@ -4,8 +4,21 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 
-import type { ModelEvent } from '../src/model.js'
-import { buildApp } from '../src/app.js'
+import { fauxAssistantMessage, fauxToolCall } from '@earendil-works/pi-ai'
+
+import { createPiModel, type ModelEvent } from '../src/model.js'
+import { buildApp as buildProductionApp } from '../src/app.js'
+import { analysisModelTools, newsSpecialistTools } from '../src/tools.js'
+import { createTestProductDatabase } from './support/product-database.js'
+
+const testDatabases = new Map<string, ReturnType<typeof createTestProductDatabase>>()
+
+function buildApp(dependencies: Parameters<typeof buildProductionApp>[0] & { storageKey?: string }) {
+  const { storageKey = crypto.randomUUID(), ...appDependencies } = dependencies
+  const database = testDatabases.get(storageKey) ?? createTestProductDatabase()
+  testDatabases.set(storageKey, database)
+  return buildProductionApp({ ...database, ...appDependencies })
+}
 
 const fact = {
   id: 'fact:NVDA:quote:sina:2026-08-12T13:48:38Z', type: 'quote', value: 217.5,
@@ -22,6 +35,21 @@ const report = {
   keyJudgments: [{ judgment: '短期偏强', evidence: [fact.id] }],
 }
 
+const reportCandidate = {
+  kind: 'integrated' as const, availability: 'available' as const,
+  status: 'completed' as const, gaps: [], specialistStatuses: [
+    { domain: 'news', status: 'not_started', impact: '消息面专项不可用' },
+    { domain: 'fundamental_valuation', status: 'not_started', impact: '基本面专项不可用' },
+    { domain: 'technical', status: 'not_started', impact: '技术面专项不可用' },
+  ], specialistReferences: [], ...report,
+  keyJudgments: report.keyJudgments.map(({ judgment, evidence }) => ({
+    type: 'market' as const, statement: judgment, direction: 'bullish' as const,
+    confidence: 'medium' as const, supportingEvidence: evidence,
+    contraryEvidence: [], contraryEvidenceStatus: 'none_found' as const,
+    invalidationConditions: report.invalidationConditions, affectedByMissingDomains: [],
+  })),
+}
+
 function fakeModel(delay = 0) {
   return {
     async *analyze({ signal, fetchFinancialContext }: { signal?: AbortSignal; fetchFinancialContext?: () => Promise<any> }): AsyncGenerator<ModelEvent> {
@@ -34,38 +62,53 @@ function fakeModel(delay = 0) {
         const timer = setTimeout(resolve, delay)
         signal?.addEventListener('abort', () => { clearTimeout(timer); reject(signal.reason) }, { once: true })
       })
-      yield { type: 'completed', report }
+      yield {
+        type: 'completed', report,
+        reportVersion: {
+          kind: 'integrated',
+          report: {
+            kind: 'integrated', availability: 'available', status: 'completed',
+            gaps: [], limitations: [], title: report.title,
+          },
+        },
+      }
     },
   }
 }
 
-async function makeApp(databasePath: string, model = fakeModel(), concurrency = 2) {
+async function makeApp(storageKey: string, model = fakeModel(), concurrency = 2) {
+  const database = testDatabases.get(storageKey) ?? createTestProductDatabase()
+  testDatabases.set(storageKey, database)
+  await database.runtimeSettingsRepository.save(
+    { analysisConcurrency: concurrency }, new Date().toISOString(),
+  )
   const app = buildApp({
-    databasePath,
+    storageKey,
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [], indicators: {} }),
     model,
-    analysisConcurrency: concurrency,
   })
   await app.ready()
   return app
 }
 
 async function waitForStatus(app: Awaited<ReturnType<typeof makeApp>>, id: string, expected: string) {
+  let latest: unknown
   for (let attempt = 0; attempt < 100; attempt += 1) {
     const response = await app.inject({ method: 'GET', url: `/api/analyses/${id}` })
-    if (response.json().status === expected) return response.json()
+    latest = response.json()
+    if ((latest as { status?: string }).status === expected) return latest
     await new Promise((resolve) => setTimeout(resolve, 5))
   }
-  throw new Error(`analysis_not_${expected}`)
+  throw new Error(`analysis_not_${expected}:${JSON.stringify(latest)}`)
 }
 
 test('创建分析立即返回标识并自动保存完成报告、快照、事实和轨迹', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'vibe-analysis-'))
-  const app = await makeApp(join(dir, 'app.db'))
+  const app = await makeApp(join(dir, 'storage'))
   const created = await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' } })
   assert.equal(created.statusCode, 202)
-  const { analysisId } = created.json()
+  const { analysisId, sessionId } = created.json()
   const completed = await waitForStatus(app, analysisId, 'completed')
   assert.equal(completed.report.title, report.title)
 
@@ -73,12 +116,1696 @@ test('创建分析立即返回标识并自动保存完成报告、快照、事�
   assert.equal(research.statusCode, 200)
   assert.equal(research.json().snapshot.symbol, 'NVDA')
   assert.equal(research.json().snapshot.portfolioContext.position, null)
+  assert.equal(typeof research.json().reportCreatedAt, 'string')
+  const reportCreatedAt = research.json().reportCreatedAt
   assert.equal(research.json().facts[0].source, 'sina')
   assert.ok(research.json().trace.some((entry: { type: string }) => entry.type === 'status'))
 
-  const events = await app.inject({ method: 'GET', url: `/api/analyses/${analysisId}/events` })
+  const versions = await app.inject({
+    method: 'GET', url: `/api/research/${analysisId}/report-versions`,
+  })
+  assert.equal(versions.statusCode, 200)
+  assert.equal(versions.json().items.length, 1)
+  assert.equal(versions.json().items[0].version, 1)
+  assert.equal(versions.json().items[0].kind, 'integrated')
+  assert.equal(versions.json().items[0].report.title, report.title)
+  assert.match(versions.json().items[0].payloadHash, /^[a-f0-9]{64}$/)
+
+  const events = await app.inject({ method: 'GET', url: `/api/agent-sessions/${sessionId}/events` })
   assert.match(events.headers['content-type'] ?? '', /text\/event-stream/)
   assert.match(events.body, /event: completed/)
+  await app.inject({
+    method: 'PATCH', url: `/api/research/${analysisId}`, payload: { note: '新备注' },
+  })
+  const afterNote = await app.inject({ method: 'GET', url: `/api/research/${analysisId}` })
+  assert.equal(afterNote.json().reportCreatedAt, reportCreatedAt)
+  assert.deepEqual(afterNote.json().report, research.json().report)
+  await app.close()
+})
+
+test('报告后每条用户消息在原主 Session 创建独立 execution 并冻结基准报告版本', async () => {
+  const app = await makeApp(crypto.randomUUID())
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' },
+  })).json()
+  await waitForStatus(app, created.analysisId, 'completed')
+  const before = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  const messagePayload = { messageId: 'message-1', message: '这份报告现在还有效吗？' }
+  const [response, replay] = await Promise.all([app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/messages`, payload: messagePayload,
+  }), app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/messages`, payload: messagePayload,
+  })])
+  assert.equal(response.statusCode, 202, response.body)
+  const followUp = response.json()
+  assert.equal(followUp.sessionId, created.sessionId)
+  assert.notEqual(followUp.executionId, before.mainAgent.execution.id)
+  assert.equal(followUp.generation, before.mainAgent.execution.generation + 1)
+  assert.equal(followUp.baseReportVersion, 1)
+  assert.equal(followUp.message, '这份报告现在还有效吗？')
+  assert.equal(replay.statusCode, 202, replay.body)
+  assert.equal(replay.json().executionId, followUp.executionId)
+  assert.equal(replay.json().generation, followUp.generation)
+  const conflict = await app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/messages`,
+    payload: { ...messagePayload, message: '同一消息 ID 不得改写内容。' },
+  })
+  assert.equal(conflict.statusCode, 409)
+  assert.equal(conflict.json().error, 'agent_operation_conflict')
+  await app.close()
+})
+
+test('重新分析同一标的会创建全新的研究、主 Session 与 execution', async () => {
+  const app = await makeApp(crypto.randomUUID())
+  const first = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' },
+  })).json()
+  await waitForStatus(app, first.analysisId, 'completed')
+  const firstBefore = (await app.inject({
+    method: 'GET', url: `/api/research/${first.analysisId}`,
+  })).json()
+
+  const secondResponse = await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' },
+  })
+  assert.equal(secondResponse.statusCode, 202, secondResponse.body)
+  const second = secondResponse.json()
+  await waitForStatus(app, second.analysisId, 'completed')
+  const firstAfter = (await app.inject({
+    method: 'GET', url: `/api/research/${first.analysisId}`,
+  })).json()
+  const secondResearch = (await app.inject({
+    method: 'GET', url: `/api/research/${second.analysisId}`,
+  })).json()
+
+  assert.notEqual(second.analysisId, first.analysisId)
+  assert.notEqual(second.sessionId, first.sessionId)
+  assert.notEqual(secondResearch.mainAgent.execution.id, firstBefore.mainAgent.execution.id)
+  assert.equal(secondResearch.mainAgent.execution.generation, 1)
+  assert.deepEqual(firstAfter.report, firstBefore.report)
+  assert.equal(firstAfter.reportCreatedAt, firstBefore.reportCreatedAt)
+  await app.close()
+})
+
+test('普通追问只注入紧凑报告语境并保留 active report', async () => {
+  const database = createTestProductDatabase()
+  let modelCalls = 0
+  let contextFetches = 0
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => {
+      contextFetches += 1
+      return { symbol, facts: [fact], gaps: [], indicators: {} }
+    },
+    model: {
+      async *analyze(input) {
+        modelCalls += 1
+        if (modelCalls === 1) {
+          yield { type: 'completed' as const, report, reportVersion: {
+            kind: 'integrated' as const,
+            report: { kind: 'integrated', availability: 'available', status: 'completed' },
+          } }
+          return
+        }
+        assert.equal(input.runtimeContext, undefined)
+        assert.equal(input.runtimeResume, undefined)
+        assert.equal(input.runtimeFollowUp?.content.message, '持仓增加后，这份报告怎么看？')
+        assert.equal(input.runtimeFollowUp?.content.baseReportVersion, 1)
+        assert.equal((input.runtimeFollowUp?.content.baseReport as any).kind, 'integrated')
+        assert.equal((input.runtimeFollowUp?.content.reportPositionContext as any).position.quantity, 10)
+        assert.equal((input.runtimeFollowUp?.content.currentPositionSummary as any).position.quantity, 12)
+        assert.equal(input.runtimeFollowUp?.content.freshness, 'current')
+        assert.deepEqual((input.runtimeFollowUp?.content.specialistStatuses as Array<{
+          domain: string; status: string
+        }>).map(({ domain, status }) => ({ domain, status })), [
+          { domain: 'news', status: 'not_started' },
+          { domain: 'fundamental_valuation', status: 'not_started' },
+          { domain: 'technical', status: 'not_started' },
+        ])
+        assert.ok(Array.isArray(input.runtimeFollowUp?.content.availableTools))
+        assert.equal((input.runtimeFollowUp?.content.availableTools as Array<{ name: string }>)
+          .some(({ name }) => name === 'submit_analysis_report'), false)
+        assert.equal('recentDailyBars' in input.runtimeFollowUp!.content, false)
+        yield { type: 'text_delta' as const, text: '持仓增加会放大原报告风险敞口。' }
+        yield {
+          type: 'chat_completed' as const,
+          text: '持仓增加会放大原报告风险敞口。', stopReason: 'stop',
+        }
+      },
+    },
+  } as any)
+  await app.ready()
+  await app.inject({
+    method: 'PUT', url: '/api/positions/NVDA', payload: { quantity: 10, averageCost: 100 },
+  })
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' },
+  })).json()
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  const before = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  await app.inject({
+    method: 'PUT', url: '/api/positions/NVDA', payload: { quantity: 12, averageCost: 100 },
+  })
+  assert.equal((await app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/messages`,
+    payload: { messageId: 'position-follow-up', message: '持仓增加后，这份报告怎么看？' },
+  })).statusCode, 202)
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  const after = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  assert.deepEqual(after.report, before.report)
+  assert.equal(after.reportCreatedAt, before.reportCreatedAt)
+  assert.equal(contextFetches, 1)
+  const versions = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}/report-versions`,
+  })).json().items
+  assert.equal(versions.length, 1)
+  assert.ok(after.trace.some((event: any) => event.type === 'chat_completed'))
+  await app.close()
+})
+
+test('追问时效绑定冻结版本而不随当前 active projection 时间改变', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: new Date('2026-08-01T00:00:00.000Z') })
+  const database = createTestProductDatabase()
+  let calls = 0
+  let frozenReportCreatedAt = ''
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [], indicators: {} }),
+    model: {
+      async *analyze(input) {
+        calls += 1
+        if (calls === 1) {
+          yield { type: 'completed' as const, report, reportVersion: {
+            kind: 'integrated' as const, report: reportCandidate,
+          } }
+          return
+        }
+        assert.equal(input.runtimeFollowUp?.content.freshness, 'stale')
+        assert.ok(Number(input.runtimeFollowUp?.content.reportAgeDays) >= 8)
+        assert.equal(input.runtimeFollowUp?.content.baseReportCreatedAt, frozenReportCreatedAt)
+        assert.match(String(input.runtimeFollowUp?.content.freshnessWarning), /基准报告可能过期/)
+        yield { type: 'chat_completed' as const, text: '已按过期材料边界回答。' }
+      },
+    },
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'STALE' },
+  })).json()
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  frozenReportCreatedAt = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json().reportCreatedAt
+  t.mock.timers.setTime(Date.parse('2026-08-09T00:00:00.000Z'))
+  const activeProjectionCreatedAt = new Date().toISOString()
+  await database.analysisRepository.updateResearch(
+    created.analysisId, { reportCreatedAt: activeProjectionCreatedAt } as any,
+    activeProjectionCreatedAt,
+  )
+  const before = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  assert.equal(before.reportCreatedAt, activeProjectionCreatedAt)
+  assert.equal((await app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/messages`,
+    payload: { messageId: 'stale-follow-up', message: '这份报告还有效吗？' },
+  })).statusCode, 202)
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  const after = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  assert.deepEqual(after.report, before.report)
+  assert.equal(after.reportCreatedAt, before.reportCreatedAt)
+  await app.close()
+})
+
+test('停止后的用户追问以新 generation 恢复同一消息与基准报告', async () => {
+  const database = createTestProductDatabase()
+  let calls = 0
+  let followUpStarted!: () => void
+  const started = new Promise<void>((resolve) => { followUpStarted = resolve })
+  let resumedInput: Parameters<ReturnType<typeof fakeModel>['analyze']>[0] | undefined
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [], indicators: {} }),
+    model: {
+      async *analyze(input) {
+        calls += 1
+        if (calls === 1) {
+          yield {
+            type: 'completed' as const, report,
+            reportVersion: { kind: 'integrated' as const, report: reportCandidate },
+          }
+          return
+        }
+        if (calls === 2) {
+          followUpStarted()
+          await new Promise<void>((resolve) => input.signal?.addEventListener(
+            'abort', () => resolve(), { once: true },
+          ))
+          yield { type: 'cancelled' as const }
+          return
+        }
+        resumedInput = input
+        yield { type: 'chat_completed' as const, text: '恢复后的回答' }
+      },
+    },
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'RFUP' },
+  })).json()
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  const followUp = (await app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/messages`,
+    payload: { messageId: 'resume-message', message: '继续解释风险。' },
+  })).json()
+  await started
+  assert.equal((await app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/cancel`,
+  })).statusCode, 202)
+  await waitForStatus(app as any, created.analysisId, 'stopped')
+  const bypass = await app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/messages`,
+    payload: { messageId: 'must-resume-first', message: '不得绕过恢复。' },
+  })
+  assert.equal(bypass.statusCode, 409)
+  assert.equal(bypass.json().error, 'analysis_resume_required')
+  const resumed = await app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/resume`,
+  })
+  assert.equal(resumed.statusCode, 202, resumed.body)
+  assert.equal(resumed.json().generation, followUp.generation + 2)
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  assert.equal(calls, 3)
+  assert.equal(resumedInput?.runtimeFollowUp?.content.message, '继续解释风险。')
+  assert.equal(resumedInput?.runtimeFollowUp?.content.baseReportVersion, 1)
+  assert.equal(resumedInput?.runtimeFollowUp?.content.updateReport, false)
+  assert.ok(resumedInput?.runtimeResume)
+  await app.close()
+})
+
+test('第二条追问从 PostgreSQL 重建同一主 Session 的前序问答', async () => {
+  const database = createTestProductDatabase()
+  let calls = 0
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [], indicators: {} }),
+    model: {
+      async *analyze(input) {
+        calls += 1
+        if (calls === 1) {
+          yield { type: 'completed' as const, report, reportVersion: {
+            kind: 'integrated' as const, report: reportCandidate,
+          } }
+          return
+        }
+        if (calls === 2) {
+          assert.deepEqual(input.runtimeFollowUp?.content.conversationHistory, [])
+          const compactedAt = new Date().toISOString()
+          await input.toolRuntime!.commitCompaction!({
+            id: `${input.executionId}:compaction:1`, executionId: input.executionId,
+            segmentId: `${input.executionId}:segment:compacted`,
+            operationId: `${input.executionId}:compaction:1:completed`,
+            event: { type: 'compaction', status: 'completed', tokensAfter: 1000 },
+            contextTokens: 100000, contextWindow: 128000, reserveTokens: 16384,
+            keepRecentTokens: 20000, tokensAfter: 1000,
+            summary: { narrative: '第一问已压缩为摘要', isReportEvidence: false },
+            usage: { input: 100, output: 20, totalTokens: 120 },
+            attempts: [{
+              attempt: 1, status: 'completed', durationMs: 10,
+              usage: { input: 100, output: 20, totalTokens: 120 },
+            }],
+            createdAt: compactedAt,
+          })
+          yield { type: 'chat_completed' as const, text: '第一轮回答：关注失效条件。' }
+          return
+        }
+        assert.deepEqual(input.runtimeFollowUp?.content.conversationHistory, [
+          { role: 'assistant', text: '第一轮回答：关注失效条件。' },
+        ])
+        assert.equal((input.runtimeFollowUp?.content.compactionSummary as any).narrative,
+          '第一问已压缩为摘要')
+        yield { type: 'chat_completed' as const, text: '第二轮回答：沿用上一轮语境。' }
+      },
+    },
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'HIST' },
+  })).json()
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  for (const payload of [
+    { messageId: 'history-1', message: '第一问是什么风险？' },
+    { messageId: 'history-2', message: '请展开你刚才的回答。' },
+  ]) {
+    assert.equal((await app.inject({
+      method: 'POST', url: `/api/analyses/${created.analysisId}/messages`, payload,
+    })).statusCode, 202)
+    await waitForStatus(app as any, created.analysisId, 'completed')
+  }
+  assert.equal(calls, 3)
+  await app.close()
+})
+
+test('显式更新报告的用户消息通过同一报告校验路径生成综合报告 V2', async () => {
+  const database = createTestProductDatabase()
+  let calls = 0
+  const updatedReport = { ...report, title: 'NVDA 更新后的综合分析' }
+  const updatedCandidate = { ...reportCandidate, title: updatedReport.title }
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [], indicators: {} }),
+    model: {
+      async *analyze(input) {
+        calls += 1
+        if (calls === 2) {
+          assert.equal(input.runtimeFollowUp?.content.updateReport, true)
+          assert.equal(input.runtimeFollowUp?.content.baseReportVersion, 1)
+          assert.equal((input.runtimeFollowUp?.content.reportPositionContext as any)
+            .position.quantity, 10)
+          assert.equal((input.runtimeFollowUp?.content.currentPositionSummary as any)
+            .position.quantity, 12)
+        }
+        yield {
+          type: 'completed' as const, report: calls === 1 ? report : updatedReport,
+          reportVersion: {
+            kind: 'integrated' as const,
+            report: calls === 1 ? reportCandidate : updatedCandidate,
+          },
+        }
+      },
+    },
+  })
+  await app.ready()
+  await app.inject({
+    method: 'PUT', url: '/api/positions/UPDR', payload: { quantity: 10, averageCost: 100 },
+  })
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'UPDR' },
+  })).json()
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  await app.inject({
+    method: 'PUT', url: '/api/positions/UPDR', payload: { quantity: 12, averageCost: 100 },
+  })
+  const response = await app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/messages`,
+    payload: { messageId: 'update-report-v2', message: '请更新报告。', updateReport: true },
+  })
+  assert.equal(response.statusCode, 202, response.body)
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  const research = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  const versions = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}/report-versions`,
+  })).json().items
+  assert.equal(research.report.title, updatedReport.title)
+  assert.deepEqual(versions.map(({ version }: { version: number }) => version), [1, 2])
+  const updateRequest = research.trace.find((event: { type?: string; messageId?: string }) => (
+    event.type === 'runtime_follow_up' && event.messageId === 'update-report-v2'
+  ))
+  assert.equal(updateRequest.intent, 'request_report_update')
+  await app.close()
+})
+
+test('用户从历史 V1 发起追问时冻结该版本的时间、报告时持仓和正文', async () => {
+  const database = createTestProductDatabase()
+  let calls = 0
+  let contextFetches = 0
+  let v1CreatedAt = ''
+  const v2Report = { ...report, title: '历史基准测试 V2' }
+  const currentFact = {
+    ...fact, id: 'fact:HISTV:quote:current-v2', value: 240,
+    observedAt: '2026-08-14T01:00:00Z', fetchedAt: '2026-08-14T01:00:01Z',
+  }
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => {
+      contextFetches += 1
+      return {
+        symbol, facts: contextFetches === 1 ? [fact] : [currentFact], gaps: [], indicators: {},
+      }
+    },
+    model: {
+      async *analyze(input) {
+        calls += 1
+        if (calls === 3) {
+          assert.equal(input.runtimeFollowUp?.content.baseReportVersion, 1)
+          assert.equal((input.runtimeFollowUp?.content.baseReport as any).title, report.title)
+          assert.equal(input.runtimeFollowUp?.content.baseReportCreatedAt, v1CreatedAt)
+          assert.equal((input.runtimeFollowUp?.content.reportPositionContext as any)
+            .position.quantity, 10)
+          assert.equal((input.runtimeFollowUp?.content.currentPositionSummary as any)
+            .position.quantity, 15)
+          assert.deepEqual(input.knownFacts.map(({ id }) => id), [fact.id])
+          assert.match(input.systemPrompt, /区分报告时的历史判断与当前持仓影响/)
+          yield { type: 'chat_completed' as const, text: '已按 V1 历史语境回答。' }
+          return
+        }
+        const next = calls === 1 ? report : v2Report
+        yield { type: 'completed' as const, report: next, reportVersion: {
+          kind: 'integrated' as const,
+          report: { ...reportCandidate, title: next.title },
+        } }
+      },
+    },
+  } as any)
+  await app.ready()
+  await app.inject({
+    method: 'PUT', url: '/api/positions/HISTV', payload: { quantity: 10, averageCost: 100 },
+  })
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'HISTV' },
+  })).json()
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  v1CreatedAt = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}/report-versions`,
+  })).json().items[0].createdAt
+  await app.inject({
+    method: 'PUT', url: '/api/positions/HISTV', payload: { quantity: 12, averageCost: 100 },
+  })
+  assert.equal((await app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/messages`,
+    payload: {
+      messageId: 'make-v2', message: '更新为 V2。', updateReport: true, baseReportVersion: 1,
+    },
+  })).statusCode, 202)
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  await app.inject({
+    method: 'PUT', url: '/api/positions/HISTV', payload: { quantity: 15, averageCost: 100 },
+  })
+  const historical = await app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/messages`,
+    payload: {
+      messageId: 'ask-v1', message: '基于 V1 解释当前影响。', baseReportVersion: 1,
+    },
+  })
+  assert.equal(historical.statusCode, 202, historical.body)
+  assert.equal(historical.json().baseReportVersion, 1)
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  const research = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  assert.equal(research.report.title, v2Report.title)
+  assert.deepEqual(research.reportVersions.map(({ version }: { version: number }) => version), [1, 2])
+  await app.close()
+})
+
+test('报告更新取得当前资料但失败时保留上一份 active report 与 V1', async () => {
+  const database = createTestProductDatabase()
+  const currentFact = {
+    ...fact, id: 'fact:NVDA:quote:current-update', value: 230,
+    observedAt: '2026-08-14T01:00:00Z', fetchedAt: '2026-08-14T01:00:01Z',
+  }
+  let contextFetches = 0
+  let modelCalls = 0
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => {
+      contextFetches += 1
+      return {
+        symbol, facts: contextFetches === 1 ? [fact] : [currentFact], gaps: [], indicators: {},
+      }
+    },
+    model: {
+      async *analyze(input) {
+        modelCalls += 1
+        if (modelCalls === 1) {
+          yield { type: 'completed' as const, report, reportVersion: {
+            kind: 'integrated' as const, report: reportCandidate,
+          } }
+          return
+        }
+        assert.equal(input.runtimeFollowUp?.content.updateReport, true)
+        assert.equal(input.runtimeFollowUp?.content.baseReportVersion, 1)
+        assert.deepEqual(new Set(input.knownFacts.map(({ id }) => id)), new Set([
+          fact.id, currentFact.id,
+        ]))
+        throw new Error('report_update_failed')
+      },
+    },
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'UPDF' },
+  })).json()
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  const before = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  assert.equal((await app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/messages`,
+    payload: { messageId: 'failed-update', message: '更新本报告。', updateReport: true },
+  })).statusCode, 202)
+  await waitForStatus(app as any, created.analysisId, 'failed')
+  const after = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  const versions = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}/report-versions`,
+  })).json().items
+  assert.equal(contextFetches, 2)
+  assert.deepEqual(after.report, before.report)
+  assert.equal(after.reportCreatedAt, before.reportCreatedAt)
+  assert.deepEqual(versions.map(({ version }: { version: number }) => version), [1])
+  await app.close()
+})
+
+test('主 Agent 启动的消息面 Agent 拥有独立 Session、轨迹和不可变专项报告版本', async () => {
+  const database = createTestProductDatabase()
+  const specialistReport = {
+    kind: 'specialist' as const, domain: 'news', availability: 'available' as const,
+    status: 'completed' as const, gaps: [], limitations: [], keyJudgments: [],
+  }
+  const model = {
+    async *analyze(input: Parameters<ReturnType<typeof createPiModel>['analyze']>[0]) {
+      const result = await input.runNewsSpecialist!({
+        launch: true, researchQuestion: '近 30 天是否有重大公司事件？', reason: '缺少消息面反方证据。',
+      })
+      assert.equal(result.status, 'completed')
+      yield { type: 'completed' as const, report, reportVersion: {
+        kind: 'integrated' as const, report: reportCandidate,
+      } }
+    },
+    async *analyzeNews(input: Parameters<NonNullable<ReturnType<typeof createPiModel>['analyzeNews']>>[0]) {
+      assert.match(input.systemPrompt, /supportingEvidence.*contraryEvidence.*精确 fact\.id/)
+      yield { type: 'trace' as const, entry: {
+        type: 'user_input' as const, content: input.researchQuestion,
+        operationId: `execution:${input.executionId}:research-question`,
+      } }
+      yield { type: 'completed' as const, report: {
+        ...report, title: '消息面专项', keyJudgments: [], limitations: [],
+      }, reportVersion: { kind: 'specialist' as const, report: specialistReport } }
+    },
+  }
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [], indicators: {} }),
+    searchNewsCandidates: async () => ({ facts: [] }),
+    readNewsDocument: async () => ({ facts: [] }),
+    listCompanyEvents: async () => ({ facts: [] }),
+    listOfficialCompanyEvents: async () => ({ facts: [] }),
+    model,
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'NEWSAGENT' },
+  })).json()
+  await waitForStatus(app as any, created.analysisId, 'completed')
+
+  const research = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  const newsAgent = research.specialistAgents.find((agent: any) => agent.domain === 'news')
+  assert.equal(newsAgent.domain, 'news')
+  assert.equal(newsAgent.isPrimary, false)
+  assert.equal(newsAgent.execution.status, 'completed')
+  assert.match(JSON.stringify(newsAgent.events), /近 30 天是否有重大公司事件/)
+  assert.ok(research.mainAgent.events.some((event: Record<string, unknown>) => (
+    event.status === 'waiting_for_specialists'
+  )))
+
+  const saveUsage = async (
+    executionId: string, role: 'main' | 'news', input: number, cacheRead: number,
+  ) => {
+    const projection = await database.toolProjectionRepository.ensureVersion({
+      executionId, role, stage: 'research', schemaHash: `usage-${role}`,
+      projectedTools: [], visibleToolNames: [], reasons: { role },
+      createdAt: '2026-08-14T05:00:00.000Z',
+    })
+    const id = `${executionId}:usage-attempt`
+    await database.toolProjectionRepository.recordModelRequest({
+      id, executionId, projectionId: projection.id, turnIndex: 1,
+      createdAt: '2026-08-14T05:00:01.000Z',
+    })
+    await database.toolProjectionRepository.completeModelRequest({
+      id, executionId, status: 'completed', usageStatus: 'complete',
+      usage: { input, cacheRead, cacheWrite: 3, output: 4, total: input + cacheRead + 7 },
+      completedAt: '2026-08-14T05:00:01.100Z',
+    })
+  }
+  await saveUsage(research.mainAgent.execution.id, 'main', 100, 20)
+  await saveUsage(newsAgent.execution.id, 'news', 40, 10)
+  const usageResearch = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  assert.deepEqual(usageResearch.mainAgent.tokenUsage, {
+    attempts: 1, reportedAttempts: 1, coverage: 1,
+    input: 100, cacheRead: 20, cacheWrite: 3, output: 4, total: 127,
+  })
+  const usageNews = usageResearch.specialistAgents.find((agent: any) => agent.domain === 'news')
+  assert.deepEqual(usageNews.tokenUsage, {
+    attempts: 1, reportedAttempts: 1, coverage: 1,
+    input: 40, cacheRead: 10, cacheWrite: 3, output: 4, total: 57,
+  })
+  assert.equal(usageNews.modelAttempts[0].usageStatus, 'complete')
+
+  const versions = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}/report-versions`,
+  })).json().items
+  assert.deepEqual(versions.map(({ kind, report: versionReport }: any) => ({
+    kind, domain: versionReport.domain ?? null,
+  })), [
+    { kind: 'specialist', domain: 'news' },
+    { kind: 'integrated', domain: null },
+  ])
+  await app.close()
+})
+
+test('主 Agent 启动的基本面 Agent 拥有独立 Session、受限工具和不可变专项报告版本', async () => {
+  const database = createTestProductDatabase()
+  const fundamentalFact = {
+    ...fact, id: 'fact:fundamental:revenue', type: 'reported_financial',
+    evidenceLevel: 'reported_financial', source: 'sec',
+    sourceReference: 'https://www.sec.gov/Archives/example',
+  }
+  const specialistReport = {
+    kind: 'specialist' as const, domain: 'fundamental_valuation', availability: 'available' as const,
+    status: 'completed' as const, gaps: [], limitations: [], keyJudgments: [{
+      type: 'fundamental', statement: '收入质量稳定', direction: 'bullish', confidence: 'medium',
+      supportingEvidence: [fundamentalFact.id], contraryEvidence: [],
+      contraryEvidenceStatus: 'none_found', invalidationConditions: ['正式财报下修收入'],
+    }],
+    targetPrice: {
+      method: 'pe', inputs: ['fact:valuation-inputs'], range: { low: 80, high: 128 },
+      asOf: '2026-08-12T14:30:00Z', evidence: ['fact:valuation:pe'],
+    },
+  }
+  const model = {
+    async *analyze(input: Parameters<ReturnType<typeof createPiModel>['analyze']>[0]) {
+      const result = await input.runFundamentalSpecialist!({
+        launch: true, researchQuestion: '最新财务质量是否改变方向？', reason: '需要核实正式财务证据。',
+      })
+      assert.equal(result.status, 'completed')
+      assert.deepEqual(result.targetPrice, specialistReport.targetPrice)
+      yield { type: 'completed' as const, report, reportVersion: {
+        kind: 'integrated' as const, report: reportCandidate,
+      } }
+    },
+    async *analyzeFundamental(input: any) {
+      assert.equal(input.portfolioContext, undefined)
+      assert.match(input.systemPrompt, /supportingEvidence.*contraryEvidence.*精确 fact\.id/)
+      yield { type: 'trace' as const, entry: {
+        type: 'tool_result' as const, name: 'get_financial_overview', toolCallId: 'overview',
+        result: { facts: [fundamentalFact], overview: { latestPeriod: '2026-Q2' } },
+        isError: false, startedAt: null, completedAt: '2026-08-13T03:00:00.000Z', completionOrder: 1,
+        operationId: `execution:${input.executionId}:fundamental-tool:overview:result`,
+      } }
+      yield { type: 'completed' as const, report: specialistReport, reportVersion: {
+        kind: 'specialist' as const, report: specialistReport,
+      } }
+    },
+  }
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fundamentalFact], gaps: [] }),
+    getFinancialOverview: async () => ({ facts: [fundamentalFact], overview: { latestPeriod: '2026-Q2' } }),
+    getFinancialMetricSeries: async () => ({
+      facts: [], returnedCount: 0, totalCount: 0, nextCursor: null, truncated: false,
+    }),
+    getValuationEvidence: async () => ({ facts: [] }),
+    readFilingDocument: async () => ({
+      facts: [], items: [], returnedCount: 0, totalCount: 0, nextCursor: null, truncated: false,
+    }),
+    listCompanyEvents: async () => ({ facts: [] }),
+    listOfficialCompanyEvents: async () => ({ facts: [] }), model,
+  } as any)
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'FUNDAGENT' },
+  })).json()
+  await waitForStatus(app as any, created.analysisId, 'completed')
+
+  const research = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  const specialist = research.specialistAgents.find((agent: any) => agent.domain === 'fundamental_valuation')
+  assert.equal(specialist.execution.status, 'completed')
+  assert.match(JSON.stringify(specialist.events), /最新财务质量是否改变方向/)
+  const versions = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}/report-versions`,
+  })).json().items
+  assert.ok(versions.some(({ kind, report: versionReport }: any) => (
+    kind === 'specialist' && versionReport.domain === 'fundamental_valuation'
+  )))
+  await app.close()
+})
+
+test('主 Agent 启动的技术面 Agent 拥有独立 Session、受限工具和不可变专项报告版本', async () => {
+  const database = createTestProductDatabase()
+  const technicalFact = {
+    ...fact, id: 'fact:technical:evidence', type: 'technical_evidence',
+    evidenceLevel: 'deterministic_technical', source: 'deterministic-calculation',
+    value: {
+      actualStart: '2025-01-01', actualEnd: '2026-01-20', totalBarCount: 260,
+      structures: Object.fromEntries([20, 60, 120, 252].map((size) => [
+        `${size}d`, { status: 'available', barCount: size, returnPct: 0.1, high: 130, low: 90 },
+      ])),
+      indicators: { ma_5: 120, ma_20: 115, macd: { line: 1, signal: 0.5, histogram: 0.5 },
+        rsi_14: 58, annualized_volatility: 0.3, max_drawdown: -0.2,
+        volume_ratio_5_to_20: 1.1 },
+      volatility: { annualized: 0.3 }, drawdown: { maximum: -0.2 },
+      volumePrice: { volumeRatio5To20: 1.1 }, keyLevels: { support: 90, resistance: 130 },
+      conflicts: [],
+    },
+  }
+  const specialistReport = {
+    kind: 'specialist' as const, domain: 'technical', availability: 'available' as const,
+    status: 'completed' as const, gaps: [], limitations: [], keyJudgments: [{
+      type: 'technical', statement: '多周期结构存在冲突', direction: 'neutral', confidence: 'medium',
+      supportingEvidence: [technicalFact.id], contraryEvidence: [technicalFact.id],
+      contraryEvidenceStatus: 'none_found', invalidationConditions: ['突破关键阻力'],
+    }],
+  }
+  const model = {
+    async *analyze(input: any) {
+      const result = await input.runTechnicalSpecialist({
+        launch: true, researchQuestion: '多周期结构是否一致？', reason: '需要完整历史证据。',
+      })
+      assert.equal(result.status, 'completed')
+      assert.deepEqual(result.keyFactIds, [technicalFact.id])
+      yield { type: 'completed' as const, report, reportVersion: {
+        kind: 'integrated' as const, report: reportCandidate,
+      } }
+    },
+    async *analyzeTechnical(input: any) {
+      assert.equal(input.portfolioContext, undefined)
+      assert.match(input.systemPrompt, /supportingEvidence.*contraryEvidence.*精确 fact\.id/)
+      yield { type: 'trace' as const, entry: {
+        type: 'tool_result' as const, name: 'get_technical_evidence', toolCallId: 'technical',
+        result: { facts: [technicalFact], totalBarCount: 260 }, isError: false,
+        startedAt: null, completedAt: '2026-08-13T03:00:00.000Z', completionOrder: 1,
+        operationId: `execution:${input.executionId}:technical-tool:result`,
+      } }
+      yield { type: 'completed' as const, report: specialistReport, reportVersion: {
+        kind: 'specialist' as const, report: specialistReport,
+      } }
+    },
+  }
+  const app = buildProductionApp({
+    ...database, financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [], gaps: [] }),
+    getTechnicalEvidence: async () => ({ facts: [technicalFact], totalBarCount: 260 }),
+    getPriceWindow: async () => ({
+      facts: [], returnedCount: 0, totalCount: 0, nextCursor: null, truncated: false,
+    }), model,
+  } as any)
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'TECHAGENT' },
+  })).json()
+  await waitForStatus(app as any, created.analysisId, 'completed')
+
+  const research = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  const specialist = research.specialistAgents.find((agent: any) => agent.domain === 'technical')
+  assert.equal(specialist.execution.status, 'completed')
+  assert.match(JSON.stringify(specialist.events), /多周期结构是否一致/)
+  const versions = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}/report-versions`,
+  })).json().items
+  assert.ok(versions.some(({ kind, report: versionReport }: any) => (
+    kind === 'specialist' && versionReport.domain === 'technical'
+  )))
+  await app.close()
+})
+
+test('专项批次单项失败不取消其余专项且主 Agent 在全部终态后继续', async () => {
+  const database = createTestProductDatabase()
+  const specialistReport = (domain: 'fundamental_valuation' | 'technical') => ({
+    kind: 'specialist' as const, domain, availability: 'partial' as const,
+    status: 'partial' as const, gaps: [], limitations: [], keyJudgments: [],
+  })
+  let mainContinued = false
+  const model = {
+    async *analyze(input: any) {
+      const requests = [
+        { domain: 'news', researchQuestion: '消息面？', reason: '补充消息证据' },
+        { domain: 'fundamental_valuation', researchQuestion: '基本面？', reason: '补充财务证据' },
+        { domain: 'technical', researchQuestion: '技术面？', reason: '补充技术证据' },
+      ] as const
+      const prepared = await input.prepareSpecialistBatch(
+        requests, `execution:${input.executionId}:specialist-batch`,
+      )
+      const byDomain = Object.fromEntries(prepared.map((item: any) => [item.domain, item]))
+      const [news, fundamental, technical] = await Promise.all([
+        input.runNewsSpecialist({ ...requests[0], launch: true, prepared: byDomain.news }),
+        input.runFundamentalSpecialist({
+          ...requests[1], launch: true, prepared: byDomain.fundamental_valuation,
+        }),
+        input.runTechnicalSpecialist({ ...requests[2], launch: true, prepared: byDomain.technical }),
+      ])
+      assert.equal(news.status, 'failed')
+      assert.equal(news.gaps[0].capability, 'news')
+      assert.equal(fundamental.status, 'partial')
+      assert.equal(technical.status, 'partial')
+      mainContinued = true
+      yield { type: 'completed' as const, report, reportVersion: {
+        kind: 'integrated' as const, report: reportCandidate,
+      } }
+    },
+    async *analyzeNews() { throw new Error('news_provider_failed') },
+    async *analyzeFundamental() {
+      const value = specialistReport('fundamental_valuation')
+      yield { type: 'completed' as const, report: value, reportVersion: {
+        kind: 'specialist' as const, report: value,
+      } }
+    },
+    async *analyzeTechnical() {
+      const value = specialistReport('technical')
+      yield { type: 'completed' as const, report: value, reportVersion: {
+        kind: 'specialist' as const, report: value,
+      } }
+    },
+  }
+  const emptyFacts = async () => ({ facts: [] })
+  const app = buildProductionApp({
+    ...database, model,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [] }),
+    searchNewsCandidates: emptyFacts, readNewsDocument: emptyFacts,
+    listCompanyEvents: emptyFacts, getFinancialOverview: emptyFacts,
+    getFinancialMetricSeries: emptyFacts, getValuationEvidence: emptyFacts,
+    readFilingDocument: emptyFacts, listOfficialCompanyEvents: emptyFacts,
+    getTechnicalEvidence: emptyFacts, getPriceWindow: emptyFacts,
+  } as any)
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'BATCHFAIL' },
+  })).json()
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  const research = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+
+  assert.equal(mainContinued, true)
+  assert.deepEqual(new Set(research.specialistAgents.map((agent: any) => agent.execution.status)),
+    new Set(['failed', 'partial']))
+  const waiting = research.mainAgent.events.filter((event: any) => (
+    event.status === 'waiting_for_specialists'
+  ))
+  assert.equal(waiting.length, 1)
+  assert.equal(research.specialistAgents.length, 3)
+  for (const agent of research.specialistAgents) assert.match(
+    waiting[0].waitReason.target, new RegExp(agent.id),
+  )
+  await app.close()
+})
+
+test('专项取消落为 stopped 且主 Agent 收到 cancelled 紧凑结果', async () => {
+  const database = createTestProductDatabase()
+  let compactStatus = ''
+  const model = {
+    async *analyze(input: any) {
+      const [prepared] = await input.prepareSpecialistBatch([{
+        domain: 'news', researchQuestion: '消息面取消测试', reason: '验证取消收口',
+      }], `execution:${input.executionId}:cancelled-specialist`)
+      const result = await input.runNewsSpecialist({
+        launch: true, researchQuestion: '消息面取消测试', reason: '验证取消收口', prepared,
+      })
+      compactStatus = result.status
+      assert.equal(result.status, 'cancelled')
+      assert.equal(result.sessionId, prepared.sessionId)
+      yield { type: 'completed' as const, report, reportVersion: {
+        kind: 'integrated' as const, report: reportCandidate,
+      } }
+    },
+    async *analyzeNews() { yield { type: 'cancelled' as const } },
+  }
+  const emptyFacts = async () => ({ facts: [] })
+  const app = buildProductionApp({
+    ...database, model,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [] }),
+    searchNewsCandidates: emptyFacts, readNewsDocument: emptyFacts, listCompanyEvents: emptyFacts,
+  } as any)
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'CANCELSP' },
+  })).json()
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  const research = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  assert.equal(compactStatus, 'cancelled')
+  assert.equal(research.specialistAgents[0].execution.status, 'stopped')
+  assert.equal(research.specialistAgents[0].events.some((event: any) => event.status === 'failed'), false)
+  await app.close()
+})
+
+test('主 Agent 跨 Turn 追问同一领域时复用长期专项 Session 并创建报告 V2', async () => {
+  const database = createTestProductDatabase()
+  let specialistRun = 0
+  const model = {
+    async *analyze(input: any) {
+      let priorExecutionId = ''
+      for (const researchQuestion of ['首次消息面问题', '消息面后续追问']) {
+        const [prepared] = await input.prepareSpecialistBatch([{
+          domain: 'news', researchQuestion, reason: '补充消息面证据',
+        }], `execution:${input.executionId}:news-follow-up:${researchQuestion}`)
+        const result = await input.runNewsSpecialist({
+          launch: true, researchQuestion, reason: '补充消息面证据', prepared,
+        })
+        assert.equal(result.sessionId, prepared.sessionId)
+        assert.notEqual(result.executionId, priorExecutionId)
+        priorExecutionId = result.executionId
+      }
+      yield { type: 'completed' as const, report, reportVersion: {
+        kind: 'integrated' as const, report: reportCandidate,
+      } }
+    },
+    async *analyzeNews() {
+      specialistRun += 1
+      const specialistReport = {
+        kind: 'specialist' as const, domain: 'news', availability: 'partial' as const,
+        status: 'partial' as const, gaps: [], limitations: [], keyJudgments: [],
+      }
+      yield { type: 'completed' as const, report: specialistReport, reportVersion: {
+        kind: 'specialist' as const, report: specialistReport,
+      } }
+    },
+  }
+  const emptyFacts = async () => ({ facts: [] })
+  const app = buildProductionApp({
+    ...database, model,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [] }),
+    searchNewsCandidates: emptyFacts, readNewsDocument: emptyFacts, listCompanyEvents: emptyFacts,
+  } as any)
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'NEWSFU' },
+  })).json()
+  await waitForStatus(app as any, created.analysisId, 'completed').catch(async (error) => {
+    const state = (await app.inject({
+      method: 'GET', url: `/api/analyses/${created.analysisId}`,
+    })).json()
+    throw new Error(`${String(error)}:${JSON.stringify(state)}`)
+  })
+  const research = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  const newsAgents = research.specialistAgents.filter((agent: any) => agent.domain === 'news')
+  const versions = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}/report-versions`,
+  })).json().items.filter(({ sessionId }: any) => sessionId === newsAgents[0].id)
+
+  assert.equal(specialistRun, 2)
+  assert.equal(newsAgents.length, 1)
+  assert.equal(newsAgents[0].execution.generation, 2)
+  assert.equal(newsAgents[0].segments.length, 2)
+  assert.equal(newsAgents[0].researchQuestion, '消息面后续追问')
+  assert.deepEqual(versions.map(({ version }: any) => version), [1, 2])
+  await app.close()
+})
+
+test('报告后用户追问复用长期专项 Session 并创建专项新 execution 与 V2', async () => {
+  const database = createTestProductDatabase()
+  let mainRun = 0
+  let specialistRun = 0
+  const model = {
+    async *analyze(input: any) {
+      mainRun += 1
+      const question = mainRun === 1 ? '首次消息面问题' : '报告后的消息面追问'
+      const [prepared] = await input.prepareSpecialistBatch([{
+        domain: 'news', researchQuestion: question, reason: '补充消息面证据',
+      }], `execution:${input.executionId}:news:${mainRun}`)
+      const result = await input.runNewsSpecialist({
+        launch: true, researchQuestion: question, reason: '补充消息面证据', prepared,
+      })
+      assert.equal(result.reportVersion, mainRun)
+      if (mainRun === 1) yield { type: 'completed' as const, report, reportVersion: {
+        kind: 'integrated' as const, report: reportCandidate,
+      } }
+      else yield {
+        type: 'chat_completed' as const, text: '消息面专项已更新到 V2。', stopReason: 'stop',
+      }
+    },
+    async *analyzeNews() {
+      specialistRun += 1
+      const specialistReport = {
+        kind: 'specialist' as const, domain: 'news', availability: 'partial' as const,
+        status: 'partial' as const, gaps: [], limitations: [], keyJudgments: [],
+      }
+      yield { type: 'completed' as const, report: specialistReport, reportVersion: {
+        kind: 'specialist' as const, report: specialistReport,
+      } }
+    },
+  }
+  const emptyFacts = async () => ({ facts: [] })
+  const app = buildProductionApp({
+    ...database, model,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [] }),
+    searchNewsCandidates: emptyFacts, readNewsDocument: emptyFacts, listCompanyEvents: emptyFacts,
+  } as any)
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'NEWSMSG' },
+  })).json()
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  assert.equal((await app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/messages`,
+    payload: { messageId: 'news-follow-up', message: '请更新消息面判断。' },
+  })).statusCode, 202)
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  const research = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  const news = research.specialistAgents.filter((agent: any) => agent.domain === 'news')
+  const versions = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}/report-versions`,
+  })).json().items
+  assert.equal(mainRun, 2)
+  assert.equal(specialistRun, 2)
+  assert.equal(news.length, 1)
+  assert.equal(news[0].execution.generation, 2)
+  assert.equal(news[0].segments.length, 2)
+  assert.deepEqual(versions.filter(({ sessionId }: any) => sessionId === news[0].id)
+    .map(({ version }: any) => version), [1, 2])
+  assert.equal(versions.filter(({ kind }: any) => kind === 'integrated').length, 1)
+  await app.close()
+})
+
+test('没有有效综合报告的终态研究仍允许继续聊天', async () => {
+  let run = 0
+  const app = await makeApp(crypto.randomUUID(), {
+    async *analyze(input: any) {
+      run += 1
+      if (run === 1) throw new Error('initial_report_failed')
+      assert.equal(input.runtimeFollowUp?.content.baseReportVersion, null)
+      assert.equal(input.runtimeFollowUp?.content.baseReport, null)
+      if (run === 2) {
+        yield { type: 'chat_completed' as const, text: '可以继续补充研究。', stopReason: 'stop' }
+        return
+      }
+      assert.equal(input.runtimeFollowUp?.content.updateReport, true)
+      yield { type: 'completed' as const, report, reportVersion: {
+        kind: 'integrated' as const, report: reportCandidate,
+      } }
+    },
+  } as any)
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'NOREPORT' },
+  })).json()
+  await waitForStatus(app as any, created.analysisId, 'failed')
+  const response = await app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/messages`,
+    payload: { messageId: 'no-report-follow-up', message: '继续补充研究。' },
+  })
+  assert.equal(response.statusCode, 202, response.body)
+  assert.equal(response.json().baseReportVersion, null)
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  const research = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  assert.equal(research.report, null)
+  assert.ok(research.trace.some((event: any) => event.type === 'chat_completed'))
+  assert.equal((await app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/messages`,
+    payload: { messageId: 'retry-report', message: '重新生成报告。', updateReport: true },
+  })).statusCode, 202)
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  const recovered = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  assert.equal(recovered.report.title, report.title)
+  assert.equal((await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}/report-versions`,
+  })).json().items[0].version, 1)
+  await app.close()
+})
+
+test('主 Agent 未启动消息面 Agent 时研究投影保留研究问题和理由', async () => {
+  const database = createTestProductDatabase()
+  const model = {
+    async *analyze() {
+      yield { type: 'trace' as const, entry: {
+        type: 'tool_result' as const, name: 'run_news_analysis', toolCallId: 'news-decision',
+        result: {
+          launched: false, status: 'not_started',
+          researchQuestion: '近期是否有改变预期的公司事件？',
+          reason: '当前事实已覆盖研究问题。',
+        },
+        isError: false, startedAt: null, completedAt: '2026-08-13T03:00:00.000Z',
+        completionOrder: 1,
+      } }
+      yield { type: 'completed' as const, report, reportVersion: {
+        kind: 'integrated' as const, report: reportCandidate,
+      } }
+    },
+  }
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [], indicators: {} }),
+    model,
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'NEWSNO' },
+  })).json()
+  await waitForStatus(app as any, created.analysisId, 'completed')
+
+  const research = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  assert.deepEqual(research.specialistAgents, [{
+    domain: 'news', status: 'not_started',
+    researchQuestion: '近期是否有改变预期的公司事件？',
+    reason: '当前事实已覆盖研究问题。',
+  }, {
+    domain: 'fundamental_valuation', status: 'not_started',
+    reason: '主 Agent 尚未作出基本面专项启动决定。',
+  }, {
+    domain: 'technical', status: 'not_started',
+    reason: '主 Agent 尚未作出技术面专项启动决定。',
+  }])
+  await app.close()
+})
+
+test('主 Agent 尚未决定时研究投影也固定显示消息面专项视角', async () => {
+  const database = createTestProductDatabase()
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [], indicators: {} }),
+    model: { async *analyze() {
+      await new Promise((resolve) => setTimeout(resolve, 100))
+      yield { type: 'completed' as const, report, reportVersion: {
+        kind: 'integrated' as const, report: reportCandidate,
+      } }
+    } },
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'NEWSWAIT' },
+  })).json()
+  const research = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  assert.deepEqual(research.specialistAgents, [{
+    domain: 'news', status: 'not_started', reason: '主 Agent 尚未作出消息面专项启动决定。',
+  }, {
+    domain: 'fundamental_valuation', status: 'not_started',
+    reason: '主 Agent 尚未作出基本面专项启动决定。',
+  }, {
+    domain: 'technical', status: 'not_started',
+    reason: '主 Agent 尚未作出技术面专项启动决定。',
+  }])
+  await app.close()
+})
+
+test('创建 execution 冻结当前 settings revision 且后续修改不影响运行值', async () => {
+  const database = createTestProductDatabase()
+  await database.runtimeSettingsRepository.save({ mainAgentToolRounds: 100 }, '2026-08-13T03:00:00.000Z')
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [], indicators: {} }),
+    model: fakeModel(50),
+  })
+  await app.ready()
+
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'SNAPSHOT' },
+  })).json()
+  await database.runtimeSettingsRepository.save({ mainAgentToolRounds: 200 }, '2026-08-13T03:01:00.000Z')
+  const settings = (await app.inject({ method: 'GET', url: '/api/settings' })).json()
+
+  assert.equal(settings.current.values.mainAgentToolRounds, 200)
+  assert.equal(settings.activeExecutions[0].executionId, created.executionId)
+  assert.equal(settings.activeExecutions[0].values.mainAgentToolRounds, 100)
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  await app.close()
+})
+
+test('模型尚未接入也能创建并读取主 Agent 完整初始生命周期', async () => {
+  const database = createTestProductDatabase()
+  let externalCalls = 0
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async () => { externalCalls += 1; throw new Error('must_not_start') },
+    model: { async *analyze() { externalCalls += 1 } },
+    modelConfigured: false,
+  })
+  const created = await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' } })
+  assert.equal(created.statusCode, 202)
+  const body = created.json()
+  assert.equal(body.existing, false)
+
+  const research = await app.inject({ method: 'GET', url: `/api/research/${body.analysisId}` })
+  assert.equal(research.statusCode, 200)
+  const record = research.json()
+  assert.equal(record.mainAgent.status, 'planning')
+  assert.equal(record.mainAgent.execution.generation, 1)
+  assert.equal(record.mainAgent.segments.length, 1)
+  assert.equal(record.mainAgent.segments[0].ordinal, 1)
+  assert.deepEqual(record.mainAgent.waitReason, {
+    kind: 'database', target: '首次研究初始化', startedAt: record.createdAt,
+  })
+  assert.equal(record.mainAgent.events[0].type, 'runtime_context')
+  await new Promise((resolve) => setTimeout(resolve, 10))
+  assert.equal(externalCalls, 0)
+  await app.close()
+})
+
+test('Runtime 状态事件与 waitReason 投影使用同一确定性值', async () => {
+  const database = createTestProductDatabase()
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [], indicators: {} }),
+    model: fakeModel(10),
+  })
+  const created = (await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'WAIT' } })).json()
+  await new Promise((resolve) => setTimeout(resolve, 2))
+  const record = (await app.inject({ method: 'GET', url: `/api/research/${created.analysisId}` })).json()
+  const running = record.mainAgent.events.find((event: { status?: string }) => event.status === 'running_model')
+  assert.deepEqual(running.waitReason, record.mainAgent.waitReason)
+  assert.equal(running.waitReason.target, '主模型响应')
+  await app.close()
+})
+
+test('同一标的重复首次研究返回已有主 Agent 生命周期', async () => {
+  const database = createTestProductDatabase()
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+  })
+  const first = (await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'aapl' } })).json()
+  const repeated = (await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'AAPL' } })).json()
+  assert.equal(repeated.existing, true)
+  assert.equal(repeated.analysisId, first.analysisId)
+  assert.equal(repeated.sessionId, first.sessionId)
+  assert.equal(repeated.executionId, first.executionId)
+  await app.close()
+})
+
+test('修改研究并发后立即启动尚未运行的排队 execution', async () => {
+  const database = createTestProductDatabase()
+  await database.runtimeSettingsRepository.save({ analysisConcurrency: 1 }, '2026-08-13T03:00:00.000Z')
+  let releaseFirst!: () => void
+  const firstBarrier = new Promise<void>((resolve) => { releaseFirst = resolve })
+  let active = 0
+  let maximumActive = 0
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [], indicators: {} }),
+    model: {
+      async *analyze() {
+        active += 1
+        maximumActive = Math.max(maximumActive, active)
+        if (active === 1) await firstBarrier
+        active -= 1
+        yield { type: 'completed' as const, report }
+      },
+    },
+  })
+  await app.ready()
+  const first = (await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'C1' } })).json()
+  const second = (await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'C2' } })).json()
+  await new Promise((resolve) => setTimeout(resolve, 10))
+  assert.equal((await app.inject({ method: 'GET', url: `/api/analyses/${second.analysisId}` })).json().status, 'queued')
+
+  await app.inject({ method: 'PUT', url: '/api/settings', payload: { analysisConcurrency: 2 } })
+  await new Promise((resolve) => setTimeout(resolve, 10))
+  assert.equal(maximumActive, 2)
+  releaseFirst()
+  await waitForStatus(app as any, first.analysisId, 'completed')
+  await waitForStatus(app as any, second.analysisId, 'completed')
+  await app.close()
+})
+
+test('即时 model/tool concurrency 对新旧 execution 使用同一全局上限', async () => {
+  const database = createTestProductDatabase()
+  await database.runtimeSettingsRepository.save({
+    analysisConcurrency: 4, modelConcurrency: 2, toolConcurrency: 2,
+  }, new Date().toISOString())
+  let activeModels = 0
+  let maxModels = 0
+  let maxNewModelGlobalActive = 0
+  let activeTools = 0
+  let maxTools = 0
+  let maxNewToolGlobalActive = 0
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol, signal) => {
+      activeTools += 1
+      maxTools = Math.max(maxTools, activeTools)
+      if (symbol.startsWith('NEW')) maxNewToolGlobalActive = Math.max(maxNewToolGlobalActive, activeTools)
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(resolve, 20)
+        signal.addEventListener('abort', () => { clearTimeout(timer); reject(signal.reason) }, { once: true })
+      })
+      activeTools -= 1
+      return { symbol, facts: [fact], gaps: [], indicators: {} }
+    },
+    model: {
+      async *analyze(input) {
+        const release = await input.acquireModelSlot(input.signal)
+        activeModels += 1
+        maxModels = Math.max(maxModels, activeModels)
+        if (String(input.symbol).startsWith('NEW')) {
+          maxNewModelGlobalActive = Math.max(maxNewModelGlobalActive, activeModels)
+        }
+        await new Promise((resolve) => setTimeout(resolve, 20))
+        activeModels -= 1
+        release()
+        yield { type: 'completed' as const, report }
+      },
+    },
+  })
+  await app.ready()
+  const oldExecutions = await Promise.all(['OLD1', 'OLD2'].map((symbol) => app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol },
+  })))
+  await app.inject({
+    method: 'PUT', url: '/api/settings', payload: { modelConcurrency: 1, toolConcurrency: 1 },
+  })
+  const newExecutions = await Promise.all(['NEW1', 'NEW2'].map((symbol) => app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol },
+  })))
+  await Promise.all([...oldExecutions, ...newExecutions].map((response) => (
+    waitForStatus(app as any, response.json().analysisId, 'completed')
+  )))
+  assert.ok(maxModels <= 2)
+  assert.ok(maxTools <= 2)
+  assert.equal(maxNewModelGlobalActive, 1)
+  assert.equal(maxNewToolGlobalActive, 1)
+  await app.close()
+})
+
+test('Runtime processing 单独耗尽 active budget 后进入确定性收口', async () => {
+  const database = createTestProductDatabase()
+  await database.runtimeSettingsRepository.save({ researchActiveMinutes: 1 }, new Date().toISOString())
+  let activeNow = 0
+  let modelCalls = 0
+  let toolCalls = 0
+  const app = buildProductionApp({
+    ...database,
+    runtimeMinuteMs: 10,
+    activeNow: () => activeNow,
+    activeTimeoutSignal: () => new AbortController().signal,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async () => {
+      toolCalls += 1
+      activeNow = 11
+      throw new Error('research_active_timeout')
+    },
+    model: {
+      async *analyze() {
+        modelCalls += 1
+        yield { type: 'completed' as const, report }
+      },
+    },
+  })
+  await app.ready()
+  const created = (await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'ABORT' } })).json()
+  const partial = await waitForStatus(app as any, created.analysisId, 'partial')
+  assert.equal(partial.report.title, report.title)
+  assert.equal(toolCalls, 1)
+  assert.equal(modelCalls, 1)
+  await app.close()
+})
+
+test('Analysis 外部数据 active start 失败会释放工具槽且下一 execution 可运行', async () => {
+  const database = createTestProductDatabase()
+  await database.runtimeSettingsRepository.save({
+    analysisConcurrency: 1, toolConcurrency: 1,
+  }, new Date().toISOString())
+  let timeoutSignals = 0
+  let fetches = 0
+  const app = buildProductionApp({
+    ...database,
+    activeTimeoutSignal: () => {
+      timeoutSignals += 1
+      if (timeoutSignals === 2) throw new Error('analysis_tool_active_start_failed')
+      return new AbortController().signal
+    },
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => {
+      fetches += 1
+      return { symbol, facts: [fact], gaps: [], indicators: {} }
+    },
+    model: fakeModel(),
+  })
+  await app.ready()
+  const first = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'ACTIVEFAIL' },
+  })).json()
+  const failed = await waitForStatus(app as any, first.analysisId, 'failed')
+  assert.equal(failed.error, 'analysis_tool_active_start_failed')
+
+  const second = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'ACTIVENEXT' },
+  })).json()
+  await waitForStatus(app as any, second.analysisId, 'completed')
+  assert.equal(fetches, 1)
+  await app.close()
+})
+
+test('8 分钟 Runtime 加 8 分钟 provider 共用 10 分钟 active budget 并进入收口', async () => {
+  const database = createTestProductDatabase()
+  await database.runtimeSettingsRepository.save({ researchActiveMinutes: 1 }, new Date().toISOString())
+  let activeNow = 0
+  let requests = 0
+  const model = createPiModel({ fauxResponses: [
+    () => {
+      requests += 1
+      activeNow = 16
+      return fauxAssistantMessage('研究预算已经耗尽。')
+    },
+    () => {
+      requests += 1
+      return fauxAssistantMessage(
+        fauxToolCall('submit_analysis_report', reportCandidate), { stopReason: 'toolUse' },
+      )
+    },
+  ] })
+  const app = buildProductionApp({
+    ...database,
+    runtimeMinuteMs: 10,
+    activeNow: () => activeNow,
+    activeTimeoutSignal: () => new AbortController().signal,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => {
+      activeNow = 8
+      return { symbol, facts: [fact], gaps: [], indicators: {} }
+    },
+    model,
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'SHARED' },
+  })).json()
+  const completed = await waitForStatus(app as any, created.analysisId, 'completed')
+  assert.equal(completed.report.title, report.title)
+  assert.equal(requests, 2)
+  const research = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  const states = research.mainAgent.events
+    .filter((event: { type?: string }) => event.type === 'status')
+    .map((event: { status: string }) => event.status)
+  assert.ok(states.includes('running_model'))
+  assert.ok(states.includes('budget_exhausted'))
+  assert.ok(states.includes('finalizing'))
+  const finalizing = research.mainAgent.events.find(
+    (event: { status?: string }) => event.status === 'finalizing',
+  )
+  assert.equal(finalizing.waitReason.target, '报告收口')
+  await app.close()
+})
+
+test('专项已有 V1 后主预算耗尽的二次收口保留真实状态与精确引用', async () => {
+  const database = createTestProductDatabase()
+  await database.runtimeSettingsRepository.save({
+    researchActiveMinutes: 1, executionWallClockMinutes: 240, modelRequestTimeoutMinutes: 60,
+  }, new Date().toISOString())
+  let activeNow = 0
+  let attempts = 0
+  let researchBudget: Parameters<typeof closure.analyze>[0]['activeBudget']
+  const outcome = {
+    launched: true, status: 'completed', sessionId: 'news-session', executionId: 'news-execution',
+    reportId: 'news-report-v1', reportVersion: 1, summary: '消息专项已完成',
+    keyFactIds: [fact.id], contraryFactIds: [], gaps: [],
+  }
+  const closingReport = {
+    ...reportCandidate, availability: 'partial' as const, status: 'partial' as const,
+    limitations: ['研究 active time 已耗尽'],
+    specialistStatuses: [
+      { domain: 'news', status: 'completed', impact: '消息面专项可用' },
+      { domain: 'fundamental_valuation', status: 'not_started', impact: '基本面专项未启动' },
+      { domain: 'technical', status: 'not_started', impact: '技术面专项未启动' },
+    ],
+    specialistReferences: [{
+      domain: 'news', sessionId: outcome.sessionId, reportId: outcome.reportId,
+      version: outcome.reportVersion, status: 'completed',
+    }],
+  }
+  const closure = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall('submit_analysis_report', closingReport), {
+      stopReason: 'toolUse',
+    }),
+  ] })
+  const research = createPiModel({ fauxResponses: [
+    () => {
+      activeNow = 1_600
+      return fauxAssistantMessage('专项已完成，主研究预算耗尽。')
+    },
+  ] })
+  const model = {
+    async *analyze(input: Parameters<typeof closure.analyze>[0]) {
+      attempts += 1
+      if (attempts === 1) {
+        researchBudget = input.activeBudget
+        input.onSpecialistOutcome?.('news', outcome)
+        yield* research.analyze(input)
+        return
+      }
+      assert.equal(input.priorSpecialistOutcomes?.length, 3)
+      assert.deepEqual(input.priorSpecialistOutcomes?.find(({ domain }) => domain === 'news'), {
+        domain: 'news', outcome,
+      })
+      assert.notEqual(input.activeBudget, researchBudget)
+      assert.equal(input.activeBudget?.exhausted(), false)
+      yield* closure.analyze(input)
+    },
+    async *analyzeNews() { throw new Error('news_specialist_must_not_restart') },
+  }
+  const app = buildProductionApp({
+    ...database, model, runtimeMinuteMs: 1_000, activeNow: () => activeNow,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    searchNewsCandidates: async () => ({ facts: [] }),
+    readNewsDocument: async () => ({ facts: [] }), listCompanyEvents: async () => ({ facts: [] }),
+    fetchFinancialContext: async (symbol) => {
+      activeNow = 800
+      return { symbol, facts: [fact], gaps: [], indicators: {} }
+    },
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'BUDGETV1' },
+  })).json()
+  const completed = await waitForStatus(app as any, created.analysisId, 'partial').catch(async (error) => {
+    const research = (await app.inject({
+      method: 'GET', url: `/api/research/${created.analysisId}`,
+    })).json()
+    throw new Error(`${String(error)}:${JSON.stringify(research)}`)
+  })
+  assert.equal(attempts, 2)
+  const versions = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}/report-versions`,
+  })).json().items
+  assert.deepEqual(versions.at(-1).report.specialistReferences, closingReport.specialistReferences)
+  const lifecycle = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json().mainAgent
+  const requestIds = lifecycle.modelAttempts.map(({ id }: { id: string }) => id)
+  assert.ok(requestIds.length >= 2)
+  assert.equal(new Set(requestIds).size, requestIds.length)
+  assert.ok(requestIds.some((id: string) => id.includes(':main:invocation:finalization-only:')))
+  await app.close()
+})
+
+test('settings snapshot 冻结失败时请求失败且不创建没有冻结契约的 execution', async () => {
+  const database = createTestProductDatabase()
+  database.agentEventRepository.createResearch = async () => { throw new Error('snapshot_failed') }
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [], indicators: {} }),
+    model: fakeModel(),
+  })
+  await app.ready()
+  const response = await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'SNAPFAIL' } })
+
+  assert.equal(response.statusCode, 500)
+  assert.deepEqual(await database.analysisRepository.listResearch(), [])
+  assert.deepEqual(await database.agentEventRepository.listSessions(response.json().analysisId ?? ''), [])
+  await app.close()
+})
+
+test('模型只接收 execution 创建时冻结的 Runtime settings', async () => {
+  const database = createTestProductDatabase()
+  await database.runtimeSettingsRepository.save({ mainAgentToolRounds: 100 }, '2026-08-13T03:00:00.000Z')
+  let receivedSettings: Record<string, unknown> | undefined
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [], indicators: {} }),
+    model: {
+      async *analyze(input) {
+        receivedSettings = input.runtimeSettings as Record<string, unknown>
+        yield { type: 'completed' as const, report }
+      },
+    },
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'FROZEN' },
+  })).json()
+  await database.runtimeSettingsRepository.save({ mainAgentToolRounds: 200 }, '2026-08-13T03:01:00.000Z')
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  assert.equal(receivedSettings?.mainAgentToolRounds, 100)
+  await app.close()
+})
+
+test('真实 Pi execution 冻结后修改 current 不改变运行轮次', async () => {
+  const database = createTestProductDatabase()
+  await database.runtimeSettingsRepository.save({
+    mainAgentToolRounds: 1,
+  }, '2026-08-13T03:02:00.000Z')
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [], indicators: {} }),
+    model: createPiModel({
+      fauxResponses: [
+        fauxAssistantMessage(fauxToolCall('fetch_financial_context', {}), { stopReason: 'toolUse' }),
+        fauxAssistantMessage(
+          fauxToolCall('submit_analysis_report', reportCandidate), { stopReason: 'toolUse' },
+        ),
+      ],
+      fauxTokensPerSecond: 1000,
+    }),
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'REALPI' },
+  })).json()
+  await database.runtimeSettingsRepository.save({
+    mainAgentToolRounds: 20,
+  }, '2026-08-13T03:03:00.000Z')
+
+  const completed = await waitForStatus(app as any, created.analysisId, 'completed')
+  assert.equal(completed.report.title, report.title)
+  assert.equal((await database.runtimeSettingsRepository.current()).values.mainAgentToolRounds, 20)
+  assert.equal(
+    (await database.runtimeSettingsRepository.getExecutionSnapshot(created.executionId))?.values.mainAgentToolRounds,
+    1,
+  )
   await app.close()
 })
 
@@ -87,7 +1814,7 @@ test('同一标的运行中重复创建返回原任务且不重复调用模型',
   let calls = 0
   const model = fakeModel(50)
   const counted = { analyze(input: Parameters<typeof model.analyze>[0]) { calls += 1; return model.analyze(input) } }
-  const app = await makeApp(join(dir, 'app.db'), counted)
+  const app = await makeApp(join(dir, 'storage'), counted)
   const first = (await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' } })).json()
   const second = (await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'nvda' } })).json()
   assert.equal(first.analysisId, second.analysisId)
@@ -98,7 +1825,7 @@ test('同一标的运行中重复创建返回原任务且不重复调用模型',
 
 test('实例并发上限使额外任务排队', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'vibe-analysis-queue-'))
-  const app = await makeApp(join(dir, 'app.db'), fakeModel(60), 1)
+  const app = await makeApp(join(dir, 'storage'), fakeModel(60), 1)
   const first = (await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' } })).json()
   const second = (await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'AMD' } })).json()
   const secondStatus = (await app.inject({ method: 'GET', url: `/api/analyses/${second.analysisId}` })).json()
@@ -108,36 +1835,919 @@ test('实例并发上限使额外任务排队', async () => {
   await app.close()
 })
 
-test('取消运行任务会停止模型并保存取消轨迹', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'vibe-analysis-cancel-'))
-  const app = await makeApp(join(dir, 'app.db'), fakeModel(1000), 1)
-  const { analysisId } = (await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' } })).json()
+test('execution wall 从创建时计时且排队超限后不启动任何外部调用', async () => {
+  const database = createTestProductDatabase()
+  await database.runtimeSettingsRepository.save({
+    analysisConcurrency: 1, executionWallClockMinutes: 1,
+  }, new Date().toISOString())
+  let providerCalls = 0
+  let toolCalls = 0
+  const app = buildProductionApp({
+    ...database,
+    runtimeMinuteMs: 10,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => {
+      toolCalls += 1
+      return { symbol, facts: [fact], gaps: [], indicators: {} }
+    },
+    model: {
+      async *analyze() {
+        providerCalls += 1
+        await new Promise((resolve) => setTimeout(resolve, 25))
+        yield { type: 'completed' as const, report }
+      },
+    },
+  })
+  await app.ready()
+  const first = (await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'WALL1' } })).json()
+  const queued = (await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'WALL2' } })).json()
+
+  const firstExpired = await waitForStatus(app as any, first.analysisId, 'budget_exhausted')
+  assert.equal(firstExpired.error, 'execution_runtime_timeout')
+  const expired = await waitForStatus(app as any, queued.analysisId, 'budget_exhausted')
+  assert.equal(expired.error, 'execution_runtime_timeout')
+  assert.equal(providerCalls, 1)
+  assert.equal(toolCalls, 1)
+  await app.close()
+})
+
+test('并发创建多个标的时运行任务数不超过实例上限', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'vibe-analysis-concurrency-'))
+  let active = 0
+  let maximumActive = 0
+  const app = await makeApp(join(dir, 'storage'), {
+    async *analyze() {
+      active += 1
+      maximumActive = Math.max(maximumActive, active)
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      active -= 1
+      yield { type: 'completed' as const, report }
+    },
+  }, 2)
+  const created = await Promise.all(Array.from({ length: 12 }, (_, index) => (
+    app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: `T${index}` } })
+  )))
+  await Promise.all(created.map((response) => waitForStatus(app, response.json().analysisId, 'completed')))
+  assert.equal(maximumActive, 2)
+  await app.close()
+})
+
+test('并发调度在队列 claim 阻塞时仍不会超出实例上限', async () => {
+  const database = createTestProductDatabase()
+  await database.runtimeSettingsRepository.save({ analysisConcurrency: 2 }, new Date().toISOString())
+  const repository = database.analysisRepository
+  const originalClaim = repository.claimNextQueued
+  repository.claimNextQueued = async (updatedAt) => {
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    return originalClaim(updatedAt)
+  }
+  let active = 0
+  let maximumActive = 0
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [], indicators: {} }),
+    model: {
+      async *analyze() {
+        active += 1
+        maximumActive = Math.max(maximumActive, active)
+        await new Promise((resolve) => setTimeout(resolve, 20))
+        active -= 1
+        yield { type: 'completed' as const, report }
+      },
+    },
+  })
+  await app.ready()
+  const created = await Promise.all(Array.from({ length: 12 }, (_, index) => (
+    app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: `C${index}` } })
+  )))
+  await Promise.all(created.map((response) => waitForStatus(app as any, response.json().analysisId, 'completed')))
+  assert.equal(maximumActive, 2)
+  await app.close()
+})
+
+test('队列 claim 瞬时失败会归还槽位且后续创建可恢复调度', async () => {
+  const database = createTestProductDatabase()
+  await database.runtimeSettingsRepository.save({ analysisConcurrency: 1 }, new Date().toISOString())
+  const repository = database.analysisRepository
+  const originalClaim = repository.claimNextQueued
+  let failOnce = true
+  repository.claimNextQueued = async (updatedAt) => {
+    if (failOnce) { failOnce = false; throw new Error('temporary_claim_failure') }
+    return originalClaim(updatedAt)
+  }
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [], indicators: {} }),
+    model: fakeModel(),
+  })
+  await app.ready()
+  const first = await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'FAILONCE' } })
   await new Promise((resolve) => setTimeout(resolve, 10))
-  const cancelled = await app.inject({ method: 'POST', url: `/api/analyses/${analysisId}/cancel` })
+  const second = await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'RECOVER' } })
+  await waitForStatus(app as any, first.json().analysisId, 'completed')
+  await waitForStatus(app as any, second.json().analysisId, 'completed')
+  await app.close()
+})
+
+test('running 轨迹写入失败会中断已领取任务并恢复后续调度', async () => {
+  const database = createTestProductDatabase()
+  await database.runtimeSettingsRepository.save({ analysisConcurrency: 1 }, new Date().toISOString())
+  const repository = database.agentEventRepository
+  const originalAppend = repository.append
+  let failOnce = true
+  repository.append = async (input) => {
+    if (failOnce && input.event.status === 'planning') {
+      failOnce = false
+      throw new Error('running_trace_write_failed')
+    }
+    return originalAppend(input)
+  }
+  let modelCalls = 0
+  const model = fakeModel()
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [], indicators: {} }),
+    model: { analyze(input: Parameters<typeof model.analyze>[0]) { modelCalls += 1; return model.analyze(input) } },
+  })
+  await app.ready()
+  const first = await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'TRACEFAIL' } })
+  const second = await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'AFTERFAIL' } })
+  const interrupted = await waitForStatus(app as any, first.json().analysisId, 'interrupted')
+  assert.equal(interrupted.error, 'analysis_running_trace_failed')
+  await waitForStatus(app as any, second.json().analysisId, 'completed')
+  assert.equal(modelCalls, 1)
+  await app.close()
+})
+
+test('取消运行任务会以 stopping → stopped 统一收敛模型与生命周期投影', async () => {
+  const database = createTestProductDatabase()
+  let modelStarted!: () => void
+  const started = new Promise<void>((resolve) => { modelStarted = resolve })
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [] }),
+    model: {
+      async *analyze(input) {
+        modelStarted()
+        await new Promise<void>((resolve) => input.signal?.addEventListener('abort', () => resolve(), { once: true }))
+        yield { type: 'cancelled' as const }
+      },
+    },
+  })
+  await app.ready()
+  const { analysisId } = (await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' } })).json()
+  await started
+  const cancelled = await Promise.race([
+    app.inject({ method: 'POST', url: `/api/analyses/${analysisId}/cancel` }),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error('cancel_waited_for_provider')), 100)),
+  ])
   assert.equal(cancelled.statusCode, 202)
-  await waitForStatus(app, analysisId, 'cancelled')
+  await waitForStatus(app, analysisId, 'stopped')
   const research = await app.inject({ method: 'GET', url: `/api/research/${analysisId}` })
-  assert.ok(research.json().trace.some((entry: { status?: string }) => entry.status === 'cancelled'))
+  assert.deepEqual(research.json().trace
+    .filter((entry: { status?: string }) => ['stopping', 'stopped'].includes(entry.status ?? ''))
+    .map((entry: { status: string }) => entry.status), ['stopping', 'stopped'])
+  assert.equal(research.json().status, 'stopped')
+  assert.equal(research.json().mainAgent.status, 'stopped')
+  await app.close()
+})
+
+test('删除运行中研究会先 Abort 并等待本地 Agent 收口，再级联删除且拒绝旧 execution 迟到写', async () => {
+  const database = createTestProductDatabase()
+  let modelStarted!: () => void
+  let releaseAfterAbort!: () => void
+  const started = new Promise<void>((resolve) => { modelStarted = resolve })
+  const afterAbort = new Promise<void>((resolve) => { releaseAfterAbort = resolve })
+  let aborted = false
+  let settled = false
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [] }),
+    model: {
+      async *analyze(input) {
+        modelStarted()
+        await Promise.race([
+          new Promise<void>((resolve) => input.signal?.addEventListener('abort', () => {
+            aborted = true
+            resolve()
+          }, { once: true })),
+          new Promise<void>((resolve) => setTimeout(resolve, 50)),
+        ])
+        if (aborted) await afterAbort
+        settled = true
+        yield { type: 'cancelled' as const }
+      },
+    },
+  })
+  await app.ready()
+  try {
+    const created = (await app.inject({
+      method: 'POST', url: '/api/analyses', payload: { symbol: 'DELETERUN' },
+    })).json()
+    await started
+
+    let deletionSettled = false
+    const deletion = app.inject({
+      method: 'DELETE', url: `/api/research/${created.analysisId}`,
+    }).then((response) => {
+      deletionSettled = true
+      return response
+    })
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    assert.equal(aborted, true)
+    assert.equal(deletionSettled, false)
+
+    releaseAfterAbort()
+    const response = await deletion
+    assert.equal(response.statusCode, 204, response.body)
+    assert.equal(settled, true)
+    assert.equal((await app.inject({
+      method: 'GET', url: `/api/research/${created.analysisId}`,
+    })).statusCode, 404)
+    assert.equal(await database.agentEventRepository.getSession(created.sessionId), null)
+    await assert.rejects(database.agentEventRepository.append({
+      sessionId: created.sessionId,
+      executionId: created.executionId,
+      operationId: `execution:${created.executionId}:late-after-delete`,
+      event: { type: 'model_event', event: { type: 'text_delta', text: 'late' } },
+      createdAt: new Date().toISOString(),
+    }), /agent_execution_fenced|agent_session_not_found/)
+  } finally {
+    releaseAfterAbort()
+    await app.close()
+  }
+})
+
+test('同步硬删除事务进行中拒绝在同一研究上创建新的追问 execution', async () => {
+  const database = createTestProductDatabase()
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [] }),
+    model: fakeModel(),
+  })
+  await app.ready()
+  let releaseDeletion!: () => void
+  let deletionStarted!: () => void
+  const release = new Promise<void>((resolve) => { releaseDeletion = resolve })
+  const started = new Promise<void>((resolve) => { deletionStarted = resolve })
+  try {
+    const created = (await app.inject({
+      method: 'POST', url: '/api/analyses', payload: { symbol: 'DELETECHAT' },
+    })).json()
+    await waitForStatus(app as any, created.analysisId, 'completed')
+    const originalRemove = database.analysisRepository.removeResearch
+    database.analysisRepository.removeResearch = async (analysisId) => {
+      deletionStarted()
+      await release
+      return originalRemove(analysisId)
+    }
+    const deletion = app.inject({
+      method: 'DELETE', url: `/api/research/${created.analysisId}`,
+    })
+    await started
+    const followUp = await app.inject({
+      method: 'POST', url: `/api/analyses/${created.analysisId}/messages`,
+      payload: { messageId: 'late-question', message: '删除时不得创建新 execution。' },
+    })
+    assert.equal(followUp.statusCode, 409)
+    assert.deepEqual(followUp.json(), { error: 'analysis_deleting' })
+    releaseDeletion()
+    assert.equal((await deletion).statusCode, 204)
+  } finally {
+    releaseDeletion()
+    await app.close()
+  }
+})
+
+test('删除 terminal=false 的 budget_exhausted 收口研究仍先 fence 与 Abort', async () => {
+  const database = createTestProductDatabase()
+  let closureStarted!: () => void
+  const closing = new Promise<void>((resolve) => { closureStarted = resolve })
+  let aborted = false
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [] }),
+    model: {
+      async *analyze(input) {
+        yield {
+          type: 'lifecycle' as const, status: 'budget_exhausted' as const,
+          operationId: `execution:${input.executionId}:budget-exhausted`,
+        }
+        closureStarted()
+        await new Promise<void>((resolve) => input.signal?.addEventListener('abort', () => {
+          aborted = true
+          resolve()
+        }, { once: true }))
+        yield { type: 'cancelled' as const }
+      },
+    },
+  })
+  await app.ready()
+  try {
+    const created = (await app.inject({
+      method: 'POST', url: '/api/analyses', payload: { symbol: 'DELBUDG' },
+    })).json()
+    await closing
+    const budgetState = await waitForStatus(app as any, created.analysisId, 'budget_exhausted')
+    assert.equal(budgetState.terminal, false)
+
+    const response = await app.inject({
+      method: 'DELETE', url: `/api/research/${created.analysisId}`,
+    })
+    assert.equal(response.statusCode, 204, response.body)
+    assert.equal(aborted, true)
+    assert.equal(await database.agentEventRepository.getSession(created.sessionId), null)
+  } finally {
+    await app.close()
+  }
+})
+
+test('主研究已终态但专项仍运行时删除会以活跃专项为根先 fence 整棵树', async () => {
+  const database = createTestProductDatabase()
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [] }),
+    model: fakeModel(),
+  })
+  await app.ready()
+  try {
+    const created = (await app.inject({
+      method: 'POST', url: '/api/analyses', payload: { symbol: 'DELCHILD' },
+    })).json()
+    await waitForStatus(app as any, created.analysisId, 'completed')
+    const specialistSessionId = `${created.sessionId}:late-news`
+    const specialistExecutionId = `${specialistSessionId}:execution`
+    await database.agentEventRepository.createSpecialistSession({
+      id: specialistSessionId, analysisId: created.analysisId, domain: 'news',
+      executionId: specialistExecutionId, status: 'planning',
+      operationId: 'late-news-created',
+      event: { type: 'specialist_context', domain: 'news' },
+      createdAt: new Date().toISOString(),
+    })
+
+    const response = await app.inject({
+      method: 'DELETE', url: `/api/research/${created.analysisId}`,
+    })
+    assert.equal(response.statusCode, 204, response.body)
+    assert.equal(await database.agentEventRepository.getSession(created.sessionId), null)
+    assert.equal(await database.agentEventRepository.getSession(specialistSessionId), null)
+  } finally {
+    await app.close()
+  }
+})
+
+test('execution 在枚举后自然完成时删除会重读权威树而不是返回 500', async () => {
+  const database = createTestProductDatabase()
+  const originalFence = database.agentEventRepository.fenceForStopping
+  let raced = false
+  database.agentEventRepository.fenceForStopping = async (input) => {
+    if (!raced) {
+      raced = true
+      await database.agentEventRepository.append({
+        sessionId: input.sessionId, executionId: input.executionId,
+        operationId: `execution:${input.executionId}:naturally-completed`,
+        event: { type: 'status', status: 'completed', terminal: true },
+        projection: { status: 'completed', executionStatus: 'completed', terminal: true },
+        createdAt: new Date().toISOString(),
+      })
+      throw new Error('agent_execution_terminal')
+    }
+    return originalFence(input)
+  }
+  const app = buildProductionApp({
+    ...database, modelConfigured: false,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [] }),
+    model: fakeModel(),
+  })
+  await app.ready()
+  try {
+    const created = (await app.inject({
+      method: 'POST', url: '/api/analyses', payload: { symbol: 'DELRACE' },
+    })).json()
+    const response = await app.inject({
+      method: 'DELETE', url: `/api/research/${created.analysisId}`,
+    })
+    assert.equal(response.statusCode, 204, response.body)
+    assert.equal(raced, true)
+    assert.equal(await database.agentEventRepository.getSession(created.sessionId), null)
+  } finally {
+    await app.close()
+  }
+})
+
+test('外部 HTTP 工具不响应 Abort 时停止仍立即收口且不启动模型', async () => {
+  const database = createTestProductDatabase()
+  await database.runtimeSettingsRepository.save({
+    analysisConcurrency: 2, toolConcurrency: 1,
+  }, new Date().toISOString())
+  let toolStarted!: () => void
+  let toolAborted!: () => void
+  const started = new Promise<void>((resolve) => { toolStarted = resolve })
+  const aborted = new Promise<void>((resolve) => { toolAborted = resolve })
+  let modelCalls = 0
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol, signal) => {
+      if (symbol === 'NEXTSTOP') return { symbol, facts: [fact], gaps: [] }
+      toolStarted()
+      await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve(), {
+        once: true,
+      }))
+      toolAborted()
+      await new Promise(() => {})
+      throw new Error('unreachable')
+    },
+    model: { async *analyze() { modelCalls += 1; yield { type: 'completed' as const, report } } },
+  })
+  await app.ready()
+  const { analysisId } = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'HTTPSTOP' },
+  })).json()
+  await started
+  const response = await Promise.race([
+    app.inject({ method: 'POST', url: `/api/analyses/${analysisId}/cancel` }),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error('cancel_waited_for_http')), 100)),
+  ])
+  assert.equal(response.statusCode, 202)
+  await aborted
+  await waitForStatus(app as any, analysisId, 'stopped')
+  assert.equal(modelCalls, 0)
+  const next = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'NEXTSTOP' },
+  })).json()
+  await waitForStatus(app as any, next.analysisId, 'completed')
+  assert.equal(modelCalls, 1)
+  await app.close()
+})
+
+test('取消并行专项时先 fence 整棵 Agent 树再统一 stopped', async () => {
+  const database = createTestProductDatabase()
+  let specialistStarted!: () => void
+  const started = new Promise<void>((resolve) => { specialistStarted = resolve })
+  const model = {
+    async *analyze(input: any) {
+      const [prepared] = await input.prepareSpecialistBatch([{
+        domain: 'news', researchQuestion: '停止测试', reason: '验证树级 fence',
+      }], `execution:${input.executionId}:cancel-tree`)
+      await input.runNewsSpecialist({
+        launch: true, researchQuestion: '停止测试', reason: '验证树级 fence', prepared,
+      })
+    },
+    async *analyzeNews(input: any) {
+      specialistStarted()
+      await new Promise<void>((resolve) => input.signal.addEventListener('abort', () => resolve(), {
+        once: true,
+      }))
+      yield { type: 'cancelled' as const }
+    },
+  }
+  const emptyFacts = async () => ({ facts: [] })
+  const app = buildProductionApp({
+    ...database, model,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [] }),
+    searchNewsCandidates: emptyFacts, readNewsDocument: emptyFacts, listCompanyEvents: emptyFacts,
+  } as any)
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'CANCELTREE' },
+  })).json()
+  await started
+  const response = await app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/cancel`,
+  })
+  assert.equal(response.statusCode, 202)
+  const research = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  assert.equal(research.mainAgent.execution.status, 'stopped')
+  const news = research.specialistAgents.find((agent: any) => agent.domain === 'news')
+  assert.equal(news.execution.status, 'stopped')
+  assert.equal(news.execution.generation, 2)
+  await app.close()
+})
+
+test('取消已领取但尚未登记 controller 的任务会停止且不启动外部工作', async () => {
+  const database = createTestProductDatabase()
+  const originalSnapshot = database.runtimeSettingsRepository.getExecutionSnapshot
+  let snapshotRequested!: () => void
+  let releaseSnapshot!: () => void
+  const requested = new Promise<void>((resolve) => { snapshotRequested = resolve })
+  const release = new Promise<void>((resolve) => { releaseSnapshot = resolve })
+  database.runtimeSettingsRepository.getExecutionSnapshot = async (executionId) => {
+    snapshotRequested()
+    await release
+    return originalSnapshot(executionId)
+  }
+  let externalCalls = 0
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async () => {
+      externalCalls += 1
+      return { symbol: 'RACE', facts: [fact], gaps: [] }
+    },
+    model: { async *analyze() { externalCalls += 1; yield { type: 'completed' as const, report } } },
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'RACE' },
+  })).json()
+  await requested
+  const response = await app.inject({ method: 'POST', url: `/api/analyses/${created.analysisId}/cancel` })
+  assert.equal(response.statusCode, 202)
+  releaseSnapshot()
+  await waitForStatus(app as any, created.analysisId, 'stopped')
+  await new Promise((resolve) => setTimeout(resolve, 10))
+  assert.equal(externalCalls, 0)
+  const research = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  assert.deepEqual(research.trace
+    .filter((event: { status?: string }) => ['stopping', 'stopped'].includes(event.status ?? ''))
+    .map((event: { status: string }) => event.status), ['stopping', 'stopped'])
+  await app.close()
+})
+
+test('用户手动恢复 stopped 研究会复用主 Session 并创建新 execution generation', async () => {
+  const database = createTestProductDatabase()
+  const toolFact = {
+    ...fact, id: 'fact:RESUME:tool:current', observedAt: new Date().toISOString(),
+    fetchedAt: new Date().toISOString(),
+  }
+  const expiredFact = {
+    ...fact, id: 'fact:RESUME:tool:expired', observedAt: '2020-01-01T00:00:00.000Z',
+    fetchedAt: new Date().toISOString(),
+  }
+  let attempts = 0
+  let contextFetches = 0
+  let firstStarted!: () => void
+  const started = new Promise<void>((resolve) => { firstStarted = resolve })
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => {
+      contextFetches += 1
+      return { symbol, facts: [fact], gaps: [] }
+    },
+    model: {
+      async *analyze(input) {
+        attempts += 1
+        if (attempts === 1) {
+          firstStarted()
+          await new Promise<void>((resolve) => input.signal?.addEventListener('abort', resolve, {
+            once: true,
+          }))
+          yield { type: 'cancelled' as const }
+          return
+        }
+        const resume = input.runtimeResume?.content as {
+          compactionSummary?: Record<string, unknown>
+          reusableToolResults?: Array<{ toolName: string; factIds: string[] }>
+          unresolved?: Array<{ kind: string; id: string; status: string }>
+        }
+        assert.equal(resume.compactionSummary?.narrative, '保留旧 execution 的研究上下文', JSON.stringify(resume))
+        assert.deepEqual(resume.reusableToolResults, [{
+          toolName: 'fetch_financial_context', factIds: [toolFact.id],
+          modelProjection: { facts: [toolFact] },
+        }])
+        assert.deepEqual(resume.unresolved, [{
+          kind: 'tool_call', id: `${originalExecutionId}:failed-batch:call`, status: 'failed',
+        }])
+        yield { type: 'completed' as const, report }
+      },
+    },
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'RESUME' },
+  })).json()
+  await started
+  const originalExecutionId = created.executionId
+  const projection = await database.toolProjectionRepository.ensureVersion({
+    executionId: originalExecutionId, role: 'main', stage: 'research',
+    schemaHash: 'resume-source', projectedTools: [
+      analysisModelTools.find(({ name }) => name === 'fetch_financial_context')!,
+    ],
+    visibleToolNames: ['fetch_financial_context'], reasons: {},
+    createdAt: new Date().toISOString(),
+  })
+  const completeSourceBatch = async (
+    id: string, status: 'completed' | 'failed', result: unknown, isError: boolean,
+  ) => {
+    const toolCallId = `${id}:call`
+    const createdAt = new Date().toISOString()
+    await database.toolProjectionRepository.beginToolBatch({
+      id, executionId: originalExecutionId, projectionId: projection.id, turnIndex: 1,
+      calls: [{ toolCallId, toolName: 'fetch_financial_context', position: 1 }], createdAt,
+    })
+    await database.toolProjectionRepository.completeToolBatch({
+      id, executionId: originalExecutionId, completedAt: createdAt,
+      results: [{
+        toolCallId, status, startedAt: createdAt, completedAt: createdAt, completionOrder: 1,
+        resultPayload: { toolName: 'fetch_financial_context', result, isError },
+        operationId: `${id}:result`, eventPayload: {
+          type: 'tool_result', name: 'fetch_financial_context', toolCallId,
+          result, isError, completedAt: createdAt, completionOrder: 1,
+        },
+      }],
+    })
+  }
+  await completeSourceBatch(
+    `${originalExecutionId}:success-batch`, 'completed', { facts: [toolFact, expiredFact] }, false,
+  )
+  await completeSourceBatch(
+    `${originalExecutionId}:failed-batch`, 'failed', { error: 'source_timeout', facts: [] }, true,
+  )
+  await database.agentEventRepository.commitCompaction({
+    id: `${originalExecutionId}:compaction:1`, executionId: originalExecutionId,
+    segmentId: `${originalExecutionId}:segment:2`,
+    operationId: `${originalExecutionId}:compaction:1:completed`,
+    event: { type: 'compaction', status: 'completed', tokensAfter: 2000 },
+    contextTokens: 120000, contextWindow: 128000, reserveTokens: 16384,
+    keepRecentTokens: 20000, tokensAfter: 2000,
+    summary: { narrative: '保留旧 execution 的研究上下文', isReportEvidence: false },
+    usage: { input: 100, output: 20, totalTokens: 120 },
+    attempts: [{
+      attempt: 1, status: 'completed', durationMs: 20,
+      usage: { input: 100, output: 20, totalTokens: 120 },
+    }],
+    createdAt: new Date().toISOString(),
+  })
+  assert.equal((await app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/cancel`,
+  })).statusCode, 202)
+  await waitForStatus(app as any, created.analysisId, 'stopped')
+  const stopped = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  const stoppedExecutionId = stopped.mainAgent.execution.id
+  assert.equal(stopped.mainAgent.id, created.sessionId)
+  assert.equal(stopped.mainAgent.execution.generation, 2)
+
+  const response = await app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/resume`,
+  })
+  assert.equal(response.statusCode, 202)
+  const resumed = response.json()
+  assert.equal(resumed.sessionId, created.sessionId)
+  assert.equal(resumed.generation, 3)
+  assert.notEqual(resumed.executionId, stoppedExecutionId)
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  const completed = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  assert.equal(completed.mainAgent.id, created.sessionId)
+  assert.equal(completed.mainAgent.execution.id, resumed.executionId)
+  assert.equal(completed.mainAgent.execution.generation, 3)
+  assert.ok(completed.trace.some((event: Record<string, unknown>) => (
+    event.resumed === true
+      && event.previousExecutionId === stoppedExecutionId
+      && event.executionId === resumed.executionId
+  )))
+  assert.equal(contextFetches, 1)
+  await assert.rejects(database.agentEventRepository.append({
+    sessionId: created.sessionId, executionId: originalExecutionId,
+    operationId: `execution:${originalExecutionId}:late-completed-after-resume`,
+    event: { type: 'status', status: 'completed', terminal: true },
+    projection: { status: 'completed', executionStatus: 'completed', terminal: true },
+    createdAt: new Date().toISOString(),
+  }), /agent_execution_fenced/)
+  await app.close()
+})
+
+test('恢复研究直接复用已完成专项 V1 而不创建新专项 execution', async () => {
+  const database = createTestProductDatabase()
+  let mainAttempts = 0
+  let newsRuns = 0
+  let firstSpecialistDone!: () => void
+  const specialistDone = new Promise<void>((resolve) => { firstSpecialistDone = resolve })
+  const specialistReport = {
+    kind: 'specialist' as const, domain: 'news', availability: 'available' as const,
+    status: 'completed' as const, gaps: [], limitations: [], keyJudgments: [],
+  }
+  let originalSpecialist: Record<string, unknown> | undefined
+  const model = {
+    async *analyze(input: any) {
+      mainAttempts += 1
+      const result = await input.runNewsSpecialist({
+        launch: true, researchQuestion: '是否有重大消息？', reason: '需要消息面报告',
+      })
+      if (mainAttempts === 1) {
+        originalSpecialist = result
+        firstSpecialistDone()
+        await new Promise<void>((resolve) => input.signal.addEventListener('abort', resolve, {
+          once: true,
+        }))
+        yield { type: 'cancelled' as const }
+        return
+      }
+      assert.equal(result.sessionId, originalSpecialist?.sessionId)
+      assert.equal(result.executionId, originalSpecialist?.executionId)
+      assert.equal(result.reportId, originalSpecialist?.reportId)
+      assert.equal(result.reportVersion, 1)
+      yield { type: 'completed' as const, report }
+    },
+    async *analyzeNews() {
+      newsRuns += 1
+      yield { type: 'completed' as const, report: { ...report, title: '消息面专项' },
+        reportVersion: { kind: 'specialist' as const, report: specialistReport } }
+    },
+  }
+  const emptyFacts = async () => ({ facts: [] })
+  const app = buildProductionApp({
+    ...database, model,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [] }),
+    searchNewsCandidates: emptyFacts, readNewsDocument: emptyFacts, listCompanyEvents: emptyFacts,
+  } as any)
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'REUSEV1' },
+  })).json()
+  await specialistDone
+  assert.equal((await app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/cancel`,
+  })).statusCode, 202)
+  await waitForStatus(app as any, created.analysisId, 'stopped')
+  assert.equal((await app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/resume`,
+  })).statusCode, 202)
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  const research = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  const news = research.specialistAgents.find((agent: any) => agent.domain === 'news')
+  assert.equal(news.execution.generation, 1)
+  assert.equal(news.reportVersion.version, 1)
+  assert.equal(newsRuns, 1)
+  await app.close()
+})
+
+test('恢复未完成专项时创建新 generation 并注入旧专项成功结果与未决项', async () => {
+  const database = createTestProductDatabase()
+  const newsFact = {
+    ...fact, id: 'fact:RECOVERNEWS:verified', type: 'news', evidenceLevel: 'verified_news',
+    fetchedAt: new Date().toISOString(),
+  }
+  let mainRuns = 0
+  let newsRuns = 0
+  let specialistStarted!: () => void
+  const started = new Promise<void>((resolve) => { specialistStarted = resolve })
+  let firstSpecialistExecution = ''
+  const specialistReport = {
+    kind: 'specialist' as const, domain: 'news', availability: 'available' as const,
+    status: 'completed' as const, gaps: [], limitations: [], keyJudgments: [],
+  }
+  const model = {
+    async *analyze(input: any) {
+      mainRuns += 1
+      const outcome = await input.runNewsSpecialist({
+        launch: true, researchQuestion: '恢复消息专项', reason: '验证专项重建',
+      })
+      if (mainRuns === 1) {
+        const aborted = new Promise<void>((resolve) => input.signal.addEventListener('abort', resolve, {
+          once: true,
+        }))
+        specialistStarted()
+        await aborted
+        yield { type: 'cancelled' as const }
+        return
+      }
+      assert.equal(outcome.reportVersion, 1)
+      yield { type: 'completed' as const, report }
+    },
+    async *analyzeNews(input: any) {
+      newsRuns += 1
+      if (newsRuns === 1) {
+        firstSpecialistExecution = input.executionId
+        const projection = await input.toolRuntime.ensureProjection({
+          executionId: input.executionId, role: 'news', stage: 'research',
+          tools: [newsSpecialistTools.find(({ name }) => name === 'search_news_candidates')!],
+          createdAt: new Date().toISOString(),
+        })
+        const completedAt = new Date().toISOString()
+        await input.toolRuntime.beginToolBatch({
+          id: `${input.executionId}:completed-batch`, executionId: input.executionId,
+          projectionId: projection.id, turnIndex: 1,
+          calls: [{ toolCallId: 'news-success', toolName: 'search_news_candidates', position: 1 }],
+          createdAt: completedAt,
+        })
+        await input.toolRuntime.completeToolBatch({
+          id: `${input.executionId}:completed-batch`, executionId: input.executionId,
+          results: [{
+            toolCallId: 'news-success', toolName: 'search_news_candidates', status: 'completed',
+            startedAt: completedAt, completedAt, completionOrder: 1,
+            result: { facts: [newsFact] }, isError: false, operationId: 'news-success-result',
+          }], completedAt,
+        })
+        await input.toolRuntime.beginToolBatch({
+          id: `${input.executionId}:failed-batch`, executionId: input.executionId,
+          projectionId: projection.id, turnIndex: 2,
+          calls: [{ toolCallId: 'news-failed', toolName: 'search_news_candidates', position: 1 }],
+          createdAt: completedAt,
+        })
+        await input.toolRuntime.completeToolBatch({
+          id: `${input.executionId}:failed-batch`, executionId: input.executionId,
+          results: [{
+            toolCallId: 'news-failed', toolName: 'search_news_candidates', status: 'failed',
+            startedAt: completedAt, completedAt, completionOrder: 1,
+            result: { error: 'source_timeout', facts: [] }, isError: true,
+            operationId: 'news-failed-result',
+          }], completedAt,
+        })
+        yield { type: 'cancelled' as const }
+        return
+      }
+      assert.notEqual(input.executionId, firstSpecialistExecution)
+      assert.deepEqual(input.runtimeResume?.content.reusableToolResults, [{
+        toolName: 'search_news_candidates', factIds: [newsFact.id],
+        modelProjection: { facts: [newsFact] },
+      }])
+      assert.deepEqual(input.runtimeResume?.content.unresolved, [{
+        kind: 'tool_call', id: 'news-failed', status: 'failed',
+      }])
+      yield { type: 'completed' as const, report: { ...report, title: '恢复消息专项' },
+        reportVersion: { kind: 'specialist' as const, report: specialistReport } }
+    },
+  }
+  const emptyFacts = async () => ({ facts: [] })
+  const app = buildProductionApp({
+    ...database, model,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [] }),
+    searchNewsCandidates: emptyFacts, readNewsDocument: emptyFacts, listCompanyEvents: emptyFacts,
+  } as any)
+  await app.ready()
+  const createdResponse = await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'RCVNEWS' },
+  })
+  assert.equal(createdResponse.statusCode, 202)
+  const created = createdResponse.json()
+  await started
+  assert.equal((await app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/cancel`,
+  })).statusCode, 202)
+  await waitForStatus(app as any, created.analysisId, 'stopped')
+  assert.equal((await app.inject({
+    method: 'POST', url: `/api/analyses/${created.analysisId}/resume`,
+  })).statusCode, 202)
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  const research = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  const news = research.specialistAgents.find((agent: any) => agent.domain === 'news')
+  assert.equal(news.execution.generation, 2)
+  assert.equal(newsRuns, 2)
   await app.close()
 })
 
 test('重启后未完成任务标记为中断且不会自动执行', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'vibe-analysis-restart-'))
-  const databasePath = join(dir, 'app.db')
-  const first = await makeApp(databasePath, fakeModel(1000), 0)
-  const { analysisId } = (await first.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' } })).json()
-  await first.close()
+  const database = createTestProductDatabase()
+  const analysisId = crypto.randomUUID()
+  const sessionId = crypto.randomUUID()
+  await database.agentEventRepository.createResearch({
+    analysisId,
+    sessionId,
+    executionId: crypto.randomUUID(),
+    symbol: 'NVDA',
+    status: 'queued',
+    operationId: `session:${sessionId}:created`,
+    event: { type: 'status', status: 'queued' },
+    createdAt: new Date().toISOString(),
+  })
   let calls = 0
-  const second = await makeApp(databasePath, { async *analyze() { calls += 1; yield { type: 'completed' as const, report } } })
+  const second = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [], indicators: {} }),
+    model: { async *analyze() { calls += 1; yield { type: 'completed' as const, report } }, },
+  })
+  await second.ready()
   const status = (await second.inject({ method: 'GET', url: `/api/analyses/${analysisId}` })).json()
   assert.equal(status.status, 'interrupted')
+  const replay = await second.inject({
+    method: 'GET', url: `/api/agent-sessions/${sessionId}/events`,
+  })
+  assert.match(replay.body, /event: interrupted/)
+  assert.match(replay.body, new RegExp(`id: ${sessionId}:2`))
   assert.equal(calls, 0)
   await second.close()
 })
 
 test('研究记录可以查询、标记、备注并按共享引用安全删除事实', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'vibe-research-'))
-  const app = await makeApp(join(dir, 'app.db'))
+  const app = await makeApp(join(dir, 'storage'))
   const first = (await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' } })).json()
   await waitForStatus(app, first.analysisId, 'completed')
   const second = (await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' } })).json()
@@ -171,7 +2781,7 @@ test('无持仓时宿主移除个性化建议且限制报告保存为部分完�
     conditionalSuggestion: '若下跌则减仓',
     limitations: ['财报输入缺失'],
   }
-  const app = await makeApp(join(dir, 'app.db'), {
+  const app = await makeApp(join(dir, 'storage'), {
     async *analyze() { yield { type: 'completed' as const, report: partialReport } },
   })
   const { analysisId } = (await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' } })).json()
@@ -186,7 +2796,7 @@ test('分析持仓语境使用组合内全部标的行情计算占比但不披�
   const dir = await mkdtemp(join(tmpdir(), 'vibe-analysis-portfolio-'))
   let capturedContext: any
   const app = buildApp({
-    databasePath: join(dir, 'app.db'),
+    storageKey: join(dir, 'storage'),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [] }),
     fetchMarketPrices: async (symbols) => {
@@ -218,7 +2828,7 @@ test('分析持仓语境使用组合内全部标的行情计算占比但不披�
 test('组合辅助行情失败时保留当前标的分析并明确个性化限制', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'vibe-analysis-portfolio-gap-'))
   const app = buildApp({
-    databasePath: join(dir, 'app.db'),
+    storageKey: join(dir, 'storage'),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [] }),
     fetchMarketPrices: async () => { throw new Error('quotes_down') },
@@ -238,7 +2848,7 @@ test('组合辅助行情失败时保留当前标的分析并明确个性化限�
 test('关键行情、财报和新闻缺失时宿主强制形成受限报告', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'vibe-analysis-gaps-'))
   const app = buildApp({
-    databasePath: join(dir, 'app.db'),
+    storageKey: join(dir, 'storage'),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({
       symbol, facts: [],
@@ -259,7 +2869,7 @@ test('工具补查返回的事实进入研究证据集合', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'vibe-analysis-tool-fact-'))
   const extraFact = { ...fact, id: 'fact:tool:extra', type: 'news' }
   const app = buildApp({
-    databasePath: join(dir, 'app.db'),
+    storageKey: join(dir, 'storage'),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [] }),
     model: {
@@ -277,16 +2887,101 @@ test('工具补查返回的事实进入研究证据集合', async () => {
   await app.close()
 })
 
+test('Runtime 按模型请求、工具批次与报告收口持久化真实状态序列', async () => {
+  const database = createTestProductDatabase()
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [] }),
+    model: {
+      async *analyze() {
+        yield { type: 'lifecycle' as const, status: 'running_model' as const, operationId: 'model-request-1' }
+        yield { type: 'lifecycle' as const, status: 'running_tools' as const, operationId: 'tool-batch-1' }
+        yield { type: 'trace' as const, entry: {
+          type: 'tool_call' as const, name: 'fetch_financial_context', input: {}, operationId: 'tool-call-1',
+        } }
+        yield { type: 'trace' as const, entry: {
+          type: 'tool_result' as const, name: 'fetch_financial_context', result: { facts: [] },
+          isError: false, operationId: 'tool-result-1',
+        } }
+        yield { type: 'lifecycle' as const, status: 'running_model' as const, operationId: 'model-request-2' }
+        yield {
+          type: 'lifecycle' as const,
+          status: 'waiting_for_specialists' as const,
+          operationId: 'specialist-wait-1',
+        }
+        yield { type: 'lifecycle' as const, status: 'finalizing' as const, operationId: 'report-closure' }
+        yield { type: 'completed' as const, report }
+      },
+    },
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'SEQUENCE' },
+  })).json()
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  const research = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  assert.deepEqual(research.mainAgent.events
+    .filter((event: { type?: string }) => event.type === 'status')
+    .map((event: { status: string }) => event.status), [
+    'planning', 'running_model', 'running_model', 'running_tools',
+    'running_model', 'waiting_for_specialists', 'finalizing', 'completed',
+  ])
+  for (const event of research.mainAgent.events.filter(
+    (item: { status?: string }) => [
+      'running_model', 'running_tools', 'waiting_for_specialists', 'finalizing',
+    ].includes(item.status ?? ''),
+  )) assert.ok(event.waitReason?.startedAt)
+  await app.close()
+})
+
+test('Runtime 重放同一 operationId 不追加第二条业务事件', async () => {
+  const app = buildApp({
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [] }),
+    model: {
+      async *analyze(): AsyncGenerator<ModelEvent> {
+        const replayed = {
+          type: 'tool_call' as const,
+          name: 'fetch_financial_context',
+          input: { symbol: 'NVDA' },
+          operationId: 'tool:provider-call-1:call',
+        }
+        yield { type: 'trace', entry: replayed }
+        yield { type: 'trace', entry: replayed }
+        yield { type: 'completed', report, operationId: 'tool:provider-report-1:report' }
+      },
+    },
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' },
+  })).json() as { analysisId: string }
+  await waitForStatus(app as any, created.analysisId, 'completed')
+  const research = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })).json()
+  assert.equal(research.trace.filter((entry: { operationId?: string }) => (
+    entry.operationId === 'tool:provider-call-1:call'
+  )).length, 1)
+  await app.close()
+})
+
 test('分析轨迹永久保存系统指令、用户语境、模型用量和最终状态', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'vibe-analysis-trace-'))
   const app = buildApp({
-    databasePath: join(dir, 'app.db'),
+    storageKey: join(dir, 'storage'),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [] }),
     model: {
       async *analyze(input: any) {
         yield { type: 'trace' as const, entry: { type: 'system_prompt' as const, content: input.systemPrompt } }
         yield { type: 'trace' as const, entry: { type: 'user_input' as const, content: input.userPrompt } }
+        yield { type: 'trace' as const, entry: {
+          type: 'model_event' as const, event: { type: 'thinking_delta', delta: '隐藏推理' },
+        } }
         yield { type: 'completed' as const, report, usage: { input: 100, output: 20, cost: 0.01 }, stopReason: 'toolUse' }
       },
     },
@@ -299,10 +2994,399 @@ test('分析轨迹永久保存系统指令、用户语境、模型用量和最�
   assert.ok(research.trace.some((entry: { type: string }) => entry.type === 'user_input'))
   assert.ok(research.trace.some((entry: { type: string; stopReason?: string }) => entry.type === 'model_completed' && entry.stopReason === 'toolUse'))
   assert.equal(JSON.stringify(research.trace).includes('"cost":0.01'), true)
+  assert.equal(JSON.stringify(research.trace).includes('隐藏推理'), false)
   await app.close()
 })
 
-test('完整历史写入冻结快照但只向模型提供最近十条日线', async () => {
+test('研究导出包含用户可读事实与报告且排除凭据、原包、隐藏推理和 fencing 数据', async () => {
+  const app = buildApp({
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [] }),
+    model: {
+      async *analyze() {
+        yield { type: 'trace' as const, entry: {
+          type: 'model_event' as const,
+          event: {
+            type: 'toolcall_delta',
+            delta: '{"authorization":"Bearer sk-delta-secret","fullText":"delta 版权全文"}',
+          },
+        } }
+        yield { type: 'trace' as const, entry: {
+          type: 'tool_result' as const, name: 'fetch_financial_context', isError: false,
+          result: {
+            facts: [fact, {
+              ...fact, id: 'fact:external:document', type: 'news',
+              value: {
+                title: '受控标题', summary: '受控事实摘要', url: 'https://example.com/news',
+                content: '版权全文不得通过通用 value.content 导出',
+                articleText: '版权全文不得通过 value.articleText 别名导出',
+                providerEnvelope: { response: 'Provider 原始响应不得导出' },
+              },
+            }, {
+              ...fact, id: 'fact:external:event', type: 'company_event',
+              value: {
+                symbol: 'NVDA', title: '受控公司事件', summary: '有限事件摘要',
+                url: 'https://example.com/event', articleText: '事件版权全文',
+              },
+            }, {
+              ...fact, id: 'fact:external:valuation', type: 'valuation',
+              value: {
+                current_multiples: { pe: 70.28 }, historical_ranges: { pe: [30.74, 56.58] },
+                comparable_symbols: ['AMD', 'AVGO'], providerEnvelope: '估值原包',
+              },
+            }, {
+              ...fact, id: 'fact:external:unknown', type: 'provider_blob',
+              value: '未知事实类型携带隐藏 reasoning 或版权全文',
+            }, {
+              ...fact, id: 'fact:external:invalid-quote', type: 'quote',
+              value: '伪装成 quote 的隐藏 reasoning 或版权全文',
+            }, {
+              ...fact, id: 'fact:external:long-news', type: 'news',
+              value: {
+                title: `受控标题${'版权正文'.repeat(200)}`,
+                summary: `受控摘要${'版权正文'.repeat(500)}`,
+                url: 'https://example.com/long-news',
+              },
+            }, {
+              ...fact, id: 'fact:external:userinfo', type: 'news',
+              value: {
+                title: '带凭据 URL', summary: '应保留文本但移除 URL',
+                url: 'https://alice:password@example.com/private',
+              },
+              sourceReference: 'https://alice:password@example.com/private',
+            }],
+            summary: [
+              '可导出的受控摘要 ghp_abcdefghijklmnopqrstuvwxyz123456 AKIAABCDEFGHIJKLMNOP',
+              'AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+            ].join(' '),
+            privateDiagnostic: '仅数据库诊断', providerRaw: { requestId: 'provider-secret' },
+            authorization: 'Bearer private-token', cookie: 'session=private-cookie',
+            reasoning: '隐藏推理', fullText: '版权正文不得导出',
+            credentials: { password: 'credential-secret' },
+            rawPayload: { providerResponse: 'provider-response-secret' },
+            chainOfThought: '隐藏思维链', documentBody: '版权正文别名不得导出',
+          },
+        } }
+        yield { type: 'trace' as const, entry: {
+          type: 'tool_result' as const, name: 'get_financial_overview', isError: false,
+          result: {
+            facts: [], overview: {
+              symbol: 'NVDA', latestPeriod: '2026-Q2',
+              qualityFlags: [{ flag_type: 'margin_pressure', severity: 'medium', period: '2026-Q2' }],
+              providerEnvelope: { raw: 'Overview Provider 原包不得导出' },
+              articleText: 'Overview 版权全文不得导出',
+            },
+          },
+        } }
+        yield {
+          type: 'completed' as const, report,
+          reportVersion: { kind: 'integrated' as const, report: reportCandidate },
+        }
+      },
+    },
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' },
+  })).json() as { analysisId: string }
+  await waitForStatus(app as any, created.analysisId, 'completed')
+
+  const response = await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}/export`,
+  })
+
+  assert.equal(response.statusCode, 200)
+  assert.match(response.headers['content-disposition'] ?? '', /attachment/)
+  const exported = response.json()
+  assert.equal(exported.schemaVersion, 1)
+  assert.equal(exported.analysis.id, created.analysisId)
+  assert.equal(exported.analysis.symbol, 'NVDA')
+  assert.equal(exported.reportVersions[0].report.title, report.title)
+  assert.ok(exported.facts.some((item: { id: string }) => item.id === fact.id))
+  assert.equal(exported.configurationVersions.length, 1)
+  assert.equal(exported.configurationVersions[0].id, 1)
+  assert.equal(typeof exported.configurationVersions[0].createdAt, 'string')
+  assert.equal(exported.configurationVersions[0].values.modelConcurrency, 4)
+  assert.ok(exported.trace.some((item: { type: string; result?: { summary?: string } }) => (
+    item.type === 'tool_result' && item.result?.summary?.includes('可导出的受控摘要')
+  )))
+  const serialized = JSON.stringify(exported)
+  assert.doesNotMatch(serialized, /privateDiagnostic|仅数据库诊断|providerRaw|provider-secret/)
+  assert.doesNotMatch(serialized, /authorization|private-token|cookie|private-cookie/i)
+  assert.doesNotMatch(serialized, /reasoning|隐藏推理|fullText|版权正文不得导出/)
+  assert.doesNotMatch(serialized, /credential-secret|provider-response-secret|隐藏思维链|版权正文别名不得导出/)
+  assert.doesNotMatch(serialized, /sk-export-secret|版权全文不得通过通用 value\.content 导出/)
+  assert.doesNotMatch(serialized, /ghp_abcdefghijklmnopqrstuvwxyz123456|AKIAABCDEFGHIJKLMNOP/)
+  assert.doesNotMatch(serialized, /wJalrXUtnFEMI\/K7MDENG\/bPxRfiCYEXAMPLEKEY/)
+  assert.doesNotMatch(serialized, /value\.articleText|Provider 原始响应不得导出/)
+  assert.doesNotMatch(serialized, /未知事实类型携带隐藏 reasoning 或版权全文/)
+  assert.doesNotMatch(serialized, /伪装成 quote 的隐藏 reasoning 或版权全文/)
+  const boundedNews = exported.facts.find((item: { id: string }) => (
+    item.id === 'fact:external:long-news'
+  ))
+  assert.ok(boundedNews.value.title.length <= 300)
+  assert.ok(boundedNews.value.summary.length <= 1_000)
+  const userinfoFact = exported.facts.find((item: { id: string }) => (
+    item.id === 'fact:external:userinfo'
+  ))
+  assert.equal('url' in userinfoFact.value, false)
+  assert.equal('sourceReference' in userinfoFact, false)
+  assert.doesNotMatch(serialized, /alice:password/)
+  const eventFact = exported.facts.find((item: { id: string }) => item.id === 'fact:external:event')
+  assert.deepEqual(eventFact.value, {
+    symbol: 'NVDA', title: '受控公司事件', summary: '有限事件摘要',
+    url: 'https://example.com/event',
+  })
+  const valuationFact = exported.facts.find((item: { id: string }) => (
+    item.id === 'fact:external:valuation'
+  ))
+  assert.deepEqual(valuationFact.value, {
+    current_multiples: { pe: 70.28 }, historical_ranges: { pe: [30.74, 56.58] },
+    comparable_symbols: ['AMD', 'AVGO'],
+  })
+  const overviewResult = exported.trace.find((item: { type: string; name?: string }) => (
+    item.type === 'tool_result' && item.name === 'get_financial_overview'
+  )).result
+  assert.deepEqual(overviewResult.overview, {
+    symbol: 'NVDA', latestPeriod: '2026-Q2',
+    qualityFlags: [{ flag_type: 'margin_pressure', severity: 'medium', period: '2026-Q2' }],
+  })
+  assert.doesNotMatch(serialized, /Overview Provider 原包不得导出|Overview 版权全文不得导出/)
+  assert.doesNotMatch(serialized, /sk-delta-secret|delta 版权全文/)
+  assert.doesNotMatch(serialized, /generation|fenc|operationId|previousExecutionId|sourceExecutionIds/i)
+  await app.close()
+})
+
+test('研究详情展开视图保留受控工具摘要但字段级脱敏内部诊断、凭据与隐藏推理', async () => {
+  const app = buildApp({
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({
+      symbol, facts: [fact], gaps: [], privateDiagnostic: '快照内部诊断',
+    }),
+    model: {
+      async *analyze() {
+        yield { type: 'trace' as const, entry: {
+          type: 'tool_result' as const, name: 'fetch_financial_context', isError: false,
+          result: {
+            facts: [fact], summary: '用户可见摘要 Authorization: Bearer sk-view-secret',
+            privateDiagnostic: '工具内部诊断',
+            providerRaw: { response: 'raw-secret' }, authorization: 'Bearer secret',
+            cookie: 'sid=secret', reasoning: 'hidden-chain',
+          },
+        } }
+        yield {
+          type: 'completed' as const, report,
+          reportVersion: { kind: 'integrated' as const, report: reportCandidate },
+        }
+      },
+    },
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' },
+  })).json() as { analysisId: string }
+  await waitForStatus(app as any, created.analysisId, 'completed')
+
+  const response = await app.inject({ method: 'GET', url: `/api/research/${created.analysisId}` })
+
+  assert.equal(response.statusCode, 200)
+  const serialized = response.body
+  assert.match(serialized, /用户可见摘要/)
+  assert.doesNotMatch(serialized, /privateDiagnostic|快照内部诊断|工具内部诊断/)
+  assert.doesNotMatch(serialized, /providerRaw|raw-secret|authorization|Bearer secret/i)
+  assert.doesNotMatch(serialized, /cookie|sid=secret|reasoning|hidden-chain/i)
+  assert.doesNotMatch(serialized, /sk-view-secret/)
+  const statusResponse = await app.inject({
+    method: 'GET', url: `/api/analyses/${created.analysisId}`,
+  })
+  assert.match(statusResponse.body, /NVDA/)
+  assert.doesNotMatch(statusResponse.body, /privateDiagnostic|快照内部诊断/)
+  const listResponse = await app.inject({ method: 'GET', url: '/api/research?symbol=NVDA' })
+  assert.match(listResponse.body, /NVDA/)
+  assert.doesNotMatch(listResponse.body, /privateDiagnostic|快照内部诊断|raw-secret|hidden-chain/)
+  const updateResponse = await app.inject({
+    method: 'PATCH', url: `/api/research/${created.analysisId}`, payload: { note: '公开备注' },
+  })
+  assert.equal(updateResponse.statusCode, 200)
+  assert.match(updateResponse.body, /公开备注/)
+  assert.doesNotMatch(updateResponse.body, /privateDiagnostic|快照内部诊断|raw-secret|hidden-chain/)
+  await app.close()
+})
+
+test('工具运行时回放保留受控结果但字段级脱敏内部诊断、凭据与隐藏推理', async () => {
+  const database = createTestProductDatabase()
+  const createdAt = new Date().toISOString()
+  const analysisId = 'analysis-public-tool-runtime'
+  const sessionId = 'session-public-tool-runtime'
+  const executionId = 'execution-public-tool-runtime'
+  await database.agentEventRepository.createResearch({
+    analysisId, sessionId, executionId, symbol: 'SAFE', status: 'planning',
+    operationId: 'runtime-context', event: { type: 'runtime_context' }, createdAt,
+  })
+  const projection = await database.toolProjectionRepository.ensureVersion({
+    executionId, role: 'main', stage: 'research', schemaHash: 'public-runtime',
+    projectedTools: [], visibleToolNames: ['fetch_financial_context'], reasons: {}, createdAt,
+  })
+  const result = {
+    summary: '运行时用户可见摘要', privateDiagnostic: '运行时内部诊断',
+    providerRaw: { body: '运行时原包' }, authorization: 'Bearer runtime-secret',
+    cookie: 'sid=runtime-secret', reasoning: '运行时隐藏推理',
+  }
+  await database.toolProjectionRepository.beginToolBatch({
+    id: 'public-runtime-batch', executionId, projectionId: projection.id, turnIndex: 1,
+    calls: [{ toolCallId: 'public-runtime-call', toolName: 'fetch_financial_context', position: 1 }],
+    createdAt,
+  })
+  await database.toolProjectionRepository.completeToolBatch({
+    id: 'public-runtime-batch', executionId, completedAt: createdAt,
+    results: [{
+      toolCallId: 'public-runtime-call', status: 'completed', startedAt: createdAt,
+      completedAt: createdAt, completionOrder: 1,
+      resultPayload: { toolName: 'fetch_financial_context', result, isError: false },
+      operationId: 'public-runtime-result', eventPayload: {
+        type: 'tool_result', name: 'fetch_financial_context', result, isError: false,
+      },
+    }],
+  })
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+  })
+
+  const response = await app.inject({
+    method: 'GET', url: `/api/agent-sessions/${sessionId}/tool-runtime?executionId=${executionId}`,
+  })
+
+  assert.equal(response.statusCode, 200)
+  assert.match(response.body, /运行时用户可见摘要/)
+  assert.doesNotMatch(response.body, /privateDiagnostic|运行时内部诊断|providerRaw|运行时原包/)
+  assert.doesNotMatch(response.body, /authorization|runtime-secret|cookie|reasoning|运行时隐藏推理/i)
+  await app.close()
+})
+
+test('报告版本读取保留报告正文但字段级脱敏内部诊断、凭据与隐藏推理', async () => {
+  const app = buildApp({
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [] }),
+    model: {
+      async *analyze() {
+        yield {
+          type: 'completed' as const, report,
+          reportVersion: { kind: 'integrated' as const, report: {
+            ...reportCandidate, privateDiagnostic: '报告内部诊断',
+            providerRaw: { body: '报告原包' }, authorization: 'Bearer report-secret',
+            cookie: 'sid=report-secret', reasoning: '报告隐藏推理',
+          } },
+        }
+      },
+    },
+  })
+  await app.ready()
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' },
+  })).json() as { analysisId: string }
+  await waitForStatus(app as any, created.analysisId, 'completed')
+
+  const response = await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}/report-versions`,
+  })
+
+  assert.equal(response.statusCode, 200)
+  assert.match(response.body, new RegExp(report.title))
+  assert.doesNotMatch(response.body, /privateDiagnostic|报告内部诊断|providerRaw|报告原包/)
+  assert.doesNotMatch(response.body, /authorization|report-secret|cookie|reasoning|报告隐藏推理/i)
+  await app.close()
+})
+
+test('首次研究把系统生成的 Runtime Context 追加到上下文末尾且不伪装为用户问题', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'vibe-first-research-runtime-context-'))
+  let modelInput: Record<string, unknown> | undefined
+  const app = buildApp({
+    storageKey: join(dir, 'storage'),
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [], indicators: {} }),
+    model: {
+      async *analyze(input: any) {
+        modelInput = input
+        yield { type: 'completed' as const, report }
+      },
+    },
+  })
+  await app.ready()
+
+  const created = await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' } })
+  await waitForStatus(app as any, created.json().analysisId, 'completed')
+  const research = (await app.inject({
+    method: 'GET', url: `/api/research/${created.json().analysisId}`,
+  })).json()
+
+  assert.match(String(modelInput?.systemPrompt), /^你是个人美股研究助手/)
+  assert.equal(modelInput?.userPrompt, undefined)
+  assert.deepEqual(modelInput?.runtimeContext && {
+    role: (modelInput.runtimeContext as any).role,
+    generatedBy: (modelInput.runtimeContext as any).generatedBy,
+    isUserInput: (modelInput.runtimeContext as any).isUserInput,
+    symbol: (modelInput.runtimeContext as any).content.symbol,
+  }, {
+    role: 'runtime_context', generatedBy: 'product_runtime', isUserInput: false, symbol: 'NVDA',
+  })
+  assert.ok(research.trace.some((entry: { type: string }) => entry.type === 'runtime_context'))
+  assert.equal(research.trace.some((entry: { type: string }) => entry.type === 'user_input'), false)
+  await app.close()
+})
+
+test('首次研究起始资料完整描述能力、工具与报告目标且不注入预算', async () => {
+  const bars = Array.from({ length: 24 }, (_, index) => ({
+    ...fact, id: `fact:context-bar:${index}`, type: 'daily_bar',
+    value: { date: `2026-07-${String(index + 1).padStart(2, '0')}`, close: 190 + index },
+    observedAt: `2026-07-${String(index + 1).padStart(2, '0')}`,
+  }))
+  let runtimeContext: any
+  const app = buildApp({
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({
+      symbol, facts: [fact, ...bars], gaps: [{ capability: 'news', reason: 'source_unavailable' }],
+      quote: { value: 217.5, adopted_source: 'sina', sources: [{ source: 'sina', status: 'ok' }] },
+      history: { items: bars, adopted_source: 'alpaca', sources: [{ source: 'alpaca', status: 'ok' }] },
+      fundamentals: { value: { quarters: [{ period: 'CY2026Q2' }], annuals: [], derived_metrics: [] } },
+      valuation: null,
+    }),
+    model: {
+      async *analyze(input: any) {
+        runtimeContext = input.runtimeContext?.content
+        yield { type: 'completed' as const, report }
+      },
+    },
+  })
+  await app.ready()
+  const created = await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' } })
+  await waitForStatus(app as any, created.json().analysisId, 'partial')
+
+  assert.equal(runtimeContext.symbol, 'NVDA')
+  assert.equal(runtimeContext.analysisPeriod, '未来一至四周')
+  assert.equal(runtimeContext.marketSummary.currentPrice, 217.5)
+  assert.equal(runtimeContext.recentDailyBars.length, 20)
+  assert.equal(runtimeContext.latestFinancialPeriod, 'CY2026Q2')
+  assert.equal(runtimeContext.capabilityStatus.quote.status, 'available')
+  assert.equal(runtimeContext.capabilityStatus.history.status, 'available')
+  assert.equal(runtimeContext.capabilityStatus.news.status, 'unavailable')
+  assert.equal(runtimeContext.capabilityStatus.valuation.status, 'unavailable')
+  assert.deepEqual(runtimeContext.availableTools.map(({ name }: { name: string }) => name), [
+    'fetch_financial_context', 'run_fundamental_analysis', 'run_news_analysis',
+    'run_technical_analysis', 'submit_analysis_report',
+  ])
+  assert.deepEqual(runtimeContext.specialistCapabilities, [
+    { domain: 'news', responsibility: '核实消息、公司事件及相反证据' },
+    { domain: 'fundamental_valuation', responsibility: '解释财务表现、估值输入与数据缺口' },
+    { domain: 'technical', responsibility: '解释多周期量价与确定性技术指标' },
+  ])
+  assert.match(runtimeContext.finalReportGoal, /候选结构化综合报告/)
+  assert.ok(runtimeContext.personalContext)
+  assert.doesNotMatch(JSON.stringify(runtimeContext), /mainAgentToolRounds|researchActiveMinutes|elapsed|budget/i)
+  await app.close()
+})
+
+test('完整历史写入冻结快照且首次研究起始资料提供最近二十条日线', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'vibe-analysis-model-context-'))
   const bars = Array.from({ length: 180 }, (_, index) => ({
     ...fact, id: `fact:bar:${index}`, type: 'daily_bar',
@@ -310,7 +3394,7 @@ test('完整历史写入冻结快照但只向模型提供最近十条日线', as
   }))
   let modelFactCount = 0
   const app = buildApp({
-    databasePath: join(dir, 'app.db'),
+    storageKey: join(dir, 'storage'),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact, ...bars], gaps: [], indicators: {} }),
     model: {
@@ -326,7 +3410,7 @@ test('完整历史写入冻结快照但只向模型提供最近十条日线', as
   await waitForStatus(app as any, created.json().analysisId, 'completed')
   const research = (await app.inject({ method: 'GET', url: `/api/research/${created.json().analysisId}` })).json()
   assert.equal(research.snapshot.facts.filter((item: { type: string }) => item.type === 'daily_bar').length, 180)
-  assert.equal(modelFactCount, 10)
+  assert.equal(modelFactCount, 20)
   await app.close()
 })
 
@@ -349,7 +3433,7 @@ test('完整多期财报写入快照但模型只收到决策窗口和可追溯�
   }))
   let modelContext: any
   const app = buildApp({
-    databasePath: join(dir, 'app.db'),
+    storageKey: join(dir, 'storage'),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({
       symbol, facts: [fact, ...financialFacts, derived], gaps: [],
@@ -386,7 +3470,7 @@ test('完整多期财报写入快照但模型只收到决策窗口和可追溯�
 test('金融上下文事件包含主备来源切换信息', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'vibe-analysis-degraded-event-'))
   const app = buildApp({
-    databasePath: join(dir, 'app.db'),
+    storageKey: join(dir, 'storage'),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({
       symbol, facts: [fact], gaps: [],
@@ -413,7 +3497,7 @@ test('系统指令要求先取冻结上下文、逐项引用依据并按缺口�
   const dir = await mkdtemp(join(tmpdir(), 'vibe-analysis-prompt-'))
   let systemPrompt = ''
   const app = buildApp({
-    databasePath: join(dir, 'app.db'),
+    storageKey: join(dir, 'storage'),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [] }),
     model: {
@@ -428,6 +3512,11 @@ test('系统指令要求先取冻结上下文、逐项引用依据并按缺口�
   await waitForStatus(app as any, created.json().analysisId, 'completed')
   assert.match(systemPrompt, /fetch_financial_context/)
   assert.match(systemPrompt, /keyJudgments/)
+  assert.match(systemPrompt, /market.*market_observation.*news.*verified_news.*fundamental.*reported_financial.*technical.*deterministic_technical.*operational.*runtime_observation/)
+  assert.match(systemPrompt, /supportingEvidence.*contraryEvidence.*精确 fact\.id/)
+  assert.match(systemPrompt, /targetPrice/)
+  assert.match(systemPrompt, /deterministic_valuation.*method.*inputs.*range.*asOf.*原样复制/)
+  assert.match(systemPrompt, /evidence.*deterministic_valuation.*精确 fact\.id/)
   assert.match(systemPrompt, /缺行情不得判断走势/)
   assert.match(systemPrompt, /财报增长率.*由宿主程序计算/)
   assert.match(systemPrompt, /不重新计算/)

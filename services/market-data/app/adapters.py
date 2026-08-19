@@ -1,14 +1,18 @@
 import gzip
+import http.client
+import ipaddress
 import json
 import os
 import re
+import socket
+import ssl
 import time
 from hashlib import sha256
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import List
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urljoin, urlsplit, urlunsplit
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from xml.etree import ElementTree
@@ -41,6 +45,189 @@ def _read(url: str, params=None, headers=None, timeout=15) -> bytes:
     return payload
 
 
+ALLOWED_DOCUMENT_CONTENT_TYPES = {"text/html", "text/plain", "application/xhtml+xml"}
+
+
+def validate_document_url(url: str) -> str:
+    return _resolve_document_url(url)[0]
+
+
+def _resolve_document_url(url: str):
+    normalized, addresses, port, host = _resolve_document_addresses(url)
+    return normalized, addresses[0], port, host
+
+
+def _resolve_document_addresses(url: str):
+    parsed = urlsplit(url)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError("news_document_url_not_public")
+    port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+    try:
+        addresses = socket.getaddrinfo(parsed.hostname, port, type=socket.SOCK_STREAM)
+    except OSError as error:
+        raise ValueError("news_document_url_not_public") from error
+    if not addresses:
+        raise ValueError("news_document_url_not_public")
+    verified_addresses = []
+    for address in addresses:
+        ip = ipaddress.ip_address(address[4][0])
+        if not ip.is_global:
+            raise ValueError("news_document_url_not_public")
+        if str(ip) not in verified_addresses:
+            verified_addresses.append(str(ip))
+    host = parsed.hostname.lower()
+    default_port = (parsed.scheme.lower() == "https" and parsed.port in {None, 443}) \
+        or (parsed.scheme.lower() == "http" and parsed.port in {None, 80})
+    normalized_host = f"[{host}]" if ":" in host else host
+    authority = normalized_host if default_port else f"{normalized_host}:{parsed.port}"
+    normalized = urlunsplit((parsed.scheme.lower(), authority, parsed.path or "/", parsed.query, ""))
+    return normalized, verified_addresses, port, host
+
+
+def html_to_text(payload: bytes) -> str:
+    """HTML 转纯文本：先剔除 script/style/noscript 块，再去标签，避免脚本噪音进入摘要。"""
+    text = payload.decode("utf-8", errors="replace")
+    text = re.sub(r"(?is)<(script|style|noscript|ix:header)[^>]*>.*?</\1\s*>", " ", text)
+    # 截断边界内未闭合的块（payload 有界，闭合标签可能在界外）：丢弃到末尾
+    text = re.sub(r"(?is)<(script|style|noscript|ix:header)[^>]*>.*$", " ", text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    return " ".join(text.split())
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, hostname: str, pinned_ip: str, port: int, timeout: float):
+        super().__init__(hostname, port=port, timeout=timeout)
+        self._pinned_ip = pinned_ip
+
+    def connect(self):
+        self.sock = socket.create_connection(
+            (self._pinned_ip, self.port), self.timeout, self.source_address,
+        )
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, hostname: str, pinned_ip: str, port: int, timeout: float):
+        super().__init__(hostname, port=port, timeout=timeout, context=ssl.create_default_context())
+        self._pinned_ip = pinned_ip
+
+    def connect(self):
+        raw_socket = socket.create_connection(
+            (self._pinned_ip, self.port), self.timeout, self.source_address,
+        )
+        self.sock = self._context.wrap_socket(raw_socket, server_hostname=self.host)
+
+
+def read_limited_document(url: str, max_bytes: int, timeout: float = 10):
+    page = read_document_page(url, 0, max_bytes, timeout)
+    return (
+        page["payload"], page["contentType"], page["truncated"], page["sourceReference"],
+    )
+
+
+class _RetryableAddressFailure(Exception):
+    """单个固定 IP 的可重试失败（连接错误或被边缘节点拒绝）。"""
+
+
+def read_document_page(url: str, cursor: int, max_bytes: int, timeout: float = 10):
+    if cursor < 0 or max_bytes < 1:
+        raise ValueError("document_cursor_invalid")
+    target = url
+    for _redirect in range(6):
+        safe_url, pinned_ips, port, hostname = _resolve_document_addresses(target)
+        parsed = urlsplit(safe_url)
+        connection_class = _PinnedHTTPSConnection if parsed.scheme == "https" else _PinnedHTTPConnection
+        retryable_failure = None
+        for pinned_ip in pinned_ips:
+            connection = connection_class(hostname, pinned_ip, port, timeout)
+            path = urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
+            try:
+                response = _open_document_response(connection, path, parsed, cursor, max_bytes)
+            except _RetryableAddressFailure as error:
+                retryable_failure = error
+                continue
+            if response.status in {301, 302, 303, 307, 308}:
+                location = response.headers.get("Location")
+                connection.close()
+                if not location:
+                    raise ValueError("news_document_redirect_invalid")
+                target = urljoin(safe_url, location)
+                break
+            if response.status not in {200, 206}:
+                connection.close()
+                raise ValueError("news_document_http_status")
+            return _parse_document_payload(response, connection, safe_url, cursor, max_bytes)
+        else:
+            raise ValueError("news_document_http_status") from retryable_failure
+    else:
+        raise ValueError("news_document_redirect_limit")
+
+
+def _open_document_response(connection, path: str, parsed, cursor: int, max_bytes: int):
+    try:
+        end_byte = cursor + max_bytes - 1
+        # SEC 等站点把缺少 Accept-Encoding 或 Connection 的请求识别为未申报的自动工具并返回 403；
+        # 一次性文档读取显式声明两个头部
+        connection.request("GET", path, headers={
+            "User-Agent": USER_AGENT, "Host": parsed.netloc,
+            "Accept-Encoding": "identity", "Connection": "close",
+            "Range": f"bytes={cursor}-{end_byte}",
+        })
+        response = connection.getresponse()
+    except (OSError, http.client.HTTPException) as error:
+        connection.close()
+        raise _RetryableAddressFailure(str(error)) from error
+    # 部分 CDN 边缘节点对直连固定 IP 返回 403/429/5xx，换下一个已验证地址重试
+    if response.status in {403, 429} or response.status >= 500:
+        connection.close()
+        raise _RetryableAddressFailure(f"http_{response.status}")
+    return response
+
+
+# 提供方忽略 Range 时的完整正文有界上限（客户端分页需要全量字节）
+MAX_DOCUMENT_BYTES = 8 * 1024 * 1024
+
+
+def _parse_document_payload(response, connection, safe_url: str, cursor: int, max_bytes: int):
+    try:
+        content_type = response.headers.get_content_type()
+        if content_type not in ALLOWED_DOCUMENT_CONTENT_TYPES:
+            raise ValueError("news_document_content_type_not_allowed")
+        if response.status == 206:
+            payload = response.read(max_bytes + 1)[:max_bytes]
+            content_range = response.headers.get("Content-Range")
+            match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", content_range or "")
+            if not match or int(match.group(1)) != cursor:
+                raise ValueError("document_content_range_invalid")
+            start_byte, provider_end, total_bytes = map(int, match.groups())
+            if provider_end != start_byte + len(payload) - 1:
+                raise ValueError("document_content_range_invalid")
+        else:
+            # 提供方忽略 Range（如 SEC 返回 chunked 200）：有界读取完整正文后客户端切片分页
+            declared_length = response.headers.get("Content-Length")
+            if declared_length and declared_length.isdigit() \
+                    and int(declared_length) > MAX_DOCUMENT_BYTES:
+                raise ValueError("document_too_large")
+            body = response.read(MAX_DOCUMENT_BYTES + 1)
+            if len(body) > MAX_DOCUMENT_BYTES:
+                raise ValueError("document_too_large")
+            total_bytes = len(body)
+            if cursor > total_bytes:
+                raise ValueError("document_cursor_invalid")
+            start_byte = cursor
+            payload = body[cursor:cursor + max_bytes]
+        end_byte = start_byte + len(payload) - 1
+        next_cursor = end_byte + 1 if end_byte + 1 < total_bytes else None
+        truncated = next_cursor is not None
+        return {
+            "payload": payload, "contentType": content_type, "sourceReference": safe_url,
+            "startByte": start_byte, "endByte": end_byte, "totalBytes": total_bytes,
+            "nextCursor": str(next_cursor) if next_cursor is not None else None,
+            "truncated": truncated,
+        }
+    finally:
+        connection.close()
+
+
 def _diagnose(target: str, payload: bytes):
     if not _diagnostics["enabled"]:
         return
@@ -70,6 +257,27 @@ def _sanitize_diagnostic(payload: bytes) -> bytes:
 class TimedSource:
     def __init__(self, timeout=15):
         self.timeout = timeout
+
+
+def search_web(query: str, timeout: float = 10):
+    if not query or len(query) > 500:
+        raise ValueError("web_search_query_invalid")
+    target = f"https://www.bing.com/search?{urlencode({'q': query, 'format': 'rss'})}"
+    with urlopen(Request(target, headers={"User-Agent": USER_AGENT}), timeout=timeout) as response:
+        payload = response.read(262145)
+        if len(payload) > 262144:
+            raise ValueError("web_search_response_too_large")
+    root = ElementTree.fromstring(payload)
+    results = []
+    for item in root.findall("./channel/item")[:10]:
+        title, link = item.findtext("title"), item.findtext("link")
+        parsed = urlsplit(link) if link else None
+        if title and parsed and parsed.scheme.lower() in {"http", "https"} and parsed.hostname:
+            results.append({
+                "title": title, "url": link,
+                "summary": item.findtext("description") or title,
+            })
+    return results
 
 
 class AlpacaSource(TimedSource):
@@ -154,7 +362,7 @@ class AlpacaHistorySource(AlpacaSource):
             params["page_token"] = page_token
         if not result:
             raise ValueError("empty_alpaca_history")
-        return result[-180:]
+        return result
 
 
 class AlpacaNewsSource(AlpacaSource):
@@ -347,6 +555,81 @@ class SecFundamentalsSource(TimedSource):
         }
 
 
+class SecFilingSource(TimedSource):
+    name = "sec"
+
+    def _recent(self, symbol: str):
+        user_agent = os.getenv("SEC_USER_AGENT")
+        if not user_agent:
+            raise RuntimeError("SEC_USER_AGENT_missing")
+        headers = {"User-Agent": user_agent, "Accept-Encoding": "gzip, deflate"}
+        mapping = json.loads(_read(
+            "https://www.sec.gov/files/company_tickers.json", headers=headers, timeout=self.timeout,
+        ))
+        company = next((value for value in mapping.values() if value.get("ticker") == symbol), None)
+        if not company:
+            raise ValueError("sec_ticker_not_found")
+        cik = str(company["cik_str"]).zfill(10)
+        submissions = json.loads(_read(
+            f"https://data.sec.gov/submissions/CIK{cik}.json", headers=headers, timeout=self.timeout,
+        ))
+        return cik, submissions.get("filings", {}).get("recent", {})
+
+    def fetch(self, symbol: str, filing_id: str):
+        cik, recent = self._recent(symbol)
+        accessions = recent.get("accessionNumber", [])
+        try:
+            index = accessions.index(filing_id)
+            form = recent["form"][index]
+            filed_at = recent["filingDate"][index]
+            primary_document = recent["primaryDocument"][index]
+        except (ValueError, IndexError, KeyError) as error:
+            raise ValueError("filing_not_found") from error
+        accession_path = filing_id.replace("-", "")
+        source_reference = (
+            f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession_path}/{primary_document}"
+        )
+        return {
+            "filingId": filing_id, "form": form, "filedAt": filed_at,
+            "sourceReference": source_reference,
+        }
+
+    def fetch_page(self, filing: dict, cursor: str = None):
+        offset = int(cursor or "0")
+        page = read_document_page(
+            filing["sourceReference"], offset, 65536, timeout=min(self.timeout, 10),
+        )
+        payload = page.pop("payload")
+        text = html_to_text(payload)
+        if not text or not isinstance(page.get("totalBytes"), int):
+            raise ValueError("filing_page_not_qualifiable")
+        return {
+            **filing, **page, "summary": text[:500], "contentHash": sha256(payload).hexdigest(),
+        }
+
+    def list_events(self, symbol: str):
+        cik, recent = self._recent(symbol)
+        supported = {"10-K": "earnings", "10-Q": "earnings", "8-K": "company_event", "S-3": "dilution"}
+        events = []
+        for filing_id, form, filed_at, primary_document in zip(
+            recent.get("accessionNumber", []), recent.get("form", []),
+            recent.get("filingDate", []), recent.get("primaryDocument", []),
+        ):
+            if form not in supported:
+                continue
+            events.append({
+                "filingId": filing_id, "form": form, "filedAt": filed_at,
+                "eventType": supported[form],
+                "sourceReference": (
+                    f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/"
+                    f"{filing_id.replace('-', '')}/{primary_document}"
+                ),
+            })
+            if len(events) >= 20:
+                break
+        return events
+
+
 COMPARABLES = {
     "NVDA": ("semiconductor", ["AMD", "AVGO", "QCOM"]),
     "AMD": ("semiconductor", ["NVDA", "AVGO", "QCOM"]),
@@ -370,18 +653,34 @@ class YahooValuationSource(TimedSource):
         industry_and_peers = COMPARABLES.get(symbol)
         if not industry_and_peers:
             company = self._metrics(symbol)
+            input_observed_at = {
+                **({"marketPrice": market_price_observed_at} if market_price_observed_at else {}),
+                **{f"company.{key}": value for key, value in company.get("observedAt", {}).items()},
+                **{
+                    f"company.historicalPe.{index}": item["observedAt"]
+                    for index, item in enumerate(company.get("historicalPe", []))
+                },
+            }
             return calculate_valuation(ValuationInput(
                 symbol=symbol, industry="unsupported", current_price=market_price or 0,
                 diluted_eps=company.get("dilutedEps"), enterprise_value=company.get("enterpriseValue"),
                 ebitda=company.get("ebitda"), revenue=company.get("revenue"), comparables=[],
-                historical_multiples={"pe": company.get("historicalPe", [])},
+                historical_multiples={
+                    "pe": [item["value"] for item in company.get("historicalPe", [])],
+                },
+                input_observed_at=input_observed_at,
                 source=self.name, as_of=market_price_observed_at,
             ))
         industry, peers = industry_and_peers
         company = self._metrics(symbol)
         comparables = []
+        peer_observed_at = {}
         for peer in peers:
             values = self._metrics(peer)
+            peer_observed_at.update({
+                f"comparables.{peer}.{key}": value
+                for key, value in values.get("observedAt", {}).items()
+            })
             comparables.append({
                 "symbol": peer, "pe": values.get("pe"),
                 "evToEbitda": _ratio(values.get("enterpriseValue"), values.get("ebitda")),
@@ -393,9 +692,22 @@ class YahooValuationSource(TimedSource):
             diluted_eps=company.get("dilutedEps"), enterprise_value=company.get("enterpriseValue"),
             ebitda=company.get("ebitda"), revenue=company.get("revenue"),
             comparables=comparables,
-            historical_multiples={"pe": company.get("historicalPe", [])},
+            historical_multiples={
+                "pe": [item["value"] for item in company.get("historicalPe", [])],
+            },
+            input_observed_at={
+                **({"marketPrice": market_price_observed_at} if market_price_observed_at else {}),
+                **{f"company.{key}": value for key, value in company.get("observedAt", {}).items()},
+                **{
+                    f"company.historicalPe.{index}": item["observedAt"]
+                    for index, item in enumerate(company.get("historicalPe", []))
+                },
+                **peer_observed_at,
+            },
             source=self.name,
-            as_of=market_price_observed_at,
+            as_of=market_price_observed_at or max(
+                [*company.get("observedAt", {}).values(), *peer_observed_at.values()], default=None,
+            ),
         ))
 
     def _metrics(self, symbol: str):
@@ -419,9 +731,14 @@ class YahooValuationSource(TimedSource):
             source_key = (series.get("meta", {}).get("type") or [None])[0]
             values = series.get(source_key, [])
             if source_key == "trailingPeRatio":
-                mapped["historicalPe"] = [item["reportedValue"]["raw"] for item in values if item.get("reportedValue")]
+                mapped["historicalPe"] = [{
+                    "value": item["reportedValue"]["raw"], "observedAt": item["asOfDate"],
+                } for item in values if item.get("reportedValue") and item.get("asOfDate")]
             if values and source_key in keys:
                 mapped[keys[source_key]] = values[-1]["reportedValue"]["raw"]
+                observed_at = values[-1].get("asOfDate")
+                if observed_at:
+                    mapped.setdefault("observedAt", {})[keys[source_key]] = observed_at
         return mapped
 
 

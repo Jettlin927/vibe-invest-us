@@ -1,0 +1,101 @@
+# 扁平 Agent 模式实验专用测试编排。
+# 与 compose.yaml 完全隔离：独立的 compose 项目名（脚本强制）、独立数据卷、独立宿主机端口
+# （默认 3100，避免占用原栈的 3000）。不发布 PostgreSQL / Financial Data 端口。
+# 用法见 scripts/verify-flat-mode.sh。
+services:
+  postgres:
+    image: postgres:16.10-alpine
+    environment:
+      POSTGRES_DB: vibe_invest
+      POSTGRES_USER: vibe_invest_bootstrap
+      POSTGRES_PASSWORD: ${POSTGRES_BOOTSTRAP_PASSWORD:-local-bootstrap-only}
+      MIGRATION_DATABASE_PASSWORD: ${MIGRATION_DATABASE_PASSWORD:-local-migration-only}
+      DATABASE_PASSWORD: ${DATABASE_PASSWORD:-local-application-only}
+    expose:
+      - "5432"
+    volumes:
+      - vibe-invest-postgres:/var/lib/postgresql/data
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vibe_invest_bootstrap -d vibe_invest"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: "no"
+
+  migrate:
+    build:
+      context: .
+      dockerfile: services/analysis-api/Dockerfile
+      target: build
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      MIGRATION_DATABASE_URL: postgresql://vibe_invest_migration:${MIGRATION_DATABASE_PASSWORD:-local-migration-only}@postgres:5432/vibe_invest
+    command: ["npm", "run", "migrate", "--workspace", "@vibe-invest/product-dao"]
+    restart: "no"
+
+  financial-data:
+    build:
+      context: .
+      dockerfile: services/market-data/Dockerfile
+    expose:
+      - "8000"
+    environment:
+      SEC_USER_AGENT: ${SEC_USER_AGENT:-}
+      ALPACA_API_KEY: ${ALPACA_API_KEY:-}
+      ALPACA_API_SECRET: ${ALPACA_API_SECRET:-}
+      ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-iex}
+      MARKET_DATA_SOURCE_CONFIG: ${MARKET_DATA_SOURCE_CONFIG:-/app/config/sources.json}
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import json, urllib.request; assert json.load(urllib.request.urlopen('http://127.0.0.1:8000/health'))['status'] == 'ok'"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: "no"
+
+  analysis-api:
+    build:
+      context: .
+      dockerfile: services/analysis-api/Dockerfile
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      financial-data:
+        condition: service_healthy
+    environment:
+      FINANCIAL_DATA_URL: http://financial-data:8000
+      DATABASE_URL: postgresql://vibe_invest_app:${DATABASE_PASSWORD:-local-application-only}@postgres:5432/vibe_invest
+      WEB_STATIC_DIR: /app/services/analysis-api/public
+      MODEL_PROVIDER: ${MODEL_PROVIDER:-}
+      MODEL_API_PROTOCOL: ${MODEL_API_PROTOCOL:-}
+      MODEL_BASE_URL: ${MODEL_BASE_URL:-}
+      MODEL_NAME: ${MODEL_NAME:-}
+      MODEL_CONTEXT_WINDOW: ${MODEL_CONTEXT_WINDOW:-}
+      MODEL_API_KEY: ${MODEL_API_KEY:-}
+      MIGRATION_VERIFICATION_TOKEN: ${MIGRATION_VERIFICATION_TOKEN:-}
+    ports:
+      - "${VIBE_INVEST_HOST:-127.0.0.1}:${VIBE_INVEST_TEST_PORT:-3100}:3000"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/api/health').then(r => { if (!r.ok) process.exit(1) })"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: "no"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  vibe-invest-postgres:

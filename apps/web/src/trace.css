@@ -1,22 +1,115 @@
-.trace-panel > div,
-.trace-stage > summary {
-  display: grid;
-  grid-template-columns: 22px 1fr auto;
-  gap: 7px;
-  padding: 10px 0;
-  border-bottom: 1px solid #d8d1c4;
-  font: 10px Inter, sans-serif;
-}
+/* 研究记录页：研究 ｜ 轨迹 tab */
+.research-tabcol { min-width: 0; }
+.research-tabs { position: sticky; z-index: 10; top: 76px; display: flex; gap: 4px; padding: 0 34px; background: #f4f0e8; border-bottom: 1px solid #d8d1c4; }
+.research-tabs button { padding: 12px 14px 10px; color: #736c63; background: transparent; border: 0; border-bottom: 2px solid transparent; font-size: 13px; font-weight: 650; }
+.research-tabs button.active { color: #211d18; border-color: #e25132; }
 
-.trace-stage { margin-top: 0 !important; }
-.trace-stage > summary { list-style: none; }
-.trace-stage > summary::-webkit-details-marker { display: none; }
-.source-diagnostics { padding: 8px 0 12px 22px; border-bottom: 1px solid #d8d1c4; }
+/* 轨迹视图 */
+.trace-view { padding: 20px 0 8px; font-family: Inter, "Noto Sans SC", system-ui, sans-serif; }
+.trace-view-header { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; margin-bottom: 14px; }
+.trace-view-header .micro { margin: 0; }
+.trace-view-header > p { margin: 0; color: #756d64; font-size: 11px; }
+.trace-feed-empty { color: #8a8177; font-size: 11px; }
+
+/* 泳道时间轴 */
+.trace-timeline { margin: 0 0 14px; padding: 10px; background: #faf8f2; border: 1px solid #e2dbcf; }
+.trace-timeline svg { display: block; width: 100%; height: auto; }
+.lane-label { fill: #8a8177; font: 9px Inter, sans-serif; }
+.lane-baseline { stroke: #e2dbcf; stroke-width: 1; }
+.lane-span.lane-model { fill: #2f6f8f; }
+.lane-span.lane-tool { fill: #b19d80; }
+.lane-span.lane-compaction { fill: #e25132; }
+.lane-span.failed { fill: #b3261e; }
+.lane-axis { fill: #a39a8e; font: 8px Inter, sans-serif; }
+
+/* 分层事件流：圆点 + 角色 chip + 类型 chip + 单行文本 + 时间 */
+.trace-feed { display: grid; margin: 0; padding: 0; list-style: none; }
+.trace-row { display: grid; grid-template-columns: 10px auto auto minmax(0, 1fr) auto; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px solid #e7e0d5; font-size: 10px; }
+.feed-dot { width: 7px; height: 7px; border-radius: 50%; }
+.actor-main { background: #211d18; }
+.actor-news { background: #2f6f8f; }
+.actor-technical { background: #3a7c49; }
+.actor-fundamental { background: #b19d80; }
+.feed-chip { padding: 2px 7px; color: #fff; border-radius: 3px; font-size: 8px; font-weight: 750; letter-spacing: .06em; }
+.feed-kind { padding: 2px 6px; border: 1px solid #d8d1c4; border-radius: 3px; color: #8a8177; font-size: 8px; }
+.kind-模型 { color: #2f6f8f; border-color: #b8d0dc; }
+.kind-工具 { color: #a05a20; border-color: #e0c8ae; }
+.kind-压缩 { color: #9b3e31; border-color: #e2bfb4; }
+.kind-专项 { color: #6e5a8e; border-color: #cdc3dd; }
+.feed-text { overflow: hidden; color: #4a443c; text-overflow: ellipsis; white-space: nowrap; }
+strong.feed-text { font-weight: 650; }
+.trace-feed time { color: #a39a8e; font-size: 9px; }
+.trace-feed li.tone-error .feed-text { color: #b3261e; font-weight: 650; }
+.trace-feed li.tone-warn .feed-text { color: #9a7600; }
+
+/* 工具行：可展开查看输入参数与返回结果 */
+.trace-row:has(> .trace-tool) { display: block; padding: 0; }
+.trace-tool > summary { display: grid; grid-template-columns: 10px auto auto minmax(0, 1fr) auto auto auto; align-items: center; gap: 8px; padding: 6px 0; cursor: pointer; list-style: none; }
+.trace-tool > summary::-webkit-details-marker { display: none; }
+.trace-tool > summary small { color: #756d64; font-size: 9px; white-space: nowrap; }
+.trace-tool .tool-detail { padding: 4px 0 10px 17px; }
+
+/* 专项（子 Agent）折叠组：嵌在主 Agent 启动工具调用之后 */
+.trace-group { display: block; padding: 0; border-bottom: 1px solid #e7e0d5; }
+.trace-group > details > summary { display: grid; grid-template-columns: 10px auto auto minmax(0, 1fr) auto auto; align-items: center; gap: 8px; padding: 6px 0; cursor: pointer; list-style: none; font-size: 10px; }
+.trace-group > details > summary::-webkit-details-marker { display: none; }
+.trace-group > details > summary::after { content: '展开'; padding: 1px 6px; color: #9b3e31; border: 1px solid #e2bfb4; border-radius: 3px; font-size: 8px; }
+.trace-group > details[open] > summary::after { content: '收起'; }
+.trace-sub { margin: 0 0 6px 17px; padding-left: 10px; border-left: 2px solid #e2dbcf; }
+.trace-sub .feed-chip { display: none; }
+.trace-sub .trace-row { grid-template-columns: 10px auto minmax(0, 1fr) auto; }
+.trace-sub .trace-tool > summary { grid-template-columns: 10px auto minmax(0, 1fr) auto auto auto; }
+
+/* 折叠区：金融上下文 / Token 明细 / 开发者信息 */
+.trace-financial-context, .trace-tokens, .trace-dev { margin-top: 12px; font-size: 10px; }
+.trace-financial-context > summary, .trace-tokens > summary, .trace-dev > summary { cursor: pointer; color: #9b3e31; }
+.trace-tokens table { width: 100%; margin-top: 8px; border-collapse: collapse; }
+.trace-tokens th { padding: 6px 4px; color: #8a8177; border-bottom: 1px solid #d8d1c4; font-size: 8px; text-align: right; text-transform: uppercase; }
+.trace-tokens td { padding: 7px 4px; border-bottom: 1px solid #e7e0d5; text-align: right; }
+.trace-tokens th:first-child, .trace-tokens td:first-child { text-align: left; }
+.trace-dev { color: #8a8177; }
+.trace-dev p { margin: 6px 0 0; line-height: 1.6; word-break: break-all; }
+.trace-dev ol { margin: 6px 0 0; padding-left: 18px; }
+.trace-financial-context .source-diagnostics { border-bottom: 0; }
+
+/* 工具调用细节（轨迹行展开与金融上下文共用） */
+.source-diagnostics { padding: 8px 0 12px; }
 .source-diagnostics details { margin: 5px 0; }
-.source-diagnostics summary { display: flex; justify-content: space-between; gap: 8px; }
+.source-diagnostics summary { display: flex; justify-content: space-between; gap: 8px; cursor: pointer; }
 .source-diagnostics ul { margin: 5px 0 10px; padding: 0; list-style: none; }
 .source-diagnostics li { display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; padding: 5px 0; border-top: 1px dotted #d8d1c4; }
 .source-diagnostics li small { grid-column: 1 / -1; overflow-wrap: anywhere; }
 .source-ok { color: #3a7c49; }
-.source-empty,
-.source-failed { color: #9b3e31; }
+.source-empty, .source-failed { color: #9b3e31; }
+.tool-state { font: 10px Inter, sans-serif; padding: 1px 7px; border-radius: 999px; white-space: nowrap; }
+.tool-state-ok { color: #3a7c49; background: rgba(58, 124, 73, .12); }
+.tool-state-error { color: #9b3e31; background: rgba(155, 62, 49, .12); }
+.tool-state-warn { color: #8a6d1f; background: rgba(138, 109, 31, .14); }
+.tool-state-pending, .tool-state-muted { color: #756d64; background: rgba(117, 109, 100, .12); }
+.tool-detail { display: grid; gap: 4px; padding: 6px 0 10px; }
+.tool-detail .micro { margin: 6px 0 0; }
+.tool-result-summary { margin: 0; color: #4c463e; }
+.tool-detail-empty { margin: 0; color: #756d64; }
+.json-block { margin: 0; max-height: 260px; overflow: auto; padding: 8px; background: #f4f0e8; border-radius: 6px; font-size: 11px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+/* 专项规划决策 */
+.specialist-decisions ul { display: grid; gap: 10px; margin: 0; padding: 0; list-style: none; }
+.specialist-decisions li { padding-top: 8px; border-top: 1px solid #e2dbcf; }
+.specialist-decisions li:first-child { padding-top: 0; border-top: 0; }
+.specialist-decisions header { display: flex; gap: 8px; align-items: baseline; justify-content: space-between; }
+.specialist-decisions p { margin: 4px 0 0; color: #4c463e; }
+
+/* 异常与降级 */
+.incident-panel { margin-bottom: 14px; padding: 14px; background: #faf4ec; border: 1px solid #d9b8a6; }
+.incident-panel ul { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.incident { padding-left: 10px; border-left: 3px solid currentColor; overflow-wrap: anywhere; }
+.incident-error { color: #9b3e31; }
+.incident-warn { color: #8a6d1f; }
+
+/* 右栏：专项研究结论（人话内容，技术内部在「轨迹」tab） */
+.research-rail { position: sticky; top: 94px; }
+.specialist-decisions, .specialist-findings { margin-bottom: 14px; padding: 14px; background: #faf8f2; border: 1px solid #d8d1c4; }
+.specialist-findings h2 { margin: 0 0 8px; font-size: 18px; font-weight: 550; }
+.specialist-findings h3 { margin: 12px 0 6px; font-size: 12px; }
+.specialist-findings p { margin: 4px 0; color: #4c463e; font-size: 11px; line-height: 1.6; }
+@media (max-width: 1050px) { .research-rail { position: static; } }

@@ -1,6 +1,11 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 
-import { isSystemHealth, type SystemHealth } from '@vibe-invest/contracts'
+import {
+  aggregateModelTokenUsage, isRuntimeSettingsResponse, isSystemHealth,
+  isTerminalAgentExecutionStatus, runtimeSettingLimits,
+  type RuntimeSettings, type RuntimeSettingsResponse, type SystemHealth,
+  type TokenUsageAggregate,
+} from '@vibe-invest/contracts'
 
 type Page = 'overview' | 'analysis' | 'research' | 'portfolio' | 'settings'
 type Position = { symbol: string; quantity: number; averageCost: number }
@@ -18,7 +23,12 @@ type PortfolioEquitySnapshot = {
   holdingsCount: number; pricedCount: number; observedAt: string; afterClose: boolean
   dailyChange: number | null; dailyReturn: number | null
 }
-type ResearchSummary = { id: string; symbol: string; status: string; createdAt?: string; error?: string | null; starred?: boolean; note?: string; report?: { title?: string; trend?: string } }
+type PortfolioEvent = {
+  id: string; kind: 'buy' | 'sell' | 'cash_adjust' | 'reconcile'
+  symbol: string | null; quantity: number | null; price: number | null
+  amount: number | null; realizedProfitLoss: number | null; note: string; createdAt: string
+}
+type ResearchSummary = { id: string; symbol: string; status: string; terminal?: boolean; createdAt?: string; reportCreatedAt?: string | null; error?: string | null; starred?: boolean; note?: string; report?: { title?: string; trend?: string } }
 type Fact = { id: string; type: string; value: unknown; observedAt: string; source: string; sourceReference: string }
 type Report = {
   title?: string; marketState?: string; trend?: string; drivers?: string[]
@@ -29,11 +39,62 @@ type Report = {
   personalImpact?: string | null; conditionalSuggestion?: string | null
   limitations?: string[]
 }
+type ModelAttempt = {
+  id: string; executionId: string; kind: 'turn' | 'compaction'; turnIndex: number
+  status: string; usageStatus: 'complete' | 'partial' | 'unknown'
+  usage: {
+    input: number | null; cacheRead: number | null; cacheWrite: number | null
+    output: number | null; total: number | null
+  }
+  durationMs: number | null; createdAt: string; completedAt: string | null
+}
+type TokenUsage = TokenUsageAggregate
 type ResearchRecord = ResearchSummary & {
   report?: Report
   facts: Fact[]
   trace: Array<Record<string, unknown>>
+  reportVersions?: Array<{ version: number; createdAt: string; report: { title?: string } }>
   snapshot?: { gaps?: Array<{ capability?: string; reason?: string }> }
+  mainAgent?: {
+    id: string; status: string
+    waitReason: { kind: string; target: string; startedAt: string } | null
+    execution: { id: string; generation: number; status: string }
+    segments: Array<{
+      id: string; ordinal: number; parentSegmentId?: string | null; createdAt: string
+    }>
+    events: Array<{
+      sequence: number; type?: string; status?: string; createdAt: string
+      previousExecutionId?: string; executionId?: string
+      message?: string; messageId?: string; text?: string
+      contextTokens?: number; contextWindow?: number; reserveTokens?: number
+      keepRecentTokens?: number; durationMs?: number
+      tokensAfter?: number
+      estimated?: boolean
+      usage?: { input?: number; output?: number; totalTokens?: number }
+      waitReason?: { kind: string; target: string; startedAt: string } | null
+    }>
+    compactionAttempts?: Array<{
+      compactionId: string; attempt: number; status: string; durationMs: number
+      usage: { input?: number; cacheRead?: number; cacheWrite?: number; output?: number; totalTokens?: number } | null
+    }>
+    modelAttempts?: ModelAttempt[]
+    tokenUsage?: TokenUsage
+  }
+  specialistAgents?: Array<{
+    id?: string; domain: string; status?: string
+    researchQuestion?: string; reason?: string
+    execution?: { id: string; generation: number; status: string }
+    segments?: NonNullable<ResearchRecord['mainAgent']>['segments']
+    events?: Array<NonNullable<ResearchRecord['mainAgent']>['events'][number] & { name?: string }>
+    compactionAttempts?: NonNullable<ResearchRecord['mainAgent']>['compactionAttempts']
+    modelAttempts?: ModelAttempt[]
+    tokenUsage?: TokenUsage
+    reportVersion?: { version: number; report: {
+      gaps?: Array<{ capability?: string; reason?: string; impact?: string }>
+      keyJudgments?: Array<{ statement?: string; direction?: string; confidence?: string }>
+      targetPrice?: { method?: string; range?: { low?: number; high?: number }; asOf?: string }
+    } }
+  }>
 }
 
 const pages: Array<{ id: Page; label: string }> = [
@@ -48,23 +109,28 @@ export function App() {
   const [page, setPage] = useState<Page>('overview')
   const [health, setHealth] = useState<SystemHealth | null>(null)
   const [modelConfigured, setModelConfigured] = useState(false)
+  const [runtimeSettings, setRuntimeSettings] = useState<RuntimeSettingsResponse | null>(null)
   const [positions, setPositions] = useState<Position[]>([])
   const [portfolio, setPortfolio] = useState<PortfolioOverview>(emptyPortfolio())
   const [portfolioHistory, setPortfolioHistory] = useState<PortfolioEquitySnapshot[]>([])
+  const [portfolioEvents, setPortfolioEvents] = useState<PortfolioEvent[]>([])
   const [records, setRecords] = useState<ResearchSummary[]>([])
   const [selectedResearch, setSelectedResearch] = useState<ResearchRecord | null>(null)
   const [analysisSymbol, setAnalysisSymbol] = useState('NVDA')
   const [analysisStatus, setAnalysisStatus] = useState('')
   const [analysisStages, setAnalysisStages] = useState<string[]>([])
   const [activeAnalysisId, setActiveAnalysisId] = useState<string | null>(null)
+  const [deletingResearchId, setDeletingResearchId] = useState<string | null>(null)
   const [error, setError] = useState('')
 
   async function loadPortfolio() {
     const response = await fetch('/api/portfolio')
     const next = await response.json() as PortfolioOverview
     const historyResponse = await fetch('/api/portfolio/history?limit=30')
+    const eventsResponse = await fetch('/api/portfolio/events?limit=50').catch(() => null)
     setPortfolio(next)
     setPortfolioHistory((await historyResponse.json() as { snapshots: PortfolioEquitySnapshot[] }).snapshots)
+    setPortfolioEvents(eventsResponse?.ok ? (await eventsResponse.json() as { events: PortfolioEvent[] }).events : [])
     setPositions(next.positions.map(({ symbol, quantity, averageCost }) => ({ symbol, quantity, averageCost })))
   }
   async function loadResearch() {
@@ -73,16 +139,37 @@ export function App() {
     setRecords(next)
     if (!selectedResearch && next[0]) void openResearch(next[0].id)
   }
+  async function loadSettings() {
+    const value: unknown = await fetch('/api/settings').then((response) => response.json())
+    if (!isRuntimeSettingsResponse(value)) throw new Error('settings_contract_invalid')
+    setModelConfigured(value.model.configured)
+    setRuntimeSettings(value)
+  }
   useEffect(() => {
     void Promise.all([
       fetch('/api/health').then((response) => response.json()).then((value: unknown) => {
         if (!isSystemHealth(value)) throw new Error('health_contract_invalid')
         setHealth(value)
       }),
-      fetch('/api/settings').then((response) => response.json()).then((value) => setModelConfigured(value.model.configured)),
+      loadSettings(),
       loadPortfolio(), loadResearch(),
     ]).catch((cause) => setError(cause instanceof Error ? cause.message : String(cause)))
   }, [])
+  useEffect(() => {
+    const agent = selectedResearch?.mainAgent
+    if (page !== 'research' || !agent || !('EventSource' in globalThis)
+      || isTerminalAgentExecutionStatus(agent.status)) return
+    const source = new EventSource(`/api/agent-sessions/${agent.id}/events`, {
+      withCredentials: false,
+    })
+    const refresh = () => { void openResearch(selectedResearch.id) }
+    for (const name of ['runtime_context', 'planning', 'running_model', 'running_tools',
+      'waiting_for_specialists', 'finalizing', 'completed', 'partial', 'failed',
+      'stopping', 'stopped', 'interrupted', 'budget_exhausted']) {
+      source.addEventListener(name, refresh)
+    }
+    return () => source.close()
+  }, [page, selectedResearch?.id, selectedResearch?.mainAgent?.status])
 
   async function savePosition(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -110,6 +197,18 @@ export function App() {
     if (!response.ok) { setError('现金保存失败'); return }
     await loadPortfolio()
   }
+  async function buyPosition(symbol: string, quantity: number, price: number) {
+    const response = await fetch(`/api/positions/${symbol}/buy`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ quantity, price }),
+    })
+    if (!response.ok) {
+      const body = await response.json().catch(() => null) as { error?: string } | null
+      setError(body?.error === 'insufficient_cash' ? '加仓失败：现金不足，请先入金或降低买入金额。' : '加仓失败：请检查买入数量和成交价。')
+      return false
+    }
+    await loadPortfolio()
+    return true
+  }
   async function reducePosition(symbol: string, quantity: number, price: number) {
     const response = await fetch(`/api/positions/${symbol}/reduce`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ quantity, price }),
@@ -125,39 +224,64 @@ export function App() {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ symbol: analysisSymbol.trim().toUpperCase() }),
     })
-    const { analysisId } = await response.json()
+    const { analysisId, sessionId } = await response.json()
     if (!response.ok || !analysisId) { setError('分析任务创建失败'); return }
     setAnalysisStatus('queued')
     setAnalysisStages(['queued'])
     setActiveAnalysisId(analysisId)
-    if ('EventSource' in globalThis) streamAnalysis(analysisId)
+    if (!modelConfigured) {
+      await openResearch(analysisId)
+      setPage('research')
+      await loadResearch()
+      return
+    }
+    if ('EventSource' in globalThis && sessionId) streamAnalysis(sessionId, analysisId)
     else await pollAnalysis(analysisId)
   }
   function addStage(stage: string) {
     setAnalysisStages((current) => current.includes(stage) ? current : [...current, stage])
   }
-  function streamAnalysis(id: string) {
-    const source = new EventSource(`/api/analyses/${id}/events`)
-    const eventNames = ['queued', 'running', 'financial_context', 'model_event', 'text_delta', 'model_completed', 'completed', 'partial', 'failed', 'cancelled', 'interrupted']
+  function streamAnalysis(sessionId: string, analysisId: string) {
+    const source = new EventSource(`/api/agent-sessions/${sessionId}/events`)
+    const eventNames = ['runtime_context', 'runtime_resume', 'runtime_follow_up', 'chat_completed', 'planning', 'running_model', 'running_tools', 'waiting_for_specialists', 'finalizing', 'financial_context', 'model_event', 'text_delta', 'model_completed', 'completed', 'partial', 'failed', 'stopping', 'stopped', 'interrupted', 'budget_exhausted']
     for (const name of eventNames) source.addEventListener(name, (event) => {
       const entry = JSON.parse((event as MessageEvent).data) as Record<string, unknown>
-      if (name !== 'text_delta') addStage(name)
-      if (['queued', 'running', 'completed', 'partial', 'failed', 'cancelled', 'interrupted'].includes(name)) setAnalysisStatus(name)
-      if (['completed', 'partial', 'failed', 'cancelled', 'interrupted'].includes(name)) {
+      if (['runtime_follow_up', 'chat_completed', 'text_delta'].includes(name)) {
+        const cursor = (event as MessageEvent).lastEventId.split(':').at(-1)
+        const sequence = Number(cursor)
+        if (Number.isInteger(sequence)) setSelectedResearch((current) => {
+          if (current?.id !== analysisId || !current.mainAgent
+            || current.mainAgent.events.some((candidate) => candidate.sequence === sequence)) return current
+          return { ...current, mainAgent: {
+            ...current.mainAgent,
+            events: [...current.mainAgent.events, {
+              sequence, type: name, createdAt: new Date().toISOString(),
+              ...(typeof entry.message === 'string' ? { message: entry.message } : {}),
+              ...(typeof entry.messageId === 'string' ? { messageId: entry.messageId } : {}),
+              ...(typeof entry.text === 'string' ? { text: entry.text } : {}),
+            }],
+          } }
+        })
+      }
+      if (!['runtime_follow_up', 'chat_completed', 'text_delta'].includes(name)) addStage(name)
+      if (['planning', 'running_model', 'running_tools', 'waiting_for_specialists', 'finalizing', 'completed', 'partial', 'failed', 'stopping', 'stopped', 'interrupted', 'budget_exhausted'].includes(name)) setAnalysisStatus(name)
+      if (isTerminalAgentExecutionStatus(
+        name, typeof entry.terminal === 'boolean' ? entry.terminal : undefined,
+      )) {
         if (name === 'failed' && typeof entry.error === 'string') setError(friendlyError(entry.error))
         source.close()
         setActiveAnalysisId(null)
-        void openResearch(id).then(() => { setPage('research'); return loadResearch() })
+        void openResearch(analysisId).then(() => { setPage('research'); return loadResearch() })
       }
     })
-    source.onerror = () => { source.close(); void pollAnalysis(id) }
+    source.onerror = () => { source.close(); void pollAnalysis(analysisId) }
   }
   async function pollAnalysis(id: string) {
     for (let attempt = 0; attempt < 120; attempt += 1) {
       const status = await fetch(`/api/analyses/${id}`).then((response) => response.json())
       setAnalysisStatus(status.status)
       addStage(status.status)
-      if (['completed', 'partial', 'failed', 'cancelled', 'interrupted'].includes(status.status)) {
+      if (isTerminalAgentExecutionStatus(status.status, status.terminal)) {
         if (status.status === 'failed' && typeof status.error === 'string') setError(friendlyError(status.error))
         const researchResponse = await fetch(`/api/research/${id}`)
         if (researchResponse.ok) setSelectedResearch(await researchResponse.json())
@@ -177,6 +301,61 @@ export function App() {
   async function cancelAnalysis() {
     if (activeAnalysisId) await fetch(`/api/analyses/${activeAnalysisId}/cancel`, { method: 'POST' })
   }
+  async function resumeResearch() {
+    if (!selectedResearch) return
+    setError('')
+    const response = await fetch(`/api/analyses/${selectedResearch.id}/resume`, { method: 'POST' })
+    const resumed = await response.json() as { sessionId?: string }
+    if (!response.ok || !resumed.sessionId) { setError('研究恢复失败'); return }
+    setActiveAnalysisId(selectedResearch.id)
+    setAnalysisStatus('planning')
+    if ('EventSource' in globalThis) streamAnalysis(resumed.sessionId, selectedResearch.id)
+    else await pollAnalysis(selectedResearch.id)
+    await openResearch(selectedResearch.id)
+    await loadResearch()
+  }
+  async function sendFollowUp(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!selectedResearch) return
+    const form = event.currentTarget
+    const data = new FormData(form)
+    const message = String(data.get('message') ?? '').trim()
+    const updateReport = data.get('updateReport') === 'on'
+    const baseReportVersion = Number(data.get('baseReportVersion'))
+    if (!message) return
+    setError('')
+    const response = await fetch(`/api/analyses/${selectedResearch.id}/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        messageId: crypto.randomUUID(), message, updateReport,
+        ...(Number.isInteger(baseReportVersion) && baseReportVersion > 0
+          ? { baseReportVersion } : {}),
+      }),
+    })
+    const result = await response.json() as { sessionId?: string }
+    if (!response.ok || !result.sessionId) { setError('追问发送失败'); return }
+    form.reset()
+    setActiveAnalysisId(selectedResearch.id)
+    setAnalysisStatus('planning')
+    if ('EventSource' in globalThis) streamAnalysis(result.sessionId, selectedResearch.id)
+    else await pollAnalysis(selectedResearch.id)
+    await openResearch(selectedResearch.id)
+  }
+  async function reanalyzeResearch() {
+    if (!selectedResearch) return
+    setError('')
+    const response = await fetch('/api/analyses', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ symbol: selectedResearch.symbol }),
+    })
+    const result = await response.json() as { analysisId?: string; sessionId?: string }
+    if (!response.ok || !result.analysisId) { setError('重新分析创建失败'); return }
+    setActiveAnalysisId(result.analysisId)
+    setAnalysisStatus('queued')
+    if ('EventSource' in globalThis && result.sessionId) {
+      streamAnalysis(result.sessionId, result.analysisId)
+    } else await pollAnalysis(result.analysisId)
+  }
   async function updateResearch(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
     if (!selectedResearch) return
@@ -189,10 +368,21 @@ export function App() {
     await loadResearch()
   }
   async function removeResearch() {
-    if (!selectedResearch) return
-    await fetch(`/api/research/${selectedResearch.id}`, { method: 'DELETE' })
-    setSelectedResearch(null)
-    await loadResearch()
+    if (!selectedResearch || deletingResearchId) return
+    const id = selectedResearch.id
+    setError('')
+    setDeletingResearchId(id)
+    try {
+      const response = await fetch(`/api/research/${id}`, { method: 'DELETE' })
+      if (!response.ok) {
+        setError(`研究删除失败：HTTP ${response.status}`)
+        return
+      }
+      setSelectedResearch(null)
+      await loadResearch()
+    } finally {
+      setDeletingResearchId(null)
+    }
   }
   function navigate(next: Page) { setPage(next); window.scrollTo({ top: 0, behavior: 'smooth' }) }
 
@@ -206,9 +396,9 @@ export function App() {
       {error && <p role="alert" className="error-banner">{error}</p>}
       {page === 'overview' && <Overview records={records} selected={selectedResearch} positions={positions} health={health} modelConfigured={modelConfigured} onNavigate={navigate} onOpen={async (id) => { await openResearch(id); navigate('research') }} />}
       {page === 'analysis' && <AnalysisPage symbol={analysisSymbol} setSymbol={setAnalysisSymbol} status={analysisStatus} stages={analysisStages} active={Boolean(activeAnalysisId)} onStart={startAnalysis} onCancel={cancelAnalysis} health={health} modelConfigured={modelConfigured} records={records} onOpen={async (id) => { await openResearch(id); navigate('research') }} />}
-      {page === 'research' && <ResearchPage records={records} record={selectedResearch} onOpen={openResearch} onUpdate={updateResearch} onDelete={removeResearch} />}
-      {page === 'portfolio' && <PortfolioPage portfolio={portfolio} history={portfolioHistory} onSave={savePosition} onSaveCash={saveCash} onReduce={reducePosition} onDelete={removePosition} />}
-      {page === 'settings' && <SettingsPage health={health} modelConfigured={modelConfigured} />}
+      {page === 'research' && <ResearchPage records={records} record={selectedResearch} onOpen={openResearch} onUpdate={updateResearch} onDelete={removeResearch} deleting={deletingResearchId === selectedResearch?.id} onResume={resumeResearch} onFollowUp={sendFollowUp} onReanalyze={reanalyzeResearch} freshnessDays={runtimeSettings?.current.values.reportFreshnessDays ?? null} />}
+      {page === 'portfolio' && <PortfolioPage portfolio={portfolio} history={portfolioHistory} events={portfolioEvents} onSave={savePosition} onSaveCash={saveCash} onBuy={buyPosition} onReduce={reducePosition} onDelete={removePosition} />}
+      {page === 'settings' && <SettingsPage health={health} modelConfigured={modelConfigured} settings={runtimeSettings} onReload={loadSettings} />}
     </main>
   </div>
 }
@@ -254,31 +444,670 @@ function AnalysisPage({ symbol, setSymbol, status, stages, active, onStart, onCa
   </>
 }
 
-function ResearchPage({ records, record, onOpen, onUpdate, onDelete }: {
+function ResearchPage({ records, record, onOpen, onUpdate, onDelete, deleting, onResume, onFollowUp, onReanalyze, freshnessDays }: {
   records: ResearchSummary[]; record: ResearchRecord | null; onOpen: (id: string) => Promise<void>
   onUpdate: (event: React.FormEvent<HTMLFormElement>) => Promise<void>; onDelete: () => Promise<void>
+  deleting: boolean
+  onResume: () => Promise<void>
+  onFollowUp: (event: React.FormEvent<HTMLFormElement>) => Promise<void>
+  onReanalyze: () => Promise<void>
+  freshnessDays: number | null
 }) {
+  const [researchTab, setResearchTab] = useState<'report' | 'trace'>('report')
+  useEffect(() => { setResearchTab('report') }, [record?.id])
   return <>
     <PageHeader eyebrow="RESEARCH ARCHIVE" title="研究记录" description="每份报告都绑定当时的数据快照、来源和分析轨迹，结论变化也有迹可循。" />
     <div className="research-layout">
       <aside className="research-index"><p className="micro">全部记录 · {records.length}</p>{records.map((item) => <button className={record?.id === item.id ? 'active' : ''} key={item.id} onClick={() => void onOpen(item.id)}><strong>{item.symbol}</strong><span>{item.report?.title ?? statusLabel(item.status)}</span><small>{item.starred ? `已标记 · ${statusLabel(item.status)}` : statusLabel(item.status)}</small></button>)}</aside>
-      <ResearchReport record={record} onUpdate={onUpdate} onDelete={onDelete} />
-      <TraceSummary trace={record?.trace ?? []} />
+      <div className="research-tabcol">
+        <div className="research-tabs" role="tablist" aria-label="研究记录视图切换">
+          <button role="tab" aria-selected={researchTab === 'report'} className={researchTab === 'report' ? 'active' : ''} onClick={() => setResearchTab('report')}>研究</button>
+          <button role="tab" aria-selected={researchTab === 'trace'} className={researchTab === 'trace' ? 'active' : ''} onClick={() => setResearchTab('trace')}>轨迹</button>
+        </div>
+        {researchTab === 'report'
+          ? <ResearchReport record={record} onUpdate={onUpdate} onDelete={onDelete} deleting={deleting} onResume={onResume} onFollowUp={onFollowUp} onReanalyze={onReanalyze} freshnessDays={freshnessDays} />
+          : <article className="research-report"><ResearchTraceView record={record} /></article>}
+      </div>
+      <div className="research-rail"><IncidentPanel record={record} /><SpecialistDecisions agents={record?.specialistAgents} /><SpecialistFindings agents={record?.specialistAgents} /></div>
     </div>
   </>
 }
 
-function ResearchReport({ record, onUpdate, onDelete }: {
+function specialistLabel(domain: string) {
+  return domain === 'news' ? '消息面' : domain === 'technical' ? '技术面'
+    : domain === 'fundamental_valuation' ? '基本面' : domain
+}
+
+function SpecialistDecisions({ agents = [] }: { agents?: ResearchRecord['specialistAgents'] }) {
+  if (!agents.length) return null
+  return <section className="agent-runtime specialist-decisions" role="region" aria-label="专项规划决策">
+    <p className="micro">专项规划决策</p>
+    <ul>{agents.map((agent) => {
+      const launched = Boolean(agent.id) || (agent.status !== undefined && agent.status !== 'not_started')
+      return <li key={agent.domain}>
+        <header><strong>{specialistLabel(agent.domain)}专项</strong><span className={'tool-state tool-state-' + (launched ? 'ok' : 'muted')}>{launched ? '已启动' : '未启动'}</span></header>
+        {agent.researchQuestion && <p>研究问题：{agent.researchQuestion}</p>}
+        {agent.reason && <p>决策理由：{agent.reason}</p>}
+      </li>
+    })}</ul>
+  </section>
+}
+
+function IncidentPanel({ record }: { record: ResearchRecord | null }) {
+  if (!record) return null
+  const incidents: Array<{ tone: 'error' | 'warn'; text: string }> = []
+  const trace = record.trace ?? []
+  const abnormal = ['failed', 'interrupted', 'budget_exhausted', 'stopped']
+  const mainStatus = record.mainAgent?.execution.status ?? record.mainAgent?.status
+  const lastError = [...trace].reverse().find((entry) => (
+    entry.type === 'status' && typeof entry.error === 'string'
+  ))
+  if (mainStatus && abnormal.includes(mainStatus)) {
+    incidents.push({ tone: 'error', text: '主 Agent 执行' + statusLabel(mainStatus) + (typeof lastError?.error === 'string' ? '：' + String(lastError.error) : '') })
+  }
+  for (const entry of trace) {
+    if (entry.type === 'tool_result' && entry.isError === true) {
+      incidents.push({ tone: 'error', text: '工具 ' + String(entry.name ?? '未知') + ' 返回错误' })
+    } else if (entry.type === 'tool_result' && entry.notStarted === true) {
+      incidents.push({ tone: 'warn', text: '工具 ' + String(entry.name ?? '未知') + ' 未开始即取消' })
+    } else if (entry.type === 'web_search_eligibility' && entry.eligible === false) {
+      incidents.push({ tone: 'warn', text: 'Web 搜索未开放：' + String(entry.query ?? '') })
+    }
+  }
+  const financialContext = trace.find((entry) => entry.type === 'financial_context')
+  const capabilities = Array.isArray(financialContext?.capabilities)
+    ? financialContext.capabilities.map(asRecord) : []
+  for (const capability of capabilities) {
+    const sources = Array.isArray(capability.sources) ? capability.sources.map(asRecord) : []
+    for (const source of sources) {
+      if (source.status === 'failed') {
+        incidents.push({ tone: 'warn', text: '数据源失败：' + capabilityLabel(String(capability.capability)) + ' · ' + String(source.source ?? '未知来源') + (typeof source.error === 'string' ? '（' + source.error + '）' : '') })
+      }
+    }
+  }
+  if (record.mainAgent?.events?.some((event) => event.type === 'compaction' && event.status === 'failed')) {
+    incidents.push({ tone: 'warn', text: '主 Agent 上下文 Compaction 曾失败，长研究可能受上下文上限影响' })
+  }
+  for (const agent of record.specialistAgents ?? []) {
+    const status = agent.execution?.status ?? agent.status
+    if (status === 'failed' || status === 'budget_exhausted') {
+      incidents.push({ tone: 'error', text: specialistLabel(agent.domain) + '专项' + statusLabel(status) + '，综合报告将说明对应缺口' })
+    } else if (status === 'stopped' || status === 'interrupted') {
+      incidents.push({ tone: 'warn', text: specialistLabel(agent.domain) + '专项' + statusLabel(status) })
+    }
+  }
+  for (const gap of record.snapshot?.gaps ?? []) {
+    incidents.push({ tone: 'warn', text: '数据缺口：' + String(gap.reason ?? gap.capability ?? '未知') })
+  }
+  if (!incidents.length) return null
+  return <section className="incident-panel" role="alert" aria-label="异常与降级">
+    <p className="micro">异常与降级 · {incidents.length}</p>
+    <ul>{incidents.map((incident, index) => (
+      <li key={index} className={'incident incident-' + incident.tone}>{incident.text}</li>
+    ))}</ul>
+  </section>
+}
+
+function SpecialistFindings({ agents = [] }: { agents?: ResearchRecord['specialistAgents'] }) {
+  return <>{agents?.filter(({ domain }) => (
+    ['news', 'fundamental_valuation', 'technical'].includes(domain)
+  )).map((agent) => {
+    const label = specialistLabel(agent.domain) + '专项'
+    const report = agent.reportVersion?.report
+    return (
+    <section className="agent-runtime specialist-findings" role="region" aria-label={`${label} Agent`} key={agent.id ?? agent.domain}>
+      <p className="micro">{label}</p>
+      <h2>{statusLabel(agent.execution?.status ?? agent.status ?? 'not_started')}</h2>
+      {agent.researchQuestion && <p>研究问题：{agent.researchQuestion}</p>}
+      {agent.reason && <p>理由：{agent.reason}</p>}
+      {agent.reportVersion && <div>
+        <h3>报告版本 {agent.reportVersion.version}</h3>
+        {report?.keyJudgments?.map((judgment, index) => (
+          <p key={index}>{judgment.statement} · {directionLabel(judgment.direction)} · {confidenceLabel(judgment.confidence)}</p>
+        ))}
+        {report?.targetPrice && <p>
+          估值区间：{report.targetPrice.range?.low}
+          {' – '}{report.targetPrice.range?.high}
+          {' · '}{report.targetPrice.method}
+          {' · '}{report.targetPrice.asOf}
+        </p>}
+        {report?.gaps?.map((gap, index) => (
+          <p key={index}>证据缺口：{gap.reason}{gap.impact ? ` · ${gap.impact}` : ''}</p>
+        ))}
+      </div>}
+    </section>
+  )})}</>
+}
+
+// ===== 研究轨迹（「轨迹」tab）=====
+// 面向用户的运行时视图：泳道时间轴给时间感，分层事件流给顺序感。
+// 默认只呈现主 Agent 主干；专项轨迹折叠嵌在启动它们的工具调用之后。
+// Token 明细与 Session/Execution 标识收进折叠区，不直接铺开。
+
+const traceEventTitle: Record<string, string> = {
+  runtime_context: '载入运行上下文', runtime_resume: '恢复执行', planning: '开始规划',
+  running_model: '模型分析中', running_tools: '工具执行中',
+  waiting_for_specialists: '等待专项分析', finalizing: '报告收口',
+  financial_context: '冻结金融上下文', model_completed: '模型返回结构化结果',
+  completed: '研究完成', partial: '部分完成', failed: '执行失败',
+  stopped: '已停止', interrupted: '服务中断', budget_exhausted: '预算耗尽',
+}
+const traceFeedSkip = new Set([
+  'text_delta', 'chat_completed', 'runtime_follow_up', 'model_event', 'context_usage',
+])
+// 主 Agent 启动各专项的工具名 → 专项 domain（轨迹分组的嵌入锚点）。
+const launchToolDomain: Record<string, string> = {
+  run_news_analysis: 'news',
+  run_fundamental_analysis: 'fundamental_valuation',
+  run_technical_analysis: 'technical',
+}
+
+type TraceToolPayload = {
+  call: Record<string, unknown>; result: Record<string, unknown> | null
+  durationMs: number | null
+}
+type TraceFeedItem = {
+  at: string; actor: string; kind: '模型' | '工具' | '系统' | '压缩'
+  text: string; tone: 'ok' | 'warn' | 'error' | 'muted'
+  anchorDomain?: string; tool?: TraceToolPayload
+}
+type MainAgent = NonNullable<ResearchRecord['mainAgent']>
+type SpecialistAgent = NonNullable<ResearchRecord['specialistAgents']>[number]
+
+function pairToolEvents(events: Array<Record<string, unknown>>) {
+  const results = new Map(
+    events.filter((entry) => entry.type === 'tool_result')
+      .map((entry) => [String(entry.toolCallId ?? ''), entry]),
+  )
+  return events.filter((entry) => entry.type === 'tool_call').map((call) => {
+    const result = results.get(String(call.toolCallId ?? '')) ?? null
+    const startedAt = typeof call.startedAt === 'string' ? call.startedAt : null
+    const completedAt = result && typeof result.completedAt === 'string' ? result.completedAt : null
+    const durationMs = startedAt && completedAt
+      ? Math.max(0, Date.parse(completedAt) - Date.parse(startedAt)) : null
+    return { call, result, durationMs }
+  })
+}
+
+function toolStateOf(result: Record<string, unknown> | null) {
+  if (!result) return { tone: 'pending', label: '等待结果' }
+  if (result.notStarted === true) return { tone: 'warn', label: '未开始即取消' }
+  if (result.isError === true) return { tone: 'error', label: '返回错误' }
+  return { tone: 'ok', label: '成功' }
+}
+
+function buildAgentFeed(actor: string, agent: MainAgent | SpecialistAgent): TraceFeedItem[] {
+  const feed: TraceFeedItem[] = []
+  const events = (agent.events ?? []) as Array<Record<string, unknown>>
+  for (const { call, result, durationMs } of pairToolEvents(events)) {
+    const name = String(call.name ?? '工具')
+    const state = toolStateOf(result)
+    feed.push({
+      at: String(call.startedAt ?? call.createdAt ?? ''), actor, kind: '工具',
+      text: `调用 ${name}`,
+      tone: state.tone === 'error' ? 'error' : result ? 'ok' : 'muted',
+      ...(launchToolDomain[name] ? { anchorDomain: launchToolDomain[name] } : {}),
+      tool: { call, result, durationMs },
+    })
+  }
+  for (const event of agent.events ?? []) {
+    const type = String(event.type ?? '')
+    if (!type || traceFeedSkip.has(type) || type === 'tool_result' || type === 'tool_call') continue
+    const at = String(event.createdAt ?? '')
+    if (type === 'compaction') {
+      feed.push({
+        at, actor, kind: '压缩',
+        text: `上下文压缩${statusLabel(event.status ?? '')}`
+          + (typeof event.contextTokens === 'number'
+            ? ` · ${event.contextTokens.toLocaleString('zh-CN')} / ${event.contextWindow?.toLocaleString('zh-CN')} Token` : '')
+          + (typeof event.reserveTokens === 'number'
+            ? ` · 保留 ${event.reserveTokens.toLocaleString('zh-CN')} · 近期 ${event.keepRecentTokens?.toLocaleString('zh-CN')}` : '')
+          + (typeof event.usage?.totalTokens === 'number'
+            ? ` · ${event.usage.totalTokens.toLocaleString('zh-CN')} Token` : '')
+          + (typeof event.tokensAfter === 'number'
+            ? ` · 压缩后 ${event.tokensAfter.toLocaleString('zh-CN')}` : '')
+          + (typeof event.durationMs === 'number' ? ` · ${(event.durationMs / 1000).toFixed(2)} 秒` : ''),
+        tone: event.status === 'failed' ? 'error' : 'warn',
+      })
+      continue
+    }
+    feed.push({
+      at, actor, kind: '系统',
+      text: (traceEventTitle[type] ?? statusLabel(event.status ?? type))
+        + (type === 'runtime_resume' && event.previousExecutionId
+          ? ` · 从 ${event.previousExecutionId} 恢复到 ${event.executionId}` : '')
+        + (event.waitReason
+          ? ` · 等待 ${event.waitReason.target}（始于 ${formatTime(event.waitReason.startedAt)}）` : ''),
+      tone: ['failed', 'interrupted', 'budget_exhausted'].includes(type) ? 'error'
+        : ['completed', 'partial'].includes(type) ? 'ok' : 'muted',
+    })
+  }
+  for (const attempt of agent.modelAttempts ?? []) {
+    if (attempt.kind !== 'turn') continue
+    feed.push({
+      at: attempt.completedAt ?? attempt.createdAt, actor, kind: '模型',
+      text: `第 ${attempt.turnIndex + 1} 轮模型请求 · ${formatOptionalNumber(attempt.usage.total)} Token`
+        + (attempt.durationMs !== null ? ` · ${(attempt.durationMs / 1000).toFixed(1)} 秒` : ''),
+      tone: attempt.status === 'failed' ? 'error' : 'muted',
+    })
+  }
+  return feed.sort((a, b) => a.at.localeCompare(b.at))
+}
+
+function ResearchTraceView({ record }: { record: ResearchRecord | null }) {
+  const main = record?.mainAgent
+  const allAttempts = [
+    ...(main?.modelAttempts ?? []),
+    ...(record?.specialistAgents ?? []).flatMap((agent) => agent.modelAttempts ?? []),
+  ]
+  const usage = aggregateModelTokenUsage(allAttempts)
+  return <section className="trace-view" role="region" aria-label="研究轨迹">
+    <header className="trace-view-header">
+      <p className="micro">研究轨迹 · 时间轴与事件流</p>
+      {allAttempts.length > 0 && <p>
+        研究合计 {usage.attempts} 次 attempt · 已上报 {usage.reportedAttempts}
+        {' · '}Coverage {(usage.coverage * 100).toFixed(1)}%
+        {' · '}Input {formatOptionalNumber(usage.input)}
+        {' · '}Cache Read {formatOptionalNumber(usage.cacheRead)}
+        {' · '}Cache Write {formatOptionalNumber(usage.cacheWrite)}
+        {' · '}Output {formatOptionalNumber(usage.output)}
+        {' · '}Total {formatOptionalNumber(usage.total)}
+      </p>}
+    </header>
+    <TraceContextLine agent={main} />
+    <TraceTimeline record={record} />
+    <FinancialContextTrace trace={record?.trace ?? []} />
+    <TraceFeed record={record} />
+    <TokenUsageTable record={record} />
+    <TraceDeveloperInfo record={record} />
+  </section>
+}
+
+function TraceContextLine({ agent }: { agent?: MainAgent }) {
+  const raw = agent?.events?.filter(
+    ({ type }) => type === 'context_usage' || type === 'compaction',
+  ).at(-1)
+  const contextTokens = raw?.type === 'compaction' && typeof raw.tokensAfter === 'number'
+    ? raw.tokensAfter : raw?.contextTokens
+  if (!raw?.contextWindow || contextTokens === undefined || raw.reserveTokens === undefined) {
+    return null
+  }
+  const trigger = raw.contextWindow - raw.reserveTokens
+  const progress = trigger > 0 ? contextTokens / trigger : 1
+  const compacting = agent?.modelAttempts?.some(({ kind, status }) => (
+    kind === 'compaction' && status === 'started'
+  )) ?? false
+  const lastCompaction = agent?.events?.filter(({ type }) => type === 'compaction').at(-1)
+  const failed = lastCompaction?.status === 'failed'
+  const tone = compacting ? 'blue' : failed ? 'red'
+    : progress < .7 ? 'green' : progress < .85 ? 'yellow'
+      : progress < .95 ? 'orange' : 'red'
+  const state = compacting ? ' · 压缩进行中' : failed ? ' · 上次压缩失败' : ''
+  const currentSegment = agent?.segments?.at(-1)?.ordinal
+  const compactCount = agent?.events?.filter(({ type, status }) => (
+    type === 'compaction' && status === 'completed'
+  )).length ?? 0
+  return <p className={`context-usage context-usage-${tone}`}>
+    上下文 {raw.estimated ? '≈' : ''}{(contextTokens / raw.contextWindow * 100).toFixed(1)}% / {raw.contextWindow.toLocaleString('zh-CN')}
+    {' · '}当前 {contextTokens.toLocaleString('zh-CN')} Token
+    {' · '}阈值 {trigger.toLocaleString('zh-CN')} Token
+    {' · '}距压缩 {Math.max(0, trigger - contextTokens).toLocaleString('zh-CN')} Token
+    {state}{currentSegment ? ` · Segment ${currentSegment}` : ''}
+    {' · '}已压缩 {compactCount} 次
+  </p>
+}
+
+// 泳道时间轴：模型 / 工具 / 压缩 三行执行跨度。
+type TraceSpan = { start: number; end: number; label: string; failed: boolean }
+function TraceTimeline({ record }: { record: ResearchRecord | null }) {
+  const lanes: Array<{ label: string; className: string; spans: TraceSpan[] }> = [
+    { label: '模型', className: 'lane-model', spans: [] },
+    { label: '工具', className: 'lane-tool', spans: [] },
+    { label: '压缩', className: 'lane-compaction', spans: [] },
+  ]
+  const agents: Array<MainAgent | SpecialistAgent> = [
+    ...(record?.mainAgent ? [record.mainAgent] : []),
+    ...(record?.specialistAgents ?? []),
+  ]
+  for (const agent of agents) {
+    for (const attempt of agent.modelAttempts ?? []) {
+      const start = Date.parse(attempt.createdAt)
+      const end = attempt.completedAt ? Date.parse(attempt.completedAt)
+        : attempt.durationMs !== null ? start + attempt.durationMs : Number.NaN
+      if (Number.isFinite(start) && Number.isFinite(end)) {
+        lanes[attempt.kind === 'compaction' ? 2 : 0].spans.push({
+          start, end, label: `${formatOptionalNumber(attempt.usage.total)} Token`,
+          failed: attempt.status === 'failed',
+        })
+      }
+    }
+    for (const { call, result } of pairToolEvents((agent.events ?? []) as Array<Record<string, unknown>>)) {
+      const start = Date.parse(String(call.startedAt ?? call.createdAt ?? ''))
+      const end = Date.parse(String(result?.completedAt ?? ''))
+      if (Number.isFinite(start) && Number.isFinite(end)) {
+        lanes[1].spans.push({
+          start, end, label: String(call.name ?? '工具'), failed: result?.isError === true,
+        })
+      }
+    }
+  }
+  for (const { call, result } of pairToolEvents(record?.trace ?? [])) {
+    const start = Date.parse(String(call.startedAt ?? ''))
+    const end = Date.parse(String(result?.completedAt ?? ''))
+    if (Number.isFinite(start) && Number.isFinite(end)) {
+      lanes[1].spans.push({
+        start, end, label: String(call.name ?? '工具'), failed: result?.isError === true,
+      })
+    }
+  }
+  const all = lanes.flatMap((lane) => lane.spans)
+  if (!all.length) return null
+  const min = Math.min(...all.map((span) => span.start))
+  const max = Math.max(...all.map((span) => span.end), min + 1)
+  const width = 960, laneHeight = 30, padLeft = 44
+  const x = (time: number) => padLeft + (time - min) / (max - min) * (width - padLeft - 8)
+  return <figure className="trace-timeline">
+    <svg viewBox={`0 0 ${width} ${lanes.length * laneHeight + 22}`} role="img"
+      aria-label="研究过程时间轴：模型、工具与压缩的执行跨度">
+      {lanes.map((lane, laneIndex) => <g key={lane.label}>
+        <text x={0} y={laneIndex * laneHeight + 18} className="lane-label">{lane.label}</text>
+        <line x1={padLeft} x2={width - 8} y1={laneIndex * laneHeight + 15}
+          y2={laneIndex * laneHeight + 15} className="lane-baseline" />
+        {lane.spans.map((span, index) => {
+          const left = x(span.start), spanWidth = Math.max(2.5, x(span.end) - left)
+          return <rect key={index} x={left} y={laneIndex * laneHeight + 8} width={spanWidth}
+            height={13} rx={2} className={`lane-span ${lane.className}${span.failed ? ' failed' : ''}`}>
+            <title>{span.label}</title>
+          </rect>
+        })}
+      </g>)}
+      <text x={padLeft} y={lanes.length * laneHeight + 14} className="lane-axis">{formatTime(new Date(min).toISOString())}</text>
+      <text x={width - 8} y={lanes.length * laneHeight + 14} className="lane-axis" textAnchor="end">{formatTime(new Date(max).toISOString())}</text>
+    </svg>
+  </figure>
+}
+
+const traceActorMeta: Record<string, { label: string; className: string }> = {
+  main: { label: '主 Agent', className: 'actor-main' },
+  news: { label: '消息面', className: 'actor-news' },
+  technical: { label: '技术面', className: 'actor-technical' },
+  fundamental_valuation: { label: '基本面', className: 'actor-fundamental' },
+}
+
+function TraceRow({ item }: { item: TraceFeedItem }) {
+  const actor = traceActorMeta[item.actor] ?? { label: item.actor, className: 'actor-main' }
+  const chips = <>
+    <i className={`feed-dot ${actor.className}`} />
+    <span className={`feed-chip ${actor.className}`}>{actor.label}</span>
+    <span className={`feed-kind kind-${item.kind}`}>{item.kind}</span>
+  </>
+  if (!item.tool) {
+    return <>
+      {chips}
+      <span className="feed-text">{item.text}</span>
+      <time>{item.at ? formatTime(item.at) : ''}</time>
+    </>
+  }
+  const { call, result, durationMs } = item.tool
+  const state = toolStateOf(result)
+  return <details className="trace-tool" data-tool-call-id={String(call.toolCallId ?? '')}>
+    <summary>
+      {chips}
+      <strong className="feed-text">{String(call.name ?? '工具')}</strong>
+      <span className={'tool-state tool-state-' + state.tone}>{state.label}</span>
+      <small>{durationMs !== null ? `耗时 ${durationMs.toLocaleString('zh-CN')} 毫秒`
+        : typeof call.startedAt === 'string' && call.startedAt ? `开始 ${formatTime(String(call.startedAt))}` : '未开始'}</small>
+    </summary>
+    <div className="tool-detail">
+      <p className="micro">输入参数</p>
+      <JsonBlock value={call.input} />
+      {result && <>
+        <p className="micro">{state.tone === 'error' ? '错误信息' : '返回结果（用户视图）'}</p>
+        <ToolResultSummary result={result} />
+        <JsonBlock value={result.result} />
+      </>}
+    </div>
+  </details>
+}
+
+type TraceFeedNode =
+  | { kind: 'item'; item: TraceFeedItem }
+  | { kind: 'group'; domain: string; at: string; status: string; items: TraceFeedItem[] }
+
+function TraceFeed({ record }: { record: ResearchRecord | null }) {
+  const mainItems: TraceFeedItem[] = []
+  const main = record?.mainAgent
+  if (main) {
+    if (main.waitReason) {
+      mainItems.push({
+        at: main.waitReason.startedAt, actor: 'main', kind: '系统',
+        text: `等待：${main.waitReason.target} · ${formatTime(main.waitReason.startedAt)}`,
+        tone: 'muted',
+      })
+    }
+    mainItems.push(...buildAgentFeed('main', main))
+  }
+  // 主 Agent 的工具调用（含专项启动）保存在研究 trace 中。
+  for (const { call, result, durationMs } of pairToolEvents(record?.trace ?? [])) {
+    const name = String(call.name ?? '工具')
+    const state = toolStateOf(result)
+    mainItems.push({
+      at: String(call.startedAt ?? ''), actor: 'main', kind: '工具',
+      text: `调用 ${name}`,
+      tone: state.tone === 'error' ? 'error' : result ? 'ok' : 'muted',
+      ...(launchToolDomain[name] ? { anchorDomain: launchToolDomain[name] } : {}),
+      tool: { call, result, durationMs },
+    })
+  }
+  mainItems.sort((a, b) => a.at.localeCompare(b.at))
+  const groups = (record?.specialistAgents ?? []).flatMap((agent) => {
+    if (!agent.domain) return []
+    return [{
+      domain: agent.domain,
+      at: String(agent.events?.[0]?.createdAt ?? ''),
+      status: agent.execution?.status ?? agent.status ?? 'not_started',
+      items: buildAgentFeed(agent.domain, agent),
+    }]
+  })
+  const nodes: TraceFeedNode[] = []
+  const placed = new Set<string>()
+  for (const item of mainItems) {
+    nodes.push({ kind: 'item', item })
+    const group = item.anchorDomain ? groups.find(({ domain }) => domain === item.anchorDomain) : undefined
+    if (group && !placed.has(group.domain)) {
+      nodes.push({ kind: 'group', ...group })
+      placed.add(group.domain)
+    }
+  }
+  for (const group of groups.filter(({ domain }) => !placed.has(domain))) {
+    const index = nodes.findIndex((node) => (
+      (node.kind === 'item' ? node.item.at : node.at) > group.at
+    ))
+    const node: TraceFeedNode = { kind: 'group', ...group }
+    if (index === -1) nodes.push(node)
+    else nodes.splice(index, 0, node)
+  }
+  if (!nodes.length) return <p className="trace-feed-empty">还没有轨迹事件。</p>
+  return <ol className="trace-feed">
+    {nodes.map((node, index) => {
+      if (node.kind === 'item') {
+        return <li key={index} className={`trace-row tone-${node.item.tone}`}>
+          <TraceRow item={node.item} />
+        </li>
+      }
+      const actor = traceActorMeta[node.domain] ?? { label: node.domain, className: 'actor-main' }
+      const tone = ['failed', 'budget_exhausted'].includes(node.status) ? 'error'
+        : node.status === 'not_started' ? 'muted' : 'ok'
+      if (!node.items.length) {
+        return <li key={index} className={`trace-row tone-${tone}`}>
+          <i className={`feed-dot ${actor.className}`} />
+          <span className={`feed-chip ${actor.className}`}>{actor.label}</span>
+          <span className="feed-kind kind-专项">专项</span>
+          <span className="feed-text">{statusLabel(node.status)}，无轨迹事件</span>
+          <time>{node.at ? formatTime(node.at) : ''}</time>
+        </li>
+      }
+      return <li key={index} className={`trace-group tone-${tone}`}>
+        <details>
+          <summary>
+            <i className={`feed-dot ${actor.className}`} />
+            <span className={`feed-chip ${actor.className}`}>{actor.label}</span>
+            <span className="feed-kind kind-专项">专项</span>
+            <span className="feed-text">{node.items.length} 条轨迹事件 · {statusLabel(node.status)}</span>
+            <time>{node.at ? formatTime(node.at) : ''}</time>
+          </summary>
+          <ol className="trace-feed trace-sub">
+            {node.items.map((item, subIndex) => (
+              <li key={subIndex} className={`trace-row tone-${item.tone}`}>
+                <TraceRow item={item} />
+              </li>
+            ))}
+          </ol>
+        </details>
+      </li>
+    })}
+  </ol>
+}
+
+function specialistCacheRate(attempts: ModelAttempt[]): string {
+  const reported = attempts.filter(({ usageStatus }) => usageStatus !== 'unknown')
+  const ready = reported.length > 0 && reported.every(({ usage }) => (
+    usage.input !== null && usage.cacheRead !== null && usage.cacheWrite !== null
+  ))
+  if (!ready) return 'N/A'
+  const base = reported.reduce((sum, { usage }) => (
+    sum + usage.input! + usage.cacheRead! + usage.cacheWrite!
+  ), 0)
+  if (base <= 0) return 'N/A'
+  return `${(reported.reduce((sum, { usage }) => sum + usage.cacheRead!, 0) / base * 100).toFixed(1)}%`
+}
+
+function TokenUsageTable({ record }: { record: ResearchRecord | null }) {
+  const rows: Array<{ label: string; usage: TokenUsage; rate: string }> = []
+  const addAgent = (label: string, attempts: ModelAttempt[]) => {
+    const turns = attempts.filter(({ kind }) => kind === 'turn')
+    if (turns.length) rows.push({
+      label, usage: aggregateModelTokenUsage(turns), rate: specialistCacheRate(turns),
+    })
+  }
+  addAgent('主 Agent', record?.mainAgent?.modelAttempts ?? [])
+  for (const agent of record?.specialistAgents ?? []) addAgent(
+    specialistLabel(agent.domain) + '专项', agent.modelAttempts ?? [],
+  )
+  const compactions = [
+    ...(record?.mainAgent?.modelAttempts ?? []),
+    ...(record?.specialistAgents ?? []).flatMap((agent) => agent.modelAttempts ?? []),
+  ].filter(({ kind }) => kind === 'compaction')
+  if (compactions.length) rows.push({
+    label: 'Compaction', usage: aggregateModelTokenUsage(compactions),
+    rate: specialistCacheRate(compactions),
+  })
+  if (!rows.length) return null
+  return <details className="trace-tokens">
+    <summary>Token 用量明细</summary>
+    <table aria-label="Token 用量明细">
+      <thead><tr>
+        <th>Agent</th><th>请求</th><th>Input</th><th>Cache Read</th><th>Cache Write</th>
+        <th>Output</th><th>Total</th><th>Coverage</th><th>缓存命中率</th>
+      </tr></thead>
+      <tbody>{rows.map((row) => <tr key={row.label}>
+        <td>{row.label}</td>
+        <td>{row.usage.attempts}</td>
+        <td>{formatOptionalNumber(row.usage.input)}</td>
+        <td>{formatOptionalNumber(row.usage.cacheRead)}</td>
+        <td>{formatOptionalNumber(row.usage.cacheWrite)}</td>
+        <td>{formatOptionalNumber(row.usage.output)}</td>
+        <td>{formatOptionalNumber(row.usage.total)}</td>
+        <td>{(row.usage.coverage * 100).toFixed(1)}%</td>
+        <td>{row.rate}</td>
+      </tr>)}</tbody>
+    </table>
+  </details>
+}
+
+function TraceDeveloperInfo({ record }: { record: ResearchRecord | null }) {
+  const main = record?.mainAgent
+  return <details className="trace-dev">
+    <summary>开发者信息</summary>
+    {main && <p>Session {main.id} · Execution {main.execution.id} · Generation {main.execution.generation}</p>}
+    {!!main?.segments?.length && <p>{main.segments.map((segment) => (
+      `Segment ${segment.ordinal}${segment.parentSegmentId
+        ? `（源自 Segment ${main.segments.find(({ id }) => id === segment.parentSegmentId)?.ordinal ?? '?'}）` : ''}`
+    )).join(' · ')}</p>}
+    {!!main?.compactionAttempts?.length && <ol>{main.compactionAttempts.map((attempt) => (
+      <li key={`${attempt.compactionId}:${attempt.attempt}`}>
+        Compaction 尝试 {attempt.attempt} · {statusLabel(attempt.status)}
+        {' · '}{attempt.usage?.totalTokens?.toLocaleString('zh-CN') ?? 'usage 未返回'} Token
+        {' · '}{(attempt.durationMs / 1000).toFixed(2)} 秒
+      </li>
+    ))}</ol>}
+    {(record?.specialistAgents ?? []).filter((agent) => agent.id).map((agent) => (
+      <p key={agent.id}>{specialistLabel(agent.domain)}专项 · Session {agent.id}
+        {agent.execution ? ` · Execution ${agent.execution.id}` : ''}</p>
+    ))}
+    <p>底层共保存 {record?.trace.length ?? 0} 条原始事件，用于排查和审计；此处不逐条渲染模型 token。完整工具输入与结果请使用研究导出。</p>
+  </details>
+}
+
+function FinancialContextTrace({ trace }: { trace: Array<Record<string, unknown>> }) {
+  const financialContext = trace.find((entry) => entry.type === 'financial_context')
+  const capabilities = Array.isArray(financialContext?.capabilities)
+    ? financialContext.capabilities.map(asRecord) : []
+  if (!capabilities.length) return null
+  return <details className="trace-financial-context">
+    <summary>冻结金融上下文</summary>
+    <div className="source-diagnostics">{capabilities.map((capability) => (
+      <CapabilityTrace key={String(capability.capability)} capability={capability} />
+    ))}</div>
+  </details>
+}
+
+function ResearchReport({ record, onUpdate, onDelete, deleting, onResume, onFollowUp, onReanalyze, freshnessDays }: {
   record: ResearchRecord | null; onUpdate: (event: React.FormEvent<HTMLFormElement>) => Promise<void>; onDelete: () => Promise<void>
+  deleting: boolean
+  onResume: () => Promise<void>
+  onFollowUp: (event: React.FormEvent<HTMLFormElement>) => Promise<void>
+  onReanalyze: () => Promise<void>
+  freshnessDays: number | null
 }) {
+  const latestBaseVersion = record?.reportVersions?.at(-1)?.version ?? null
+  const [selectedBaseVersion, setSelectedBaseVersion] = useState<number | null>(latestBaseVersion)
+  useEffect(() => {
+    setSelectedBaseVersion(latestBaseVersion)
+  }, [record?.id, latestBaseVersion])
   if (!record) return <article className="research-report empty">选择一条研究记录开始阅读。</article>
   const facts = new Map(record.facts.map((fact) => [fact.id, fact]))
   const report = record.report
   const indicatorFact = record.facts.find((fact) => fact.type === 'indicators')
   const indicator = asRecord(indicatorFact?.value)
   const valuationFact = record.facts.find((fact) => fact.type === 'valuation')
+  const selectedVersion = record.reportVersions?.find(({ version }) => (
+    version === selectedBaseVersion
+  ))
+  const stale = freshnessDays !== null && isReportOlderThan(
+    selectedVersion?.createdAt ?? record.reportCreatedAt, freshnessDays,
+  )
+  const conversation = (record.mainAgent?.events ?? []).reduce<Array<{
+    key: string; role: 'user' | 'assistant'; text: string; streaming?: boolean
+  }>>((messages, event) => {
+    if (event.type === 'runtime_follow_up' && event.message) {
+      messages.push({ key: `user:${event.sequence}`, role: 'user', text: event.message })
+    }
+    if (event.type === 'chat_completed' && event.text) {
+      if (messages.at(-1)?.streaming) messages.pop()
+      messages.push({ key: `assistant:${event.sequence}`, role: 'assistant', text: event.text })
+    }
+    if (event.type === 'text_delta' && event.text) {
+      const previous = messages.at(-1)
+      if (previous?.role === 'assistant' && previous.streaming) previous.text += event.text
+      else messages.push({
+        key: `assistant-stream:${event.sequence}`, role: 'assistant', text: event.text, streaming: true,
+      })
+    }
+    return messages
+  }, [])
   return <article className="research-report">
-    <header className="report-title"><div><p className="micro">{record.symbol} · {statusLabel(record.status)}</p><h2>{report?.title ?? '受限分析'}</h2></div><span className={`verdict ${record.status}`}>{trendVerdict(report?.trend)}<small>未来 1—4 周</small></span></header>
+    <header className="report-title"><div><p className="micro">{record.symbol} · {statusLabel(record.status)}</p><h2>{report?.title ?? '受限分析'}</h2>{stale && <p role="status" className="data-warning">此报告可能过期：已超过当前 {freshnessDays} 天时效阈值。</p>}</div><span className={`verdict ${record.status}`}>{trendVerdict(report?.trend)}<small>未来 1—4 周</small></span></header>
     {record.error && <p role="alert" className="error-banner">{friendlyError(record.error)}</p>}
     <section className="report-hero"><div><p className="micro">当前市场状态</p><p>{report?.marketState ?? '没有足够数据形成市场状态判断。'}</p><strong>{report?.trend}</strong></div><PriceChart facts={record.facts} /></section>
     <section className="indicator-strip"><Metric label="MA 5" value={formatMaybeMoney(indicator.ma_5)} /><Metric label="MA 20" value={formatMaybeMoney(indicator.ma_20)} /><Metric label="RSI 14" value={formatMaybeNumber(indicator.rsi_14)} /><Metric label="年化波动" value={formatPercent(indicator.annualized_volatility)} /><Metric label="最大回撤" value={formatPercent(indicator.max_drawdown)} /></section>
@@ -290,19 +1119,42 @@ function ResearchReport({ record, onUpdate, onDelete }: {
     {(report?.personalImpact || report?.conditionalSuggestion) && <ReportBlock number="06" title="与你的持仓"><p>{report.personalImpact}</p>{report.conditionalSuggestion && <p className="suggestion">条件式方向：{report.conditionalSuggestion}</p>}</ReportBlock>}
     <details className="evidence-drawer"><summary>查看全部支持与相反证据</summary><div className="evidence-columns"><section><h3>支持证据</h3><Evidence facts={facts} ids={report?.supportingEvidence ?? []} /></section><section><h3>相反证据</h3><Evidence facts={facts} ids={report?.contraryEvidence ?? []} /></section></div></details>
     {!!report?.limitations?.length && <section className="limitations"><p className="micro">数据与分析限制</p><BulletList values={report.limitations} /></section>}
-    <form className="research-meta" onSubmit={(event) => void onUpdate(event)}><label><input type="checkbox" name="starred" defaultChecked={record.starred} /> 标记这份研究</label><label>个人备注<textarea name="note" defaultValue={record.note ?? ''} /></label><div><button type="submit">保存备注</button><button type="button" className="quiet danger" onClick={() => void onDelete()}>删除记录</button></div></form>
+    {!!conversation.length && <section className="research-conversation" aria-label="与主 Agent 的对话">
+      <p className="micro">继续对话</p>
+      {conversation.map((message) => <p key={message.key} className={message.role}>
+        <strong>{message.role === 'user' ? '你' : '主 Agent'}</strong>{message.text}
+      </p>)}
+    </section>}
+    <form className="research-follow-up" onSubmit={(event) => void onFollowUp(event)}>
+      <label>继续与主 Agent 对话<textarea name="message" aria-label="追问主 Agent" required /></label>
+      {!!record.reportVersions?.length && <label>报告基准版本<select
+        name="baseReportVersion" aria-label="报告基准版本"
+        value={String(selectedBaseVersion ?? latestBaseVersion ?? '')}
+        onChange={(event) => setSelectedBaseVersion(Number(event.target.value))}
+      >{record.reportVersions.map((version) => <option
+          key={version.version} value={version.version}
+        >V{version.version} · {version.report.title ?? version.createdAt}</option>)}</select></label>}
+      <label className="follow-up-report-toggle"><input type="checkbox" name="updateReport" />
+        用本次结果更新综合报告</label>
+      {stale && <p className="data-warning">当前报告可能过期，追问会同时提供报告时与当前持仓语境。</p>}
+      <button type="submit">发送追问</button>
+    </form>
+    <form className="research-meta" onSubmit={(event) => void onUpdate(event)}><label><input type="checkbox" name="starred" defaultChecked={record.starred} /> 标记这份研究</label><label>个人备注<textarea name="note" defaultValue={record.note ?? ''} /></label><div><button type="submit">保存备注</button><a className="quiet" href={`/api/research/${record.id}/export`} download>导出研究 JSON</a>{isTerminalAgentExecutionStatus(record.status, record.terminal) && <button type="button" className="quiet" onClick={() => void onReanalyze()}>重新分析 {record.symbol}</button>}{['stopped', 'interrupted'].includes(record.status) && <button type="button" className="quiet" onClick={() => void onResume()}>恢复研究</button>}<button type="button" className="quiet danger" disabled={deleting} onClick={() => void onDelete()}>{deleting ? '正在删除…' : '删除记录'}</button></div></form>
   </article>
 }
 
-function PortfolioPage({ portfolio, history, onSave, onSaveCash, onReduce, onDelete }: {
+function PortfolioPage({ portfolio, history, events, onSave, onSaveCash, onBuy, onReduce, onDelete }: {
   portfolio: PortfolioOverview
   history: PortfolioEquitySnapshot[]
+  events: PortfolioEvent[]
   onSave: (event: React.FormEvent<HTMLFormElement>) => Promise<void>
   onSaveCash: (event: React.FormEvent<HTMLFormElement>) => Promise<void>
+  onBuy: (symbol: string, quantity: number, price: number) => Promise<boolean>
   onReduce: (symbol: string, quantity: number, price: number) => Promise<boolean>
   onDelete: (symbol: string) => Promise<void>
 }) {
   const [reducing, setReducing] = useState<PortfolioPosition | null>(null)
+  const [buying, setBuying] = useState<PortfolioPosition | null>(null)
   return <><PageHeader eyebrow="PRIVATE PORTFOLIO" title="我的持仓" description="现金、持仓市值和盈亏共同构成你的组合语境；行情缺失时不猜测组合总值。" />
     <div className="portfolio-kpis">
       <PortfolioKpi label="组合总值" value={formatNullableMoney(portfolio.totalEquity)} note="持仓市值 + USD 现金" />
@@ -319,11 +1171,13 @@ function PortfolioPage({ portfolio, history, onSave, onSaveCash, onReduce, onDel
     <section className="portfolio-holdings">
       <header><div><p className="micro">当前持仓 · {portfolio.positions.length}</p><h2>组合明细</h2></div>{portfolio.unpricedPositionCount > 0 && <p className="data-warning">{portfolio.unpricedPositionCount} 项行情缺失，组合汇总已关闭。</p>}</header>
       <div className="portfolio-table-scroll"><div className="portfolio-table-row head"><span>标的</span><span>数量</span><span>平均成本</span><span>当前价</span><span>市值</span><span>仓位</span><span>未实现盈亏</span><span /></div>
-        {portfolio.positions.map((item) => <div className="portfolio-table-row" key={item.symbol}><strong>{item.symbol}</strong><span>{formatNumber(item.quantity)}</span><span>{formatMoney(item.averageCost)}</span><span>{formatNullableMoney(item.marketPrice)}</span><span>{formatNullableMoney(item.marketValue)}</span><span>{item.portfolioWeight === null ? '—' : formatPercent(item.portfolioWeight)}</span><span className={valueTone(item.unrealizedProfitLoss)}>{formatSignedMoney(item.unrealizedProfitLoss)}<small>{item.unrealizedReturn === null ? '' : formatSignedPercent(item.unrealizedReturn)}</small></span><span className="position-actions"><button className="quiet" onClick={() => setReducing(item)}>减仓</button><button className="text-button" onClick={() => void onDelete(item.symbol)}>删除</button></span></div>)}
+        {portfolio.positions.map((item) => <div className="portfolio-table-row" key={item.symbol}><strong>{item.symbol}</strong><span>{formatNumber(item.quantity)}</span><span>{formatMoney(item.averageCost)}</span><span>{formatNullableMoney(item.marketPrice)}</span><span>{formatNullableMoney(item.marketValue)}</span><span>{item.portfolioWeight === null ? '—' : formatPercent(item.portfolioWeight)}</span><span className={valueTone(item.unrealizedProfitLoss)}>{formatSignedMoney(item.unrealizedProfitLoss)}<small>{item.unrealizedReturn === null ? '' : formatSignedPercent(item.unrealizedReturn)}</small></span><span className="position-actions"><button className="quiet" onClick={() => setBuying(item)}>加仓</button><button className="quiet" onClick={() => setReducing(item)}>减仓</button><button className="text-button" onClick={() => void onDelete(item.symbol)}>删除</button></span></div>)}
         {!portfolio.positions.length && <p className="empty-row">尚未录入持仓。</p>}
       </div>
     </section>
-    <div className="portfolio-editors"><section className="cash-form"><p className="micro">现金余额</p><h2>维护 USD 现金</h2><form onSubmit={(event) => void onSaveCash(event)}><label>当前现金<input key={portfolio.cash} name="cash" aria-label="当前现金" type="number" min="0" step="any" defaultValue={portfolio.cash} required /></label><button type="submit">保存现金</button></form><p>现金不会因手工录入已有持仓自动变化；只有明确减仓时，卖出所得会计入现金。</p></section><section className="position-form"><p className="micro">新增或更新持仓</p><form onSubmit={(event) => void onSave(event)}><label>股票代码<input name="symbol" aria-label="股票代码" required /></label><label>数量<input name="quantity" aria-label="数量" type="number" min="0.000001" step="any" required /></label><label>平均成本<input name="averageCost" aria-label="平均成本" type="number" min="0" step="any" required /></label><button type="submit">保存持仓</button></form><p>这是手工快照录入，不代表系统执行了一笔买入交易。</p></section></div>
+    <div className="portfolio-editors"><section className="cash-form"><p className="micro">资金调整</p><h2>入金或出金</h2><form onSubmit={(event) => void onSaveCash(event)}><label>目标现金<input key={portfolio.cash} name="cash" aria-label="目标现金" type="number" min="0" step="any" defaultValue={portfolio.cash} required /></label><button type="submit">记录资金调整</button></form><p>调高记为入金、调低记为出金，差额作为资金调整事件记入调仓账本；买入扣现金、卖出加现金也会自动记录。</p></section><section className="position-form"><p className="micro">校准持仓</p><form onSubmit={(event) => void onSave(event)}><label>股票代码<input name="symbol" aria-label="股票代码" required /></label><label>数量<input name="quantity" aria-label="数量" type="number" min="0.000001" step="any" required /></label><label>平均成本<input name="averageCost" aria-label="平均成本" type="number" min="0" step="any" required /></label><button type="submit">校准持仓</button></form><p>把持仓对齐到券商实际数量与成本；不影响现金，差额以校准事件记入调仓账本。日常买入请用「加仓」。</p></section></div>
+    <EventLedger events={events} />
+    {buying && <BuyDialog position={buying} cash={portfolio.cash} onCancel={() => setBuying(null)} onSubmit={async (quantity, price) => { if (await onBuy(buying.symbol, quantity, price)) setBuying(null) }} />}
     {reducing && <ReduceDialog position={reducing} cash={portfolio.cash} onCancel={() => setReducing(null)} onSubmit={async (quantity, price) => { if (await onReduce(reducing.symbol, quantity, price)) setReducing(null) }} />}
   </>
 }
@@ -354,6 +1208,23 @@ function PositionBars({ positions, mode }: { positions: PortfolioPosition[]; mod
   return <section className="portfolio-bars"><p className="micro">{mode === 'weight' ? '仓位分布' : '盈亏分解'}</p><h2>{mode === 'weight' ? '谁占用了组合' : '谁在贡献盈亏'}</h2>{values.length ? values.map((item) => <div className="portfolio-bar-row" key={item.symbol}><strong>{item.symbol}</strong><span className={item.value < 0 ? 'bar-track negative' : 'bar-track'}><i style={{ width: `${max ? Math.abs(item.value) / max * 100 : 0}%` }} /></span><small className={valueTone(item.value)}>{mode === 'weight' ? formatPercent(item.value) : formatSignedMoney(item.value)}</small></div>) : <p className="chart-empty">行情可用后显示</p>}</section>
 }
 
+function BuyDialog({ position, cash, onCancel, onSubmit }: { position: PortfolioPosition; cash: number; onCancel: () => void; onSubmit: (quantity: number, price: number) => Promise<void> }) {
+  const [quantity, setQuantity] = useState('')
+  const [price, setPrice] = useState(position.marketPrice === null ? '' : String(position.marketPrice))
+  const shares = Number(quantity), buyPrice = Number(price), valid = Number.isFinite(shares) && shares > 0 && Number.isFinite(buyPrice) && buyPrice >= 0
+  const spent = valid ? shares * buyPrice : 0, affordable = spent <= cash
+  const nextAverageCost = valid ? (position.quantity * position.averageCost + spent) / (position.quantity + shares) : 0
+  return <div className="portfolio-modal"><form role="dialog" aria-modal="true" aria-label={`加仓 ${position.symbol}`} onSubmit={(event) => { event.preventDefault(); if (valid && affordable) void onSubmit(shares, buyPrice) }}><p className="micro">BUY POSITION</p><h2>加仓 {position.symbol}</h2><p>当前持有 {formatNumber(position.quantity)} 股，平均成本 {formatMoney(position.averageCost)}，可用现金 {formatMoney(cash)}。</p><label>买入数量<input autoFocus aria-label="买入数量" type="number" min="0.000001" step="any" value={quantity} onChange={(event) => setQuantity(event.target.value)} required /></label><label>成交价<input aria-label="成交价" type="number" min="0" step="any" value={price} onChange={(event) => setPrice(event.target.value)} required /></label><div className="trade-preview"><span>买入花费<strong>{valid ? formatMoney(spent) : '—'}</strong></span><span>加仓后现金<strong>{valid ? formatMoney(cash - spent) : '—'}</strong></span><span>加仓后平均成本<strong>{valid ? formatMoney(nextAverageCost) : '—'}</strong></span></div>{valid && !affordable && <p role="alert" className="missing">买入金额超过当前现金，请先入金或降低买入金额。</p>}<div className="modal-actions"><button type="button" className="quiet" onClick={onCancel}>取消</button><button type="submit" disabled={!valid || !affordable}>确认加仓</button></div></form></div>
+}
+
+const eventKindLabels: Record<PortfolioEvent['kind'], string> = { buy: '买入', sell: '卖出', cash_adjust: '资金调整', reconcile: '校准' }
+
+function EventLedger({ events }: { events: PortfolioEvent[] }) {
+  return <section className="equity-history"><header><div><p className="micro">调仓账本 · 最近 {events.length} 条</p><h2>每一次仓位与现金变化</h2></div><p>持仓与现金都由这些事件推导而来</p></header>
+    {events.length ? <div className="equity-table-scroll"><table aria-label="调仓事件账本"><thead><tr><th>时间</th><th>事件</th><th>标的</th><th>数量</th><th>价格</th><th>现金变化</th><th>已实现盈亏</th><th>备注</th></tr></thead><tbody>{events.map((event) => <tr key={event.id}><td>{event.createdAt.slice(0, 16).replace('T', ' ')}</td><td>{eventKindLabels[event.kind]}</td><td>{event.symbol ?? '—'}</td><td>{event.quantity === null ? '—' : formatNumber(event.quantity)}</td><td>{event.price === null ? '—' : formatMoney(event.price)}</td><td className={valueTone(event.amount)}>{event.amount === null ? '—' : formatSignedMoney(event.amount)}</td><td className={valueTone(event.realizedProfitLoss)}>{event.realizedProfitLoss === null ? '—' : formatSignedMoney(event.realizedProfitLoss)}</td><td>{event.note || '—'}</td></tr>)}</tbody></table></div> : <p className="chart-empty">买入、卖出、资金调整或校准后在这里留下记录</p>}
+  </section>
+}
+
 function ReduceDialog({ position, cash, onCancel, onSubmit }: { position: PortfolioPosition; cash: number; onCancel: () => void; onSubmit: (quantity: number, price: number) => Promise<void> }) {
   const [quantity, setQuantity] = useState('')
   const [price, setPrice] = useState(position.marketPrice === null ? '' : String(position.marketPrice))
@@ -362,8 +1233,72 @@ function ReduceDialog({ position, cash, onCancel, onSubmit }: { position: Portfo
   return <div className="portfolio-modal"><form role="dialog" aria-modal="true" aria-label={`减仓 ${position.symbol}`} onSubmit={(event) => { event.preventDefault(); if (valid) void onSubmit(shares, salePrice) }}><p className="micro">REDUCE POSITION</p><h2>减仓 {position.symbol}</h2><p>当前持有 {formatNumber(position.quantity)} 股，平均成本 {formatMoney(position.averageCost)}。</p><label>卖出数量<input autoFocus aria-label="卖出数量" type="number" min="0.000001" max={position.quantity} step="any" value={quantity} onChange={(event) => setQuantity(event.target.value)} required /></label><label>成交价<input aria-label="成交价" type="number" min="0" step="any" value={price} onChange={(event) => setPrice(event.target.value)} required /></label><div className="trade-preview"><span>卖出所得<strong>{valid ? formatMoney(proceeds) : '—'}</strong></span><span>减仓后现金<strong>{valid ? formatMoney(cash + proceeds) : '—'}</strong></span><span>本次已实现盈亏<strong className={valueTone(realized)}>{valid ? formatSignedMoney(realized) : '—'}</strong></span></div>{shares > position.quantity && <p role="alert" className="missing">卖出数量不能超过当前持仓。</p>}<div className="modal-actions"><button type="button" className="quiet" onClick={onCancel}>取消</button><button type="submit" disabled={!valid}>确认减仓</button></div></form></div>
 }
 
-function SettingsPage({ health, modelConfigured }: { health: SystemHealth | null; modelConfigured: boolean }) {
-  return <><PageHeader eyebrow="INSTANCE SETTINGS" title="系统设置" description="这里仅显示当前实例能力是否就绪，密钥值永远不会返回浏览器。" /><div className="settings-grid"><Setting title="Analysis API" description="分析任务、研究记录与持仓管理" ready={health?.status === 'ok'} /><Setting title="Financial Data" description="行情、新闻、财报与确定性计算" ready={health?.dependencies.financialData.status === 'ok'} /><Setting title="AI Model" description="由 .env 指定的兼容模型端点" ready={modelConfigured} /><Setting title="SQLite" description="私有持仓、快照、事实与研究轨迹" ready={health?.dependencies.database.status === 'ok'} /></div></>
+function SettingsPage({ health, modelConfigured, settings, onReload }: {
+  health: SystemHealth | null; modelConfigured: boolean; settings: RuntimeSettingsResponse | null
+  onReload: () => Promise<void>
+}) {
+  const [writeError, setWriteError] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  const submittingRef = useRef(false)
+  const fields: Array<{ key: keyof RuntimeSettings; label: string }> = [
+    { key: 'mainAgentToolRounds', label: '主 Agent 轮次' },
+    { key: 'specialistAgentToolRounds', label: '专项 Agent 轮次' },
+    { key: 'researchActiveMinutes', label: '研究时长（分钟）' },
+    { key: 'executionWallClockMinutes', label: 'Execution 墙钟（分钟）' },
+    { key: 'analysisConcurrency', label: '研究并发' },
+    { key: 'modelConcurrency', label: '模型并发' },
+    { key: 'toolConcurrency', label: '工具并发' },
+    { key: 'modelRequestTimeoutMinutes', label: '模型请求超时（分钟）' },
+    { key: 'reportFreshnessDays', label: 'Freshness（天）' },
+    { key: 'compactionReserveTokens', label: 'Compaction 保留 Token' },
+    { key: 'agentModeFlat', label: '扁平 Agent 模式（0=分层，1=扁平，实验）' },
+    { key: 'flatAgentToolRounds', label: '扁平模式轮次上限' },
+  ]
+  async function save(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const data = new FormData(event.currentTarget)
+    const body = Object.fromEntries(fields.map(({ key }) => [key, Number(data.get(key))]))
+    await writeSettings('Runtime 设置保存失败', '/api/settings', {
+      method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+    })
+  }
+  async function restoreDefaults() {
+    await writeSettings('Runtime 设置恢复失败', '/api/settings/defaults', { method: 'POST' })
+  }
+  async function restoreField(key: keyof RuntimeSettings) {
+    await writeSettings('Runtime 设置恢复失败', '/api/settings', {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ [key]: settings!.defaults[key] }),
+    })
+  }
+  async function writeSettings(message: string, url: string, init: RequestInit) {
+    if (submittingRef.current) return
+    submittingRef.current = true
+    setSubmitting(true)
+    setWriteError('')
+    try {
+      const response = await fetch(url, init)
+      if (!response.ok) {
+        const body = await response.json().catch(() => null) as { error?: unknown } | null
+        const detail = typeof body?.error === 'string' ? `：${body.error}` : ''
+        throw new Error(`${message}（HTTP ${response.status}）${detail}`)
+      }
+      await onReload()
+    } catch (cause) {
+      setWriteError(cause instanceof Error ? cause.message : message)
+    } finally {
+      submittingRef.current = false
+      setSubmitting(false)
+    }
+  }
+  return <><PageHeader eyebrow="INSTANCE SETTINGS" title="系统设置" description="普通 Runtime 设置保存在 PostgreSQL；密钥值永远不会返回浏览器。" /><div className="settings-grid"><Setting title="Analysis API" description="分析任务、研究记录与持仓管理" ready={health?.status === 'ok'} /><Setting title="Financial Data" description="行情、新闻、财报与确定性计算" readyLabel="在线" ready={health?.dependencies.financialData.status === 'ok'} /><Setting title="AI Model" description="由 .env 指定的兼容模型端点；这里只检查配置完整性" readyLabel="已配置" ready={modelConfigured} /><Setting title="PostgreSQL" description="持仓、权益历史、事实与研究轨迹" ready={health?.dependencies.productDatabase.status === 'ok'} /></div>{settings?.current && settings.defaults && <section className="runtime-settings" aria-busy={submitting}><header><div><p className="micro">AGENT RUNTIME</p><h2>当前 revision #{settings.current.id}</h2><p>上次修改：{formatTime(settings.current.createdAt)}</p></div><button type="button" className="quiet" disabled={submitting} onClick={() => void restoreDefaults()}>恢复全部默认值</button></header>{writeError && <p role="alert" className="error-banner">{writeError}</p>}<form key={settings.current.id} onSubmit={(event) => void save(event)}>{fields.map(({ key, label }) => <label key={key}>{label}<input aria-label={label} name={key} type="number" min={runtimeSettingLimits[key][0]} max={runtimeSettingLimits[key][1]} defaultValue={settings.current!.values[key]} disabled={submitting} required /><small>默认 {settings.defaults![key].toLocaleString('zh-CN')} <button type="button" className="text-button" disabled={submitting} onClick={() => void restoreField(key)}>恢复此项</button></small></label>)}<button type="submit" disabled={submitting}>{submitting ? '保存中…' : '保存 Runtime 设置'}</button></form>{settings.activeExecutions.length > 0 && <div className="frozen-settings"><h3>运行中的冻结值</h3>{settings.activeExecutions.map((snapshot) => <article key={snapshot.executionId}><strong>运行 execution {snapshot.executionId}</strong><span>{formatFrozenSettings(snapshot.values)}</span></article>)}</div>}</section>}</>
+}
+
+function formatFrozenSettings(settings: RuntimeSettings) {
+  const mode = settings.agentModeFlat === 1
+    ? `扁平 ${settings.flatAgentToolRounds} 轮`
+    : `主 Agent ${settings.mainAgentToolRounds} 轮 · 专项 ${settings.specialistAgentToolRounds} 轮`
+  return `${mode} · 研究 ${settings.researchActiveMinutes} 分钟 · 墙钟 ${settings.executionWallClockMinutes} 分钟 · 研究/模型/工具并发 ${settings.analysisConcurrency}/${settings.modelConcurrency}/${settings.toolConcurrency} · 模型超时 ${settings.modelRequestTimeoutMinutes} 分钟 · Freshness ${settings.reportFreshnessDays} 天 · Compaction 保留 ${settings.compactionReserveTokens.toLocaleString('zh-CN')} Token`
 }
 
 function PriceChart({ facts, compact = false }: { facts: Fact[]; compact?: boolean }) {
@@ -394,16 +1329,26 @@ function FactCard({ fact }: { fact: Fact }) {
   return href ? <a className="fact-card" href={href} target="_blank" rel="noreferrer">{content}</a> : <div className="fact-card">{content}</div>
 }
 
-function TraceSummary({ trace }: { trace: Array<Record<string, unknown>> }) {
-  const stages = [
-    ['system_prompt', '载入分析规则'], ['financial_context', '冻结金融上下文'], ['tool_call', '调用只读工具'],
-    ['tool_result', '工具返回事实'], ['model_completed', '生成结构化报告'], ['status', '保存任务状态'],
-  ] as const
-  const financialContext = trace.find((entry) => entry.type === 'financial_context')
-  const capabilities = Array.isArray(financialContext?.capabilities)
-    ? financialContext.capabilities.map(asRecord)
-    : []
-  return <aside className="trace-panel"><p className="micro">分析轨迹</p>{stages.map(([type, label], index) => { const entries = trace.filter((entry) => entry.type === type); const count = entries.length; const expandable = type === 'financial_context' && capabilities.length > 0; return expandable ? <details className="trace-stage" key={type}><summary><i>{index + 1}</i><span>{label}</span><small>{count} 次</small></summary><div className="source-diagnostics">{capabilities.map((capability) => <CapabilityTrace key={String(capability.capability)} capability={capability} />)}</div></details> : <div key={type}><i>{index + 1}</i><span>{label}</span><small>{count ? `${count} 次` : '无'}</small></div> })}<details><summary>开发者信息</summary><p>底层共保存 {trace.length} 条原始事件，用于排查和审计；此处不逐条渲染模型 token。</p></details></aside>
+function ToolResultSummary({ result }: { result: Record<string, unknown> }) {
+  const payload = result.result && typeof result.result === 'object'
+    ? result.result as Record<string, unknown>
+    : null
+  const summary = typeof payload?.summary === 'string' ? payload.summary : null
+  const factCount = Array.isArray(payload?.facts) ? payload.facts.length : null
+  const launched = typeof payload?.launched === 'boolean' ? payload.launched : null
+  const parts = [
+    launched === true ? '专项已启动' : launched === false ? '专项未启动' : null,
+    summary, factCount !== null ? '产生 ' + factCount + ' 条原子事实' : null,
+  ].filter((part) => part !== null)
+  return parts.length ? <p className="tool-result-summary">{parts.join(' · ')}</p> : null
+}
+
+function JsonBlock({ value, limit = 8000 }: { value: unknown; limit?: number }) {
+  if (value === undefined || value === null) return <p className="tool-detail-empty">无</p>
+  let text = ''
+  try { text = JSON.stringify(value, null, 2) ?? '' } catch { text = String(value) }
+  const truncated = text.length > limit
+  return <pre className="json-block">{truncated ? text.slice(0, limit) + '\n…（已截断，完整内容请使用研究导出）' : text}</pre>
 }
 
 function CapabilityTrace({ capability }: { capability: Record<string, unknown> }) {
@@ -428,7 +1373,7 @@ function BulletList({ values }: { values: string[] }) { return <ul className="pl
 function Metric({ label, value }: { label: string; value: string }) { return <div><span>{label}</span><strong>{value}</strong></div> }
 function StatusRow({ label, ready }: { label: string; ready: boolean }) { return <div className="status-row"><i className={ready ? 'live-dot' : 'live-dot off'} /><span>{label}</span><small>{ready ? '正常' : '不可用'}</small></div> }
 function SystemBadge({ health, modelConfigured }: { health: SystemHealth | null; modelConfigured: boolean }) { const ready = health?.status === 'ok' && modelConfigured; return <div className="system-badge"><i className={ready ? 'live-dot' : 'live-dot off'} /><span>本地实例</span><small>{ready ? '全部正常' : '能力受限'}</small></div> }
-function Setting({ title, description, ready }: { title: string; description: string; ready: boolean }) { return <section><div><p className="micro">INSTANCE CAPABILITY</p><h2>{title}</h2><p>{description}</p></div><span className={ready ? 'ready-chip' : 'ready-chip off'}><i />{ready ? '正常' : '不可用'}</span></section> }
+function Setting({ title, description, ready, readyLabel = '正常' }: { title: string; description: string; ready: boolean; readyLabel?: string }) { return <section><div><p className="micro">INSTANCE CAPABILITY</p><h2>{title}</h2><p>{description}</p></div><span className={ready ? 'ready-chip' : 'ready-chip off'}><i />{ready ? readyLabel : '不可用'}</span></section> }
 
 function normalizedBars(facts: Fact[]) {
   const map = new Map<string, { date: string; close: number; volume: number }>()
@@ -497,11 +1442,13 @@ function factHeadline(fact: Fact) {
   return String(value.title ?? value.name ?? value.status ?? '结构化事实')
 }
 function asRecord(value: unknown): Record<string, any> { return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, any> : {} }
-function pipelineIndex(status: string, stages: string[]) { if (['completed', 'partial'].includes(status)) return 6; if (status === 'failed' || status === 'cancelled' || status === 'interrupted') return Math.max(0, stages.includes('model_event') ? 4 : stages.includes('financial_context') ? 3 : 1); return stages.includes('model_completed') ? 5 : stages.includes('model_event') ? 4 : stages.includes('financial_context') ? 3 : status === 'running' ? 2 : status === 'queued' ? 1 : 0 }
+function pipelineIndex(status: string, stages: string[]) { if (['completed', 'partial'].includes(status)) return 6; if (['failed', 'stopped', 'interrupted', 'budget_exhausted'].includes(status)) return Math.max(0, stages.includes('model_event') ? 4 : stages.includes('financial_context') ? 3 : 1); return stages.includes('model_completed') ? 5 : stages.includes('model_event') ? 4 : stages.includes('financial_context') ? 3 : ['running', 'running_model', 'running_tools', 'waiting_for_specialists', 'finalizing'].includes(status) ? 2 : ['queued', 'planning'].includes(status) ? 1 : 0 }
 function pipelineLabel(stage: string) { return ({ queued: '创建分析任务', running: '准备市场与持仓材料', financial_context: '冻结金融上下文', model_event: 'AI 综合判断', model_completed: '校验结构化报告', completed: '保存研究记录' } as Record<string, string>)[stage] }
 function safeReference(value: string) { return value.startsWith('http://') || value.startsWith('https://') ? value : undefined }
 function factLabel(type: string) { return ({ quote: '当前价格', daily_bar: '历史行情', news: '相关新闻', indicators: '技术指标', valuation: '估值结果', dilutedEps: '每股收益', revenue: '营业收入', netIncome: '净利润', operatingCashFlow: '经营现金流' } as Record<string, string>)[type] ?? '结构化事实' }
-function statusLabel(status: string) { return ({ queued: '排队中', running: '分析中', completed: '已完成', partial: '部分完成', failed: '失败', cancelled: '已取消', interrupted: '服务中断' } as Record<string, string>)[status] ?? status }
+function statusLabel(status: string) { return ({ queued: '排队中', planning: '规划中', not_started: '未启动', running: '分析中', running_model: '模型分析中', running_tools: '工具执行中', waiting_for_specialists: '等待专项分析', finalizing: '报告收口中', completed: '已完成', partial: '部分完成', failed: '失败', stopping: '正在停止', stopped: '已停止', interrupted: '服务中断', budget_exhausted: '预算已耗尽' } as Record<string, string>)[status] ?? status }
+function directionLabel(direction?: string) { return ({ bullish: '偏多', bearish: '偏空', neutral: '中性' } as Record<string, string>)[direction ?? ''] ?? direction ?? '方向未知' }
+function confidenceLabel(confidence?: string) { return ({ low: '低置信度', medium: '中等置信度', high: '高置信度' } as Record<string, string>)[confidence ?? ''] ?? confidence ?? '置信度未知' }
 function trendVerdict(trend?: string) { if (!trend) return '受限'; if (/偏强|看涨|上升/.test(trend)) return '谨慎偏多'; if (/偏弱|看跌|下降/.test(trend)) return '谨慎偏空'; return '中性观察' }
 function formatTime(value: string) { const date = new Date(value); return Number.isNaN(date.valueOf()) ? value : date.toLocaleString('zh-CN', { dateStyle: 'medium', timeStyle: 'short' }) }
 function formatMoney(value: number) { return Number.isFinite(value) ? new Intl.NumberFormat('zh-CN', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 }).format(value) : '—' }
@@ -509,6 +1456,7 @@ function formatNullableMoney(value: number | null) { return value === null ? '�
 function formatSignedMoney(value: number | null) { if (value === null || !Number.isFinite(value)) return '不可用'; return `${value > 0 ? '+' : ''}${formatMoney(value)}` }
 function formatSignedMoneyOrDash(value: number | null) { return value === null ? '—' : formatSignedMoney(value) }
 function formatNumber(value: number) { return new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 4 }).format(value) }
+function formatOptionalNumber(value: number | null) { return value === null ? 'N/A' : formatNumber(value) }
 function formatCompact(value: number) { return Number.isFinite(value) ? new Intl.NumberFormat('zh-CN', { notation: 'compact', maximumFractionDigits: 2 }).format(value) : '—' }
 function formatMaybeMoney(value: unknown) { return formatMoney(Number(value)) }
 function formatMaybeNumber(value: unknown) { const number = Number(value); return Number.isFinite(number) ? number.toFixed(2) : '—' }
@@ -517,4 +1465,10 @@ function formatSignedPercent(value: number) { return `${value > 0 ? '+' : ''}${(
 function formatSignedPercentOrDash(value: number | null) { return value === null ? '—' : formatSignedPercent(value) }
 function valueTone(value?: number | null) { return value === undefined || value === null || value === 0 ? '' : value > 0 ? 'positive' : 'negative' }
 function emptyPortfolio(): PortfolioOverview { return { cash: 0, totalCost: 0, totalMarketValue: 0, totalEquity: 0, totalUnrealizedProfitLoss: 0, totalUnrealizedReturn: null, pricedPositionCount: 0, unpricedPositionCount: 0, positions: [] } }
-function friendlyError(value: string) { if (value.startsWith('unknown_evidence:')) return 'AI 引用了一条不存在的报告依据，本次报告已被拒绝。'; if (value.includes('report_tool_required')) return 'AI 没有返回规定格式的报告，本次分析未保存为完成报告。'; if (value.includes('model_not_configured')) return '尚未配置 AI 模型，暂时不能创建新分析。'; if (value.includes('model_')) return 'AI 模型调用失败，请检查模型配置后重试。'; if (value.includes('financial_context')) return '金融数据格式不完整，本次分析已停止以避免生成错误结论。'; return `分析没有完成：${value}` }
+function friendlyError(value: string) { if (value.startsWith('unknown_evidence:')) return 'AI 引用了一条不存在的报告依据，本次报告已被拒绝。'; if (value.includes('report_tool_required')) return 'AI 没有返回规定格式的报告，本次分析未保存为完成报告。'; if (value.includes('model_not_configured')) return '尚未配置 AI 模型，暂时不能创建新分析。'; if (value.includes('model_request_conflict')) return '模型请求审计发生冲突，请重新发起分析；这不表示 API Key 缺失。'; if (value.includes('model_')) return 'AI 模型调用失败，请检查模型配置后重试。'; if (value.includes('financial_context')) return '金融数据格式不完整，本次分析已停止以避免生成错误结论。'; return `分析没有完成：${value}` }
+
+function isReportOlderThan(createdAt: string | null | undefined, freshnessDays: number) {
+  if (!createdAt) return false
+  const createdTime = Date.parse(createdAt)
+  return Number.isFinite(createdTime) && Date.now() - createdTime > freshnessDays * 86_400_000
+}

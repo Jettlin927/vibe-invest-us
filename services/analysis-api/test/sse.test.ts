@@ -1,15 +1,17 @@
 import assert from 'node:assert/strict'
-import { mkdtemp } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
 import test from 'node:test'
 
-import { buildApp } from '../src/app.js'
+import { buildApp as buildProductionApp } from '../src/app.js'
+import { createTestProductDatabase } from './support/product-database.js'
 
-test('真实 HTTP SSE 在任务完成前依次发送运行进度和终态', async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'vibe-sse-'))
+function buildApp(dependencies: Parameters<typeof buildProductionApp>[0]) {
+  return buildProductionApp({ ...createTestProductDatabase(), ...dependencies })
+}
+
+test('真实 HTTP SSE 断线后用 Last-Event-ID 补回事件再继续 live', async () => {
+  let finishModel: (() => void) | undefined
+  const modelMayFinish = new Promise<void>((resolve) => { finishModel = resolve })
   const app = buildApp({
-    databasePath: join(directory, 'app.db'),
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({
       symbol, gaps: [], facts: [{
@@ -20,7 +22,7 @@ test('真实 HTTP SSE 在任务完成前依次发送运行进度和终态', asyn
     model: {
       async *analyze() {
         yield { type: 'text_delta' as const, text: '正在形成判断' }
-        await new Promise((resolve) => setTimeout(resolve, 25))
+        await modelMayFinish
         yield { type: 'completed' as const, report: {
           title: '报告', marketState: '稳定', trend: '震荡', drivers: ['量价'],
           supportingEvidence: ['fact-1'], contraryEvidence: ['fact-1'],
@@ -38,12 +40,178 @@ test('真实 HTTP SSE 在任务完成前依次发送运行进度和终态', asyn
   const baseUrl = `http://127.0.0.1:${address.port}`
   const created = await fetch(`${baseUrl}/api/analyses`, {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ symbol: 'NVDA' }),
-  }).then((response) => response.json()) as { analysisId: string }
-  const response = await fetch(`${baseUrl}/api/analyses/${created.analysisId}/events`)
-  const stream = await response.text()
+  }).then((response) => response.json()) as { analysisId: string; sessionId: string }
+  const firstController = new AbortController()
+  const firstResponse = await fetch(`${baseUrl}/api/agent-sessions/${created.sessionId}/events`, {
+    signal: firstController.signal,
+  })
+  const reader = firstResponse.body!.getReader()
+  const decoder = new TextDecoder()
+  let firstStream = ''
+  while (!firstStream.includes('event: text_delta')) {
+    const chunk = await reader.read()
+    if (chunk.done) break
+    firstStream += decoder.decode(chunk.value, { stream: true })
+  }
+  firstController.abort()
+  const textDeltaId = [...firstStream.matchAll(/id: ([^\n]+)\nevent: text_delta/g)].at(-1)?.[1]
+  try {
+    assert.match(textDeltaId ?? '', new RegExp(`^${created.sessionId}:\\d+$`))
+    finishModel!()
 
-  assert.match(response.headers.get('content-type') ?? '', /text\/event-stream/)
-  assert.ok(stream.indexOf('event: running') < stream.indexOf('event: text_delta'))
-  assert.ok(stream.indexOf('event: text_delta') < stream.indexOf('event: completed'))
+    const response = await fetch(`${baseUrl}/api/agent-sessions/${created.sessionId}/events`, {
+      headers: { 'last-event-id': textDeltaId! },
+    })
+    const replayed = await response.text()
+
+    assert.match(response.headers.get('content-type') ?? '', /text\/event-stream/)
+    assert.doesNotMatch(replayed, /event: queued|event: running|event: text_delta/)
+    assert.match(replayed, /event: model_completed/)
+    assert.match(replayed, /event: completed/)
+    const cursorSequence = Number(textDeltaId!.split(':').at(-1))
+    const replayedIds = [...replayed.matchAll(/id: ([^\n]+)/g)].map((match) => match[1]!)
+    assert.ok(replayedIds.every((id) => id.startsWith(`${created.sessionId}:`)
+      && Number(id.split(':').at(-1)) > cursorSequence))
+    const wrongSession = await fetch(`${baseUrl}/api/agent-sessions/${created.sessionId}/events`, {
+      headers: { 'last-event-id': `another-session:${cursorSequence}` },
+    })
+    assert.equal(wrongSession.status, 400)
+    assert.deepEqual(await wrongSession.json(), { error: 'invalid_last_event_id' })
+  } finally {
+    finishModel!()
+    await app.close()
+  }
+})
+
+test('SSE 在 PostgreSQL catch-up 与 live 交接窗口不会漏掉终态', async () => {
+  const database = createTestProductDatabase()
+  const originalList = database.agentEventRepository.list
+  let finishModel: (() => void) | undefined
+  const modelMayFinish = new Promise<void>((resolve) => { finishModel = resolve })
+  let closeCatchUpWindow = false
+  database.agentEventRepository.list = async (sessionId, afterSequence) => {
+    const staleCatchUp = await originalList(sessionId, afterSequence)
+    if (closeCatchUpWindow) {
+      closeCatchUpWindow = false
+      finishModel!()
+      while ((await database.agentEventRepository.getSession(sessionId))?.status === 'running') {
+        await new Promise((resolve) => setTimeout(resolve, 1))
+      }
+    }
+    return staleCatchUp
+  }
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, gaps: [], facts: [] }),
+    model: {
+      async *analyze() {
+        await modelMayFinish
+        yield { type: 'completed' as const, report: {
+          title: '交接测试', marketState: '数据不足', trend: '未知', drivers: [],
+          supportingEvidence: [], contraryEvidence: [], keyJudgments: [], scenarios: [],
+          invalidationConditions: [], valuation: null, personalImpact: null,
+          conditionalSuggestion: null, limitations: ['测试数据为空'],
+        } }
+      },
+    },
+  })
+  await app.listen({ host: '127.0.0.1', port: 0 })
+  const address = app.server.address()
+  assert.ok(address && typeof address === 'object')
+  const baseUrl = `http://127.0.0.1:${address.port}`
+  const created = await fetch(`${baseUrl}/api/analyses`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ symbol: 'HANDOFF' }),
+  }).then((response) => response.json()) as { analysisId: string; sessionId: string }
+  while ((await database.agentEventRepository.getSession(created.sessionId))?.status !== 'running') {
+    await new Promise((resolve) => setTimeout(resolve, 1))
+  }
+  closeCatchUpWindow = true
+  try {
+    const response = await fetch(`${baseUrl}/api/agent-sessions/${created.sessionId}/events`)
+    assert.match(await response.text(), /event: partial/)
+  } finally {
+    finishModel!()
+    await app.close()
+  }
+})
+
+for (const terminal of ['stopped', 'budget_exhausted']) {
+  test(`SSE 在 ${terminal} 终态后结束`, async () => {
+    const database = createTestProductDatabase()
+    const createdAt = new Date().toISOString()
+    await database.agentEventRepository.createResearch({
+      analysisId: `analysis-${terminal}`, sessionId: `session-${terminal}`,
+      executionId: `execution-${terminal}`, symbol: `T${terminal.length}`,
+      status: 'planning', analysisStatus: 'queued', operationId: 'runtime-context',
+      event: { type: 'runtime_context', status: 'planning' }, createdAt,
+    })
+    await database.agentEventRepository.append({
+      sessionId: `session-${terminal}`, executionId: `execution-${terminal}`,
+      operationId: `terminal-${terminal}`,
+      event: { type: 'status', status: terminal },
+      projection: { status: terminal, executionStatus: terminal as 'stopped' | 'budget_exhausted' },
+      createdAt,
+    })
+    const app = buildProductionApp({
+      ...database,
+      financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    })
+    const response = await app.inject({ method: 'GET', url: `/api/agent-sessions/session-${terminal}/events` })
+    assert.match(response.body, new RegExp(`event: ${terminal}`))
+    await app.close()
+  })
+}
+
+test('SSE 实时展开保留受控摘要但字段级脱敏内部诊断、凭据与隐藏推理', async () => {
+  const database = createTestProductDatabase()
+  const createdAt = new Date().toISOString()
+  await database.agentEventRepository.createResearch({
+    analysisId: 'analysis-public-sse', sessionId: 'session-public-sse',
+    executionId: 'execution-public-sse', symbol: 'SAFE',
+    status: 'planning', operationId: 'runtime-context',
+    event: { type: 'runtime_context', status: 'planning' }, createdAt,
+  })
+  await database.agentEventRepository.append({
+    sessionId: 'session-public-sse', executionId: 'execution-public-sse',
+    operationId: 'sensitive-tool-result', event: {
+      type: 'tool_result', name: 'fetch_financial_context', isError: false,
+      result: {
+        summary: 'SSE 用户可见摘要 Authorization: Bearer sk-sse-secret',
+        privateDiagnostic: 'SSE 内部诊断',
+        providerRaw: { body: 'SSE 原包' }, authorization: 'Bearer sse-secret',
+        cookie: 'sid=sse-secret', reasoning: 'SSE 隐藏推理',
+      },
+    }, createdAt,
+  })
+  await database.agentEventRepository.append({
+    sessionId: 'session-public-sse', executionId: 'execution-public-sse',
+    operationId: 'sensitive-model-delta', event: {
+      type: 'model_event', event: {
+        type: 'toolcall_delta',
+        delta: '{"authorization":"Bearer sk-sse-delta","fullText":"SSE delta 版权全文"}',
+      },
+    }, createdAt,
+  })
+  await database.agentEventRepository.append({
+    sessionId: 'session-public-sse', executionId: 'execution-public-sse',
+    operationId: 'completed', event: { type: 'status', status: 'completed', terminal: true },
+    projection: { status: 'completed', executionStatus: 'completed', terminal: true }, createdAt,
+  })
+  const app = buildProductionApp({
+    ...database,
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+  })
+
+  const response = await app.inject({
+    method: 'GET', url: '/api/agent-sessions/session-public-sse/events',
+  })
+
+  assert.match(response.body, /SSE 用户可见摘要/)
+  assert.doesNotMatch(response.body, /privateDiagnostic|SSE 内部诊断|providerRaw|SSE 原包/)
+  assert.doesNotMatch(response.body, /authorization|Bearer sse-secret|cookie|reasoning|SSE 隐藏推理/i)
+  assert.doesNotMatch(response.body, /sk-sse-secret/)
+  assert.doesNotMatch(response.body, /sk-sse-delta|SSE delta 版权全文/)
   await app.close()
 })

@@ -14,7 +14,7 @@
 - 异步分析、SSE 实时进度、并发限制、取消和重启中断；
 - 冻结快照、原子事实、完整分析轨迹和可追溯报告依据；
 - 自动保存、标记、备注、重新打开和删除研究记录；
-- Docker Compose 双容器自托管，SQLite 持久卷只属于 Analysis API。
+- Docker Compose 三容器自托管，PostgreSQL 持久卷保存全部产品数据。
 
 ## 自托管启动
 
@@ -27,9 +27,9 @@ cp .env.example .env
 docker compose up --build -d --wait
 ```
 
-打开 [http://localhost:3000](http://localhost:3000)。默认只向宿主机开放 Web 与 Analysis API；Financial Data 仅在 Compose 内部网络可用。
+打开 [http://localhost:3000](http://localhost:3000)。默认只在 `127.0.0.1` 开放 Web 与 Analysis API；PostgreSQL 和 Financial Data 仅在 Compose 内部网络可用。
 
-停止容器但保留 SQLite 数据卷：
+停止容器但保留 PostgreSQL 数据卷：
 
 ```bash
 docker compose down
@@ -64,7 +64,7 @@ npm run dev:web
 npm run verify:self-hosted
 ```
 
-该命令会构建并启动容器、验证 Web、聚合健康、内部网络和 SQLite 持久卷，然后停止容器但保留数据卷。
+该命令会构建并启动 PostgreSQL、Financial Data 和 Analysis API，先独立执行数据库 migration，再验证 Web、聚合健康和内部网络，最后停止容器但保留 PostgreSQL 数据卷。
 
 配置真实模型端点后，执行完整“真实数据 → 真实模型 → 研究记录”验收：
 
@@ -74,7 +74,17 @@ npm run verify:real-analysis
 
 ## 配置
 
-复制 `.env.example` 后配置自己的模型供应商。模型凭据只通过运行环境注入，不写入 SQLite，也不提交到 Git。
+复制 `.env.example` 后先替换三个 PostgreSQL 密码，再配置自己的模型供应商。初始化账户只在新卷首次启动时创建角色；migration 账户负责 DDL，API 使用仅具产品表 DML 权限的 application 账户。模型凭据只通过运行环境注入，不写入数据库，也不提交到 Git。
+
+从旧版迁移时，保留源数据库和备份并停止 Analysis API，再使用受控的一次性入口依次执行 `plan`、`execute`、`verify`。只有三步全部通过并经人工确认后，才能另行清理源文件和迁移收据；应用运行时不会读取或双写旧数据库。
+
+```bash
+LEGACY_SQLITE_PATH=/绝对路径/旧数据库.db npm run migrate:sqlite --workspace @vibe-invest/analysis-api -- plan
+LEGACY_SQLITE_PATH=/绝对路径/旧数据库.db DATABASE_URL='postgresql://...' npm run migrate:sqlite --workspace @vibe-invest/analysis-api -- execute
+LEGACY_SQLITE_PATH=/绝对路径/旧数据库.db DATABASE_URL='postgresql://...' MIGRATION_API_BASE_URL=http://127.0.0.1:3000 MIGRATION_VERIFICATION_TOKEN='一次性随机令牌' npm run migrate:sqlite --workspace @vibe-invest/analysis-api -- verify
+```
+
+执行 `verify` 时，以相同的 `MIGRATION_VERIFICATION_TOKEN` 临时启动 Analysis API；未配置该令牌或令牌不匹配时，精确迁移读回端点返回 404。确认后移除该环境变量并重启 API。
 
 Model 模块不内置供应商、模型或服务地址，通过 OpenAI-compatible 协议连接用户在 `.env` 中指定的端点。`MODEL_PROVIDER` 是用于配置和审计的自定义标签；`MODEL_API_PROTOCOL` 可选 `chat-completions` 或 `responses`，其余配置也均无默认值。即使本地端点不校验密钥，也需要手动为 `MODEL_API_KEY` 填写一个非空连接占位值。例如 Docker 访问宿主机 Ollama 时，可配置 `MODEL_API_PROTOCOL=responses` 和 `MODEL_BASE_URL=http://host.docker.internal:11434/v1`。未完整配置模型时，页面仍可维护持仓和查看已有记录，但新分析会明确失败，不会生成伪报告。
 

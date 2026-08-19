@@ -62,6 +62,212 @@
         }
       }
     },
+    "/v1/financial-overview": {
+      "post": {
+        "summary": "Financial Overview",
+        "operationId": "getFinancialOverview",
+        "parameters": [
+          {
+            "name": "symbol",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Symbol"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FinancialOverviewResult"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/financial-metric-series": {
+      "post": {
+        "summary": "Financial Metric Series Endpoint",
+        "operationId": "getFinancialMetricSeries",
+        "parameters": [
+          {
+            "name": "symbol",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Symbol"
+            }
+          },
+          {
+            "name": "metric",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Metric"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PaginatedFactResult"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/valuation-evidence": {
+      "post": {
+        "summary": "Valuation Evidence Endpoint",
+        "operationId": "getValuationEvidence",
+        "parameters": [
+          {
+            "name": "symbol",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Symbol"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValuationEvidenceResult"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/filing-document": {
+      "post": {
+        "summary": "Filing Document",
+        "operationId": "readFilingDocument",
+        "parameters": [
+          {
+            "name": "symbol",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Symbol"
+            }
+          },
+          {
+            "name": "filing_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Filing Id"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FilingDocumentResult"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/news-search": {
       "post": {
         "summary": "News Search",
@@ -74,6 +280,161 @@
             "schema": {
               "type": "string",
               "title": "Keyword"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FactQueryResult"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/news-document": {
+      "post": {
+        "summary": "News Document",
+        "operationId": "readNewsDocument",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewsDocumentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NewsDocumentResult"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/web-search": {
+      "post": {
+        "summary": "Web Search",
+        "operationId": "searchWebEvidence",
+        "parameters": [
+          {
+            "name": "query",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Query"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FactQueryResult"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/company-events": {
+      "post": {
+        "summary": "Company Events",
+        "operationId": "listCompanyEvents",
+        "parameters": [
+          {
+            "name": "symbol",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Symbol"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FactQueryResult"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/official-company-events": {
+      "post": {
+        "summary": "Official Company Events",
+        "operationId": "listOfficialCompanyEvents",
+        "parameters": [
+          {
+            "name": "symbol",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Symbol"
             }
           }
         ],
@@ -174,6 +535,164 @@
         }
       }
     },
+    "/v1/technical-evidence": {
+      "post": {
+        "summary": "Technical Evidence",
+        "operationId": "getTechnicalEvidence",
+        "parameters": [
+          {
+            "name": "symbol",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Symbol"
+            }
+          },
+          {
+            "name": "start_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Start Date"
+            }
+          },
+          {
+            "name": "end_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "End Date"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TechnicalEvidenceResult"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/price-window": {
+      "post": {
+        "summary": "Price Window",
+        "operationId": "getPriceWindow",
+        "parameters": [
+          {
+            "name": "symbol",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Symbol"
+            }
+          },
+          {
+            "name": "start_date",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "date",
+              "title": "Start Date"
+            }
+          },
+          {
+            "name": "end_date",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "date",
+              "title": "End Date"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 60,
+              "title": "Page Size"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PriceWindowResult"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/quotes": {
       "post": {
         "summary": "Quotes",
@@ -247,6 +766,17 @@
           "sourceReference": {
             "type": "string",
             "title": "Sourcereference"
+          },
+          "evidenceLevel": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Evidencelevel"
           }
         },
         "type": "object",
@@ -350,6 +880,15 @@
             "type": "array",
             "title": "Sources",
             "default": []
+          },
+          "eligibility": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Eligibility"
           }
         },
         "type": "object",
@@ -357,6 +896,71 @@
           "facts"
         ],
         "title": "FactQueryResult"
+      },
+      "FilingDocumentResult": {
+        "properties": {
+          "facts": {
+            "items": {
+              "$ref": "#/components/schemas/AtomicFact"
+            },
+            "type": "array",
+            "title": "Facts"
+          },
+          "sources": {
+            "items": {
+              "$ref": "#/components/schemas/SourceStatus"
+            },
+            "type": "array",
+            "title": "Sources",
+            "default": []
+          },
+          "eligibility": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Eligibility"
+          },
+          "returnedCount": {
+            "type": "integer",
+            "title": "Returnedcount"
+          },
+          "totalCount": {
+            "type": "integer",
+            "title": "Totalcount"
+          },
+          "nextCursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Nextcursor"
+          },
+          "truncated": {
+            "type": "boolean",
+            "title": "Truncated"
+          },
+          "items": {
+            "items": {},
+            "type": "array",
+            "title": "Items"
+          }
+        },
+        "type": "object",
+        "required": [
+          "facts",
+          "returnedCount",
+          "totalCount",
+          "truncated",
+          "items"
+        ],
+        "title": "FilingDocumentResult"
       },
       "FinancialContext": {
         "properties": {
@@ -436,6 +1040,43 @@
           "gaps"
         ],
         "title": "FinancialContext"
+      },
+      "FinancialOverviewResult": {
+        "properties": {
+          "facts": {
+            "items": {
+              "$ref": "#/components/schemas/AtomicFact"
+            },
+            "type": "array",
+            "title": "Facts"
+          },
+          "sources": {
+            "items": {
+              "$ref": "#/components/schemas/SourceStatus"
+            },
+            "type": "array",
+            "title": "Sources",
+            "default": []
+          },
+          "eligibility": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Eligibility"
+          },
+          "overview": {
+            "title": "Overview"
+          }
+        },
+        "type": "object",
+        "required": [
+          "facts",
+          "overview"
+        ],
+        "title": "FinancialOverviewResult"
       },
       "HTTPValidationError": {
         "properties": {
@@ -534,6 +1175,203 @@
           "histogram"
         ],
         "title": "Macd"
+      },
+      "NewsDocumentRequest": {
+        "properties": {
+          "candidate": {
+            "$ref": "#/components/schemas/AtomicFact"
+          }
+        },
+        "type": "object",
+        "required": [
+          "candidate"
+        ],
+        "title": "NewsDocumentRequest"
+      },
+      "NewsDocumentResult": {
+        "properties": {
+          "facts": {
+            "items": {
+              "$ref": "#/components/schemas/AtomicFact"
+            },
+            "type": "array",
+            "title": "Facts"
+          },
+          "sources": {
+            "items": {
+              "$ref": "#/components/schemas/SourceStatus"
+            },
+            "type": "array",
+            "title": "Sources",
+            "default": []
+          },
+          "eligibility": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Eligibility"
+          },
+          "excerpt": {
+            "type": "string",
+            "title": "Excerpt"
+          }
+        },
+        "type": "object",
+        "required": [
+          "facts",
+          "excerpt"
+        ],
+        "title": "NewsDocumentResult"
+      },
+      "PaginatedFactResult": {
+        "properties": {
+          "facts": {
+            "items": {
+              "$ref": "#/components/schemas/AtomicFact"
+            },
+            "type": "array",
+            "title": "Facts"
+          },
+          "sources": {
+            "items": {
+              "$ref": "#/components/schemas/SourceStatus"
+            },
+            "type": "array",
+            "title": "Sources",
+            "default": []
+          },
+          "eligibility": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Eligibility"
+          },
+          "returnedCount": {
+            "type": "integer",
+            "title": "Returnedcount"
+          },
+          "totalCount": {
+            "type": "integer",
+            "title": "Totalcount"
+          },
+          "nextCursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Nextcursor"
+          },
+          "truncated": {
+            "type": "boolean",
+            "title": "Truncated"
+          }
+        },
+        "type": "object",
+        "required": [
+          "facts",
+          "returnedCount",
+          "totalCount",
+          "truncated"
+        ],
+        "title": "PaginatedFactResult"
+      },
+      "PriceWindowResult": {
+        "properties": {
+          "facts": {
+            "items": {
+              "$ref": "#/components/schemas/AtomicFact"
+            },
+            "type": "array",
+            "title": "Facts"
+          },
+          "sources": {
+            "items": {
+              "$ref": "#/components/schemas/SourceStatus"
+            },
+            "type": "array",
+            "title": "Sources",
+            "default": []
+          },
+          "eligibility": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Eligibility"
+          },
+          "returnedCount": {
+            "type": "integer",
+            "title": "Returnedcount"
+          },
+          "totalCount": {
+            "type": "integer",
+            "title": "Totalcount"
+          },
+          "nextCursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Nextcursor"
+          },
+          "truncated": {
+            "type": "boolean",
+            "title": "Truncated"
+          },
+          "symbol": {
+            "type": "string",
+            "title": "Symbol"
+          },
+          "actualStart": {
+            "type": "string",
+            "title": "Actualstart"
+          },
+          "actualEnd": {
+            "type": "string",
+            "title": "Actualend"
+          },
+          "totalBarCount": {
+            "type": "integer",
+            "title": "Totalbarcount"
+          },
+          "sampling": {
+            "type": "string",
+            "enum": [
+              "daily",
+              "weekly"
+            ],
+            "title": "Sampling"
+          }
+        },
+        "type": "object",
+        "required": [
+          "facts",
+          "returnedCount",
+          "totalCount",
+          "truncated",
+          "symbol",
+          "actualStart",
+          "actualEnd",
+          "totalBarCount",
+          "sampling"
+        ],
+        "title": "PriceWindowResult"
       },
       "QuoteBatch": {
         "properties": {
@@ -673,6 +1511,218 @@
         ],
         "title": "SourceStatus"
       },
+      "TechnicalDrawdown": {
+        "properties": {
+          "maximum": {
+            "type": "number",
+            "title": "Maximum"
+          }
+        },
+        "type": "object",
+        "required": [
+          "maximum"
+        ],
+        "title": "TechnicalDrawdown"
+      },
+      "TechnicalEvidenceResult": {
+        "properties": {
+          "facts": {
+            "items": {
+              "$ref": "#/components/schemas/AtomicFact"
+            },
+            "type": "array",
+            "title": "Facts"
+          },
+          "sources": {
+            "items": {
+              "$ref": "#/components/schemas/SourceStatus"
+            },
+            "type": "array",
+            "title": "Sources",
+            "default": []
+          },
+          "eligibility": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Eligibility"
+          },
+          "symbol": {
+            "type": "string",
+            "title": "Symbol"
+          },
+          "actualStart": {
+            "type": "string",
+            "title": "Actualstart"
+          },
+          "actualEnd": {
+            "type": "string",
+            "title": "Actualend"
+          },
+          "totalBarCount": {
+            "type": "integer",
+            "title": "Totalbarcount"
+          },
+          "structures": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/TechnicalWindowStructure"
+            },
+            "type": "object",
+            "title": "Structures"
+          },
+          "indicators": {
+            "$ref": "#/components/schemas/Indicators"
+          },
+          "volatility": {
+            "$ref": "#/components/schemas/TechnicalVolatility"
+          },
+          "drawdown": {
+            "$ref": "#/components/schemas/TechnicalDrawdown"
+          },
+          "volumePrice": {
+            "$ref": "#/components/schemas/TechnicalVolumePrice"
+          },
+          "keyLevels": {
+            "$ref": "#/components/schemas/TechnicalKeyLevels"
+          },
+          "conflicts": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Conflicts"
+          }
+        },
+        "type": "object",
+        "required": [
+          "facts",
+          "symbol",
+          "actualStart",
+          "actualEnd",
+          "totalBarCount",
+          "structures",
+          "indicators",
+          "volatility",
+          "drawdown",
+          "volumePrice",
+          "keyLevels",
+          "conflicts"
+        ],
+        "title": "TechnicalEvidenceResult"
+      },
+      "TechnicalKeyLevels": {
+        "properties": {
+          "support": {
+            "type": "number",
+            "title": "Support"
+          },
+          "resistance": {
+            "type": "number",
+            "title": "Resistance"
+          }
+        },
+        "type": "object",
+        "required": [
+          "support",
+          "resistance"
+        ],
+        "title": "TechnicalKeyLevels"
+      },
+      "TechnicalVolatility": {
+        "properties": {
+          "annualized": {
+            "type": "number",
+            "title": "Annualized"
+          }
+        },
+        "type": "object",
+        "required": [
+          "annualized"
+        ],
+        "title": "TechnicalVolatility"
+      },
+      "TechnicalVolumePrice": {
+        "properties": {
+          "volumeRatio5To20": {
+            "type": "number",
+            "title": "Volumeratio5To20"
+          }
+        },
+        "type": "object",
+        "required": [
+          "volumeRatio5To20"
+        ],
+        "title": "TechnicalVolumePrice"
+      },
+      "TechnicalWindowStructure": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "available",
+              "unavailable"
+            ],
+            "title": "Status"
+          },
+          "barCount": {
+            "type": "integer",
+            "title": "Barcount"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "returnPct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Returnpct"
+          },
+          "high": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "High"
+          },
+          "low": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Low"
+          }
+        },
+        "type": "object",
+        "required": [
+          "status",
+          "barCount"
+        ],
+        "title": "TechnicalWindowStructure"
+      },
       "ValidationError": {
         "properties": {
           "loc": {
@@ -705,6 +1755,252 @@
           "type"
         ],
         "title": "ValidationError"
+      },
+      "ValuationComparable": {
+        "properties": {
+          "symbol": {
+            "type": "string",
+            "title": "Symbol"
+          },
+          "pe": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pe"
+          },
+          "evToEbitda": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Evtoebitda"
+          },
+          "evToRevenue": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Evtorevenue"
+          }
+        },
+        "type": "object",
+        "required": [
+          "symbol"
+        ],
+        "title": "ValuationComparable"
+      },
+      "ValuationEvidenceResult": {
+        "properties": {
+          "symbol": {
+            "type": "string",
+            "title": "Symbol"
+          },
+          "authorizedComparables": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Authorizedcomparables"
+          },
+          "comparables": {
+            "items": {
+              "$ref": "#/components/schemas/ValuationComparable"
+            },
+            "type": "array",
+            "title": "Comparables"
+          },
+          "excludedComparables": {
+            "items": {
+              "$ref": "#/components/schemas/ValuationExcludedComparable"
+            },
+            "type": "array",
+            "title": "Excludedcomparables",
+            "default": []
+          },
+          "currentMultiples": {
+            "additionalProperties": {
+              "type": "number"
+            },
+            "type": "object",
+            "title": "Currentmultiples"
+          },
+          "historicalRanges": {
+            "additionalProperties": {
+              "items": {
+                "type": "number"
+              },
+              "type": "array"
+            },
+            "type": "object",
+            "title": "Historicalranges"
+          },
+          "methods": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ValuationMethodView"
+            },
+            "type": "object",
+            "title": "Methods"
+          },
+          "facts": {
+            "items": {
+              "$ref": "#/components/schemas/AtomicFact"
+            },
+            "type": "array",
+            "title": "Facts"
+          },
+          "sources": {
+            "items": {
+              "$ref": "#/components/schemas/SourceStatus"
+            },
+            "type": "array",
+            "title": "Sources",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "symbol",
+          "authorizedComparables",
+          "comparables",
+          "currentMultiples",
+          "historicalRanges",
+          "methods",
+          "facts"
+        ],
+        "title": "ValuationEvidenceResult"
+      },
+      "ValuationExcludedComparable": {
+        "properties": {
+          "symbol": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Symbol"
+          },
+          "method": {
+            "type": "string",
+            "title": "Method"
+          },
+          "value": {
+            "type": "number",
+            "title": "Value"
+          },
+          "reason": {
+            "type": "string",
+            "title": "Reason"
+          }
+        },
+        "type": "object",
+        "required": [
+          "method",
+          "value",
+          "reason"
+        ],
+        "title": "ValuationExcludedComparable"
+      },
+      "ValuationMethodView": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "available",
+              "unavailable"
+            ],
+            "title": "Status"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "anchor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Anchor"
+          },
+          "multiple": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Multiple"
+          },
+          "targetPrice": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Targetprice"
+          },
+          "range": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "number"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Range"
+          },
+          "multiplePercentile": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Multiplepercentile"
+          }
+        },
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "title": "ValuationMethodView"
       }
     }
   }

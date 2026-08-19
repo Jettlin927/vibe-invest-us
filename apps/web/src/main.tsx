@@ -1,4 +1,4 @@
-import { StrictMode } from 'react'
+import { StrictMode, type ComponentType } from 'react'
 import { createRoot } from 'react-dom/client'
 
 import { App } from './app.js'
@@ -7,8 +7,11 @@ import './prototype/workbench-prototype.css'
 import './styles.css'
 import './trace.css'
 
-const prototypeRoute = import.meta.env.DEV && window.location.pathname === '/prototype/workbench'
+const prototypeRoutes: Record<string, ComponentType> = {
+  '/prototype/workbench': WorkbenchPrototype,
+}
+const Prototype = import.meta.env.DEV ? prototypeRoutes[window.location.pathname] : undefined
 
 createRoot(document.getElementById('root')!).render(
-  <StrictMode>{prototypeRoute ? <WorkbenchPrototype /> : <App />}</StrictMode>,
+  <StrictMode>{Prototype ? <Prototype /> : <App />}</StrictMode>,
 )
