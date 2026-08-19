@@ -1,11 +1,10 @@
 from datetime import date, datetime, timedelta, timezone
-import re
 from typing import Literal, List, Optional
 
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-from app.adapters import SecFilingSource, read_limited_document, search_web
+from app.adapters import SecFilingSource, html_to_text, read_limited_document, search_web
 from app.context import (
     build_financial_context, company_event_facts, read_news_document_fact,
     filing_document_page, financial_metric_series_result, financial_overview_facts, search_news_facts,
@@ -107,7 +106,7 @@ def news_document(request: NewsDocumentRequest) -> NewsDocumentResult:
         return read_limited_document(url, max_bytes, timeout=10)
 
     payload, _content_type, _truncated, _final_url = reader(candidate.sourceReference, 65536)
-    text = " ".join(re.sub(r"<[^>]+>", " ", payload.decode("utf-8", errors="replace")).split())
+    text = html_to_text(payload)
     fact = read_news_document_fact(
         candidate, datetime.now(timezone.utc),
         lambda _url, _max_bytes: (payload, _content_type, _truncated, _final_url),

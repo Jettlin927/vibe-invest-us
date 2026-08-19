@@ -122,6 +122,8 @@ export function createFinancialDataClient(baseUrl: string) {
       return {
         symbol: result.symbol, authorizedComparables: result.authorizedComparables as string[],
         comparables: result.comparables as unknown[],
+        ...(Array.isArray(result.excludedComparables)
+          ? { excludedComparables: result.excludedComparables as unknown[] } : {}),
         currentMultiples: result.currentMultiples as Record<string, unknown>,
         historicalRanges: result.historicalRanges as Record<string, unknown>,
         methods: result.methods as Record<string, unknown>, facts: result.facts, sources: result.sources,

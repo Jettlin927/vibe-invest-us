@@ -1822,6 +1822,14 @@
             "type": "array",
             "title": "Comparables"
           },
+          "excludedComparables": {
+            "items": {
+              "$ref": "#/components/schemas/ValuationExcludedComparable"
+            },
+            "type": "array",
+            "title": "Excludedcomparables",
+            "default": []
+          },
           "currentMultiples": {
             "additionalProperties": {
               "type": "number"
@@ -1874,6 +1882,40 @@
         ],
         "title": "ValuationEvidenceResult"
       },
+      "ValuationExcludedComparable": {
+        "properties": {
+          "symbol": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Symbol"
+          },
+          "method": {
+            "type": "string",
+            "title": "Method"
+          },
+          "value": {
+            "type": "number",
+            "title": "Value"
+          },
+          "reason": {
+            "type": "string",
+            "title": "Reason"
+          }
+        },
+        "type": "object",
+        "required": [
+          "method",
+          "value",
+          "reason"
+        ],
+        "title": "ValuationExcludedComparable"
+      },
       "ValuationMethodView": {
         "properties": {
           "status": {
@@ -1894,6 +1936,17 @@
               }
             ],
             "title": "Reason"
+          },
+          "anchor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Anchor"
           },
           "multiple": {
             "anyOf": [

@@ -6,6 +6,7 @@ const baseUrl = process.env.VIBE_INVEST_BASE_URL
 const timeoutMs = Number(process.env.REAL_ANALYSIS_TIMEOUT_SECONDS ?? 1200) * 1000
 const contextWindow = Number(process.env.MODEL_CONTEXT_WINDOW)
 const successStatuses = new Set(['completed', 'partial'])
+const verifySymbol = (process.env.VERIFY_SYMBOL ?? 'NVDA').trim().toUpperCase()
 
 assert.ok(Number.isInteger(contextWindow) && contextWindow > 73_000, 'MODEL_CONTEXT_WINDOW must exceed 73000')
 
@@ -136,7 +137,7 @@ function reportVersionCount(analysisId, kind = 'integrated') {
 async function verifyInfrastructure() {
   const health = await waitForHealth()
   assert.equal(health.dependencies?.productDatabase?.engine, 'postgresql')
-  assert.equal(health.dependencies?.productDatabase?.schemaVersion, 24)
+  assert.equal(health.dependencies?.productDatabase?.schemaVersion, 25)
   assert.equal(health.dependencies?.financialData?.status, 'ok')
   const [privileges] = sqlJson(`SELECT
     has_schema_privilege('vibe_invest_app', 'public', 'CREATE') AS schema_create,
@@ -145,12 +146,12 @@ async function verifyInfrastructure() {
   assert.deepEqual(privileges, {
     schema_create: false, database_create: false, database_temp: false,
   })
-  console.log(JSON.stringify({ phase: 'infrastructure', schemaVersion: 24, leastPrivilege: true }))
+  console.log(JSON.stringify({ phase: 'infrastructure', schemaVersion: 25, leastPrivilege: true }))
 }
 
 async function verifyFirstResearch() {
   for (const attempt of [1, 2]) {
-    const created = await createAnalysis('NVDA')
+    const created = await createAnalysis(verifySymbol)
     const ssePromise = replay(created.sessionId)
     const terminal = await waitForAnyTerminal(created.analysisId)
     if (!successStatuses.has(terminal.status)) {
@@ -277,7 +278,7 @@ async function verifyFollowUpAndCompaction(created) {
 }
 
 async function verifyRestartResumeStopDelete(survivor) {
-  const created = await createAnalysis('NVDA')
+  const created = await createAnalysis(verifySymbol)
   await waitForActive(created.analysisId)
   const sharedFacts = await waitFor('shared facts', async () => Number(sql(`SELECT count(*) FROM analysis_facts a
     JOIN analysis_facts b USING (fact_id) WHERE a.analysis_id=${literal(survivor.analysisId)}

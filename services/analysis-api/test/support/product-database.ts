@@ -73,25 +73,81 @@ export function createTestProductDatabase() {
     }>
   }>()
 
+  const portfolioEvents: import('@vibe-invest/product-dao').PortfolioEvent[] = []
+  let eventSequence = 0
+  const pushEvent = (event: Omit<import('@vibe-invest/product-dao').PortfolioEvent, 'id' | 'createdAt'>) => {
+    eventSequence += 1
+    const recorded = {
+      ...event,
+      id: `test-event-${eventSequence}`,
+      createdAt: new Date(Date.UTC(2026, 7, 14, 0, 0, eventSequence)).toISOString(),
+    }
+    portfolioEvents.push(recorded)
+    return recorded
+  }
+
   const portfolioRepository: PortfolioRepository = {
     async list() { return [...positions.values()].sort((left, right) => left.symbol.localeCompare(right.symbol)) },
-    async save(position) { positions.set(position.symbol, { ...position }); return position },
-    async remove(symbol) { positions.delete(symbol) },
     async cash() { return cash },
-    async setCash(value) { cash = value; return value },
-    async reduce(symbol, quantity, price) {
+    async recordBuy(symbol, quantity, price, note = '') {
+      const spent = quantity * price
+      if (spent > cash) return null
+      const position = positions.get(symbol)
+      const nextQuantity = (position?.quantity ?? 0) + quantity
+      const nextAverageCost = position
+        ? (position.quantity * position.averageCost + spent) / nextQuantity
+        : price
+      cash -= spent
+      positions.set(symbol, { symbol, quantity: nextQuantity, averageCost: nextAverageCost })
+      const event = pushEvent({ kind: 'buy', symbol, quantity, price, amount: -spent, realizedProfitLoss: null, note })
+      return {
+        event,
+        position: { symbol, quantity: nextQuantity, averageCost: nextAverageCost },
+        cash,
+        spent,
+      }
+    },
+    async recordSell(symbol, quantity, price, note = '') {
       const position = positions.get(symbol)
       if (!position || quantity > position.quantity) return null
       const remaining = position.quantity - quantity
-      cash += quantity * price
+      const proceeds = quantity * price
+      const realizedProfitLoss = (price - position.averageCost) * quantity
+      cash += proceeds
       if (remaining === 0) positions.delete(symbol)
       else positions.set(symbol, { ...position, quantity: remaining })
+      const event = pushEvent({ kind: 'sell', symbol, quantity, price, amount: proceeds, realizedProfitLoss, note })
       return {
+        event,
         position: remaining === 0 ? null : { ...position, quantity: remaining },
         cash,
-        proceeds: quantity * price,
-        realizedProfitLoss: (price - position.averageCost) * quantity,
+        proceeds,
+        realizedProfitLoss,
       }
+    },
+    async recordCashAdjustment(targetCash, note = '') {
+      if (targetCash < 0) return null
+      const delta = targetCash - cash
+      if (delta === 0) return { event: null, cash }
+      cash = targetCash
+      const event = pushEvent({
+        kind: 'cash_adjust', symbol: null, quantity: null, price: null,
+        amount: delta, realizedProfitLoss: null, note: note || (delta > 0 ? '入金' : '出金'),
+      })
+      return { event, cash }
+    },
+    async recordReconcile(symbol, quantity, averageCost, note = '') {
+      if (quantity === 0) positions.delete(symbol)
+      else positions.set(symbol, { symbol, quantity, averageCost })
+      const event = pushEvent({
+        kind: 'reconcile', symbol, quantity, price: averageCost,
+        amount: null, realizedProfitLoss: null, note: note || '校准持仓',
+      })
+      return { event, position: quantity === 0 ? null : { symbol, quantity, averageCost } }
+    },
+    async listEvents(limit = 100) {
+      const safeLimit = Number.isInteger(limit) ? Math.max(1, Math.min(limit, 500)) : 100
+      return [...portfolioEvents].reverse().slice(0, safeLimit)
     },
     async saveSnapshot(snapshot) {
       const current = snapshots.get(snapshot.marketDay)

@@ -485,7 +485,7 @@ test('真实 PostgreSQL v21 经当前迁移将未终态模型请求封存为 out
     assert.deepEqual(lifecycle?.modelAttempts[0]?.usage, {
       input: null, cacheRead: null, cacheWrite: null, output: null, total: null,
     })
-    assert.deepEqual(await checkSchema(appPool), { status: 'ok', version: 24 })
+    assert.deepEqual(await checkSchema(appPool), { status: 'ok', version: 25 })
   } finally {
     await removeResearchFixture(appPool, analysisId)
     await migrationPool.query(
@@ -523,7 +523,7 @@ test('真实 PostgreSQL v22 接受技术面 Tool Projection 角色', {
       createdAt: '2026-08-14T00:00:01.000Z',
     })
     assert.equal(projection.role, 'technical')
-    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 24 })
+    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 25 })
   } finally {
     const cleanup = createPool(migrationUrl!)
     await cleanup.query('DELETE FROM analyses WHERE id = $1', [analysisId])
@@ -1629,7 +1629,7 @@ test('真实 PostgreSQL migration 幂等且 application role 没有 DDL 权限',
   await migrate(migrationUrl!)
 
   const pool = createPool(applicationUrl!)
-  assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 24 })
+  assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 25 })
   const privileges = await pool.query<{ can_create: boolean; can_temp: boolean }>(
     `SELECT has_schema_privilege(current_user, 'public', 'CREATE') AS can_create,
             has_database_privilege(current_user, current_database(), 'TEMP') AS can_temp`,
@@ -1686,7 +1686,7 @@ test('真实 PostgreSQL migration receipt 为空时按 max=0 升级', {
     )
     await pool.query('DELETE FROM product_schema_migrations')
     await migrate(migrationUrl!)
-    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 24 })
+    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 25 })
     assert.deepEqual((await pool.query<{ sequence: number; provenance: string }>(
       `SELECT sequence, provenance FROM tool_event_migration_provenance WHERE session_id = $1`,
       [sessionId],
@@ -1753,23 +1753,23 @@ test('真实 PostgreSQL 拒绝未来 schema 且不修改数据库', {
   })
   try {
     await pool.query('DROP TABLE tool_event_migration_provenance')
-    await pool.query('INSERT INTO product_schema_migrations (version) VALUES (25)')
+    await pool.query('INSERT INTO product_schema_migrations (version) VALUES (26)')
     const before = await fingerprint()
 
     await assert.rejects(
       migrate(migrationUrl!),
-      /product_schema_future_version_unsupported:25/,
+      /product_schema_future_version_unsupported:26/,
     )
 
     assert.deepEqual(await fingerprint(), before)
   } finally {
-    await pool.query('DELETE FROM product_schema_migrations WHERE version = 25')
+    await pool.query('DELETE FROM product_schema_migrations WHERE version = 26')
     await migrate(migrationUrl!)
     await pool.end()
   }
 })
 
-test('真实 PostgreSQL v12 无 Tool Batch 的历史工具事件原样升级到 v24', {
+test('真实 PostgreSQL v12 无 Tool Batch 的历史工具事件原样升级到 v25', {
   skip: !migrationUrl,
   concurrency: false,
 }, async () => {
@@ -1813,7 +1813,7 @@ test('真实 PostgreSQL v12 无 Tool Batch 的历史工具事件原样升级到 
 
     await migrate(migrationUrl!)
 
-    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 24 })
+    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 25 })
     assert.deepEqual((await pool.query<{ sequence: number; provenance: string }>(
       `SELECT sequence, provenance FROM tool_event_migration_provenance
        WHERE session_id = $1 ORDER BY sequence`, [sessionId],
@@ -1908,25 +1908,40 @@ test('application role 的事务失败会回滚产品写入', {
   await pool.end()
 })
 
-test('真实 PostgreSQL 持仓 DAO 完成 CRUD、现金和原子减仓', {
+test('真实 PostgreSQL 持仓 DAO 通过调仓事件完成入金、加仓、减仓并留下账本', {
   skip: !applicationUrl,
   concurrency: false,
 }, async () => {
   const pool = createPool(applicationUrl!)
   try {
     const portfolio = createPortfolioRepository(pool)
-    await portfolio.remove('NVDA')
-    await portfolio.setCash(500)
-    await portfolio.save({ symbol: 'NVDA', quantity: 10.125, averageCost: 100.25 })
-    assert.deepEqual((await portfolio.list()).find(({ symbol }) => symbol === 'NVDA'),
-      { symbol: 'NVDA', quantity: 10.125, averageCost: 100.25 })
-    assert.deepEqual(await portfolio.reduce('NVDA', 0.125, 125.5), {
-      position: { symbol: 'NVDA', quantity: 10, averageCost: 100.25 },
-      cash: 515.6875,
-      proceeds: 15.6875,
-      realizedProfitLoss: 3.15625,
-    })
-    assert.equal(await portfolio.cash(), 515.6875)
+    await portfolio.recordReconcile('NVDA', 0, 0)
+    const funded = await portfolio.recordCashAdjustment(1600)
+    assert.equal(funded?.cash, 1600)
+    assert.equal(funded?.event?.kind, 'cash_adjust')
+    assert.equal(funded?.event?.amount, 1600)
+
+    const bought = await portfolio.recordBuy('NVDA', 10.125, 100.25)
+    assert.deepEqual(bought?.position, { symbol: 'NVDA', quantity: 10.125, averageCost: 100.25 })
+    assert.equal(bought?.cash, 584.96875)
+    assert.equal(bought?.event?.kind, 'buy')
+    assert.equal(bought?.event?.amount, -1015.03125)
+
+    const rejected = await portfolio.recordBuy('NVDA', 100, 100)
+    assert.equal(rejected, null)
+    assert.equal(await portfolio.cash(), 584.96875)
+
+    const sold = await portfolio.recordSell('NVDA', 0.125, 125.5)
+    assert.deepEqual(sold?.position, { symbol: 'NVDA', quantity: 10, averageCost: 100.25 })
+    assert.equal(sold?.cash, 600.65625)
+    assert.equal(sold?.proceeds, 15.6875)
+    assert.equal(sold?.realizedProfitLoss, 3.15625)
+    assert.equal(sold?.event?.kind, 'sell')
+    assert.equal(sold?.event?.realizedProfitLoss, 3.15625)
+    assert.equal(await portfolio.cash(), 600.65625)
+
+    const events = await portfolio.listEvents(3)
+    assert.deepEqual(events.map((event) => event.kind), ['sell', 'buy', 'cash_adjust'])
   } finally {
     await pool.end()
   }

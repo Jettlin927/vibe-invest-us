@@ -115,11 +115,11 @@ def test_valuation_evidence_exposes_deterministic_methods_and_explicit_unavailab
         {"symbol": "AVGO", "pe": 32, "evToEbitda": 22},
         {"symbol": "QCOM", "pe": 20, "evToEbitda": 14},
     ]
-    assert evidence["currentMultiples"] == {"pe": 30}
+    assert evidence["currentMultiples"] == {"pe": 30, "evToEbitda": 20, "evToRevenue": 5}
     assert evidence["historicalRanges"] == {"pe": [18, 34]}
     assert evidence["methods"]["dcf"] == {"status": "unavailable", "reason": "not_implemented"}
     assert evidence["methods"]["pe"] == {
-        "status": "available", "multiple": 28, "targetPrice": 112,
+        "status": "available", "anchor": "comparables", "multiple": 28, "targetPrice": 112,
         "range": {"low": 80, "high": 128}, "multiplePercentile": 0.6667,
     }
     assert "targetPrice" not in evidence["methods"]["dcf"]
@@ -129,7 +129,7 @@ def test_valuation_evidence_exposes_deterministic_methods_and_explicit_unavailab
     assert pe_fact.value == {
         "method": "pe", "status": "available", "inputs": ["fact:eps", "fact:price"],
         "formula": "diluted_eps * adopted_comparable_pe", "unit": "USD/share",
-        "unitConversion": "none",
+        "unitConversion": "none", "anchor": "comparables",
         "multiple": 28, "targetPrice": 112, "range": {"low": 80, "high": 128},
         "asOf": "2026-08-12T14:30:00Z",
     }
@@ -155,3 +155,75 @@ def test_valuation_evidence_missing_inputs_closes_methods_without_placeholder_fa
     }
     assert evidence["facts"] == []
     assert "targetPrice" not in str(evidence)
+
+def test_outlier_comparable_multiples_are_excluded_with_trace():
+    result = calculate_valuation(ValuationInput(
+        symbol="NVDA", industry="semiconductor", current_price=120,
+        diluted_eps=4, enterprise_value=500, ebitda=25, revenue=100,
+        comparables=[
+            {"symbol": "AMD", "pe": 131.2, "evToEbitda": 18},
+            {"symbol": "AVGO", "pe": 32, "evToEbitda": 22},
+            {"symbol": "QCOM", "pe": 20, "evToEbitda": 14},
+        ],
+    ))
+
+    assert result.methods["pe"].multiple == 26  # median(20, 32)，剔除 131.2 离群值
+    assert result.methods["pe"].target_price == 104
+    assert result.methods["pe"].range == [80, 128]
+    assert result.excluded_comparables == [
+        {"symbol": "AMD", "method": "pe", "value": 131.2, "reason": "sanity_bound_exceeded"},
+    ]
+
+
+def test_pe_falls_back_to_historical_anchor_without_comparables():
+    result = calculate_valuation(ValuationInput(
+        symbol="NBIS", industry="unsupported", current_price=100,
+        diluted_eps=2, enterprise_value=None, ebitda=None, revenue=None,
+        comparables=[],
+        historical_multiples={"pe": [40, 45, 50, 55, 200]},
+    ))
+
+    assert result.methods["industry"].status == "unavailable"
+    assert result.methods["pe"].status == "available"
+    assert result.methods["pe"].anchor == "historical_pe"
+    assert result.methods["pe"].multiple == 47.5  # median(40, 45, 50, 55)，200 超出合理性上限被剔除
+    assert result.methods["pe"].target_price == 95
+    assert result.methods["pe"].range == [80, 110]
+
+
+def test_enterprise_multiple_derives_target_price_by_rerating():
+    result = calculate_valuation(ValuationInput(
+        symbol="NVDA", industry="semiconductor", current_price=120,
+        diluted_eps=4, enterprise_value=500, ebitda=25, revenue=100,
+        comparables=[
+            {"symbol": "AMD", "pe": 28, "evToEbitda": 18},
+            {"symbol": "AVGO", "pe": 32, "evToEbitda": 22},
+            {"symbol": "QCOM", "pe": 20, "evToEbitda": 14},
+        ],
+    ))
+
+    method = result.methods["evToEbitda"]
+    assert method.status == "available"
+    assert method.multiple == 18
+    assert method.target_price == 108  # 120 * 18 / (500/25)
+    assert method.range == [84, 132]
+
+
+def test_valuation_evidence_enterprise_method_uses_price_formula_with_target():
+    result = calculate_valuation(ValuationInput(
+        symbol="NVDA", industry="semiconductor", current_price=120,
+        diluted_eps=4, enterprise_value=500, ebitda=25, revenue=100,
+        comparables=[
+            {"symbol": "AMD", "pe": 28, "evToEbitda": 18},
+            {"symbol": "AVGO", "pe": 32, "evToEbitda": 22},
+        ],
+        source="yahoo-timeseries", as_of="2026-08-12T14:30:00Z",
+    ))
+    evidence = valuation_evidence(
+        result, datetime(2026, 8, 13, tzinfo=timezone.utc), ["fact:inputs"],
+    )
+
+    ev_fact = next(fact for fact in evidence["facts"] if fact.value["method"] == "evToEbitda")
+    assert ev_fact.value["unit"] == "USD/share"
+    assert ev_fact.value["formula"] == "current_price * (adopted_ev_to_ebitda / own_ev_to_ebitda)"
+    assert ev_fact.value["targetPrice"] == 120.0  # median(18, 22)=20，120 * 20 / (500/25)

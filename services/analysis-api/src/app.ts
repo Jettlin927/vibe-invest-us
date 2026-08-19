@@ -185,8 +185,14 @@ export function buildApp(dependencies: AppDependencies) {
     if (typeof cash !== 'number' || !Number.isFinite(cash) || cash < 0) {
       return reply.status(400).send({ error: 'invalid_cash' })
     }
-    return { cash: await portfolio.setCash(cash) }
+    const result = await portfolio.adjustCash(cash)
+    if (!result) return reply.status(400).send({ error: 'invalid_cash' })
+    return { cash: result.cash }
   })
+
+  app.get<{ Querystring: { limit?: string } }>('/api/portfolio/events', async (request) => ({
+    events: await portfolio.listEvents(Number(request.query.limit ?? 100)),
+  }))
 
   app.get('/api/settings', async () => ({
     model: { configured: dependencies.modelConfigured ?? Boolean(dependencies.model) },
@@ -233,9 +239,26 @@ export function buildApp(dependencies: AppDependencies) {
       ) {
         return reply.status(400).send({ error: 'invalid_position' })
       }
-      return portfolio.save({ symbol, quantity, averageCost })
+      const result = await portfolio.reconcile({ symbol, quantity, averageCost })
+      return result.position
     },
   )
+
+  app.post<{
+    Params: { symbol: string }
+    Body: { quantity?: unknown; price?: unknown }
+  }>('/api/positions/:symbol/buy', async (request, reply) => {
+    const symbol = normalizeSymbol(request.params.symbol)
+    const { quantity, price } = request.body ?? {}
+    if (
+      !isValidSymbol(symbol)
+      || typeof quantity !== 'number' || !Number.isFinite(quantity) || quantity <= 0
+      || typeof price !== 'number' || !Number.isFinite(price) || price < 0
+    ) return reply.status(400).send({ error: 'invalid_purchase' })
+    const result = await portfolio.recordBuy(symbol, quantity, price)
+    if (!result) return reply.status(400).send({ error: 'insufficient_cash' })
+    return { position: result.position, cash: result.cash, spent: result.spent }
+  })
 
   app.delete<{ Params: { symbol: string } }>('/api/positions/:symbol', async (request, reply) => {
     const symbol = normalizeSymbol(request.params.symbol)
@@ -255,8 +278,12 @@ export function buildApp(dependencies: AppDependencies) {
       || typeof quantity !== 'number' || !Number.isFinite(quantity) || quantity <= 0
       || typeof price !== 'number' || !Number.isFinite(price) || price < 0
     ) return reply.status(400).send({ error: 'invalid_reduction' })
-    const result = await portfolio.reduce(symbol, quantity, price)
-    return result ?? reply.status(400).send({ error: 'reduction_exceeds_position' })
+    const result = await portfolio.recordSell(symbol, quantity, price)
+    if (!result) return reply.status(400).send({ error: 'reduction_exceeds_position' })
+    return {
+      position: result.position, cash: result.cash,
+      proceeds: result.proceeds, realizedProfitLoss: result.realizedProfitLoss,
+    }
   })
 
   app.post<{

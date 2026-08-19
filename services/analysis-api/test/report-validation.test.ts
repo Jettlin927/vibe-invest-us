@@ -200,7 +200,7 @@ test('引用不属于当前研究的事实时在引用完整性层返回字段�
   }])
 })
 
-test('标题级新闻只能作为线索不能支撑消息面关键判断', () => {
+test('标题级新闻只能支撑 low 置信度的消息面判断', () => {
   const result = validateReportCandidate({
     kind: 'specialist', availability: 'available', status: 'completed', gaps: [], limitations: [],
     domain: 'news', keyJudgments: [{
@@ -217,9 +217,26 @@ test('标题级新闻只能作为线索不能支撑消息面关键判断', () =>
   if (result.ok) return
   assert.deepEqual(result.errors, [{
     path: '/keyJudgments/0/supportingEvidence/0', rule: 'evidence_qualification',
-    message: 'title_only 事实不能支撑 news 判断',
+    message: 'title_only 证据只能支撑 low 置信度的 news 判断；请降低置信度或改用 verified_news / official_company_event 证据',
     allowedEvidenceTypes: ['verified_news', 'official_company_event'],
   }])
+})
+
+test('标题级新闻可以支撑 low 置信度的消息面判断', () => {
+  const result = validateReportCandidate({
+    kind: 'specialist', availability: 'partial', status: 'partial',
+    gaps: [{ capability: 'news_document', reason: 'source_unavailable', impact: '正文未核实' }],
+    limitations: [], domain: 'news', keyJudgments: [{
+      type: 'news', statement: '多个标题暗示指引可能上调', direction: 'bullish', confidence: 'low',
+      supportingEvidence: ['fact:title-only'], contraryEvidence: [],
+      contraryEvidenceStatus: 'none_found', invalidationConditions: ['正式公告未确认'],
+    }],
+  }, {
+    role: 'news',
+    knownFacts: [{ id: 'fact:title-only', type: 'news', evidenceLevel: 'title_only' }],
+  })
+
+  assert.equal(result.ok, true)
 })
 
 test('Web Search lead 必须读取正文核实后才能支撑消息面判断', () => {

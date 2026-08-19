@@ -69,6 +69,8 @@ export const defaultRuntimeSettings = {
   modelRequestTimeoutMinutes: 15,
   reportFreshnessDays: 7,
   compactionReserveTokens: 16_384,
+  agentModeFlat: 0,
+  flatAgentToolRounds: 40,
 } as const
 
 export type RuntimeSettings = {
@@ -103,6 +105,8 @@ export const runtimeSettingLimits: Record<keyof RuntimeSettings, readonly [numbe
   modelRequestTimeoutMinutes: [1, 60],
   reportFreshnessDays: [1, 365],
   compactionReserveTokens: [1, 1_000_000],
+  agentModeFlat: [0, 1],
+  flatAgentToolRounds: [1, 500],
 }
 
 export function parseRuntimeSettingsUpdate(value: unknown): Partial<RuntimeSettings> {

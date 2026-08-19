@@ -73,7 +73,7 @@ test('用户保存持仓后能在持仓列表看到它', async () => {
   await user.type(await view.findByLabelText('股票代码'), 'NVDA')
   await user.type(view.getByLabelText('数量'), '12')
   await user.type(view.getByLabelText('平均成本'), '105')
-  await user.click(view.getByRole('button', { name: '保存持仓' }))
+  await user.click(view.getByRole('button', { name: '校准持仓' }))
   await view.findAllByText('NVDA')
   await view.findAllByText('US$1,260.00')
 })
@@ -118,8 +118,63 @@ test('持仓页展示现金、盈亏和仓位，并能减仓后把卖出所得�
   await view.findByText('US$1,000.00')
   await view.findByText('+US$100.00')
   await user.click(view.getByRole('button', { name: '确认减仓' }))
-  await waitFor(() => assert.equal(view.getByLabelText('当前现金').getAttribute('value'), '1000'))
+  await waitFor(() => assert.equal(view.getByLabelText('目标现金').getAttribute('value'), '1000'))
   await view.findAllByText('US$750.00')
+})
+
+test('持仓页可以加仓，买入花费从现金扣减并记入调仓账本', async () => {
+  setupDom()
+  let portfolio = {
+    cash: 2000, totalCost: 1000, totalMarketValue: 1200, totalEquity: 3200,
+    totalUnrealizedProfitLoss: 200, totalUnrealizedReturn: .2,
+    pricedPositionCount: 1, unpricedPositionCount: 0,
+    positions: [{
+      symbol: 'NVDA', quantity: 10, averageCost: 100, costAmount: 1000,
+      marketPrice: 120, marketValue: 1200, unrealizedProfitLoss: 200,
+      unrealizedReturn: .2, portfolioWeight: 1200 / 3200,
+    }],
+  }
+  let events: unknown[] = [{
+    id: 'event-1', kind: 'cash_adjust', symbol: null, quantity: null, price: null,
+    amount: 2000, realizedProfitLoss: null, note: '入金', createdAt: '2026-08-14T01:00:00.000Z',
+  }]
+  globalThis.fetch = async (input, init) => {
+    const url = String(input)
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { database: { status: 'ok' }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/settings') return Response.json({ model: { configured: false } })
+    if (url === '/api/research') return Response.json({ records: [] })
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+    if (url === '/api/portfolio/events?limit=50') return Response.json({ events })
+    if (url === '/api/portfolio') return Response.json(portfolio)
+    if (url === '/api/positions/NVDA/buy' && init?.method === 'POST') {
+      portfolio = {
+        ...portfolio, cash: 800, totalCost: 2200, totalMarketValue: 2400, totalEquity: 3200,
+        totalUnrealizedProfitLoss: 200,
+        positions: [{ ...portfolio.positions[0], quantity: 20, averageCost: 110, costAmount: 2200, marketValue: 2400, portfolioWeight: 2400 / 3200 }],
+      }
+      events = [{
+        id: 'event-2', kind: 'buy', symbol: 'NVDA', quantity: 10, price: 120,
+        amount: -1200, realizedProfitLoss: null, note: '', createdAt: '2026-08-14T02:00:00.000Z',
+      }, ...events]
+      return Response.json({ position: { symbol: 'NVDA', quantity: 20, averageCost: 110 }, cash: 800, spent: 1200 })
+    }
+    throw new Error(`unexpected_fetch:${url}`)
+  }
+  const view = render(React.createElement(App))
+  const user = userEvent.setup({ document: window.document })
+  await user.click(await view.findByRole('button', { name: '我的持仓' }))
+  await view.findByText('US$2,000.00')
+  await user.click(view.getByRole('button', { name: '加仓' }))
+  await user.type(view.getByLabelText('买入数量'), '10')
+  await view.findAllByText('US$1,200.00')
+  await view.findByText('US$800.00')
+  await view.findByText('US$110.00')
+  await user.click(view.getByRole('button', { name: '确认加仓' }))
+  await waitFor(() => assert.equal(view.getByLabelText('目标现金').getAttribute('value'), '800'))
+  const ledger = await view.findByRole('table', { name: '调仓事件账本' })
+  assert.match(ledger.textContent ?? '', /买入/)
+  assert.match(ledger.textContent ?? '', /入金/)
+  assert.match(ledger.textContent ?? '', /-US\$1,200\.00/)
 })
 
 test('持仓页把组合权益历史画成曲线并按最新日期展示明细', async () => {

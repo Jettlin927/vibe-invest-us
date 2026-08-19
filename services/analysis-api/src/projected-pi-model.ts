@@ -25,8 +25,8 @@ import {
 } from './runtime-policy.js'
 import { toolRegistry } from './tool-registry.js'
 import {
-  analysisModelTools, finalizationModelTools, financialSpecialistTools, newsSpecialistTools,
-  technicalSpecialistTools,
+  analysisModelTools, finalizationModelTools, financialSpecialistTools, flatFinalizationTools,
+  flatResearchTools, newsSpecialistTools, technicalSpecialistTools, webSearchEvidenceTool,
 } from './tools.js'
 import { validateReportCandidate } from './report-validation.js'
 
@@ -79,6 +79,13 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
       const rememberFacts = (facts: Fact[]) => {
         for (const fact of facts) knownFacts.set(fact.id, fact)
       }
+      const flatMode = input.agentMode === 'flat'
+      const flatCandidateFactIds = new Set<string>()
+      const flatRegularCandidateFactIds = new Set<string>()
+      let flatWebSearchEligible = false
+      let flatWebSearchQuery = ''
+      let flatWebSearchDecisionIndex = 0
+      let pendingFlatWebSearchDecision: Extract<ModelEvent, { type: 'trace' }>['entry'] | undefined
       let frozenContext: Awaited<ReturnType<AnalyzeInput['fetchFinancialContext']>> | undefined
       let newsDecisionRecorded = false
       let fundamentalDecisionRecorded = false
@@ -107,17 +114,21 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
         }
         return { launched: false, status: 'not_started', reason, researchQuestion }
       }
-      if (!input.runNewsSpecialist && !specialistOutcomes.has('news')) rememberSpecialistOutcome('news', {
-        launched: false, status: 'not_started', reason: 'news_specialist_runtime_unavailable',
-      })
-      if (!input.runFundamentalSpecialist && !specialistOutcomes.has('fundamental_valuation')) {
+      if (!flatMode && !input.runNewsSpecialist && !specialistOutcomes.has('news')) {
+        rememberSpecialistOutcome('news', {
+          launched: false, status: 'not_started', reason: 'news_specialist_runtime_unavailable',
+        })
+      }
+      if (!flatMode && !input.runFundamentalSpecialist && !specialistOutcomes.has('fundamental_valuation')) {
         rememberSpecialistOutcome('fundamental_valuation', {
         launched: false, status: 'not_started', reason: 'fundamental_specialist_runtime_unavailable',
         })
       }
-      if (!input.runTechnicalSpecialist && !specialistOutcomes.has('technical')) rememberSpecialistOutcome('technical', {
-        launched: false, status: 'not_started', reason: 'technical_specialist_runtime_unavailable',
-      })
+      if (!flatMode && !input.runTechnicalSpecialist && !specialistOutcomes.has('technical')) {
+        rememberSpecialistOutcome('technical', {
+          launched: false, status: 'not_started', reason: 'technical_specialist_runtime_unavailable',
+        })
+      }
       const reportValidationState = { failures: 0, exhausted: false }
 
       const loadFrozenContext = async (symbol: string) => {
@@ -182,18 +193,55 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
 
       const ordinaryFollowUp = Boolean(input.runtimeFollowUp
         && input.runtimeFollowUp.content.updateReport !== true)
+      const baseResearchTools = flatMode ? flatResearchTools : analysisModelTools
+      const baseFinalizationTools = flatMode ? flatFinalizationTools : finalizationModelTools
       const followUpResearchTools = ordinaryFollowUp
-        ? analysisModelTools.filter(({ name }) => name !== 'submit_analysis_report')
-        : analysisModelTools
+        ? baseResearchTools.filter(({ name }) => name !== 'submit_analysis_report')
+        : baseResearchTools
+      const currentResearchTools = () => flatMode && flatWebSearchEligible
+        ? [...followUpResearchTools, webSearchEvidenceTool]
+        : followUpResearchTools
+      const flatDomainTool = async (
+        name: string, onStart: () => Promise<void>, signal: AbortSignal,
+        task: (toolSignal: AbortSignal) => Promise<unknown>,
+      ): Promise<ExecutedTool> => {
+        const owner = await acquireActiveSlot({
+          acquire: () => acquireToolSlot(input, toolGate, signal), activeBudget, signal,
+        })
+        try {
+          await onStart()
+          const scoped = toolSignal(options, settings, owner.signal)
+          const result = await raceWithAbort(() => task(scoped), scoped)
+          const facts = asRecord(result).facts
+          if (Array.isArray(facts)) for (const fact of facts as Fact[]) knownFacts.set(fact.id, fact)
+          return succeeded(asRecord(result))
+        } catch (error) {
+          return failed(error instanceof Error ? error.message : String(error))
+        } finally { owner.finish() }
+      }
+      const flatSymbol = (params: unknown) => {
+        const symbol = stringParam(params, 'symbol') || input.symbol
+        return symbol.trim().toUpperCase() === input.symbol.trim().toUpperCase() ? symbol : null
+      }
+      const flatUnavailable = async (symbol: string | null, onStart: () => Promise<void>) => {
+        await onStart()
+        return failed(symbol ? 'tool_not_available' : 'tool_symbol_not_allowed')
+      }
       const main = runProjectedAgent({
         role: 'main', input, options, settings, executionSignal: agentSignal, activeBudget,
         invocationId: input.finalizationOnly ? 'finalization-only' : undefined,
         onPolicyFailure: (error) => { policyFailure ??= error },
         modelGate, toolGate, provider, queue,
-        initialTools: input.finalizationOnly ? finalizationModelTools : followUpResearchTools,
+        initialTools: input.finalizationOnly ? baseFinalizationTools : currentResearchTools(),
         initialStage: input.finalizationOnly ? 'finalization' : 'research',
-        nextResearchTools: () => followUpResearchTools,
-        nextFinalizationTools: () => ordinaryFollowUp ? [] : finalizationModelTools,
+        nextResearchTools: () => currentResearchTools(),
+        nextFinalizationTools: () => ordinaryFollowUp ? [] : baseFinalizationTools,
+        toolRoundLimit: flatMode ? settings.flatAgentToolRounds : undefined,
+        beforeNextProjection: flatMode ? () => {
+          const decision = pendingFlatWebSearchDecision
+          pendingFlatWebSearchDecision = undefined
+          return decision
+        } : undefined,
         systemPrompt: effectiveSystemPrompt,
         userPrompt: input.runtimeFollowUp
           ? [input.runtimeFollowUp.content.message, runtimeFollowUpMessage(input.runtimeFollowUp),
@@ -204,7 +252,7 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
             ? runtimeResumeMessage(input.runtimeResume) : ''].filter(Boolean).join('\n')
           : input.userPrompt ?? '',
         shouldRejectNextTurn: () => reportValidationState.exhausted,
-        prepareSpecialistBatch: input.prepareSpecialistBatch ? async (calls, batchId) => {
+        prepareSpecialistBatch: input.prepareSpecialistBatch && !flatMode ? async (calls, batchId) => {
           const domainByTool = {
             run_news_analysis: 'news', run_fundamental_analysis: 'fundamental_valuation',
             run_technical_analysis: 'technical',
@@ -327,22 +375,159 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
             rememberSpecialistOutcome('technical', result)
             return succeeded(result)
           }
+          if (flatMode && name === 'search_news_candidates') {
+            if (!input.searchNewsCandidates) { await onStart(); return failed('tool_not_available') }
+            const query = canonicalNewsSearchQuery(input.symbol)
+            const result = await flatDomainTool(name, onStart, signal, (toolSignal) => (
+              input.searchNewsCandidates!(query, toolSignal)
+            ))
+            const facts = asRecord(result.result).facts
+            if (Array.isArray(facts)) for (const fact of facts as Fact[]) {
+              flatCandidateFactIds.add(fact.id); flatRegularCandidateFactIds.add(fact.id)
+            }
+            const eligibility = asRecord(asRecord(result.result).eligibility)
+            const reasons = Array.isArray(eligibility.reasons)
+              ? eligibility.reasons as Array<{ source: string; reason: string }> : []
+            flatWebSearchEligible = validWebSearchReasons(reasons)
+            flatWebSearchQuery = asString(eligibility.normalizedQuery) || query
+            pendingFlatWebSearchDecision = {
+              type: 'web_search_eligibility', query: flatWebSearchQuery,
+              eligible: flatWebSearchEligible, reasons,
+              operationId: 'execution:' + input.executionId
+                + ':web-search-eligibility:' + (++flatWebSearchDecisionIndex),
+            }
+            return result
+          }
+          if (flatMode && name === 'search_web_evidence') {
+            const query = stringParam(params, 'query')
+            if (!flatWebSearchEligible || normalizeQuery(query) !== normalizeQuery(flatWebSearchQuery)
+              || !input.searchWebEvidence) {
+              await onStart()
+              return failed(
+                'tool_not_available：search_web_evidence 尚未解锁。'
+                + '解锁条件：同一规范化查询连续三个既定新闻源均不合格；'
+                + '解锁后 query 必须与该次 search_news_candidates 的查询一致。',
+              )
+            }
+            const result = await flatDomainTool(name, onStart, signal, (toolSignal) => (
+              input.searchWebEvidence!(query, toolSignal)
+            ))
+            const facts = asRecord(result.result).facts
+            if (Array.isArray(facts)) for (const fact of facts as Fact[]) flatCandidateFactIds.add(fact.id)
+            return result
+          }
+          if (flatMode && name === 'read_news_document') {
+            const factId = stringParam(params, 'factId')
+            const candidate = knownFacts.get(factId)
+            if (!candidate || !flatCandidateFactIds.has(factId) || !input.readNewsDocument) {
+              await onStart()
+              const available = [...flatCandidateFactIds].slice(0, 20)
+              return failed(
+                'news_candidate_not_found：factId 必须来自本次 search_news_candidates 或 search_web_evidence 返回的 facts[].id；'
+                + (available.length
+                  ? '当前可用候选：' + available.join('、')
+                  : '当前无可用候选，请先调用 search_news_candidates'),
+              )
+            }
+            const result = await flatDomainTool(name, onStart, signal, (toolSignal) => (
+              input.readNewsDocument!(candidate, toolSignal)
+            ))
+            const verifiedFacts = asRecord(result.result).facts
+            if (flatRegularCandidateFactIds.has(factId) && Array.isArray(verifiedFacts)
+              && (verifiedFacts as Fact[]).some((fact) => fact.evidenceLevel === 'verified_news')) {
+              flatWebSearchEligible = false
+              pendingFlatWebSearchDecision = {
+                type: 'web_search_eligibility', query: flatWebSearchQuery,
+                eligible: false, reasons: [{ source: candidate.source, reason: 'qualified' }],
+                operationId: 'execution:' + input.executionId
+                  + ':web-search-eligibility:' + (++flatWebSearchDecisionIndex),
+              }
+            }
+            return result.isError ? result : {
+              ...result,
+              result: {
+                facts: result.result.facts, sources: result.result.sources,
+                modelProjection: result.result,
+              },
+            }
+          }
+          if (flatMode && name === 'list_company_events') {
+            const symbol = flatSymbol(params)
+            if (!symbol || !input.listCompanyEvents) return flatUnavailable(symbol, onStart)
+            return flatDomainTool(name, onStart, signal, (toolSignal) => (
+              input.listCompanyEvents!(symbol, toolSignal)
+            ))
+          }
+          if (flatMode && name === 'get_financial_overview') {
+            const symbol = flatSymbol(params)
+            if (!symbol || !input.getFinancialOverview) return flatUnavailable(symbol, onStart)
+            return flatDomainTool(name, onStart, signal, (toolSignal) => (
+              input.getFinancialOverview!(symbol, toolSignal)
+            ))
+          }
+          if (flatMode && name === 'get_financial_metric_series') {
+            const symbol = flatSymbol(params)
+            if (!symbol || !input.getFinancialMetricSeries) return flatUnavailable(symbol, onStart)
+            return flatDomainTool(name, onStart, signal, (toolSignal) => (
+              input.getFinancialMetricSeries!(
+                symbol, stringParam(params, 'metric'), stringParam(params, 'cursor') || undefined,
+                toolSignal,
+              )
+            ))
+          }
+          if (flatMode && name === 'get_valuation_evidence') {
+            const symbol = flatSymbol(params)
+            if (!symbol || !input.getValuationEvidence) return flatUnavailable(symbol, onStart)
+            return flatDomainTool(name, onStart, signal, (toolSignal) => (
+              input.getValuationEvidence!(symbol, toolSignal)
+            ))
+          }
+          if (flatMode && name === 'read_filing_document') {
+            const symbol = flatSymbol(params)
+            if (!symbol || !input.readFilingDocument) return flatUnavailable(symbol, onStart)
+            return flatDomainTool(name, onStart, signal, (toolSignal) => (
+              input.readFilingDocument!(
+                symbol, stringParam(params, 'filingId'), stringParam(params, 'cursor') || undefined,
+                toolSignal,
+              )
+            ))
+          }
+          if (flatMode && name === 'get_technical_evidence') {
+            const symbol = flatSymbol(params)
+            if (!symbol || !input.getTechnicalEvidence) return flatUnavailable(symbol, onStart)
+            return flatDomainTool(name, onStart, signal, (toolSignal) => (
+              input.getTechnicalEvidence!(symbol, toolSignal)
+            ))
+          }
+          if (flatMode && name === 'get_price_window') {
+            const symbol = flatSymbol(params)
+            if (!symbol || !input.getPriceWindow) return flatUnavailable(symbol, onStart)
+            return flatDomainTool(name, onStart, signal, (toolSignal) => (
+              input.getPriceWindow!(
+                symbol, stringParam(params, 'startDate'), stringParam(params, 'endDate'),
+                stringParam(params, 'cursor') || undefined, toolSignal,
+              )
+            ))
+          }
           if (name === 'submit_analysis_report') {
             try {
               await onStart()
-              if (input.runNewsSpecialist && !newsDecisionRecorded) {
+              if (!flatMode && input.runNewsSpecialist && !newsDecisionRecorded) {
                 return failed('news_specialist_decision_required')
               }
-              if (input.runFundamentalSpecialist && !fundamentalDecisionRecorded) {
+              if (!flatMode && input.runFundamentalSpecialist && !fundamentalDecisionRecorded) {
                 return failed('fundamental_specialist_decision_required')
               }
-              if (input.runTechnicalSpecialist && !technicalDecisionRecorded) {
+              if (!flatMode && input.runTechnicalSpecialist && !technicalDecisionRecorded) {
                 return failed('technical_specialist_decision_required')
               }
               return await (async (submitted: unknown) => {
                 if (input.refreshKnownFacts) rememberFacts(await input.refreshKnownFacts())
-                const validation = validateReportCandidate(submitted, {
-                  role: 'main', knownFacts: [...knownFacts.values()],
+                const validation = validateReportCandidate(submitted, flatMode ? {
+                  role: 'main' as const, knownFacts: [...knownFacts.values()],
+                  agentMode: 'flat' as const, specialistStatuses: [], specialistReports: [],
+                } : {
+                  role: 'main' as const, knownFacts: [...knownFacts.values()],
                   specialistStatuses: [...specialistOutcomes].map(([domain, outcome]) => ({
                     domain: domain as 'news' | 'fundamental_valuation' | 'technical',
                     status: asString(outcome.status),
@@ -512,7 +697,12 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
             const query = stringParam(params, 'query')
             if (!webSearchEligible || normalizeQuery(query) !== normalizeQuery(webSearchQuery)
               || !input.searchWebEvidence) {
-              await onStart(); return failed('tool_not_available')
+              await onStart()
+              return failed(
+                'tool_not_available：search_web_evidence 尚未解锁。'
+                + '解锁条件：同一规范化查询连续三个既定新闻源均不合格；'
+                + '解锁后 query 必须与该次 search_news_candidates 的查询一致。',
+              )
             }
             const result = await runTool(name, onStart, signal, (toolSignal) => (
               input.searchWebEvidence!(query, toolSignal)
@@ -525,7 +715,14 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
             const factId = stringParam(params, 'factId')
             const candidate = knownFacts.get(factId)
             if (!candidate || !candidateFactIds.has(factId)) {
-              await onStart(); return failed('news_candidate_not_found')
+              await onStart()
+              const available = [...candidateFactIds].slice(0, 20)
+              return failed(
+                'news_candidate_not_found：factId 必须来自本次 search_news_candidates 或 search_web_evidence 返回的 facts[].id；'
+                + (available.length
+                  ? '当前可用候选：' + available.join('、')
+                  : '当前无可用候选，请先调用 search_news_candidates'),
+              )
             }
             const result = await runTool(name, onStart, signal, (toolSignal) => (
               input.readNewsDocument(candidate, toolSignal)
@@ -762,6 +959,7 @@ async function runProjectedAgent(config: {
   initialTools: Tool[]; systemPrompt: string; userPrompt: string
   initialStage?: Stage
   invocationId?: string
+  toolRoundLimit?: number
   shouldRejectNextTurn?: () => boolean
   nextResearchTools?: () => Tool[]
   nextFinalizationTools?: () => Tool[]
@@ -885,8 +1083,9 @@ async function runProjectedAgent(config: {
         details: { audit }, terminate: executed.terminate,
       }
     }, config.role === 'main'
-      && !['run_news_analysis', 'run_fundamental_analysis', 'run_technical_analysis']
-        .includes(definition.name) ? 'sequential' : undefined)),
+      ? (toolRegistry.definition(definition.name)?.executionMode === 'sequential'
+        ? 'sequential' : undefined)
+      : undefined)),
     toAdapterTool({
       name: unavailableToolName, description: 'Unavailable tool',
       parameters: { type: 'object', additionalProperties: true },
@@ -1136,7 +1335,8 @@ async function runProjectedAgent(config: {
       }
       if (lastAssistantHadCalls) toolRounds += 1
       const limit = config.role === 'main'
-        ? config.settings.mainAgentToolRounds : config.settings.specialistAgentToolRounds
+        ? (config.toolRoundLimit ?? config.settings.mainAgentToolRounds)
+        : config.settings.specialistAgentToolRounds
       if (stage === 'finalization' || config.activeBudget.exhausted() || toolRounds >= limit) {
         if (stage !== 'finalization') {
           stage = 'finalization'

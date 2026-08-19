@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto'
+
 import { Pool, type PoolClient } from 'pg'
 import {
   agentExecutionStatuses, aggregateModelTokenUsage, defaultRuntimeSettings, parseRuntimeSettingsUpdate,
@@ -6,7 +8,7 @@ import {
   type ExecutionSettingsSnapshot, type RuntimeSettings, type RuntimeSettingsRevision,
 } from '@vibe-invest/contracts'
 
-export const schemaVersion = 24
+export const schemaVersion = 25
 
 const migrationSql = `
 CREATE TABLE IF NOT EXISTS product_schema_migrations (
@@ -40,6 +42,18 @@ CREATE TABLE IF NOT EXISTS portfolio_equity_snapshots (
   priced_count integer NOT NULL,
   observed_at timestamptz NOT NULL,
   after_close boolean NOT NULL DEFAULT false
+);
+
+CREATE TABLE IF NOT EXISTS portfolio_events (
+  id text PRIMARY KEY,
+  kind text NOT NULL CHECK (kind IN ('buy', 'sell', 'cash_adjust', 'reconcile')),
+  symbol text,
+  quantity numeric,
+  price numeric,
+  amount numeric,
+  realized_pnl numeric,
+  note text NOT NULL DEFAULT '',
+  created_at timestamptz NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS legacy_portfolio_migrations (
@@ -580,10 +594,27 @@ INSERT INTO product_schema_migrations (version)
 VALUES (24)
 ON CONFLICT (version) DO NOTHING;
 
+INSERT INTO portfolio_events (id, kind, symbol, quantity, price, note, created_at)
+SELECT 'opening:position:' || symbol, 'reconcile', symbol, quantity, average_cost,
+       '期初建仓：迁移自手工快照持仓', updated_at
+FROM positions
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO portfolio_events (id, kind, amount, note, created_at)
+SELECT 'opening:cash', 'cash_adjust', cash, '期初入金：迁移自手工维护现金', updated_at
+FROM portfolio_settings
+WHERE id = 1 AND cash > 0
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO product_schema_migrations (version)
+VALUES (25)
+ON CONFLICT (version) DO NOTHING;
+
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM vibe_invest_app;
 REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM vibe_invest_app;
 GRANT SELECT ON product_schema_migrations TO vibe_invest_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON positions, portfolio_settings, portfolio_equity_snapshots TO vibe_invest_app;
+GRANT SELECT, INSERT ON portfolio_events TO vibe_invest_app;
 GRANT SELECT, INSERT ON legacy_portfolio_migrations TO vibe_invest_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON analyses, atomic_facts, analysis_facts, analysis_trace TO vibe_invest_app;
 GRANT SELECT, INSERT ON analysis_deletion_tombstones TO vibe_invest_app;
@@ -711,7 +742,9 @@ async function freezeExecutionSettings(
 
 export function createRuntimeSettingsRepository(pool: Pool) {
   const mapRevision = (row: RuntimeSettingsRevisionRow): RuntimeSettingsRevision => ({
-    id: row.id, values: row.settings_json, createdAt: row.created_at,
+    id: row.id,
+    values: { ...defaultRuntimeSettings, ...row.settings_json },
+    createdAt: row.created_at,
   })
   const mapSnapshot = (row: ExecutionSettingsSnapshotRow): ExecutionSettingsSnapshot => ({
     executionId: row.execution_id, ...mapRevision(row),
@@ -811,6 +844,18 @@ export type ProductPosition = {
   averageCost: number
 }
 
+export type PortfolioEvent = {
+  id: string
+  kind: 'buy' | 'sell' | 'cash_adjust' | 'reconcile'
+  symbol: string | null
+  quantity: number | null
+  price: number | null
+  amount: number | null
+  realizedProfitLoss: number | null
+  note: string
+  createdAt: string
+}
+
 export type ProductEquitySnapshot = {
   marketDay: string
   totalEquity: number
@@ -878,11 +923,24 @@ export async function executeLegacyPortfolioMigration(options: {
          VALUES ($1, $2, $3, $4)`,
         [position.symbol, position.quantity, position.averageCost, position.updatedAt],
       )
+      await client.query(
+        `INSERT INTO portfolio_events (id, kind, symbol, quantity, price, note, created_at)
+         VALUES ($1, 'reconcile', $2, $3, $4, '期初建仓：迁移自手工快照持仓', $5)`,
+        ['opening:position:' + position.symbol, position.symbol,
+          position.quantity, position.averageCost, position.updatedAt],
+      )
     }
     await client.query(
       'UPDATE portfolio_settings SET cash = $1, updated_at = $2 WHERE id = 1',
       [options.data.cash.value, options.data.cash.updatedAt],
     )
+    if (Number(options.data.cash.value) > 0) {
+      await client.query(
+        `INSERT INTO portfolio_events (id, kind, amount, note, created_at)
+         VALUES ('opening:cash', 'cash_adjust', $1, '期初入金：迁移自手工维护现金', $2)`,
+        [options.data.cash.value, options.data.cash.updatedAt],
+      )
+    }
     for (const snapshot of options.data.snapshots) {
       await client.query(
         `INSERT INTO portfolio_equity_snapshots (
@@ -924,6 +982,63 @@ export async function verifyLegacyPortfolioMigration(
 }
 
 type PositionRow = { symbol: string; quantity: string; average_cost: string }
+type EventRow = {
+  id: string
+  kind: 'buy' | 'sell' | 'cash_adjust' | 'reconcile'
+  symbol: string | null
+  quantity: string | null
+  price: string | null
+  amount: string | null
+  realized_pnl: string | null
+  note: string
+  created_at: string
+}
+
+async function insertEvent(
+  client: PoolClient,
+  event: {
+    kind: PortfolioEvent['kind']
+    symbol?: string
+    quantity?: number
+    price?: number
+    amount?: number
+    realizedProfitLoss?: number
+    note?: string
+    createdAt: string
+  },
+): Promise<PortfolioEvent> {
+  const id = randomUUID()
+  await client.query(
+    `INSERT INTO portfolio_events (id, kind, symbol, quantity, price, amount, realized_pnl, note, created_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+    [id, event.kind, event.symbol ?? null,
+      event.quantity === undefined ? null : String(event.quantity),
+      event.price === undefined ? null : String(event.price),
+      event.amount === undefined ? null : String(event.amount),
+      event.realizedProfitLoss === undefined ? null : String(event.realizedProfitLoss),
+      event.note ?? '', event.createdAt],
+  )
+  return {
+    id, kind: event.kind, symbol: event.symbol ?? null,
+    quantity: event.quantity ?? null, price: event.price ?? null,
+    amount: event.amount ?? null, realizedProfitLoss: event.realizedProfitLoss ?? null,
+    note: event.note ?? '', createdAt: event.createdAt,
+  }
+}
+
+function toEvent(row: EventRow): PortfolioEvent {
+  return {
+    id: row.id,
+    kind: row.kind,
+    symbol: row.symbol,
+    quantity: row.quantity === null ? null : Number(row.quantity),
+    price: row.price === null ? null : Number(row.price),
+    amount: row.amount === null ? null : Number(row.amount),
+    realizedProfitLoss: row.realized_pnl === null ? null : Number(row.realized_pnl),
+    note: row.note,
+    createdAt: new Date(row.created_at).toISOString(),
+  }
+}
 type SnapshotRow = {
   market_day: string
   total_equity: string
@@ -944,21 +1059,6 @@ export function createPortfolioRepository(pool: Pool) {
       )
       return result.rows.map(toPosition)
     },
-    async save(position: ProductPosition) {
-      await pool.query(
-        `INSERT INTO positions (symbol, quantity, average_cost, updated_at)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (symbol) DO UPDATE SET
-           quantity = excluded.quantity,
-           average_cost = excluded.average_cost,
-           updated_at = excluded.updated_at`,
-        [position.symbol, String(position.quantity), String(position.averageCost), new Date().toISOString()],
-      )
-      return position
-    },
-    async remove(symbol: string) {
-      await pool.query('DELETE FROM positions WHERE symbol = $1', [symbol])
-    },
     async cash() {
       const result = await pool.query<{ cash: string }>(
         'SELECT cash::text FROM portfolio_settings WHERE id = $1',
@@ -966,14 +1066,65 @@ export function createPortfolioRepository(pool: Pool) {
       )
       return Number(result.rows[0]?.cash ?? 0)
     },
-    async setCash(cash: number) {
-      await pool.query(
-        'UPDATE portfolio_settings SET cash = $1, updated_at = $2 WHERE id = $3',
-        [String(cash), new Date().toISOString(), 1],
-      )
-      return cash
+    // 买入（加仓）：同一事务内追加事件、扣减现金、按加权平均更新持仓投影；现金不足时整体回滚。
+    async recordBuy(symbol: string, quantity: number, price: number, note = '') {
+      const client = await pool.connect()
+      try {
+        await client.query('BEGIN')
+        const cashResult = await client.query<{ cash: string }>(
+          'SELECT cash::text FROM portfolio_settings WHERE id = $1 FOR UPDATE',
+          [1],
+        )
+        const cash = Number(cashResult.rows[0]?.cash ?? 0)
+        const spent = quantity * price
+        if (spent > cash) {
+          await client.query('ROLLBACK')
+          return null
+        }
+        const positionResult = await client.query<PositionRow>(
+          `SELECT symbol, quantity::text, average_cost::text
+           FROM positions WHERE symbol = $1 FOR UPDATE`,
+          [symbol],
+        )
+        const row = positionResult.rows[0]
+        const nextQuantity = (row ? Number(row.quantity) : 0) + quantity
+        const nextAverageCost = row
+          ? (Number(row.quantity) * Number(row.average_cost) + spent) / nextQuantity
+          : price
+        const now = new Date().toISOString()
+        await client.query(
+          `INSERT INTO positions (symbol, quantity, average_cost, updated_at)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (symbol) DO UPDATE SET
+             quantity = excluded.quantity,
+             average_cost = excluded.average_cost,
+             updated_at = excluded.updated_at`,
+          [symbol, String(nextQuantity), String(nextAverageCost), now],
+        )
+        const nextCash = cash - spent
+        await client.query(
+          'UPDATE portfolio_settings SET cash = $1, updated_at = $2 WHERE id = $3',
+          [String(nextCash), now, 1],
+        )
+        const event = await insertEvent(client, {
+          kind: 'buy', symbol, quantity, price, amount: -spent, note, createdAt: now,
+        })
+        await client.query('COMMIT')
+        return {
+          event,
+          position: { symbol, quantity: nextQuantity, averageCost: nextAverageCost },
+          cash: nextCash,
+          spent,
+        }
+      } catch (error) {
+        await client.query('ROLLBACK')
+        throw error
+      } finally {
+        client.release()
+      }
     },
-    async reduce(symbol: string, quantity: number, price: number) {
+    // 卖出（减仓）：同一事务内追加事件、增加现金、减少持仓数量并记录本次已实现盈亏。
+    async recordSell(symbol: string, quantity: number, price: number, note = '') {
       const client = await pool.connect()
       try {
         await client.query('BEGIN')
@@ -994,24 +1145,31 @@ export function createPortfolioRepository(pool: Pool) {
         const remaining = Number(row.quantity) - quantity
         const proceeds = quantity * price
         const cash = Number(cashResult.rows[0]?.cash ?? 0) + proceeds
+        const realizedProfitLoss = (price - Number(row.average_cost)) * quantity
+        const now = new Date().toISOString()
         if (remaining === 0) {
           await client.query('DELETE FROM positions WHERE symbol = $1', [symbol])
         } else {
           await client.query(
             'UPDATE positions SET quantity = $1, updated_at = $2 WHERE symbol = $3',
-            [String(remaining), new Date().toISOString(), symbol],
+            [String(remaining), now, symbol],
           )
         }
         await client.query(
           'UPDATE portfolio_settings SET cash = $1, updated_at = $2 WHERE id = $3',
-          [String(cash), new Date().toISOString(), 1],
+          [String(cash), now, 1],
         )
+        const event = await insertEvent(client, {
+          kind: 'sell', symbol, quantity, price, amount: proceeds,
+          realizedProfitLoss, note, createdAt: now,
+        })
         await client.query('COMMIT')
         return {
+          event,
           position: remaining === 0 ? null : toPosition({ ...row, quantity: String(remaining) }),
           cash,
           proceeds,
-          realizedProfitLoss: (price - Number(row.average_cost)) * quantity,
+          realizedProfitLoss,
         }
       } catch (error) {
         await client.query('ROLLBACK')
@@ -1019,6 +1177,89 @@ export function createPortfolioRepository(pool: Pool) {
       } finally {
         client.release()
       }
+    },
+    // 资金调整：以目标现金值为输入，差额记一条入金或出金事件；现金只通过事件变化。
+    async recordCashAdjustment(targetCash: number, note = '') {
+      const client = await pool.connect()
+      try {
+        await client.query('BEGIN')
+        const cashResult = await client.query<{ cash: string }>(
+          'SELECT cash::text FROM portfolio_settings WHERE id = $1 FOR UPDATE',
+          [1],
+        )
+        const cash = Number(cashResult.rows[0]?.cash ?? 0)
+        const delta = targetCash - cash
+        if (delta === 0 || targetCash < 0) {
+          await client.query('ROLLBACK')
+          return targetCash < 0 ? null : { event: null, cash }
+        }
+        const now = new Date().toISOString()
+        await client.query(
+          'UPDATE portfolio_settings SET cash = $1, updated_at = $2 WHERE id = $3',
+          [String(targetCash), now, 1],
+        )
+        const event = await insertEvent(client, {
+          kind: 'cash_adjust', amount: delta,
+          note: note || (delta > 0 ? '入金' : '出金'), createdAt: now,
+        })
+        await client.query('COMMIT')
+        return { event, cash: targetCash }
+      } catch (error) {
+        await client.query('ROLLBACK')
+        throw error
+      } finally {
+        client.release()
+      }
+    },
+    // 校准：把某标的持仓对齐到实际数量与成本；现金不变，差额由事件留痕，保持账本可审计。
+    async recordReconcile(symbol: string, quantity: number, averageCost: number, note = '') {
+      const client = await pool.connect()
+      try {
+        await client.query('BEGIN')
+        await client.query(
+          'SELECT symbol FROM positions WHERE symbol = $1 FOR UPDATE',
+          [symbol],
+        )
+        const now = new Date().toISOString()
+        if (quantity === 0) {
+          await client.query('DELETE FROM positions WHERE symbol = $1', [symbol])
+        } else {
+          await client.query(
+            `INSERT INTO positions (symbol, quantity, average_cost, updated_at)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (symbol) DO UPDATE SET
+               quantity = excluded.quantity,
+               average_cost = excluded.average_cost,
+               updated_at = excluded.updated_at`,
+            [symbol, String(quantity), String(averageCost), now],
+          )
+        }
+        const event = await insertEvent(client, {
+          kind: 'reconcile', symbol, quantity, price: averageCost,
+          note: note || '校准持仓', createdAt: now,
+        })
+        await client.query('COMMIT')
+        return {
+          event,
+          position: quantity === 0 ? null : { symbol, quantity, averageCost },
+        }
+      } catch (error) {
+        await client.query('ROLLBACK')
+        throw error
+      } finally {
+        client.release()
+      }
+    },
+    async listEvents(limit = 100): Promise<PortfolioEvent[]> {
+      const safeLimit = Number.isInteger(limit) ? Math.max(1, Math.min(limit, 500)) : 100
+      const result = await pool.query<EventRow>(
+        `SELECT id, kind, symbol, quantity::text, price::text, amount::text,
+                realized_pnl::text, note, created_at::text
+         FROM portfolio_events
+         ORDER BY created_at DESC, id DESC LIMIT $1`,
+        [safeLimit],
+      )
+      return result.rows.map(toEvent)
     },
     async saveSnapshot(snapshot: ProductEquitySnapshot) {
       const result = await pool.query(

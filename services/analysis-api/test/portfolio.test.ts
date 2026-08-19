@@ -317,3 +317,97 @@ test('持仓接口拒绝无效数量和成本', async () => {
   assert.deepEqual(response.json(), { error: 'invalid_position' })
   await app.close()
 })
+test('加仓按成交价扣减现金并按加权平均更新成本，现金不足时拒绝', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'vibe-invest-buy-'))
+  const app = await createTestApp(join(dataDir, 'storage'))
+  await app.inject({ method: 'PUT', url: '/api/portfolio/cash', payload: { cash: 2200 } })
+
+  const first = await app.inject({
+    method: 'POST', url: '/api/positions/NVDA/buy', payload: { quantity: 10, price: 100 },
+  })
+  assert.equal(first.statusCode, 200)
+  assert.deepEqual(first.json(), {
+    position: { symbol: 'NVDA', quantity: 10, averageCost: 100 },
+    cash: 1200,
+    spent: 1000,
+  })
+
+  const second = await app.inject({
+    method: 'POST', url: '/api/positions/nvda/buy', payload: { quantity: 10, price: 120 },
+  })
+  assert.equal(second.statusCode, 200)
+  assert.deepEqual(second.json(), {
+    position: { symbol: 'NVDA', quantity: 20, averageCost: 110 },
+    cash: 0,
+    spent: 1200,
+  })
+
+  const rejected = await app.inject({
+    method: 'POST', url: '/api/positions/NVDA/buy', payload: { quantity: 1, price: 1 },
+  })
+  assert.equal(rejected.statusCode, 400)
+  assert.deepEqual(rejected.json(), { error: 'insufficient_cash' })
+  assert.deepEqual((await app.inject({ method: 'GET', url: '/api/positions' })).json(), {
+    positions: [{ symbol: 'NVDA', quantity: 20, averageCost: 110 }],
+  })
+  assert.equal((await app.inject({ method: 'GET', url: '/api/portfolio' })).json().cash, 0)
+  await app.close()
+})
+
+test('资金调整以目标值记录入金或出金事件，目标不变时不产生事件', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'vibe-invest-cash-adjust-'))
+  const app = await createTestApp(join(dataDir, 'storage'))
+
+  await app.inject({ method: 'PUT', url: '/api/portfolio/cash', payload: { cash: 800 } })
+  await app.inject({ method: 'PUT', url: '/api/portfolio/cash', payload: { cash: 300 } })
+  const unchanged = await app.inject({ method: 'PUT', url: '/api/portfolio/cash', payload: { cash: 300 } })
+  assert.deepEqual(unchanged.json(), { cash: 300 })
+
+  const events = (await app.inject({ method: 'GET', url: '/api/portfolio/events' })).json().events
+  assert.deepEqual(
+    events.map((event: { kind: string; amount: number; note: string }) => ({
+      kind: event.kind, amount: event.amount, note: event.note,
+    })),
+    [
+      { kind: 'cash_adjust', amount: -500, note: '出金' },
+      { kind: 'cash_adjust', amount: 800, note: '入金' },
+    ],
+  )
+  await app.close()
+})
+
+test('调仓事件账本覆盖买入、卖出、入金与校准，删除持仓记录校准到零', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'vibe-invest-events-'))
+  const app = await createPricedTestApp(join(dataDir, 'storage'), { NVDA: 120 })
+  await app.inject({ method: 'PUT', url: '/api/portfolio/cash', payload: { cash: 2000 } })
+  await app.inject({ method: 'POST', url: '/api/positions/NVDA/buy', payload: { quantity: 10, price: 100 } })
+  await app.inject({ method: 'POST', url: '/api/positions/NVDA/reduce', payload: { quantity: 4, price: 125 } })
+  await app.inject({ method: 'PUT', url: '/api/positions/NVDA', payload: { quantity: 8, averageCost: 95 } })
+
+  const overview = (await app.inject({ method: 'GET', url: '/api/portfolio' })).json()
+  assert.equal(overview.cash, 1500)
+  assert.deepEqual(overview.positions[0].quantity, 8)
+  assert.deepEqual(overview.positions[0].averageCost, 95)
+
+  const events = (await app.inject({ method: 'GET', url: '/api/portfolio/events' })).json().events
+  assert.deepEqual(
+    events.map((event: { kind: string; symbol: string | null; quantity: number | null; price: number | null; amount: number | null; realizedProfitLoss: number | null }) => ({
+      kind: event.kind, symbol: event.symbol, quantity: event.quantity,
+      price: event.price, amount: event.amount, realizedProfitLoss: event.realizedProfitLoss,
+    })),
+    [
+      { kind: 'reconcile', symbol: 'NVDA', quantity: 8, price: 95, amount: null, realizedProfitLoss: null },
+      { kind: 'sell', symbol: 'NVDA', quantity: 4, price: 125, amount: 500, realizedProfitLoss: 100 },
+      { kind: 'buy', symbol: 'NVDA', quantity: 10, price: 100, amount: -1000, realizedProfitLoss: null },
+      { kind: 'cash_adjust', symbol: null, quantity: null, price: null, amount: 2000, realizedProfitLoss: null },
+    ],
+  )
+
+  const removed = await app.inject({ method: 'DELETE', url: '/api/positions/NVDA' })
+  assert.equal(removed.statusCode, 204)
+  const afterRemove = (await app.inject({ method: 'GET', url: '/api/portfolio/events?limit=1' })).json().events
+  assert.equal(afterRemove[0].kind, 'reconcile')
+  assert.equal(afterRemove[0].quantity, 0)
+  assert.deepEqual((await app.inject({ method: 'GET', url: '/api/positions' })).json(), { positions: [] })
+  await app.close()
+})

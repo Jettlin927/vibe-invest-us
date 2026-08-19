@@ -40,6 +40,8 @@ test('Runtime 设置默认值符合产品预算与安全上限', () => {
     modelRequestTimeoutMinutes: 15,
     reportFreshnessDays: 7,
     compactionReserveTokens: 16_384,
+    agentModeFlat: 0,
+    flatAgentToolRounds: 40,
   })
 })
 

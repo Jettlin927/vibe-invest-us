@@ -4,7 +4,7 @@ import type { RegisteredToolDefinition } from './types.js'
 export const submitSpecialistReportDefinition: RegisteredToolDefinition = {
   model: {
     name: 'submit_specialist_report',
-    description: '提交经四层校验的消息面、基本面或技术面专项报告',
+    description: '提交经四层校验的专项报告。没有 deterministic_valuation 证据时不要提交 targetPrice；证据不足的判断降低置信度，数据缺口写入 gaps',
     parameters: Type.Object({
       kind: Type.Literal('specialist'), domain: Type.Union([
         Type.Literal('news'), Type.Literal('fundamental_valuation'), Type.Literal('technical'),

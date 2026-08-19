@@ -23,6 +23,11 @@ type PortfolioEquitySnapshot = {
   holdingsCount: number; pricedCount: number; observedAt: string; afterClose: boolean
   dailyChange: number | null; dailyReturn: number | null
 }
+type PortfolioEvent = {
+  id: string; kind: 'buy' | 'sell' | 'cash_adjust' | 'reconcile'
+  symbol: string | null; quantity: number | null; price: number | null
+  amount: number | null; realizedProfitLoss: number | null; note: string; createdAt: string
+}
 type ResearchSummary = { id: string; symbol: string; status: string; terminal?: boolean; createdAt?: string; reportCreatedAt?: string | null; error?: string | null; starred?: boolean; note?: string; report?: { title?: string; trend?: string } }
 type Fact = { id: string; type: string; value: unknown; observedAt: string; source: string; sourceReference: string }
 type Report = {
@@ -108,6 +113,7 @@ export function App() {
   const [positions, setPositions] = useState<Position[]>([])
   const [portfolio, setPortfolio] = useState<PortfolioOverview>(emptyPortfolio())
   const [portfolioHistory, setPortfolioHistory] = useState<PortfolioEquitySnapshot[]>([])
+  const [portfolioEvents, setPortfolioEvents] = useState<PortfolioEvent[]>([])
   const [records, setRecords] = useState<ResearchSummary[]>([])
   const [selectedResearch, setSelectedResearch] = useState<ResearchRecord | null>(null)
   const [analysisSymbol, setAnalysisSymbol] = useState('NVDA')
@@ -121,8 +127,10 @@ export function App() {
     const response = await fetch('/api/portfolio')
     const next = await response.json() as PortfolioOverview
     const historyResponse = await fetch('/api/portfolio/history?limit=30')
+    const eventsResponse = await fetch('/api/portfolio/events?limit=50').catch(() => null)
     setPortfolio(next)
     setPortfolioHistory((await historyResponse.json() as { snapshots: PortfolioEquitySnapshot[] }).snapshots)
+    setPortfolioEvents(eventsResponse?.ok ? (await eventsResponse.json() as { events: PortfolioEvent[] }).events : [])
     setPositions(next.positions.map(({ symbol, quantity, averageCost }) => ({ symbol, quantity, averageCost })))
   }
   async function loadResearch() {
@@ -188,6 +196,18 @@ export function App() {
     })
     if (!response.ok) { setError('现金保存失败'); return }
     await loadPortfolio()
+  }
+  async function buyPosition(symbol: string, quantity: number, price: number) {
+    const response = await fetch(`/api/positions/${symbol}/buy`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ quantity, price }),
+    })
+    if (!response.ok) {
+      const body = await response.json().catch(() => null) as { error?: string } | null
+      setError(body?.error === 'insufficient_cash' ? '加仓失败：现金不足，请先入金或降低买入金额。' : '加仓失败：请检查买入数量和成交价。')
+      return false
+    }
+    await loadPortfolio()
+    return true
   }
   async function reducePosition(symbol: string, quantity: number, price: number) {
     const response = await fetch(`/api/positions/${symbol}/reduce`, {
@@ -377,7 +397,7 @@ export function App() {
       {page === 'overview' && <Overview records={records} selected={selectedResearch} positions={positions} health={health} modelConfigured={modelConfigured} onNavigate={navigate} onOpen={async (id) => { await openResearch(id); navigate('research') }} />}
       {page === 'analysis' && <AnalysisPage symbol={analysisSymbol} setSymbol={setAnalysisSymbol} status={analysisStatus} stages={analysisStages} active={Boolean(activeAnalysisId)} onStart={startAnalysis} onCancel={cancelAnalysis} health={health} modelConfigured={modelConfigured} records={records} onOpen={async (id) => { await openResearch(id); navigate('research') }} />}
       {page === 'research' && <ResearchPage records={records} record={selectedResearch} onOpen={openResearch} onUpdate={updateResearch} onDelete={removeResearch} deleting={deletingResearchId === selectedResearch?.id} onResume={resumeResearch} onFollowUp={sendFollowUp} onReanalyze={reanalyzeResearch} freshnessDays={runtimeSettings?.current.values.reportFreshnessDays ?? null} />}
-      {page === 'portfolio' && <PortfolioPage portfolio={portfolio} history={portfolioHistory} onSave={savePosition} onSaveCash={saveCash} onReduce={reducePosition} onDelete={removePosition} />}
+      {page === 'portfolio' && <PortfolioPage portfolio={portfolio} history={portfolioHistory} events={portfolioEvents} onSave={savePosition} onSaveCash={saveCash} onBuy={buyPosition} onReduce={reducePosition} onDelete={removePosition} />}
       {page === 'settings' && <SettingsPage health={health} modelConfigured={modelConfigured} settings={runtimeSettings} onReload={loadSettings} />}
     </main>
   </div>
@@ -1123,15 +1143,18 @@ function ResearchReport({ record, onUpdate, onDelete, deleting, onResume, onFoll
   </article>
 }
 
-function PortfolioPage({ portfolio, history, onSave, onSaveCash, onReduce, onDelete }: {
+function PortfolioPage({ portfolio, history, events, onSave, onSaveCash, onBuy, onReduce, onDelete }: {
   portfolio: PortfolioOverview
   history: PortfolioEquitySnapshot[]
+  events: PortfolioEvent[]
   onSave: (event: React.FormEvent<HTMLFormElement>) => Promise<void>
   onSaveCash: (event: React.FormEvent<HTMLFormElement>) => Promise<void>
+  onBuy: (symbol: string, quantity: number, price: number) => Promise<boolean>
   onReduce: (symbol: string, quantity: number, price: number) => Promise<boolean>
   onDelete: (symbol: string) => Promise<void>
 }) {
   const [reducing, setReducing] = useState<PortfolioPosition | null>(null)
+  const [buying, setBuying] = useState<PortfolioPosition | null>(null)
   return <><PageHeader eyebrow="PRIVATE PORTFOLIO" title="我的持仓" description="现金、持仓市值和盈亏共同构成你的组合语境；行情缺失时不猜测组合总值。" />
     <div className="portfolio-kpis">
       <PortfolioKpi label="组合总值" value={formatNullableMoney(portfolio.totalEquity)} note="持仓市值 + USD 现金" />
@@ -1148,11 +1171,13 @@ function PortfolioPage({ portfolio, history, onSave, onSaveCash, onReduce, onDel
     <section className="portfolio-holdings">
       <header><div><p className="micro">当前持仓 · {portfolio.positions.length}</p><h2>组合明细</h2></div>{portfolio.unpricedPositionCount > 0 && <p className="data-warning">{portfolio.unpricedPositionCount} 项行情缺失，组合汇总已关闭。</p>}</header>
       <div className="portfolio-table-scroll"><div className="portfolio-table-row head"><span>标的</span><span>数量</span><span>平均成本</span><span>当前价</span><span>市值</span><span>仓位</span><span>未实现盈亏</span><span /></div>
-        {portfolio.positions.map((item) => <div className="portfolio-table-row" key={item.symbol}><strong>{item.symbol}</strong><span>{formatNumber(item.quantity)}</span><span>{formatMoney(item.averageCost)}</span><span>{formatNullableMoney(item.marketPrice)}</span><span>{formatNullableMoney(item.marketValue)}</span><span>{item.portfolioWeight === null ? '—' : formatPercent(item.portfolioWeight)}</span><span className={valueTone(item.unrealizedProfitLoss)}>{formatSignedMoney(item.unrealizedProfitLoss)}<small>{item.unrealizedReturn === null ? '' : formatSignedPercent(item.unrealizedReturn)}</small></span><span className="position-actions"><button className="quiet" onClick={() => setReducing(item)}>减仓</button><button className="text-button" onClick={() => void onDelete(item.symbol)}>删除</button></span></div>)}
+        {portfolio.positions.map((item) => <div className="portfolio-table-row" key={item.symbol}><strong>{item.symbol}</strong><span>{formatNumber(item.quantity)}</span><span>{formatMoney(item.averageCost)}</span><span>{formatNullableMoney(item.marketPrice)}</span><span>{formatNullableMoney(item.marketValue)}</span><span>{item.portfolioWeight === null ? '—' : formatPercent(item.portfolioWeight)}</span><span className={valueTone(item.unrealizedProfitLoss)}>{formatSignedMoney(item.unrealizedProfitLoss)}<small>{item.unrealizedReturn === null ? '' : formatSignedPercent(item.unrealizedReturn)}</small></span><span className="position-actions"><button className="quiet" onClick={() => setBuying(item)}>加仓</button><button className="quiet" onClick={() => setReducing(item)}>减仓</button><button className="text-button" onClick={() => void onDelete(item.symbol)}>删除</button></span></div>)}
         {!portfolio.positions.length && <p className="empty-row">尚未录入持仓。</p>}
       </div>
     </section>
-    <div className="portfolio-editors"><section className="cash-form"><p className="micro">现金余额</p><h2>维护 USD 现金</h2><form onSubmit={(event) => void onSaveCash(event)}><label>当前现金<input key={portfolio.cash} name="cash" aria-label="当前现金" type="number" min="0" step="any" defaultValue={portfolio.cash} required /></label><button type="submit">保存现金</button></form><p>现金不会因手工录入已有持仓自动变化；只有明确减仓时，卖出所得会计入现金。</p></section><section className="position-form"><p className="micro">新增或更新持仓</p><form onSubmit={(event) => void onSave(event)}><label>股票代码<input name="symbol" aria-label="股票代码" required /></label><label>数量<input name="quantity" aria-label="数量" type="number" min="0.000001" step="any" required /></label><label>平均成本<input name="averageCost" aria-label="平均成本" type="number" min="0" step="any" required /></label><button type="submit">保存持仓</button></form><p>这是手工快照录入，不代表系统执行了一笔买入交易。</p></section></div>
+    <div className="portfolio-editors"><section className="cash-form"><p className="micro">资金调整</p><h2>入金或出金</h2><form onSubmit={(event) => void onSaveCash(event)}><label>目标现金<input key={portfolio.cash} name="cash" aria-label="目标现金" type="number" min="0" step="any" defaultValue={portfolio.cash} required /></label><button type="submit">记录资金调整</button></form><p>调高记为入金、调低记为出金，差额作为资金调整事件记入调仓账本；买入扣现金、卖出加现金也会自动记录。</p></section><section className="position-form"><p className="micro">校准持仓</p><form onSubmit={(event) => void onSave(event)}><label>股票代码<input name="symbol" aria-label="股票代码" required /></label><label>数量<input name="quantity" aria-label="数量" type="number" min="0.000001" step="any" required /></label><label>平均成本<input name="averageCost" aria-label="平均成本" type="number" min="0" step="any" required /></label><button type="submit">校准持仓</button></form><p>把持仓对齐到券商实际数量与成本；不影响现金，差额以校准事件记入调仓账本。日常买入请用「加仓」。</p></section></div>
+    <EventLedger events={events} />
+    {buying && <BuyDialog position={buying} cash={portfolio.cash} onCancel={() => setBuying(null)} onSubmit={async (quantity, price) => { if (await onBuy(buying.symbol, quantity, price)) setBuying(null) }} />}
     {reducing && <ReduceDialog position={reducing} cash={portfolio.cash} onCancel={() => setReducing(null)} onSubmit={async (quantity, price) => { if (await onReduce(reducing.symbol, quantity, price)) setReducing(null) }} />}
   </>
 }
@@ -1183,6 +1208,23 @@ function PositionBars({ positions, mode }: { positions: PortfolioPosition[]; mod
   return <section className="portfolio-bars"><p className="micro">{mode === 'weight' ? '仓位分布' : '盈亏分解'}</p><h2>{mode === 'weight' ? '谁占用了组合' : '谁在贡献盈亏'}</h2>{values.length ? values.map((item) => <div className="portfolio-bar-row" key={item.symbol}><strong>{item.symbol}</strong><span className={item.value < 0 ? 'bar-track negative' : 'bar-track'}><i style={{ width: `${max ? Math.abs(item.value) / max * 100 : 0}%` }} /></span><small className={valueTone(item.value)}>{mode === 'weight' ? formatPercent(item.value) : formatSignedMoney(item.value)}</small></div>) : <p className="chart-empty">行情可用后显示</p>}</section>
 }
 
+function BuyDialog({ position, cash, onCancel, onSubmit }: { position: PortfolioPosition; cash: number; onCancel: () => void; onSubmit: (quantity: number, price: number) => Promise<void> }) {
+  const [quantity, setQuantity] = useState('')
+  const [price, setPrice] = useState(position.marketPrice === null ? '' : String(position.marketPrice))
+  const shares = Number(quantity), buyPrice = Number(price), valid = Number.isFinite(shares) && shares > 0 && Number.isFinite(buyPrice) && buyPrice >= 0
+  const spent = valid ? shares * buyPrice : 0, affordable = spent <= cash
+  const nextAverageCost = valid ? (position.quantity * position.averageCost + spent) / (position.quantity + shares) : 0
+  return <div className="portfolio-modal"><form role="dialog" aria-modal="true" aria-label={`加仓 ${position.symbol}`} onSubmit={(event) => { event.preventDefault(); if (valid && affordable) void onSubmit(shares, buyPrice) }}><p className="micro">BUY POSITION</p><h2>加仓 {position.symbol}</h2><p>当前持有 {formatNumber(position.quantity)} 股，平均成本 {formatMoney(position.averageCost)}，可用现金 {formatMoney(cash)}。</p><label>买入数量<input autoFocus aria-label="买入数量" type="number" min="0.000001" step="any" value={quantity} onChange={(event) => setQuantity(event.target.value)} required /></label><label>成交价<input aria-label="成交价" type="number" min="0" step="any" value={price} onChange={(event) => setPrice(event.target.value)} required /></label><div className="trade-preview"><span>买入花费<strong>{valid ? formatMoney(spent) : '—'}</strong></span><span>加仓后现金<strong>{valid ? formatMoney(cash - spent) : '—'}</strong></span><span>加仓后平均成本<strong>{valid ? formatMoney(nextAverageCost) : '—'}</strong></span></div>{valid && !affordable && <p role="alert" className="missing">买入金额超过当前现金，请先入金或降低买入金额。</p>}<div className="modal-actions"><button type="button" className="quiet" onClick={onCancel}>取消</button><button type="submit" disabled={!valid || !affordable}>确认加仓</button></div></form></div>
+}
+
+const eventKindLabels: Record<PortfolioEvent['kind'], string> = { buy: '买入', sell: '卖出', cash_adjust: '资金调整', reconcile: '校准' }
+
+function EventLedger({ events }: { events: PortfolioEvent[] }) {
+  return <section className="equity-history"><header><div><p className="micro">调仓账本 · 最近 {events.length} 条</p><h2>每一次仓位与现金变化</h2></div><p>持仓与现金都由这些事件推导而来</p></header>
+    {events.length ? <div className="equity-table-scroll"><table aria-label="调仓事件账本"><thead><tr><th>时间</th><th>事件</th><th>标的</th><th>数量</th><th>价格</th><th>现金变化</th><th>已实现盈亏</th><th>备注</th></tr></thead><tbody>{events.map((event) => <tr key={event.id}><td>{event.createdAt.slice(0, 16).replace('T', ' ')}</td><td>{eventKindLabels[event.kind]}</td><td>{event.symbol ?? '—'}</td><td>{event.quantity === null ? '—' : formatNumber(event.quantity)}</td><td>{event.price === null ? '—' : formatMoney(event.price)}</td><td className={valueTone(event.amount)}>{event.amount === null ? '—' : formatSignedMoney(event.amount)}</td><td className={valueTone(event.realizedProfitLoss)}>{event.realizedProfitLoss === null ? '—' : formatSignedMoney(event.realizedProfitLoss)}</td><td>{event.note || '—'}</td></tr>)}</tbody></table></div> : <p className="chart-empty">买入、卖出、资金调整或校准后在这里留下记录</p>}
+  </section>
+}
+
 function ReduceDialog({ position, cash, onCancel, onSubmit }: { position: PortfolioPosition; cash: number; onCancel: () => void; onSubmit: (quantity: number, price: number) => Promise<void> }) {
   const [quantity, setQuantity] = useState('')
   const [price, setPrice] = useState(position.marketPrice === null ? '' : String(position.marketPrice))
@@ -1209,6 +1251,8 @@ function SettingsPage({ health, modelConfigured, settings, onReload }: {
     { key: 'modelRequestTimeoutMinutes', label: '模型请求超时（分钟）' },
     { key: 'reportFreshnessDays', label: 'Freshness（天）' },
     { key: 'compactionReserveTokens', label: 'Compaction 保留 Token' },
+    { key: 'agentModeFlat', label: '扁平 Agent 模式（0=分层，1=扁平，实验）' },
+    { key: 'flatAgentToolRounds', label: '扁平模式轮次上限' },
   ]
   async function save(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -1251,7 +1295,10 @@ function SettingsPage({ health, modelConfigured, settings, onReload }: {
 }
 
 function formatFrozenSettings(settings: RuntimeSettings) {
-  return `主 Agent ${settings.mainAgentToolRounds} 轮 · 专项 ${settings.specialistAgentToolRounds} 轮 · 研究 ${settings.researchActiveMinutes} 分钟 · 墙钟 ${settings.executionWallClockMinutes} 分钟 · 研究/模型/工具并发 ${settings.analysisConcurrency}/${settings.modelConcurrency}/${settings.toolConcurrency} · 模型超时 ${settings.modelRequestTimeoutMinutes} 分钟 · Freshness ${settings.reportFreshnessDays} 天 · Compaction 保留 ${settings.compactionReserveTokens.toLocaleString('zh-CN')} Token`
+  const mode = settings.agentModeFlat === 1
+    ? `扁平 ${settings.flatAgentToolRounds} 轮`
+    : `主 Agent ${settings.mainAgentToolRounds} 轮 · 专项 ${settings.specialistAgentToolRounds} 轮`
+  return `${mode} · 研究 ${settings.researchActiveMinutes} 分钟 · 墙钟 ${settings.executionWallClockMinutes} 分钟 · 研究/模型/工具并发 ${settings.analysisConcurrency}/${settings.modelConcurrency}/${settings.toolConcurrency} · 模型超时 ${settings.modelRequestTimeoutMinutes} 分钟 · Freshness ${settings.reportFreshnessDays} 天 · Compaction 保留 ${settings.compactionReserveTokens.toLocaleString('zh-CN')} Token`
 }
 
 function PriceChart({ facts, compact = false }: { facts: Fact[]; compact?: boolean }) {

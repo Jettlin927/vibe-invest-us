@@ -396,7 +396,7 @@ def test_document_redirect_revalidates_every_hop_and_sends_no_cookie_or_credenti
     def resolve(url):
         resolved.append(url)
         host = "first.example" if len(resolved) == 1 else "second.example"
-        return url, "93.184.216.34", 443, host
+        return url, ["93.184.216.34"], 443, host
 
     class Connection:
         def __init__(self, hostname, pinned_ip, port, timeout):
@@ -412,7 +412,7 @@ def test_document_redirect_revalidates_every_hop_and_sends_no_cookie_or_credenti
         def close(self):
             pass
 
-    monkeypatch.setattr("app.adapters._resolve_document_url", resolve)
+    monkeypatch.setattr("app.adapters._resolve_document_addresses", resolve)
     monkeypatch.setattr("app.adapters._PinnedHTTPSConnection", Connection)
 
     page = read_document_page("https://first.example/start", 0, 64, timeout=7)
@@ -450,8 +450,8 @@ def test_document_page_sends_byte_range_and_uses_provider_total(monkeypatch):
         def close(self):
             pass
 
-    monkeypatch.setattr("app.adapters._resolve_document_url", lambda url: (
-        url, "93.184.216.34", 443, "example.com",
+    monkeypatch.setattr("app.adapters._resolve_document_addresses", lambda url: (
+        url, ["93.184.216.34"], 443, "example.com",
     ))
     monkeypatch.setattr("app.adapters._PinnedHTTPSConnection", Connection)
 
@@ -465,12 +465,11 @@ def test_document_page_sends_byte_range_and_uses_provider_total(monkeypatch):
     assert page["truncated"] is True
 
 
-def test_document_page_fails_closed_when_provider_ignores_nonzero_range(monkeypatch):
+def test_document_page_rejects_cursor_beyond_full_body(monkeypatch):
     class Response:
         status = 200
         headers = Message()
         headers["Content-Type"] = "text/html"
-        headers["Content-Length"] = "200000"
         def read(self, _limit):
             return b"abcde"
 
@@ -484,14 +483,146 @@ def test_document_page_fails_closed_when_provider_ignores_nonzero_range(monkeypa
         def close(self):
             pass
 
-    monkeypatch.setattr("app.adapters._resolve_document_url", lambda url: (
-        url, "93.184.216.34", 443, "example.com",
+    monkeypatch.setattr("app.adapters._resolve_document_addresses", lambda url: (
+        url, ["93.184.216.34"], 443, "example.com",
     ))
     monkeypatch.setattr("app.adapters._PinnedHTTPSConnection", Connection)
 
     try:
         read_document_page("https://example.com/filing", 65536, 65536)
     except ValueError as error:
-        assert str(error) == "document_range_not_supported"
+        assert str(error) == "document_cursor_invalid"
     else:
-        raise AssertionError("ignored_range_accepted")
+        raise AssertionError("cursor_beyond_body_accepted")
+
+
+def test_document_page_slices_full_body_when_provider_ignores_range(monkeypatch):
+    body = b"x" * 100000
+
+    class Response:
+        status = 200
+        headers = Message()
+        headers["Content-Type"] = "text/html"
+        def read(self, limit):
+            return body
+
+    class Connection:
+        def __init__(self, *args):
+            pass
+        def request(self, method, path, headers):
+            pass
+        def getresponse(self):
+            return Response()
+        def close(self):
+            pass
+
+    monkeypatch.setattr("app.adapters._resolve_document_addresses", lambda url: (
+        url, ["93.184.216.34"], 443, "example.com",
+    ))
+    monkeypatch.setattr("app.adapters._PinnedHTTPSConnection", Connection)
+
+    page = read_document_page("https://example.com/filing", 65536, 65536)
+
+    assert page["payload"] == b"x" * (100000 - 65536)
+    assert page["startByte"] == 65536
+    assert page["endByte"] == 99999
+    assert page["totalBytes"] == 100000
+    assert page["nextCursor"] is None
+    assert page["truncated"] is False
+
+def test_document_page_falls_back_to_next_pinned_ip_on_edge_rejection(monkeypatch):
+    attempts = []
+
+    class ForbiddenResponse:
+        status = 403
+        headers = Message()
+
+        def read(self, _limit):
+            return b""
+
+    class OkResponse:
+        status = 200
+        headers = Message()
+        headers["Content-Type"] = "text/html"
+        headers["Content-Length"] = "5"
+
+        def read(self, _limit):
+            return b"hello"
+
+    responses = [ForbiddenResponse(), OkResponse()]
+
+    class Connection:
+        def __init__(self, hostname, pinned_ip, port, timeout):
+            self.pinned_ip = pinned_ip
+
+        def request(self, method, path, headers):
+            attempts.append(self.pinned_ip)
+
+        def getresponse(self):
+            return responses.pop(0)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("app.adapters._resolve_document_addresses", lambda url: (
+        url, ["203.0.113.10", "93.184.216.34"], 443, "example.com",
+    ))
+    monkeypatch.setattr("app.adapters._PinnedHTTPSConnection", Connection)
+
+    page = read_document_page("https://example.com/doc", 0, 64)
+
+    assert attempts == ["203.0.113.10", "93.184.216.34"]
+    assert page["payload"] == b"hello"
+
+
+def test_document_page_raises_after_all_pinned_ips_rejected(monkeypatch):
+    class ForbiddenResponse:
+        status = 403
+        headers = Message()
+
+        def read(self, _limit):
+            return b""
+
+    class Connection:
+        def __init__(self, *args):
+            pass
+
+        def request(self, method, path, headers):
+            pass
+
+        def getresponse(self):
+            return ForbiddenResponse()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("app.adapters._resolve_document_addresses", lambda url: (
+        url, ["203.0.113.10", "198.51.100.20"], 443, "example.com",
+    ))
+    monkeypatch.setattr("app.adapters._PinnedHTTPSConnection", Connection)
+
+    try:
+        read_document_page("https://example.com/doc", 0, 64)
+    except ValueError as error:
+        assert str(error) == "news_document_http_status"
+    else:
+        raise AssertionError("all_ips_rejected_accepted")
+
+
+def test_html_to_text_strips_script_and_style_noise():
+    from app.adapters import html_to_text
+    payload = (
+        b"<html><head><style>body { color: red; }</style></head>"
+        b"<body><script>window.finNeoPageStart = Date.now();</script>"
+        b"<h1>Guidance</h1><p>Management raised guidance.</p></body></html>"
+    )
+    assert html_to_text(payload) == "Guidance Management raised guidance."
+
+
+def test_html_to_text_drops_unclosed_script_at_truncation_boundary():
+    from app.adapters import html_to_text
+    payload = (
+        b"<p>Real article lead.</p>"
+        b"<script>(function(){var tracker = 'unclosed because of byte cap';"
+    )
+    assert html_to_text(payload) == "Real article lead."

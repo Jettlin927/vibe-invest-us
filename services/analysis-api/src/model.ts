@@ -111,6 +111,7 @@ export type AnalyzeInput = {
   runtimeSettings: RuntimeSettings
   symbol: string
   systemPrompt: string
+  agentMode?: 'flat'
   userPrompt?: string
   runtimeContext?: RuntimeContext
   runtimeResume?: RuntimeResume
@@ -129,6 +130,16 @@ export type AnalyzeInput = {
     symbol: string,
     signal: AbortSignal,
   ) => Promise<{ facts: Fact[]; [key: string]: unknown }>
+  searchNewsCandidates?: AnalyzeNewsInput['searchNewsCandidates']
+  searchWebEvidence?: NonNullable<AnalyzeNewsInput['searchWebEvidence']>
+  readNewsDocument?: AnalyzeNewsInput['readNewsDocument']
+  listCompanyEvents?: AnalyzeNewsInput['listCompanyEvents']
+  getFinancialOverview?: AnalyzeFundamentalInput['getFinancialOverview']
+  getFinancialMetricSeries?: AnalyzeFundamentalInput['getFinancialMetricSeries']
+  getValuationEvidence?: AnalyzeFundamentalInput['getValuationEvidence']
+  readFilingDocument?: AnalyzeFundamentalInput['readFilingDocument']
+  getTechnicalEvidence?: AnalyzeTechnicalInput['getTechnicalEvidence']
+  getPriceWindow?: AnalyzeTechnicalInput['getPriceWindow']
   financialContextToolViews?: FinancialContextToolViews
   prepareSpecialistBatch?: (requests: Array<{
     domain: 'news' | 'fundamental_valuation' | 'technical'

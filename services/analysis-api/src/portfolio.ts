@@ -71,10 +71,14 @@ export function createPortfolio(repository: PortfolioRepository) {
 
   return {
     list: () => repository.list(),
-    save: (position: ProductPosition) => repository.save(position),
-    remove: (symbol: string) => repository.remove(symbol),
-    setCash: (cash: number) => repository.setCash(cash),
-    reduce: (symbol: string, quantity: number, price: number) => repository.reduce(symbol, quantity, price),
+    recordBuy: (symbol: string, quantity: number, price: number) => repository.recordBuy(symbol, quantity, price),
+    recordSell: (symbol: string, quantity: number, price: number) => repository.recordSell(symbol, quantity, price),
+    adjustCash: (cash: number) => repository.recordCashAdjustment(cash),
+    reconcile: (position: ProductPosition) => repository.recordReconcile(
+      position.symbol, position.quantity, position.averageCost,
+    ),
+    remove: (symbol: string) => repository.recordReconcile(symbol, 0, 0),
+    listEvents: (limit?: number) => repository.listEvents(limit),
     overview,
     async recordSnapshot(value: PortfolioOverview, observedAt = new Date()) {
       if (value.totalEquity === null || value.totalMarketValue === null || value.positions.length === 0) return false

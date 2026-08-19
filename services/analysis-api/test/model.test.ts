@@ -11,7 +11,9 @@ import {
   type AnalyzeInput, type ModelOptions, type ToolRuntime,
 } from '../src/model.js'
 import { createActiveBudget } from '../src/runtime-policy.js'
-import { analysisModelTools, financialSpecialistTools } from '../src/tools.js'
+import {
+  analysisModelTools, financialSpecialistTools, flatResearchTools, flatSubmitAnalysisReportTool,
+} from '../src/tools.js'
 
 const facts = [{
   id: 'fact:nvda:price:2026-08-12',
@@ -2927,4 +2929,114 @@ test('真实 Pi 用冻结 tool concurrency 限制跨 execution 外部工具请�
   releaseFirst()
   await Promise.all([first, second])
   assert.equal(maximumActive, 1)
+})
+
+test('扁平模式投影全部领域工具且不包含专项启动工具', () => {
+  const names = flatResearchTools.map((tool) => tool.name)
+  assert.deepEqual(names, [
+    'fetch_financial_context', 'search_news_candidates', 'read_news_document',
+    'list_company_events', 'get_financial_overview', 'get_financial_metric_series',
+    'get_valuation_evidence', 'read_filing_document', 'get_technical_evidence',
+    'get_price_window', 'submit_analysis_report',
+  ])
+  assert.equal(names.some((name) => name.startsWith('run_')), false)
+  assert.equal(names.includes('submit_specialist_report'), false)
+  assert.equal(names.includes('search_web_evidence'), false)
+  const required = (flatSubmitAnalysisReportTool.parameters as { required?: string[] }).required ?? []
+  assert.equal(required.includes('specialistReferences'), false)
+  assert.equal(required.includes('specialistStatuses'), false)
+})
+
+test('扁平模式直接执行领域工具并提交无专项引用的综合报告', async () => {
+  const technicalFacts = [{
+    id: 'fact:nvda:technical:1', type: 'technical_evidence',
+    value: {
+      actualStart: '2025-08-12', actualEnd: '2026-08-12', totalBarCount: 252,
+      structures: Object.fromEntries([20, 60, 120, 252].map((size) => [
+        String(size) + 'd', { status: 'available', barCount: size, returnPct: 0.1, high: 130, low: 90 },
+      ])),
+      indicators: {
+        ma_5: 120, ma_20: 115, macd: { line: 1, signal: 0.5, histogram: 0.5 },
+        rsi_14: 58, annualized_volatility: 0.3, max_drawdown: -0.2, volume_ratio_5_to_20: 1.1,
+      },
+      volatility: { annualized: 0.3 }, drawdown: { maximum: -0.2 },
+      volumePrice: { volumeRatio5To20: 1.1 }, keyLevels: { support: 90, resistance: 130 },
+      conflicts: [],
+    },
+    observedAt: '2026-08-12T14:00:00Z', fetchedAt: '2026-08-12T14:00:00Z',
+    source: 'host', sourceReference: 'internal://technical',
+    evidenceLevel: 'deterministic_technical',
+  }]
+  const { specialistStatuses: _omitStatuses, specialistReferences: _omitReferences,
+    ...validReportWithoutSpecialists } = validReport
+  const flatReport = {
+    ...validReportWithoutSpecialists,
+    keyJudgments: [{
+      type: 'technical', statement: 'RSI 处于中性偏强区间', direction: 'bullish',
+      confidence: 'medium', supportingEvidence: ['fact:nvda:technical:1'],
+      contraryEvidence: [], contraryEvidenceStatus: 'none_found',
+      invalidationConditions: ['RSI 跌破 50'], affectedByMissingDomains: [],
+    }],
+  }
+  const projections: string[][] = []
+  const toolRuntime = createTestToolRuntime()
+  const ensureProjection = toolRuntime.ensureProjection.bind(toolRuntime)
+  toolRuntime.ensureProjection = async (input) => {
+    projections.push(input.tools.map(({ name }) => name))
+    return ensureProjection(input)
+  }
+  let technicalCalls = 0
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall('get_technical_evidence', { symbol: 'NVDA' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('submit_analysis_report', flatReport), { stopReason: 'toolUse' }),
+  ] })
+  const events = []
+  for await (const event of model.analyze({
+    executionId: 'flat-research', runtimeSettings: runtimeSettings({ agentModeFlat: 1 }),
+    symbol: 'NVDA', systemPrompt: 'system', userPrompt: 'user', knownFacts: facts,
+    agentMode: 'flat', toolRuntime,
+    fetchFinancialContext: async () => ({ facts }),
+    getTechnicalEvidence: async (symbol) => {
+      technicalCalls += 1
+      assert.equal(symbol, 'NVDA')
+      return { facts: technicalFacts }
+    },
+    runNewsSpecialist: async () => { throw new Error('flat_mode_must_not_launch_specialist') },
+  })) events.push(event)
+
+  assert.equal(technicalCalls, 1)
+  assert.equal(projections[0]?.includes('get_technical_evidence'), true)
+  assert.equal(projections[0]?.includes('run_technical_analysis'), false)
+  assert.equal(events.some((event) => event.type === 'trace' && event.entry.type === 'tool_result'
+    && event.entry.name === 'get_technical_evidence'), true)
+  const completed = events.find((event) => event.type === 'completed')
+  assert.ok(completed)
+  assert.equal(completed.reportVersion?.kind, 'integrated')
+})
+
+test('扁平模式拒绝其他标的价格窗口并保留符号约束', async () => {
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall('get_price_window', {
+      symbol: 'AAPL', startDate: '2026-01-01', endDate: '2026-02-01',
+    }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('submit_analysis_report', (() => {
+      const { specialistStatuses, specialistReferences, ...rest } = validReport
+      void specialistStatuses; void specialistReferences
+      return rest
+    })()), { stopReason: 'toolUse' }),
+  ] })
+  let priceWindowCalls = 0
+  const events = []
+  for await (const event of model.analyze({
+    executionId: 'flat-symbol-guard', runtimeSettings: runtimeSettings({ agentModeFlat: 1 }),
+    symbol: 'NVDA', systemPrompt: 'system', userPrompt: 'user', knownFacts: facts,
+    agentMode: 'flat',
+    fetchFinancialContext: async () => ({ facts }),
+    getPriceWindow: async () => { priceWindowCalls += 1; return { facts: [] } },
+  })) events.push(event)
+
+  assert.equal(priceWindowCalls, 0)
+  const result = events.find((event) => event.type === 'trace' && event.entry.type === 'tool_result'
+    && event.entry.name === 'get_price_window')
+  assert.match(JSON.stringify(result), /tool_symbol_not_allowed/)
 })

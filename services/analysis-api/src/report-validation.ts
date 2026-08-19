@@ -14,6 +14,7 @@ export type ReportFact = {
 
 export type ReportValidationContext = {
   role: 'main' | 'news' | 'fundamental_valuation' | 'technical'
+  agentMode?: 'flat'
   knownFacts: ReportFact[]
   specialistReports?: Array<{
     domain: 'news' | 'fundamental_valuation' | 'technical'
@@ -102,14 +103,19 @@ export function validateReportCandidate(
   if ('keyJudgments' in candidate && !Array.isArray(candidate.keyJudgments)) {
     envelopeErrors.push(typeError('/keyJudgments', '关键判断必须是数组'))
   }
-  if (context.role === 'main' && !('specialistStatuses' in candidate)) envelopeErrors.push({
-    path: '/specialistStatuses', rule: 'required',
-    message: '缺少专项状态列表', allowedEvidenceTypes: [],
-  })
-  if (context.role === 'main' && !('specialistReferences' in candidate)) envelopeErrors.push({
-    path: '/specialistReferences', rule: 'required',
-    message: '缺少专项报告引用列表', allowedEvidenceTypes: [],
-  })
+  const flatMain = context.role === 'main' && context.agentMode === 'flat'
+  if (context.role === 'main' && !flatMain && !('specialistStatuses' in candidate)) {
+    envelopeErrors.push({
+      path: '/specialistStatuses', rule: 'required',
+      message: '缺少专项状态列表', allowedEvidenceTypes: [],
+    })
+  }
+  if (context.role === 'main' && !flatMain && !('specialistReferences' in candidate)) {
+    envelopeErrors.push({
+      path: '/specialistReferences', rule: 'required',
+      message: '缺少专项报告引用列表', allowedEvidenceTypes: [],
+    })
+  }
   if ('specialistReferences' in candidate && !Array.isArray(candidate.specialistReferences)) {
     envelopeErrors.push(typeError('/specialistReferences', '专项报告引用必须是数组'))
   } else if (Array.isArray(candidate.specialistReferences)) {
@@ -330,13 +336,22 @@ export function validateReportCandidate(
   const qualificationErrors = [...missingSupportErrors, ...judgmentReferences.flatMap(({ id, judgment, path }) => {
     const fact = facts.get(id)!
     const allowed = allowedEvidenceFor(String(judgment.type))
-    if (allowed.includes(evidenceLevel(fact))
-      && (evidenceLevel(fact) !== 'deterministic_valuation'
+    const level = evidenceLevel(fact)
+    if (allowed.includes(level)
+      && (level !== 'deterministic_valuation'
         || qualifiedValuationEvidence(fact, facts))
-      && (evidenceLevel(fact) !== 'deterministic_technical'
+      && (level !== 'deterministic_technical'
         || qualifiedTechnicalEvidence(fact))) return []
+    // 新闻源降级通道：文档读取失败时，title_only 候选仍可支撑 low 置信度的 news 判断，
+    // 事实链保留 title_only 等级，不升级为 verified_news
+    if (level === 'title_only' && String(judgment.type) === 'news') {
+      if (judgment.confidence === 'low') return []
+      return [{ path, rule: 'evidence_qualification',
+        message: 'title_only 证据只能支撑 low 置信度的 news 判断；请降低置信度或改用 verified_news / official_company_event 证据',
+        allowedEvidenceTypes: allowed }]
+    }
     return [{ path, rule: 'evidence_qualification',
-      message: `${evidenceLevel(fact)} 事实不能支撑 ${String(judgment.type)} 判断`,
+      message: `${level} 事实不能支撑 ${String(judgment.type)} 判断`,
       allowedEvidenceTypes: allowed }]
   })]
   if (qualificationErrors.length) return { ok: false, errors: qualificationErrors }
@@ -499,15 +514,23 @@ function qualifiedTargetPrice(value: unknown, facts: Map<string, ReportFact>) {
       && evidence.unit === 'USD/share'
       && evidence.method === target.method
       && evidence.asOf === target.asOf
-      && arraysEqual(evidence.inputs, target.inputs)
-      && evidenceRange.low === range.low
-      && evidenceRange.high === range.high
+      && sameIdSet(evidence.inputs, target.inputs)
+      && numbersClose(Number(evidenceRange.low), Number(range.low))
+      && numbersClose(Number(evidenceRange.high), Number(range.high))
   })
 }
 
-function arraysEqual(left: unknown, right: unknown) {
-  return Array.isArray(left) && Array.isArray(right)
-    && left.length === right.length && left.every((value, index) => value === right[index])
+// 模型复数浮点输出可能经过四舍五入，区间比较允许微小相对误差
+function numbersClose(actual: number, expected: number) {
+  if (!Number.isFinite(actual) || !Number.isFinite(expected)) return false
+  return Math.abs(actual - expected) <= Math.max(0.01, Math.abs(expected) * 1e-4)
+}
+
+// 输入事实 ID 集合相等（顺序无关，允许模型按不同顺序列举）
+function sameIdSet(left: unknown, right: unknown) {
+  if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false
+  const remaining = new Set(left)
+  return right.every((value) => remaining.delete(value))
 }
 
 function asRecord(value: unknown): Record<string, unknown> {

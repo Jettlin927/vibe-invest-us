@@ -105,7 +105,7 @@ const boundedResultKeys = [
   'keyFactIds', 'contraryFactIds',
   'cursor', 'nextCursor', 'pagination', 'truncated', 'resultCount',
   'returnedCount', 'totalCount', 'items', 'overview',
-  'symbol', 'authorizedComparables', 'comparables',
+  'symbol', 'authorizedComparables', 'comparables', 'excludedComparables',
   'currentMultiples', 'historicalRanges', 'methods',
   'actualStart', 'actualEnd', 'totalBarCount', 'sampling', 'structures',
   'indicators', 'volatility', 'drawdown', 'volumePrice', 'keyLevels', 'conflicts',
@@ -132,6 +132,7 @@ function projectPublicToolResult(name: string, result: Record<string, unknown>) 
     ...selectTyped(result, ['symbol'], 'string'),
     ...optionalArray('authorizedComparables', result.authorizedComparables, stringValue),
     ...optionalArray('comparables', result.comparables, projectComparable),
+    ...optionalArray('excludedComparables', result.excludedComparables, projectExcludedComparable),
     ...optionalObject('currentMultiples', projectNumericRecord(result.currentMultiples)),
     ...optionalObject('historicalRanges', projectNumericRangeRecord(result.historicalRanges)),
     ...optionalObject('methods', projectValuationMethods(result.methods)),
@@ -208,6 +209,14 @@ function projectComparable(value: unknown) {
   }
 }
 
+function projectExcludedComparable(value: unknown) {
+  const item = record(value)
+  return {
+    ...selectTyped(item, ['symbol', 'method', 'reason'], 'string'),
+    ...selectTyped(item, ['value'], 'number'),
+  }
+}
+
 function projectNumericRecord(value: unknown) {
   return selectTyped(record(value), ['pe', 'evToEbitda', 'evToRevenue'], 'number')
 }
@@ -228,7 +237,7 @@ function projectValuationMethods(value: unknown) {
     if (!source[name] || typeof source[name] !== 'object') return []
     const method = record(source[name])
     return [[name, {
-      ...selectTyped(method, ['status', 'reason'], 'string'),
+      ...selectTyped(method, ['status', 'reason', 'anchor'], 'string'),
       ...selectTyped(method, ['multiple', 'targetPrice', 'multiplePercentile'], 'number'),
       ...optionalObject('range', selectTyped(record(method.range), ['low', 'high'], 'number')),
     }]]

@@ -161,16 +161,25 @@ class ValuationComparable(BaseModel):
 class ValuationMethodView(BaseModel):
     status: Literal["available", "unavailable"]
     reason: Optional[str] = None
+    anchor: Optional[str] = None
     multiple: Optional[float] = None
     targetPrice: Optional[float] = None
     range: Optional[dict[str, float]] = None
     multiplePercentile: Optional[float] = None
 
 
+class ValuationExcludedComparable(BaseModel):
+    symbol: Optional[str] = None
+    method: str
+    value: float
+    reason: str
+
+
 class ValuationEvidenceResult(BaseModel):
     symbol: str
     authorizedComparables: List[str]
     comparables: List[ValuationComparable]
+    excludedComparables: List[ValuationExcludedComparable] = []
     currentMultiples: dict[str, float]
     historicalRanges: dict[str, List[float]]
     methods: dict[str, ValuationMethodView]

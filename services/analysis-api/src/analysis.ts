@@ -20,7 +20,8 @@ import {
   acquireActiveSlot, createActiveBudget, createConcurrencyGate, raceWithAbort,
 } from './runtime-policy.js'
 import {
-  analysisModelTools, financialSpecialistTools, newsSpecialistTools, technicalSpecialistTools,
+  analysisModelTools, financialSpecialistTools, flatResearchTools, newsSpecialistTools,
+  technicalSpecialistTools,
 } from './tools.js'
 import { toolRegistry } from './tool-registry.js'
 
@@ -363,6 +364,7 @@ export function createAnalysisService(options: {
   ) {
     const controller = new AbortController()
     controllers.set(analysisId, controller)
+    const flatMode = runtimeSettings.agentModeFlat === 1
     const job = await get(analysisId)
     if (!job || job.status !== 'running') { controllers.delete(analysisId); return }
     const wallDeadline = AbortSignal.timeout(Math.max(1, Math.ceil(remainingWallMs)))
@@ -517,7 +519,7 @@ export function createAnalysisService(options: {
         }, { snapshot, facts: context.facts })
       assertPolicy()
       const modelContext = createModelContext(snapshot)
-      const runtimeContext = createInitialRuntimeContext(modelContext, portfolioContext)
+      const runtimeContext = createInitialRuntimeContext(modelContext, portfolioContext, flatMode)
       const previousExecutionId = typeof resumeEvent?.previousExecutionId === 'string'
         ? resumeEvent.previousExecutionId : undefined
       const sourceExecutionIds = Array.isArray(resumeEvent?.sourceExecutionIds)
@@ -528,7 +530,9 @@ export function createAnalysisService(options: {
       const knownFactIds = new Set(modelContext.facts.map((fact) => fact.id))
       const reusableToolResults = reusableResults(
         previousRuntimes, knownFactIds, modelContext.facts,
-        'main', analysisModelTools.map(({ name }) => name),
+        'main',
+        (flatMode ? flatResearchTools : analysisModelTools).map(({ name }) => name),
+        flatMode,
       )
       const specialistSessions = (await options.eventRepository.listSessions(analysisId))
         .filter(({ isPrimary }) => !isPrimary)
@@ -674,7 +678,7 @@ export function createAnalysisService(options: {
               ?.portfolioContext ?? null,
           currentPositionSummary: portfolioContext,
           specialistStatuses,
-          availableTools: analysisModelTools.filter(({ name }) => (
+          availableTools: (flatMode ? flatResearchTools : analysisModelTools).filter(({ name }) => (
             updateReport || name !== 'submit_analysis_report'
           )).map(({ name, description }) => ({
             name, purpose: description,
@@ -960,7 +964,8 @@ export function createAnalysisService(options: {
         executionId,
         runtimeSettings,
         symbol: job.symbol,
-        systemPrompt: ANALYSIS_SYSTEM_PROMPT,
+        systemPrompt: flatMode ? ANALYSIS_SYSTEM_PROMPT_FLAT : ANALYSIS_SYSTEM_PROMPT,
+        agentMode: flatMode ? 'flat' : undefined,
         runtimeContext: followUpEvent ? undefined : runtimeContext,
         runtimeResume,
         runtimeFollowUp,
@@ -970,15 +975,29 @@ export function createAnalysisService(options: {
         onSpecialistOutcome: rememberSpecialistOutcome,
         fetchFinancialContext: async () => modelContext,
         financialContextToolViews: { model: modelContext, retained: snapshot },
-        prepareSpecialistBatch,
+        ...(flatMode ? {
+          searchNewsCandidates: options.searchNewsCandidates,
+          searchWebEvidence: options.searchWebEvidence,
+          readNewsDocument: options.readNewsDocument,
+          listCompanyEvents: options.listCompanyEvents,
+          getFinancialOverview: options.getFinancialOverview,
+          getFinancialMetricSeries: options.getFinancialMetricSeries,
+          getValuationEvidence: options.getValuationEvidence,
+          readFilingDocument: options.readFilingDocument,
+          getTechnicalEvidence: options.getTechnicalEvidence,
+          getPriceWindow: options.getPriceWindow,
+        } : {}),
+        prepareSpecialistBatch: flatMode ? undefined : prepareSpecialistBatch,
         signal: controller.signal,
         executionDeadlineSignal: wallDeadline,
         activeBudget,
         acquireModelSlot: (signal) => modelGate.acquire(signal),
         acquireToolSlot: (signal) => toolGate.acquire(signal),
-        runNewsSpecialist: newsRuntimeAvailable ? runNewsSpecialist : undefined,
-        runFundamentalSpecialist: fundamentalRuntimeAvailable ? runFundamentalSpecialist : undefined,
-        runTechnicalSpecialist: technicalRuntimeAvailable ? runTechnicalSpecialist : undefined,
+        runNewsSpecialist: !flatMode && newsRuntimeAvailable ? runNewsSpecialist : undefined,
+        runFundamentalSpecialist: !flatMode && fundamentalRuntimeAvailable
+          ? runFundamentalSpecialist : undefined,
+        runTechnicalSpecialist: !flatMode && technicalRuntimeAvailable
+          ? runTechnicalSpecialist : undefined,
         toolRuntime,
       })) {
         resumeProcessing()
@@ -1076,7 +1095,8 @@ export function createAnalysisService(options: {
           )
           for await (const event of options.model.analyze({
             executionId, runtimeSettings, symbol: job.symbol,
-            systemPrompt: ANALYSIS_SYSTEM_PROMPT,
+            systemPrompt: flatMode ? ANALYSIS_SYSTEM_PROMPT_FLAT : ANALYSIS_SYSTEM_PROMPT,
+            agentMode: flatMode ? 'flat' : undefined,
             userPrompt: `研究 active time 已耗尽，请仅生成确定性受限报告。`,
             knownFacts: limitedContext.facts,
             refreshKnownFacts,
@@ -1317,6 +1337,14 @@ export function createAnalysisService(options: {
     const record = await repository.research(analysisId)
     if (!record) return null
     const session = await options.eventRepository.findPrimarySession(analysisId)
+    const flatMode = session
+      ? await options.settingsRepository.getExecutionSnapshot(session.executionId)
+        .then((snapshot) => (snapshot?.values.agentModeFlat ?? 0) === 1)
+        .catch(() => false)
+      : false
+    const notStartedReason = (domain: string) => flatMode
+      ? '扁平模式：本研究不使用专项 Agent。'
+      : '主 Agent 尚未作出' + domain + '专项启动决定。'
     const trace = session
       ? (await options.eventRepository.list(session.id, 0)).map(({ payload }) => payload)
       : []
@@ -1350,7 +1378,7 @@ export function createAnalysisService(options: {
         researchQuestion: newsResult.researchQuestion, reason: newsResult.reason,
       } : {
         domain: 'news', status: 'not_started',
-        reason: '主 Agent 尚未作出消息面专项启动决定。',
+        reason: notStartedReason('消息面'),
       })
     }
     const fundamentalDecision = specialistDecision('run_fundamental_analysis')
@@ -1361,7 +1389,7 @@ export function createAnalysisService(options: {
         researchQuestion: fundamentalResult.researchQuestion, reason: fundamentalResult.reason,
       } : {
         domain: 'fundamental_valuation', status: 'not_started',
-        reason: '主 Agent 尚未作出基本面专项启动决定。',
+        reason: notStartedReason('基本面'),
       })
     }
     const technicalDecision = specialistDecision('run_technical_analysis')
@@ -1372,7 +1400,7 @@ export function createAnalysisService(options: {
         researchQuestion: technicalResult.researchQuestion, reason: technicalResult.reason,
       } : {
         domain: 'technical', status: 'not_started',
-        reason: '主 Agent 尚未作出技术面专项启动决定。',
+        reason: notStartedReason('技术面'),
       })
     }
     return {
@@ -1502,9 +1530,7 @@ function waitTarget(status: AgentExecutionStatus) {
   } as Partial<Record<AgentExecutionStatus, string>>)[status] ?? ''
 }
 
-const ANALYSIS_SYSTEM_PROMPT = `你是个人美股研究助手，分析周期为未来一至四周。
-你可以自主规划分析路径。建议先确认本次冻结的金融上下文；按需调用 fetch_financial_context。需要深入解释正式财务事实、消息面或多周期技术结构时，必须分别通过 run_fundamental_analysis、run_news_analysis、run_technical_analysis 明确决定是否启动独立专项 Agent。专项 Agent 只接收本领域受控工具，主 Agent 最终必须调用 submit_analysis_report 提交报告。
-不得编造行情、新闻、财报、估值或持仓；所有事实判断只能引用工具结果中真实存在的事实 ID。
+const ANALYSIS_PROMPT_SHARED_CLAUSES = `不得编造行情、新闻、财报、估值或持仓；所有事实判断只能引用工具结果中真实存在的事实 ID。
 每条 keyJudgments 都必须关联一个或多个事实 ID；supportingEvidence 和 contraryEvidence 也必须引用事实 ID。
 证据资格必须逐条匹配：market 只能引用 market_observation 或 verified_market；news 只能引用 verified_news 或 official_company_event；fundamental 只能引用 official_filing、reported_financial、deterministic_financial_metric 或 deterministic_valuation；technical 只能引用 deterministic_technical；operational 只能引用 runtime_observation。supportingEvidence 与 contraryEvidence 数组只能逐字复制工具结果中的精确 fact.id，禁止填写标题、指标名、数值或自然语言证据描述；没有合格事实时删除该判断并把缺口写入 gaps，不能用不合格证据硬凑。
 财报增长率、利润率、TTM、自由现金流、质量标记、技术指标与估值结果由宿主程序计算，你只负责解释，不重新计算或改写输入数字。
@@ -1514,6 +1540,14 @@ const ANALYSIS_SYSTEM_PROMPT = `你是个人美股研究助手，分析周期为
 数据不足时明确写入 limitations；缺行情不得判断走势，缺财报或估值输入不得给目标价，缺新闻不得推断新闻驱动。
 追问同时提供 reportPositionContext 和 currentPositionSummary 时，必须区分报告时的历史判断与当前持仓影响。
 操作建议只能是带前提的方向建议，不给具体股数或无条件买卖指令。`
+
+const ANALYSIS_SYSTEM_PROMPT = `你是个人美股研究助手，分析周期为未来一至四周。
+你可以自主规划分析路径。建议先确认本次冻结的金融上下文；按需调用 fetch_financial_context。需要深入解释正式财务事实、消息面或多周期技术结构时，必须分别通过 run_fundamental_analysis、run_news_analysis、run_technical_analysis 明确决定是否启动独立专项 Agent。专项 Agent 只接收本领域受控工具，主 Agent 最终必须调用 submit_analysis_report 提交报告。
+${ANALYSIS_PROMPT_SHARED_CLAUSES}`
+
+const ANALYSIS_SYSTEM_PROMPT_FLAT = `你是个人美股研究助手，分析周期为未来一至四周。
+你可以自主规划分析路径。建议先确认本次冻结的金融上下文；按需调用 fetch_financial_context。本次研究为扁平模式：没有独立专项 Agent，你直接承担消息面、基本面估值与技术面三个领域的研究职责，使用各领域受控工具自行取证——消息面使用 search_news_candidates、read_news_document、list_company_events（search_web_evidence 仅在既定新闻源均不合格后解锁）；基本面使用 get_financial_overview、get_financial_metric_series、get_valuation_evidence、read_filing_document、list_company_events；技术面使用 get_technical_evidence、get_price_window。可以在同一轮并行调用多个领域工具。完成研究后必须调用 submit_analysis_report 提交报告。
+${ANALYSIS_PROMPT_SHARED_CLAUSES}`
 
 function sourceDegradations(context: FinancialContext) {
   return Object.entries(context).flatMap(([capability, value]) => {
@@ -1656,6 +1690,7 @@ type ToolReplay = Awaited<ReturnType<ToolProjectionRepository['replay']>>
 function reusableResults(
   runtimes: ToolReplay[], knownFactIds: Set<string>, facts: Fact[],
   role: 'main' | 'fundamental' | 'news' | 'technical', currentToolNames: string[],
+  bypassRoleCheck = false,
 ) {
   const factsById = new Map(facts.map((fact) => [fact.id, fact]))
   return runtimes.flatMap((runtime) => runtime.toolBatches.flatMap((batch) => {
@@ -1667,7 +1702,8 @@ function reusableResults(
       const toolName = typeof payload?.toolName === 'string' ? payload.toolName : ''
       const definition = toolName ? toolRegistry.definition(toolName) : undefined
       if (result.status !== 'completed' || payload?.isError !== false || !definition
-        || !definition.allowedRoles.includes(role) || !currentToolNames.includes(toolName)
+        || (!bypassRoleCheck && !definition.allowedRoles.includes(role))
+        || !currentToolNames.includes(toolName)
         || !projection?.visibleToolNames.includes(toolName)
         || !projection.projectedTools.some((projected) => (
           JSON.stringify(projected) === JSON.stringify(definition.model)
@@ -1723,6 +1759,7 @@ function specialistToolNames(domain: SpecialistDomain) {
 
 function createInitialRuntimeContext(
   modelContext: ReturnType<typeof createModelContext>, personalContext: unknown,
+  flatMode = false,
 ): NonNullable<AnalyzeInput['runtimeContext']> {
   const quote = modelContext.facts.find((fact) => fact.type === 'quote')
   const dailyBars = modelContext.facts.filter((fact) => fact.type === 'daily_bar')
@@ -1752,12 +1789,26 @@ function createInitialRuntimeContext(
         valuation: capability('valuation', modelContext.valuation !== null && modelContext.valuation !== undefined),
       },
       personalContext,
-      availableTools: analysisModelTools.map(({ name, description }) => ({ name, purpose: description })),
-      specialistCapabilities: [
-        { domain: 'news', responsibility: '核实消息、公司事件及相反证据' },
-        { domain: 'fundamental_valuation', responsibility: '解释财务表现、估值输入与数据缺口' },
-        { domain: 'technical', responsibility: '解释多周期量价与确定性技术指标' },
-      ],
+      availableTools: (flatMode ? flatResearchTools : analysisModelTools)
+        .map(({ name, description }) => ({ name, purpose: description })),
+      ...(flatMode ? {
+        agentMode: 'flat',
+        domainResponsibilities: [
+          { domain: 'news', responsibility: '核实消息、公司事件及相反证据' },
+          { domain: 'fundamental_valuation', responsibility: '解释财务表现、估值输入与数据缺口' },
+          { domain: 'technical', responsibility: '解释多周期量价与确定性技术指标' },
+        ],
+        conditionalTools: [{
+          name: 'search_web_evidence',
+          unlock: '同一规范化查询的既定新闻源均不合格后自动加入工具投影；query 必须与该次 search_news_candidates 一致',
+        }],
+      } : {
+        specialistCapabilities: [
+          { domain: 'news', responsibility: '核实消息、公司事件及相反证据' },
+          { domain: 'fundamental_valuation', responsibility: '解释财务表现、估值输入与数据缺口' },
+          { domain: 'technical', responsibility: '解释多周期量价与确定性技术指标' },
+        ],
+      }),
       finalReportGoal: '基于合格事实提交候选结构化综合报告；缺失资料形成明确限制，不补造结论。',
     },
   }

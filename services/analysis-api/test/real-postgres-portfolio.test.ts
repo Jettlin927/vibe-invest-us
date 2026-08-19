@@ -75,16 +75,37 @@ test('真实 PostgreSQL HTTP 持仓与研究闭环在重启后持久化', {
   await first.inject({ method: 'GET', url: '/api/portfolio' })
   observedAt = new Date('2026-08-11T20:05:00Z')
   await first.inject({ method: 'GET', url: '/api/portfolio' })
+  const bought = await first.inject({
+    method: 'POST', url: '/api/positions/MSFT/buy',
+    payload: { quantity: 2, price: 200 },
+  })
+  assert.deepEqual(bought.json(), {
+    position: { symbol: 'MSFT', quantity: 7, averageCost: 200 },
+    cash: 116.1875,
+    spent: 400,
+  })
+  const rejected = await first.inject({
+    method: 'POST', url: '/api/positions/NVDA/buy',
+    payload: { quantity: 100, price: 100 },
+  })
+  assert.equal(rejected.statusCode, 400)
+  assert.deepEqual(rejected.json(), { error: 'insufficient_cash' })
   await first.close()
 
   const second = createPostgresApp()
   await second.ready()
   assert.deepEqual((await second.inject({ method: 'GET', url: '/api/positions' })).json(), {
     positions: [
-      { symbol: 'MSFT', quantity: 5, averageCost: 200 },
+      { symbol: 'MSFT', quantity: 7, averageCost: 200 },
       { symbol: 'NVDA', quantity: 10, averageCost: 100.25 },
     ],
   })
+  // 账本只增不改：断言本次操作产生的最新五条事件，历史事件保留在更后面
+  const events = (await second.inject({ method: 'GET', url: '/api/portfolio/events?limit=5' })).json().events
+  assert.deepEqual(
+    events.map((event: { kind: string }) => event.kind),
+    ['buy', 'sell', 'cash_adjust', 'reconcile', 'reconcile'],
+  )
   const history = (await second.inject({
     method: 'GET', url: '/api/portfolio/history?limit=30',
   })).json()

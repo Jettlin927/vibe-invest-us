@@ -53,6 +53,11 @@ def validate_document_url(url: str) -> str:
 
 
 def _resolve_document_url(url: str):
+    normalized, addresses, port, host = _resolve_document_addresses(url)
+    return normalized, addresses[0], port, host
+
+
+def _resolve_document_addresses(url: str):
     parsed = urlsplit(url)
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
         raise ValueError("news_document_url_not_public")
@@ -68,14 +73,25 @@ def _resolve_document_url(url: str):
         ip = ipaddress.ip_address(address[4][0])
         if not ip.is_global:
             raise ValueError("news_document_url_not_public")
-        verified_addresses.append(str(ip))
+        if str(ip) not in verified_addresses:
+            verified_addresses.append(str(ip))
     host = parsed.hostname.lower()
     default_port = (parsed.scheme.lower() == "https" and parsed.port in {None, 443}) \
         or (parsed.scheme.lower() == "http" and parsed.port in {None, 80})
     normalized_host = f"[{host}]" if ":" in host else host
     authority = normalized_host if default_port else f"{normalized_host}:{parsed.port}"
     normalized = urlunsplit((parsed.scheme.lower(), authority, parsed.path or "/", parsed.query, ""))
-    return normalized, verified_addresses[0], port, host
+    return normalized, verified_addresses, port, host
+
+
+def html_to_text(payload: bytes) -> str:
+    """HTML 转纯文本：先剔除 script/style/noscript 块，再去标签，避免脚本噪音进入摘要。"""
+    text = payload.decode("utf-8", errors="replace")
+    text = re.sub(r"(?is)<(script|style|noscript|ix:header)[^>]*>.*?</\1\s*>", " ", text)
+    # 截断边界内未闭合的块（payload 有界，闭合标签可能在界外）：丢弃到末尾
+    text = re.sub(r"(?is)<(script|style|noscript|ix:header)[^>]*>.*$", " ", text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    return " ".join(text.split())
 
 
 class _PinnedHTTPConnection(http.client.HTTPConnection):
@@ -108,63 +124,108 @@ def read_limited_document(url: str, max_bytes: int, timeout: float = 10):
     )
 
 
+class _RetryableAddressFailure(Exception):
+    """单个固定 IP 的可重试失败（连接错误或被边缘节点拒绝）。"""
+
+
 def read_document_page(url: str, cursor: int, max_bytes: int, timeout: float = 10):
     if cursor < 0 or max_bytes < 1:
         raise ValueError("document_cursor_invalid")
     target = url
     for _redirect in range(6):
-        safe_url, pinned_ip, port, hostname = _resolve_document_url(target)
+        safe_url, pinned_ips, port, hostname = _resolve_document_addresses(target)
         parsed = urlsplit(safe_url)
         connection_class = _PinnedHTTPSConnection if parsed.scheme == "https" else _PinnedHTTPConnection
-        connection = connection_class(hostname, pinned_ip, port, timeout)
-        path = urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
-        try:
-            end_byte = cursor + max_bytes - 1
-            connection.request("GET", path, headers={
-                "User-Agent": USER_AGENT, "Host": parsed.netloc,
-                "Range": f"bytes={cursor}-{end_byte}",
-            })
-            response = connection.getresponse()
+        retryable_failure = None
+        for pinned_ip in pinned_ips:
+            connection = connection_class(hostname, pinned_ip, port, timeout)
+            path = urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
+            try:
+                response = _open_document_response(connection, path, parsed, cursor, max_bytes)
+            except _RetryableAddressFailure as error:
+                retryable_failure = error
+                continue
             if response.status in {301, 302, 303, 307, 308}:
                 location = response.headers.get("Location")
+                connection.close()
                 if not location:
                     raise ValueError("news_document_redirect_invalid")
                 target = urljoin(safe_url, location)
-                continue
+                break
             if response.status not in {200, 206}:
+                connection.close()
                 raise ValueError("news_document_http_status")
-            content_type = response.headers.get_content_type()
-            if content_type not in ALLOWED_DOCUMENT_CONTENT_TYPES:
-                raise ValueError("news_document_content_type_not_allowed")
+            return _parse_document_payload(response, connection, safe_url, cursor, max_bytes)
+        else:
+            raise ValueError("news_document_http_status") from retryable_failure
+    else:
+        raise ValueError("news_document_redirect_limit")
+
+
+def _open_document_response(connection, path: str, parsed, cursor: int, max_bytes: int):
+    try:
+        end_byte = cursor + max_bytes - 1
+        # SEC 等站点把缺少 Accept-Encoding 或 Connection 的请求识别为未申报的自动工具并返回 403；
+        # 一次性文档读取显式声明两个头部
+        connection.request("GET", path, headers={
+            "User-Agent": USER_AGENT, "Host": parsed.netloc,
+            "Accept-Encoding": "identity", "Connection": "close",
+            "Range": f"bytes={cursor}-{end_byte}",
+        })
+        response = connection.getresponse()
+    except (OSError, http.client.HTTPException) as error:
+        connection.close()
+        raise _RetryableAddressFailure(str(error)) from error
+    # 部分 CDN 边缘节点对直连固定 IP 返回 403/429/5xx，换下一个已验证地址重试
+    if response.status in {403, 429} or response.status >= 500:
+        connection.close()
+        raise _RetryableAddressFailure(f"http_{response.status}")
+    return response
+
+
+# 提供方忽略 Range 时的完整正文有界上限（客户端分页需要全量字节）
+MAX_DOCUMENT_BYTES = 8 * 1024 * 1024
+
+
+def _parse_document_payload(response, connection, safe_url: str, cursor: int, max_bytes: int):
+    try:
+        content_type = response.headers.get_content_type()
+        if content_type not in ALLOWED_DOCUMENT_CONTENT_TYPES:
+            raise ValueError("news_document_content_type_not_allowed")
+        if response.status == 206:
             payload = response.read(max_bytes + 1)[:max_bytes]
             content_range = response.headers.get("Content-Range")
-            total_bytes = None
+            match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", content_range or "")
+            if not match or int(match.group(1)) != cursor:
+                raise ValueError("document_content_range_invalid")
+            start_byte, provider_end, total_bytes = map(int, match.groups())
+            if provider_end != start_byte + len(payload) - 1:
+                raise ValueError("document_content_range_invalid")
+        else:
+            # 提供方忽略 Range（如 SEC 返回 chunked 200）：有界读取完整正文后客户端切片分页
+            declared_length = response.headers.get("Content-Length")
+            if declared_length and declared_length.isdigit() \
+                    and int(declared_length) > MAX_DOCUMENT_BYTES:
+                raise ValueError("document_too_large")
+            body = response.read(MAX_DOCUMENT_BYTES + 1)
+            if len(body) > MAX_DOCUMENT_BYTES:
+                raise ValueError("document_too_large")
+            total_bytes = len(body)
+            if cursor > total_bytes:
+                raise ValueError("document_cursor_invalid")
             start_byte = cursor
-            if response.status == 206:
-                match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", content_range or "")
-                if not match or int(match.group(1)) != cursor:
-                    raise ValueError("document_content_range_invalid")
-                start_byte, provider_end, total_bytes = map(int, match.groups())
-                if provider_end != start_byte + len(payload) - 1:
-                    raise ValueError("document_content_range_invalid")
-            elif cursor != 0:
-                raise ValueError("document_range_not_supported")
-            else:
-                content_length = response.headers.get("Content-Length")
-                if content_length and content_length.isdigit():
-                    total_bytes = int(content_length)
-            end_byte = start_byte + len(payload) - 1
-            next_cursor = end_byte + 1 if total_bytes is not None and end_byte + 1 < total_bytes else None
-            truncated = next_cursor is not None or (total_bytes is None and len(payload) == max_bytes)
-            return {
-                "payload": payload, "contentType": content_type, "sourceReference": safe_url,
-                "startByte": start_byte, "endByte": end_byte, "totalBytes": total_bytes,
-                "nextCursor": str(next_cursor) if next_cursor is not None else None,
-                "truncated": truncated,
-            }
-        finally:
-            connection.close()
-    raise ValueError("news_document_redirect_limit")
+            payload = body[cursor:cursor + max_bytes]
+        end_byte = start_byte + len(payload) - 1
+        next_cursor = end_byte + 1 if end_byte + 1 < total_bytes else None
+        truncated = next_cursor is not None
+        return {
+            "payload": payload, "contentType": content_type, "sourceReference": safe_url,
+            "startByte": start_byte, "endByte": end_byte, "totalBytes": total_bytes,
+            "nextCursor": str(next_cursor) if next_cursor is not None else None,
+            "truncated": truncated,
+        }
+    finally:
+        connection.close()
 
 
 def _diagnose(target: str, payload: bytes):
@@ -539,7 +600,7 @@ class SecFilingSource(TimedSource):
             filing["sourceReference"], offset, 65536, timeout=min(self.timeout, 10),
         )
         payload = page.pop("payload")
-        text = " ".join(re.sub(r"<[^>]+>", " ", payload.decode("utf-8", errors="replace")).split())
+        text = html_to_text(payload)
         if not text or not isinstance(page.get("totalBytes"), int):
             raise ValueError("filing_page_not_qualifiable")
         return {
