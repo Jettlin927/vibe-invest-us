@@ -679,22 +679,49 @@ def _append_financial_facts(facts, symbol, now, fundamentals):
 
 
 def _first_available(sources: Iterable[Any], symbol: str) -> CapabilityResult:
+    return _capability_result([_fetch_source(source, symbol) for source in sources])
+
+
+def _first_available_batch(source_groups, scheduler) -> List[CapabilityResult]:
+    groups = [(symbol, list(sources)) for symbol, sources in source_groups]
+    results = [[None] * len(sources) for _, sources in groups]
+    jobs = [
+        (group_index, source_index, source, symbol)
+        for group_index, (symbol, sources) in enumerate(groups)
+        for source_index, source in enumerate(sources)
+    ]
+    attempts = scheduler.run([
+        lambda source=source, symbol=symbol: _fetch_source(source, symbol)
+        for _, _, source, symbol in jobs
+    ])
+    for (group_index, source_index, _, _), attempt in zip(jobs, attempts):
+        results[group_index][source_index] = attempt
+    return [_capability_result(group) for group in results]
+
+
+def _fetch_source(source, symbol: str):
+    try:
+        return source, source.fetch(symbol), None
+    except Exception as error:
+        return source, None, error
+
+
+def _capability_result(results) -> CapabilityResult:
     statuses: List[SourceStatus] = []
     observations: List[SourceObservation] = []
     adopted = None
     value = None
-    for source in sources:
-        try:
-            candidate = source.fetch(symbol)
-            if candidate is None or candidate == [] or candidate == {}:
-                statuses.append(SourceStatus(source=source.name, status="empty", item_count=0))
-                continue
-            statuses.append(SourceStatus(source=source.name, status="ok", item_count=_item_count(candidate)))
-            observations.append(SourceObservation(source=source.name, value=candidate))
-            if adopted is None:
-                adopted, value = source.name, candidate
-        except Exception as error:
+    for source, candidate, error in results:
+        if error is not None:
             statuses.append(SourceStatus(source=source.name, status="failed", error=_safe_error(error), item_count=0))
+            continue
+        if candidate is None or candidate == [] or candidate == {}:
+            statuses.append(SourceStatus(source=source.name, status="empty", item_count=0))
+            continue
+        statuses.append(SourceStatus(source=source.name, status="ok", item_count=_item_count(candidate)))
+        observations.append(SourceObservation(source=source.name, value=candidate))
+        if adopted is None:
+            adopted, value = source.name, candidate
     return CapabilityResult(
         value=value,
         adopted_source=adopted,

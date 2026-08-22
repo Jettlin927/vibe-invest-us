@@ -150,6 +150,8 @@ export function buildApp(dependencies: AppDependencies) {
 
   app.get('/api/positions', async () => ({ positions: await portfolio.list() }))
 
+  app.get('/api/portfolio/stored', async () => portfolio.overview({}))
+
   app.get('/api/migration-verification', async (request, reply) => {
     const token = dependencies.migrationVerificationToken
     if (!token || request.headers.authorization !== `Bearer ${token}`) {

@@ -117,6 +117,33 @@ test('用户可以维护现金并查看组合总值、仓位和未实现盈亏',
   await app.close()
 })
 
+test('用户不等待外部行情也能读取已保存的持仓和现金', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'vibe-invest-stored-portfolio-'))
+  const app = await createTestApp(join(dataDir, 'storage'))
+  await app.inject({ method: 'PUT', url: '/api/positions/NVDA', payload: { quantity: 10, averageCost: 100 } })
+  await app.inject({ method: 'PUT', url: '/api/portfolio/cash', payload: { cash: 500 } })
+
+  const response = await app.inject({ method: 'GET', url: '/api/portfolio/stored' })
+
+  assert.equal(response.statusCode, 200)
+  assert.deepEqual(response.json(), {
+    cash: 500,
+    totalCost: 1000,
+    totalMarketValue: null,
+    totalEquity: null,
+    totalUnrealizedProfitLoss: null,
+    totalUnrealizedReturn: null,
+    pricedPositionCount: 0,
+    unpricedPositionCount: 1,
+    positions: [{
+      symbol: 'NVDA', quantity: 10, averageCost: 100, costAmount: 1000,
+      marketPrice: null, marketValue: null, unrealizedProfitLoss: null,
+      unrealizedReturn: null, portfolioWeight: null,
+    }],
+  })
+  await app.close()
+})
+
 test('组合行情请求超时不会把仍在请求中的价格误报为已获取', async () => {
   const dataDir = await mkdtemp(join(tmpdir(), 'vibe-invest-portfolio-timeout-'))
   const app = buildApp({
