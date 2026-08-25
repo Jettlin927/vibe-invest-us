@@ -241,7 +241,7 @@ test('自由对话只在显式调用报告 Artifact 工具后保存报告', asyn
 
 test('自由对话在安全 Turn 边界可以 compaction 并继续使用同一上下文', async () => {
   const model = createPiModel({
-    contextWindow: 1_350,
+    contextWindow: 1_300,
     fauxResponses: [
       fauxAssistantMessage(fauxToolCall('fetch_financial_context', { symbol: 'NVDA' }), { stopReason: 'toolUse' }),
       fauxAssistantMessage(fauxText('压缩后继续回答。')),

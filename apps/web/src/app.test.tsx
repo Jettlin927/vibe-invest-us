@@ -469,12 +469,14 @@ test('研究页可选择历史报告版本作为追问基准且运行中不显�
   Reflect.deleteProperty(globalThis, 'EventSource')
   let followUpBody: Record<string, unknown> | undefined
   let pollCompleted = false
+  const freshVersionCreatedAt = new Date(Date.now() - 1 * 86_400_000).toISOString()
+  const staleVersionCreatedAt = new Date(Date.now() - 30 * 86_400_000).toISOString()
   const record: any = {
     id: 'versioned-research', symbol: 'NVDA', status: 'completed', terminal: true,
-    report: { title: '当前 V2' }, reportCreatedAt: '2026-08-14T00:00:00Z', facts: [], trace: [],
+    report: { title: '当前 V2' }, reportCreatedAt: freshVersionCreatedAt, facts: [], trace: [],
     reportVersions: [
-      { version: 1, createdAt: '2026-08-01T00:00:00Z', report: { title: '历史 V1' } },
-      { version: 2, createdAt: '2026-08-14T00:00:00Z', report: { title: '当前 V2' } },
+      { version: 1, createdAt: staleVersionCreatedAt, report: { title: '历史 V1' } },
+      { version: 2, createdAt: freshVersionCreatedAt, report: { title: '当前 V2' } },
     ],
     mainAgent: {
       id: 'versioned-session', status: 'completed', waitReason: null,
