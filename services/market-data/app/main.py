@@ -1,4 +1,6 @@
+from collections import deque
 from datetime import date, datetime, timedelta, timezone
+import threading
 from typing import Literal, List, Optional
 
 from fastapi import FastAPI
@@ -10,7 +12,7 @@ from app.context import (
     filing_document_page, financial_metric_series_result, financial_overview_facts, search_news_facts,
     official_company_event_facts, price_window_result, technical_evidence_result,
     technical_indicator_facts, web_search_lead_facts, valuation_evidence_result,
-    _first_available,
+    _first_available_batch,
 )
 from app.models import AtomicFact, FactQueryResult, FilingDocumentResult, FinancialContext, FinancialOverviewResult, NewsDocumentResult, PaginatedFactResult, PriceWindowResult, QuoteBatch, QuoteSnapshot, SourceStatus, TechnicalEvidenceResult, ValuationEvidenceResult
 from app.source_config import build_sources, load_source_config
@@ -21,8 +23,62 @@ class HealthResponse(BaseModel):
     status: Literal["ok"]
 
 
+class _Batch:
+    def __init__(self, jobs):
+        self.jobs = deque(enumerate(jobs))
+        self.results = [None] * len(jobs)
+        self.remaining = len(jobs)
+        self.error = None
+        self.done = threading.Event()
+
+
+class _FairBatchScheduler:
+    def __init__(self, workers: int):
+        self._condition = threading.Condition()
+        self._batches = deque()
+        for index in range(workers):
+            threading.Thread(
+                target=self._worker, name=f"quote-batch-{index}", daemon=True,
+            ).start()
+
+    def run(self, jobs):
+        if not jobs:
+            return []
+        batch = _Batch(jobs)
+        with self._condition:
+            self._batches.append(batch)
+            self._condition.notify_all()
+        batch.done.wait()
+        if batch.error is not None:
+            raise batch.error
+        return batch.results
+
+    def _worker(self):
+        while True:
+            with self._condition:
+                while not self._batches:
+                    self._condition.wait()
+                batch = self._batches.popleft()
+                result_index, job = batch.jobs.popleft()
+                if batch.jobs:
+                    self._batches.append(batch)
+            try:
+                result, error = job(), None
+            except BaseException as cause:
+                result, error = None, cause
+            with self._condition:
+                batch.results[result_index] = result
+                batch.remaining -= 1
+                if error is not None and batch.error is None:
+                    batch.error = error
+                if batch.remaining == 0:
+                    batch.done.set()
+
+
 app = FastAPI(title="vibe-invest Financial Data")
 source_config = load_source_config()
+_QUOTE_BATCH_CONCURRENCY = 16
+_quote_batch_scheduler = _FairBatchScheduler(_QUOTE_BATCH_CONCURRENCY)
 
 
 @app.get("/health", operation_id="getHealth", response_model=HealthResponse)
@@ -182,10 +238,14 @@ def price_window(
 
 @app.post("/v1/quotes", operation_id="createQuoteBatch", response_model=QuoteBatch)
 def quotes(symbols: List[str]) -> QuoteBatch:
+    normalized_symbols = [symbol.strip().upper() for symbol in symbols[:100]]
+    if not normalized_symbols:
+        return QuoteBatch(quotes=[])
+    outcomes = _first_available_batch([
+        (symbol, build_sources(source_config, "quote")) for symbol in normalized_symbols
+    ], _quote_batch_scheduler)
     result = []
-    for symbol_input in symbols[:100]:
-        symbol = symbol_input.strip().upper()
-        outcome = _first_available(build_sources(source_config, "quote"), symbol)
+    for symbol, outcome in zip(normalized_symbols, outcomes):
         quote = outcome.value
         result.append(QuoteSnapshot(
             symbol=symbol,
