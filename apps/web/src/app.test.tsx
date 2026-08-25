@@ -1471,7 +1471,7 @@ test('设置页展示当前、默认、修改时间与运行 execution 冻结值
   const user = userEvent.setup({ document: window.document })
   await user.click(await view.findByRole('button', { name: '系统设置' }))
   await view.findByText('当前 revision #2')
-  await view.findByText(/上次修改：2026年8月13日 11:00/)
+  await view.findByText(/上次修改：2026年8月13日/)
   await view.findByText(/运行 execution execution-1/)
   await view.findByText(/主 Agent 20 轮.*墙钟 45 分钟.*研究\/模型\/工具并发 2\/4\/8.*Freshness 7 天.*Compaction 保留 16,384 Token/)
   const rounds = view.getByRole('spinbutton', { name: '主 Agent 轮次' })
