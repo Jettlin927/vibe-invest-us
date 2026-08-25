@@ -141,6 +141,9 @@ test('自由对话 Thread 可以创建、回放 SSE 并在同一 Thread 继续�
   await waitForConversation(app, thread.id, 'completed')
   const detail = await app.inject({ method: 'GET', url: `/api/conversations/${thread.id}` })
   assert.match(JSON.stringify(detail.json()), /继续说明失效条件。/)
+  const followUpEvents = await app.inject({ method: 'GET', url: `/api/conversations/${thread.id}/events` })
+  assert.equal(followUpEvents.statusCode, 200)
+  assert.match(followUpEvents.body, /回答：继续说明失效条件。/)
 })
 
 test('自由对话可以创建并等待受控 subagent', async () => {

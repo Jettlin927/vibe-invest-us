@@ -14,7 +14,7 @@ import type {
   ConversationToolExecutor, FreeConversationInput, ModelEvent, ToolRuntime,
 } from './model.js'
 import type { PiAgentAdapterContent, PiAgentAdapterMessage } from './agent-runtime/pi-agent-adapter.js'
-import { conversationResearchTools } from './tools.js'
+import { toolRegistry } from './tool-registry.js'
 import { createActiveBudget } from './runtime-policy.js'
 
 type ConversationModel = {
@@ -37,6 +37,7 @@ type ConversationOptions = {
   eventRepository: AgentEventRepository
   settingsRepository: RuntimeSettingsRepository
   toolProjectionRepository: ToolProjectionRepository
+  tools: Tool[]
   model: ConversationModel
   createToolExecutor: (input: {
     threadId: string
@@ -65,9 +66,12 @@ export function createConversationService(options: ConversationOptions) {
   const stopping = new Map<string, Promise<boolean>>()
   let running = 0
   let concurrency = 2
-  const initialized = options.settingsRepository.current().then((revision) => {
-    concurrency = revision.values.analysisConcurrency
-  })
+  const initialized = Promise.all([
+    options.eventRepository.interruptActiveSessions(new Date().toISOString()),
+    options.settingsRepository.current().then((revision) => {
+      concurrency = revision.values.analysisConcurrency
+    }),
+  ]).then(() => { queueMicrotask(() => void schedule()) })
 
   const emit = (event: AgentEvent) => {
     for (const listener of listeners.get(event.sessionId) ?? []) listener(event)
@@ -202,10 +206,13 @@ export function createConversationService(options: ConversationOptions) {
           timestamp: Date.parse(String(event.createdAt)) || Date.now(),
         })
       } else if (event.type === 'tool_result' && typeof event.toolCallId === 'string') {
+        const toolName = typeof event.name === 'string' ? event.name : 'tool'
+        const rawResult = event.result && typeof event.result === 'object'
+          ? event.result as Record<string, unknown> : {}
         messages.push({
           role: 'toolResult', toolCallId: event.toolCallId,
-          toolName: typeof event.name === 'string' ? event.name : 'tool',
-          content: [{ type: 'text', text: JSON.stringify(event.result ?? {}) }],
+          toolName,
+          content: [{ type: 'text', text: JSON.stringify(toolRegistry.projectResult(toolName, rawResult)) }],
           isError: event.isError === true,
           timestamp: Date.parse(String(event.createdAt)) || Date.now(),
         })
@@ -214,12 +221,16 @@ export function createConversationService(options: ConversationOptions) {
     return messages
   }
 
-  async function findThreadByRun(runId: string) {
+  async function findThreadByRun(parentThreadId: string, runId: string) {
     const cached = childThreadByRun.get(runId)
-    if (cached) return options.repository.get(cached)
+    if (cached) {
+      const thread = await options.repository.get(cached)
+      return thread?.parentThreadId === parentThreadId ? thread : null
+    }
     const candidate = (await options.repository.list()).find(({ executionId: id }) => id === runId)
-    if (candidate) childThreadByRun.set(runId, candidate.id)
-    return candidate ?? null
+    if (!candidate || candidate.parentThreadId !== parentThreadId) return null
+    childThreadByRun.set(runId, candidate.id)
+    return candidate
   }
 
   async function summarizeThread(thread: ConversationThread) {
@@ -308,6 +319,10 @@ export function createConversationService(options: ConversationOptions) {
         try {
           const goal = typeof record.goal === 'string' ? record.goal.trim() : ''
           if (!goal) throw new Error('subagent_goal_required')
+          const contextRefs = Array.isArray(record.contextRefs)
+            ? record.contextRefs.filter((value): value is string => typeof value === 'string' && value.trim())
+            : []
+          if (contextRefs.length) throw new Error('subagent_context_refs_not_supported')
           const child = await createChild(threadId, goal)
           const join = record.join === 'wait' ? 'wait' : 'async'
           const result = join === 'wait'
@@ -322,7 +337,7 @@ export function createConversationService(options: ConversationOptions) {
         await onStart()
         try {
           const runId = typeof record.runId === 'string' ? record.runId : ''
-          const child = await findThreadByRun(runId)
+          const child = await findThreadByRun(threadId, runId)
           if (!child) throw new Error('subagent_not_found')
           if (name === 'wait_agent') return { result: await waitForThread(child.id, signal), isError: false }
           if (name === 'read_agent_result') return { result: await summarizeThread(child), isError: false }
@@ -348,7 +363,7 @@ export function createConversationService(options: ConversationOptions) {
         summary: latestCompaction?.summary,
       }),
       signal: executionSignal, executionDeadlineSignal: wallDeadline, activeBudget: budget,
-      toolRuntime, tools: conversationResearchTools,
+      toolRuntime, tools: options.tools,
       executeTool,
     }
     try {
@@ -472,7 +487,17 @@ export function createConversationService(options: ConversationOptions) {
     const existing = stopping.get(threadId)
     if (existing) return existing
     const task = (async () => {
-    for (const childId of childrenByParent.get(threadId) ?? []) await cancel(childId)
+      const storedChildren = await options.repository.listChildren(threadId)
+      const childIds = new Set([
+        ...(childrenByParent.get(threadId) ?? []),
+        ...storedChildren.map(({ id }) => id),
+      ])
+      for (const childId of childIds) {
+        const child = await options.repository.get(childId)
+        if (child && !['completed', 'failed', 'stopped', 'interrupted'].includes(child.status)) {
+          await cancel(childId)
+        }
+      }
       const thread = await options.repository.get(threadId)
       if (!thread) return false
       const fenceExecutionId = randomUUID()
@@ -526,11 +551,15 @@ export function createConversationService(options: ConversationOptions) {
     subscriptions.add(listener); listeners.set(sessionId, subscriptions)
     try {
       let cursor = afterSequence
+      let lastReplayed: AgentEvent | undefined
       for (const entry of await options.eventRepository.list(sessionId, afterSequence)) {
-        cursor = entry.sequence; yield entry
-        if (entry.payload.type === 'status' && isTerminalAgentExecutionStatus(
-          String(entry.payload.status), entry.payload.terminal as boolean | undefined,
-        )) return
+        cursor = entry.sequence; lastReplayed = entry; yield entry
+      }
+      if (lastReplayed && lastReplayed.payload.type === 'status'
+        && isTerminalAgentExecutionStatus(
+          String(lastReplayed.payload.status), lastReplayed.payload.terminal as boolean | undefined,
+        )) {
+        return
       }
       while (!signal?.aborted) {
         if (!queue.some(({ sequence }) => sequence > cursor)) {

@@ -379,14 +379,16 @@ export function App() {
     setSelectedConversation(value.thread)
     setConversationEvents(value.lifecycle?.events ?? [])
   }
-  function streamConversation(sessionId: string, threadId: string) {
+  function streamConversation(sessionId: string, threadId: string, afterSequence = 0) {
     if (!('EventSource' in globalThis)) return
-    const source = new EventSource(`/api/conversations/${threadId}/events`)
+    const suffix = afterSequence > 0 ? `?after=${afterSequence}` : ''
+    const source = new EventSource(`/api/conversations/${threadId}/events${suffix}`)
     const names = ['user_message', 'assistant_message', 'text_delta', 'tool_call', 'tool_result',
       'running_model', 'running_tools', 'completed', 'failed', 'stopped', 'interrupted']
     for (const name of names) source.addEventListener(name, (event) => {
       const message = event as MessageEvent
       const sequence = Number(message.lastEventId.split(':').at(-1))
+      if (Number.isInteger(sequence) && sequence <= afterSequence) return
       const payload = JSON.parse(message.data) as ConversationEvent
       if (Number.isInteger(sequence)) setConversationEvents((current) => (
         current.some((entry) => entry.sequence === sequence)
@@ -421,13 +423,14 @@ export function App() {
     const form = event.currentTarget
     const message = String(new FormData(form).get('message') ?? '').trim()
     if (!message) return
+    const afterSequence = conversationEvents.reduce((latest, item) => Math.max(latest, item.sequence), 0)
     const response = await fetch(`/api/conversations/${selectedConversation.id}/messages`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ message, messageId: crypto.randomUUID() }),
     })
     const result = await response.json() as { sessionId?: string }
     if (!response.ok || !result.sessionId) { setError('研究消息发送失败'); return }
-    form.reset(); streamConversation(result.sessionId, selectedConversation.id)
+    form.reset(); streamConversation(result.sessionId, selectedConversation.id, afterSequence)
   }
   async function cancelConversation() {
     if (selectedConversation) await fetch(`/api/conversations/${selectedConversation.id}/cancel`, { method: 'POST' })

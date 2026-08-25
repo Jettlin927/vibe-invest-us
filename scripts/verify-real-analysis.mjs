@@ -137,7 +137,7 @@ function reportVersionCount(analysisId, kind = 'integrated') {
 async function verifyInfrastructure() {
   const health = await waitForHealth()
   assert.equal(health.dependencies?.productDatabase?.engine, 'postgresql')
-  assert.equal(health.dependencies?.productDatabase?.schemaVersion, 25)
+  assert.equal(health.dependencies?.productDatabase?.schemaVersion, 26)
   assert.equal(health.dependencies?.financialData?.status, 'ok')
   const [privileges] = sqlJson(`SELECT
     has_schema_privilege('vibe_invest_app', 'public', 'CREATE') AS schema_create,
@@ -146,7 +146,7 @@ async function verifyInfrastructure() {
   assert.deepEqual(privileges, {
     schema_create: false, database_create: false, database_temp: false,
   })
-  console.log(JSON.stringify({ phase: 'infrastructure', schemaVersion: 25, leastPrivilege: true }))
+  console.log(JSON.stringify({ phase: 'infrastructure', schemaVersion: 26, leastPrivilege: true }))
 }
 
 async function verifyFirstResearch() {

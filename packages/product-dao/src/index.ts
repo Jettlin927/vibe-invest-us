@@ -9,7 +9,7 @@ import {
   type ExecutionSettingsSnapshot, type RuntimeSettings, type RuntimeSettingsRevision,
 } from '@vibe-invest/contracts'
 
-export const schemaVersion = 25
+export const schemaVersion = 26
 
 const migrationSql = `
 CREATE TABLE IF NOT EXISTS product_schema_migrations (
@@ -465,7 +465,7 @@ UPDATE analyses analysis SET active = EXISTS (
 );
 WITH duplicate_active AS (
   SELECT id, row_number() OVER (PARTITION BY symbol ORDER BY created_at, id) AS position
-  FROM analyses WHERE active
+  FROM analyses WHERE active AND kind = 'research' AND symbol IS NOT NULL
 )
 UPDATE analyses SET status = 'interrupted', active = false, updated_at = now()
 FROM duplicate_active
@@ -617,6 +617,10 @@ ON CONFLICT (id) DO NOTHING;
 
 INSERT INTO product_schema_migrations (version)
 VALUES (25)
+ON CONFLICT (version) DO NOTHING;
+
+INSERT INTO product_schema_migrations (version)
+VALUES (26)
 ON CONFLICT (version) DO NOTHING;
 
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM vibe_invest_app;
@@ -1438,7 +1442,7 @@ export function createAnalysisRepository(pool: Pool) {
     async updateResearch(id: string, values: { starred?: boolean; note?: string }, updatedAt: string) {
       const result = await pool.query<AnalysisRow>(
         `UPDATE analyses SET starred = COALESCE($1, starred), note = COALESCE($2, note), updated_at = $3
-         WHERE id = $4 RETURNING *`, [values.starred ?? null, values.note ?? null, updatedAt, id],
+         WHERE id = $4 AND kind = 'research' RETURNING *`, [values.starred ?? null, values.note ?? null, updatedAt, id],
       )
       return result.rows[0] ? mapAnalysisRow(result.rows[0]) : null
     },
@@ -1447,7 +1451,9 @@ export function createAnalysisRepository(pool: Pool) {
       try {
         await client.query('BEGIN')
         await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [id])
-        const analysis = await client.query('SELECT id FROM analyses WHERE id = $1 FOR UPDATE', [id])
+        const analysis = await client.query(
+          "SELECT id FROM analyses WHERE id = $1 AND kind = 'research' FOR UPDATE", [id],
+        )
         if (!analysis.rowCount) { await client.query('ROLLBACK'); return false }
         const running = await client.query(
           `SELECT 1 FROM agent_sessions session

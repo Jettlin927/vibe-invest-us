@@ -68,7 +68,7 @@ export function createToolRegistry(definitions: RegisteredToolDefinition[]) {
       || !definition.allowedStages.every((stage) => oneOf(stage, ['research', 'finalization']))) {
       invalid(name, 'allowed_stages')
     }
-    if (!oneOf(definition.sideEffect, ['read_only', 'creates_report', 'creates_agent'])) invalid(name, 'side_effect')
+    if (!oneOf(definition.sideEffect, ['read_only', 'creates_report', 'creates_agent', 'controls_agent'])) invalid(name, 'side_effect')
     if (!oneOf(definition.externalNetwork, ['none', 'financial_data'])) invalid(name, 'external_network')
     if (definition.hostAccess !== 'none') invalid(name, 'host_access')
     if (!oneOf(definition.resultRetention, ['research_record', 'report_version'])) invalid(name, 'result_retention')
@@ -90,7 +90,7 @@ export function createToolRegistry(definitions: RegisteredToolDefinition[]) {
       .map((definition) => definition.model),
     projectConversation: () => validated
       .filter((definition) => definition.allowedStages.includes('research')
-        && ['read_only', 'creates_agent', 'creates_report'].includes(definition.sideEffect)
+        && ['read_only', 'creates_agent', 'creates_report', 'controls_agent'].includes(definition.sideEffect)
         && ![
           'search_web_evidence', 'run_news_analysis', 'run_fundamental_analysis',
           'run_technical_analysis', 'submit_analysis_report', 'submit_specialist_report',

@@ -122,6 +122,7 @@ export function buildApp(dependencies: AppDependencies) {
         eventRepository: dependencies.agentEventRepository,
         settingsRepository: dependencies.runtimeSettingsRepository,
         toolProjectionRepository: dependencies.toolProjectionRepository,
+        tools: conversationResearchTools,
         model: { analyzeConversation: dependencies.model.analyzeConversation },
         createToolExecutor: ({ threadId, knownFacts }) => createResearchToolExecutor({
           fetchFinancialContext: dependencies.fetchFinancialContext,
@@ -424,12 +425,19 @@ export function buildApp(dependencies: AppDependencies) {
     const result = await conversation.resume(request.params.id)
     return result ? reply.status(202).send(result) : reply.status(409).send({ error: 'conversation_not_resumable' })
   })
-  app.get<{ Params: { id: string }; Headers: { 'last-event-id'?: string } }>(
+  app.get<{
+    Params: { id: string }
+    Headers: { 'last-event-id'?: string }
+    Querystring: { after?: string }
+  }>(
     '/api/conversations/:id/events', async (request, reply) => {
       if (!conversation) return reply.status(404).send({ error: 'conversation_unavailable' })
       const thread = await conversation.get(request.params.id)
       if (!thread) return reply.status(404).send({ error: 'conversation_not_found' })
-      const cursor = parseLastEventId(request.headers['last-event-id'], thread.sessionId)
+      const headerCursor = parseLastEventId(request.headers['last-event-id'], thread.sessionId)
+      const queryCursor = request.query.after === undefined
+        ? 0 : parseEventSequence(request.query.after)
+      const cursor = headerCursor === 0 && request.query.after !== undefined ? queryCursor : headerCursor
       if (cursor === null) return reply.status(400).send({ error: 'invalid_last_event_id' })
       reply.hijack()
       reply.raw.writeHead(200, {
@@ -599,6 +607,12 @@ function parseLastEventId(value: string | undefined, sessionId: string) {
   const match = value.match(/^(.+):(0|[1-9]\d*)$/)
   if (!match || match[1] !== sessionId) return null
   const sequence = Number(match[2])
+  return Number.isSafeInteger(sequence) ? sequence : null
+}
+
+function parseEventSequence(value: string) {
+  if (!/^(0|[1-9]\d*)$/.test(value)) return null
+  const sequence = Number(value)
   return Number.isSafeInteger(sequence) ? sequence : null
 }
 

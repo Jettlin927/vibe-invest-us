@@ -47,7 +47,7 @@ export const stopAgentDefinition: RegisteredToolDefinition = {
     parameters: Type.Object({ runId }),
   },
   resultSchema: Type.Object({ runId: Type.String(), stopped: Type.Boolean() }),
-  allowedRoles: ['main'], allowedStages: ['research'], sideEffect: 'read_only',
+  allowedRoles: ['main'], allowedStages: ['research'], sideEffect: 'controls_agent',
   externalNetwork: 'none', hostAccess: 'none', resultRetention: 'research_record',
   modelProjection: 'bounded_summary', executionMode: 'sequential', countsAsToolRound: true,
 }
