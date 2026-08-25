@@ -320,7 +320,9 @@ export function createConversationService(options: ConversationOptions) {
           const goal = typeof record.goal === 'string' ? record.goal.trim() : ''
           if (!goal) throw new Error('subagent_goal_required')
           const contextRefs = Array.isArray(record.contextRefs)
-            ? record.contextRefs.filter((value): value is string => typeof value === 'string' && value.trim())
+            ? record.contextRefs.filter((value): value is string => (
+              typeof value === 'string' && Boolean(value.trim())
+            ))
             : []
           if (contextRefs.length) throw new Error('subagent_context_refs_not_supported')
           const child = await createChild(threadId, goal)
