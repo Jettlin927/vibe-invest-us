@@ -17,6 +17,10 @@ import { searchNewsCandidatesDefinition } from './tool-definitions/search-news-c
 import { searchWebEvidenceDefinition } from './tool-definitions/search-web-evidence.js'
 import { submitSpecialistReportDefinition } from './tool-definitions/submit-specialist-report.js'
 import { submitAnalysisReportDefinition } from './tool-definitions/submit-analysis-report.js'
+import { createResearchReportDefinition } from './tool-definitions/create-research-report.js'
+import {
+  readAgentResultDefinition, spawnAgentDefinition, stopAgentDefinition, waitAgentDefinition,
+} from './tool-definitions/subagents.js'
 import type {
   RegisteredToolDefinition, ToolRole, ToolStage,
 } from './tool-definitions/types.js'
@@ -29,6 +33,11 @@ export const registeredToolDefinitions = [
   runNewsAnalysisDefinition,
   runTechnicalAnalysisDefinition,
   submitAnalysisReportDefinition,
+  createResearchReportDefinition,
+  spawnAgentDefinition,
+  waitAgentDefinition,
+  readAgentResultDefinition,
+  stopAgentDefinition,
   getFinancialOverviewDefinition,
   getFinancialMetricSeriesDefinition,
   getValuationEvidenceDefinition,
@@ -59,7 +68,7 @@ export function createToolRegistry(definitions: RegisteredToolDefinition[]) {
       || !definition.allowedStages.every((stage) => oneOf(stage, ['research', 'finalization']))) {
       invalid(name, 'allowed_stages')
     }
-    if (!oneOf(definition.sideEffect, ['read_only', 'creates_report'])) invalid(name, 'side_effect')
+    if (!oneOf(definition.sideEffect, ['read_only', 'creates_report', 'creates_agent'])) invalid(name, 'side_effect')
     if (!oneOf(definition.externalNetwork, ['none', 'financial_data'])) invalid(name, 'external_network')
     if (definition.hostAccess !== 'none') invalid(name, 'host_access')
     if (!oneOf(definition.resultRetention, ['research_record', 'report_version'])) invalid(name, 'result_retention')
@@ -75,14 +84,24 @@ export function createToolRegistry(definitions: RegisteredToolDefinition[]) {
     list: () => [...validated],
     project: ({ role, stage }: { role: ToolRole; stage: ToolStage }) => validated
       .filter((definition) => definition.allowedRoles.includes(role)
-        && definition.allowedStages.includes(stage))
+        && definition.allowedStages.includes(stage)
+        && !subagentTool(definition.model.name)
+        && definition.model.name !== 'create_research_report')
+      .map((definition) => definition.model),
+    projectConversation: () => validated
+      .filter((definition) => definition.allowedStages.includes('research')
+        && ['read_only', 'creates_agent', 'creates_report'].includes(definition.sideEffect)
+        && ![
+          'search_web_evidence', 'run_news_analysis', 'run_fundamental_analysis',
+          'run_technical_analysis', 'submit_analysis_report', 'submit_specialist_report',
+        ].includes(definition.model.name))
       .map((definition) => definition.model),
     definition: (name: string) => validated.find((definition) => definition.model.name === name),
     projectResult(name: string, result: Record<string, unknown>) {
       const projection = validated.find((definition) => definition.model.name === name)?.modelProjection
       if (projection === 'full_result') return result
       if (projection === 'acknowledgement') {
-        if (['submit_analysis_report', 'submit_specialist_report'].includes(name)) {
+        if (['submit_analysis_report', 'submit_specialist_report', 'create_research_report'].includes(name)) {
           return projectReportSubmission(result)
         }
         return { submitted: result.submitted === true, ...(result.error ? { error: result.error } : {}) }
@@ -102,6 +121,7 @@ export function createToolRegistry(definitions: RegisteredToolDefinition[]) {
 const boundedResultKeys = [
   'facts', 'gaps', 'summary', 'analysis', 'error', 'source', 'sources',
   'launched', 'status', 'sessionId', 'executionId', 'reportId', 'reportVersion',
+  'agentId', 'runId', 'stopped',
   'keyFactIds', 'contraryFactIds',
   'cursor', 'nextCursor', 'pagination', 'truncated', 'resultCount',
   'returnedCount', 'totalCount', 'items', 'overview',
@@ -115,8 +135,16 @@ function selectResult(result: Record<string, unknown>, allowed: string[]) {
   return Object.fromEntries(allowed.flatMap((key) => key in result ? [[key, result[key]]] : []))
 }
 
+function subagentTool(name: string) {
+  return ['spawn_agent', 'wait_agent', 'read_agent_result', 'stop_agent'].includes(name)
+}
+
 function projectPublicToolResult(name: string, result: Record<string, unknown>) {
   const common = projectCommonResult(result)
+  if (['spawn_agent', 'wait_agent', 'read_agent_result', 'stop_agent'].includes(name)) return {
+    ...selectTyped(result, ['agentId', 'runId', 'status', 'summary', 'stopped'], 'string'),
+    ...selectTyped(result, ['stopped'], 'boolean'),
+  }
   if (['fetch_financial_context', 'search_news_candidates', 'search_web_evidence',
     'read_news_document', 'list_company_events'].includes(name)) return common
   if (name === 'get_financial_overview') return {
@@ -160,7 +188,7 @@ function projectPublicToolResult(name: string, result: Record<string, unknown>) 
   if (['run_news_analysis', 'run_fundamental_analysis', 'run_technical_analysis'].includes(name)) {
     return projectSpecialistResult(result)
   }
-  if (['submit_analysis_report', 'submit_specialist_report'].includes(name)) {
+  if (['submit_analysis_report', 'submit_specialist_report', 'create_research_report'].includes(name)) {
     return projectReportSubmission(result)
   }
   return {}
@@ -387,7 +415,8 @@ function validReportPolicy(definition: RegisteredToolDefinition) {
       && definition.modelProjection !== 'acknowledgement'
   }
   const name = definition.model.name
-  const expectedRoles: ToolRole[] = name === 'submit_analysis_report' ? ['main']
+  const expectedRoles: ToolRole[] = name === 'submit_analysis_report' || name === 'create_research_report'
+    ? ['main']
     : name === 'submit_specialist_report' ? ['fundamental', 'news', 'technical'] : []
   return expectedRoles.length > 0
     && definition.allowedRoles.length === expectedRoles.length

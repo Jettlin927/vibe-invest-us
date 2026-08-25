@@ -6,7 +6,6 @@ export const newsSpecialistTools = toolRegistry.project({ role: 'news', stage: '
   .filter(({ name }) => name !== 'search_web_evidence')
 export const technicalSpecialistTools = toolRegistry.project({ role: 'technical', stage: 'research' })
 export const finalizationModelTools = toolRegistry.project({ role: 'main', stage: 'finalization' })
-
 // ---- 扁平模式（实验开关 agentModeFlat=1）：单 Agent 直接持有全部领域工具 ----
 
 const submitAnalysisReport = toolRegistry.definition('submit_analysis_report')!.model
@@ -45,3 +44,4 @@ export const flatResearchTools = dedupeByName([
 export const flatFinalizationTools = [flatSubmitAnalysisReportTool]
 
 export const webSearchEvidenceTool = toolRegistry.definition('search_web_evidence')!.model
+export const conversationResearchTools = toolRegistry.projectConversation()

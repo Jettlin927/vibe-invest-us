@@ -5,7 +5,7 @@ import type { Pool } from 'pg'
 import { defaultRuntimeSettings } from '@vibe-invest/contracts'
 
 import {
-  checkSchema, createAgentEventRepository, createAnalysisRepository, createPool,
+  checkSchema, createAgentEventRepository, createAnalysisRepository, createConversationRepository, createPool,
   createPortfolioRepository, createRuntimeSettingsRepository, createToolProjectionRepository, migrate,
 } from '../src/index.js'
 
@@ -489,7 +489,7 @@ test('真实 PostgreSQL v21 经当前迁移将未终态模型请求封存为 out
   } finally {
     await removeResearchFixture(appPool, analysisId)
     await migrationPool.query(
-      `INSERT INTO product_schema_migrations (version) VALUES (22), (23), (24)
+      `INSERT INTO product_schema_migrations (version) VALUES (22), (23), (24), (25)
        ON CONFLICT DO NOTHING`,
     )
     await appPool.end()
@@ -2764,6 +2764,59 @@ test('真实 PostgreSQL 启动恢复在一个事务内中断全部活跃 Session
     await removeResearchFixture(pool, replacement.analysisId)
   } finally {
     await removeResearchFixture(pool, analysisId)
+    await pool.end()
+  }
+})
+
+test('真实 PostgreSQL Conversation Thread 支持长会话 Run、父子 Thread 和幂等创建', {
+  skip: !migrationUrl || !applicationUrl,
+  concurrency: false,
+}, async () => {
+  await migrate(migrationUrl!)
+  const pool = createPool(applicationUrl!)
+  const threads = createConversationRepository(pool)
+  const events = createAgentEventRepository(pool)
+  const rootId = `conversation-${crypto.randomUUID()}`
+  try {
+    const root = await threads.create({
+      id: rootId, sessionId: `${rootId}:session`, executionId: `${rootId}:execution`,
+      segmentId: `${rootId}:segment:1`, operationId: `${rootId}:created`,
+      event: { type: 'user_message', message: 'root' }, createdAt: new Date().toISOString(),
+    })
+    assert.equal(root.created, true)
+    assert.equal(root.thread?.parentThreadId, null)
+    const rootThread = root.thread!
+    await events.append({
+      sessionId: rootThread.sessionId, executionId: rootThread.executionId,
+      operationId: `${rootId}:completed`, event: { type: 'status', status: 'completed', terminal: true },
+      projection: { status: 'completed', executionStatus: 'completed', terminal: true },
+      createdAt: new Date().toISOString(),
+    })
+    await threads.setStatus(rootId, 'completed', new Date().toISOString())
+    const run = await threads.createRun({
+      threadId: rootId, executionId: `${rootId}:execution:2`, segmentId: `${rootId}:segment:2`,
+      operationId: `${rootId}:message:2`, event: { type: 'user_message', message: 'next' },
+      createdAt: new Date().toISOString(),
+    })
+    assert.equal(run.created, true)
+    const childId = `conversation-child-${crypto.randomUUID()}`
+    const child = await threads.create({
+      id: childId, parentThreadId: rootId, sessionId: `${childId}:session`,
+      executionId: `${childId}:execution`, segmentId: `${childId}:segment:1`,
+      operationId: `${childId}:created`, event: { type: 'user_message', message: 'child' },
+      createdAt: new Date().toISOString(),
+    })
+    assert.equal(child.thread?.parentThreadId, rootId)
+    assert.deepEqual((await threads.listChildren(rootId)).map(({ id }) => id), [childId])
+    const replay = await threads.create({
+      id: childId, parentThreadId: rootId, sessionId: `${childId}:session`,
+      executionId: `${childId}:execution`, segmentId: `${childId}:segment:1`,
+      operationId: `${childId}:created`, event: { type: 'user_message', message: 'child' },
+      createdAt: new Date().toISOString(),
+    })
+    assert.equal(replay.created, false)
+  } finally {
+    await pool.query('DELETE FROM analyses WHERE id = $1 OR parent_id = $1', [rootId])
     await pool.end()
   }
 })

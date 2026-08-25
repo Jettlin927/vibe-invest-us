@@ -1,5 +1,5 @@
 import type {
-  AgentEvent, AgentEventRepository, AgentSession, AnalysisRecord, AnalysisRepository, PortfolioRepository,
+  AgentEvent, AgentEventRepository, AgentSession, AnalysisRecord, AnalysisRepository, ConversationRepository, PortfolioRepository,
   ProductEquitySnapshot, RuntimeSettingsRepository,
   ToolProjectionRepository,
   ProductPosition,
@@ -962,9 +962,79 @@ export function createTestProductDatabase() {
     },
   }
 
+  const conversationRepository: ConversationRepository = {
+    async create(input) {
+      const existing = analyses.get(input.id)
+      if (existing) return { thread: await this.get(input.id), created: false }
+      const event = { sessionId: input.sessionId, sequence: 1, operationId: input.operationId, payload: structuredClone(input.event), createdAt: input.createdAt }
+      analyses.set(input.id, {
+        id: input.id, symbol: '', status: 'queued', createdAt: input.createdAt, updatedAt: input.createdAt,
+        snapshot: null, report: null, reportCreatedAt: null, error: null, starred: false, note: input.title ?? '',
+      })
+      agentSessions.set(input.sessionId, {
+        id: input.sessionId, analysisId: input.id, isPrimary: true, executionId: input.executionId,
+        status: 'planning', latestSequence: 1, createdAt: input.createdAt, updatedAt: input.createdAt,
+      })
+      agentEvents.set(input.sessionId, [event])
+      lifecycles.set(input.sessionId, {
+        execution: { id: input.executionId, generation: 1, status: 'planning', terminal: false, createdAt: input.createdAt, updatedAt: input.createdAt },
+        waitReason: { kind: 'database', target: '对话初始化', startedAt: input.createdAt },
+        segments: [{ id: input.segmentId, ordinal: 1, createdAt: input.createdAt }],
+      })
+      executionSettingsSnapshots.set(input.executionId, {
+        executionId: input.executionId, id: runtimeSettingsRevisions.at(-1)!.id,
+        values: { ...runtimeSettingsRevisions.at(-1)!.values }, createdAt: input.createdAt,
+      })
+      return { thread: await this.get(input.id), created: true }
+    },
+    async get(id) {
+      const record = analyses.get(id)
+      const session = [...agentSessions.values()].find(({ analysisId, isPrimary }) => analysisId === id && isPrimary)
+      if (!record || !session) return null
+      return {
+        id, capability: 'research', title: record.note, status: ['completed', 'partial'].includes(record.status) ? 'completed' : record.status as never,
+        createdAt: record.createdAt, updatedAt: record.updatedAt, sessionId: session.id, executionId: session.executionId,
+      }
+    },
+    async list() {
+      return (await Promise.all([...analyses.keys()].map((id) => this.get(id)))).filter(Boolean) as never
+    },
+    async listChildren() { return [] as never },
+    async claimNextQueued(updatedAt) {
+      const record = [...analyses.values()].find(({ status }) => status === 'queued')
+      if (!record) return null
+      analyses.set(record.id, { ...record, status: 'running', updatedAt })
+      return record.id
+    },
+    async createRun(input) {
+      const session = [...agentSessions.values()].find(({ analysisId, isPrimary }) => analysisId === input.threadId && isPrimary)
+      if (!session) throw new Error('conversation_not_found')
+      const lifecycle = lifecycles.get(session.id)!
+      if (!lifecycle.execution.terminal) throw new Error('conversation_run_active')
+      const sequence = session.latestSequence + 1
+      const generation = lifecycle.execution.generation + 1
+      agentEvents.set(session.id, [...(agentEvents.get(session.id) ?? []), { sessionId: session.id, sequence, operationId: input.operationId, payload: structuredClone(input.event), createdAt: input.createdAt }])
+      agentSessions.set(session.id, { ...session, executionId: input.executionId, status: 'planning', latestSequence: sequence, updatedAt: input.createdAt })
+      lifecycles.set(session.id, {
+        execution: { id: input.executionId, generation, status: 'planning', terminal: false, createdAt: input.createdAt, updatedAt: input.createdAt },
+        waitReason: { kind: 'database', target: '组装对话上下文', startedAt: input.createdAt },
+        segments: [...lifecycle.segments, { id: input.segmentId, ordinal: lifecycle.segments.length + 1, createdAt: input.createdAt }],
+        events: [...(lifecycle.events ?? []), { sequence, createdAt: input.createdAt, ...structuredClone(input.event) }],
+      })
+      const record = analyses.get(input.threadId)!
+      analyses.set(input.threadId, { ...record, status: 'queued', updatedAt: input.createdAt })
+      executionSettingsSnapshots.set(input.executionId, { executionId: input.executionId, id: runtimeSettingsRevisions.at(-1)!.id, values: { ...runtimeSettingsRevisions.at(-1)!.values }, createdAt: input.createdAt })
+      return { sessionId: session.id, executionId: input.executionId, generation, created: true }
+    },
+    async setStatus(id, status, updatedAt, error) {
+      const record = analyses.get(id)
+      if (record) analyses.set(id, { ...record, status, error: error ?? record.error, updatedAt })
+    },
+  }
+
   return {
     productDatabase: {
-      checkSchema: async () => ({ status: 'ok' as const, version: 24 }),
+      checkSchema: async () => ({ status: 'ok' as const, version: 25 }),
       close: async () => {},
     },
     portfolioRepository,
@@ -972,5 +1042,6 @@ export function createTestProductDatabase() {
     agentEventRepository,
     runtimeSettingsRepository,
     toolProjectionRepository,
+    conversationRepository,
   }
 }

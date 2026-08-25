@@ -41,6 +41,8 @@ test('唯一 Registry 中每个工具独立声明完整权限、保留、网络�
     'run_news_analysis',
     'run_technical_analysis',
     'submit_analysis_report',
+    'create_research_report',
+    'spawn_agent', 'wait_agent', 'read_agent_result', 'stop_agent',
     'get_financial_overview',
     'get_financial_metric_series',
     'get_valuation_evidence',

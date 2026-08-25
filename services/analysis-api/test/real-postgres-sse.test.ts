@@ -7,6 +7,7 @@ import {
   checkSchema,
   createAgentEventRepository,
   createAnalysisRepository,
+  createConversationRepository,
   createPool,
   createPortfolioRepository,
   createRuntimeSettingsRepository,
@@ -77,7 +78,7 @@ function specialistResults(context: { messages: Array<{
   })
 }
 
-test('真实 v12 历史 Tool 事件升级到 v24 后经 DAO、HTTP 与 SSE 原样读取', {
+test('真实 v12 历史 Tool 事件升级到 v25 后经 DAO、HTTP 与 SSE 原样读取', {
   skip: !databaseUrl || !migrationDatabaseUrl,
   concurrency: false,
 }, async () => {
@@ -2746,3 +2747,50 @@ async function closeHttp(server: Server) {
     error ? reject(error) : resolve()
   )))
 }
+
+test('真实 PostgreSQL Conversation API 完成自由对话并结束 SSE', {
+  skip: !databaseUrl || !migrationDatabaseUrl,
+  concurrency: false,
+}, async () => {
+  await migrate(migrationDatabaseUrl!)
+  const pool = createPool(databaseUrl!)
+  const events = createAgentEventRepository(pool)
+  const app = buildApp({
+    productDatabase: { checkSchema: () => checkSchema(pool), close: () => pool.end() },
+    portfolioRepository: createPortfolioRepository(pool),
+    analysisRepository: createAnalysisRepository(pool),
+    agentEventRepository: events,
+    conversationRepository: createConversationRepository(pool),
+    runtimeSettingsRepository: createRuntimeSettingsRepository(pool),
+    toolProjectionRepository: createToolProjectionRepository(pool),
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, gaps: [], facts: [] }),
+    model: {
+      async *analyze() { /* legacy route is not used in this test */ },
+      async *analyzeConversation(input: { userPrompt: string }): AsyncGenerator<ModelEvent> {
+        yield { type: 'chat_completed', text: `回答：${input.userPrompt}`, operationId: 'conversation:completed' }
+      },
+    },
+  })
+  await app.ready()
+  try {
+    const created = await app.inject({
+      method: 'POST', url: '/api/conversations', payload: { message: '真实 PG 对话' },
+    })
+    assert.equal(created.statusCode, 202)
+    const id = created.json().id as string
+    let detail = created.json()
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      detail = (await app.inject({ method: 'GET', url: `/api/conversations/${id}` })).json()
+      if (detail.thread?.status === 'completed') break
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    assert.equal(detail.thread.status, 'completed')
+    const sse = await app.inject({ method: 'GET', url: `/api/conversations/${id}/events` })
+    assert.equal(sse.statusCode, 200)
+    assert.match(sse.body, /event: chat_completed/)
+    await pool.query('DELETE FROM analyses WHERE id = $1', [id])
+  } finally {
+    await app.close()
+  }
+})

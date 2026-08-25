@@ -17,7 +17,7 @@ import {
 } from './agent-runtime/pi-agent-adapter.js'
 import type {
   AnalysisReport, AnalyzeFundamentalInput, AnalyzeInput, AnalyzeNewsInput, AnalyzeTechnicalInput,
-  ModelEvent, ModelOptions,
+  FreeConversationInput, ModelEvent, ModelOptions,
 } from './model.js'
 import {
   acquireActiveSlot, createActiveBudget, createConcurrencyGate, deadlineSignal, raceWithAbort,
@@ -27,6 +27,7 @@ import { toolRegistry } from './tool-registry.js'
 import {
   analysisModelTools, finalizationModelTools, financialSpecialistTools, flatFinalizationTools,
   flatResearchTools, newsSpecialistTools, technicalSpecialistTools, webSearchEvidenceTool,
+  conversationResearchTools,
 } from './tools.js'
 import { validateReportCandidate } from './report-validation.js'
 
@@ -593,6 +594,81 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
         await task.catch(() => undefined)
       }
     },
+    async *analyzeConversation(input: FreeConversationInput): AsyncGenerator<ModelEvent> {
+      if (!input.toolRuntime) throw new Error('tool_runtime_required')
+      const settings = input.runtimeSettings
+      modelGate.setLimit(settings.modelConcurrency)
+      toolGate.setLimit(settings.toolConcurrency)
+      const runtimeMinuteMs = options.runtimeMinuteMs ?? 60_000
+      const executionSignal = deadlineSignal(
+        input.signal, settings.executionWallClockMinutes * runtimeMinuteMs,
+        input.executionDeadlineSignal,
+      )
+      const activeBudget = input.activeBudget ?? createActiveBudget(
+        settings.researchActiveMinutes * runtimeMinuteMs, options.activeNow,
+        options.activeTimeoutSignal,
+      )
+      const consumer = new AbortController()
+      const agentSignal = AbortSignal.any([executionSignal, consumer.signal])
+      const provider = createProviderRuntime(options)
+      const queue = createAsyncQueue<ModelEvent>()
+      let policyFailure: Error | undefined
+      queue.push(trace({
+        type: 'system_prompt', content: securedSystemPrompt(input.systemPrompt),
+        operationId: `execution:${input.executionId}:system-prompt`,
+      }))
+      if (input.runtimeContext) queue.push(trace({
+        type: 'runtime_context', content: input.runtimeContext,
+        operationId: `execution:${input.executionId}:runtime-context`,
+      }))
+      if (input.runtimeResume) queue.push(trace({
+        type: 'runtime_resume', content: input.runtimeResume,
+        operationId: `execution:${input.executionId}:runtime-resume`,
+      }))
+      queue.push(trace({
+        type: 'user_input', content: input.userPrompt,
+        operationId: `execution:${input.executionId}:user-input`,
+      }))
+      queue.push(trace({
+        type: 'runtime_policy', settings,
+        operationId: `execution:${input.executionId}:runtime-policy`,
+      }))
+      const main = runProjectedAgent({
+        role: 'main', input, options, settings, executionSignal: agentSignal, activeBudget,
+        modelGate, toolGate, provider, queue,
+        initialTools: input.tools.length ? input.tools : conversationResearchTools,
+        initialStage: 'research', completionMode: 'chat',
+        initialMessages: input.initialMessages,
+        nextResearchTools: () => input.tools.length ? input.tools : conversationResearchTools,
+        nextFinalizationTools: () => [],
+        systemPrompt: securedSystemPrompt(input.systemPrompt), userPrompt: input.userPrompt,
+        execute: input.executeTool,
+        onPolicyFailure: (error) => { policyFailure ??= error },
+      })
+      const task = main.then((outcome) => {
+        if (policyFailure) throw policyFailure
+        if (outcome.report && outcome.reportVersion) queue.push({
+          type: 'artifact_completed', kind: 'research_report', report: outcome.reportVersion.report,
+          operationId: `execution:${input.executionId}:artifact:research-report`,
+        })
+        queue.push({
+          type: 'chat_completed', text: outcome.text || (outcome.report ? '研究报告已保存。' : ''), usage: outcome.usage,
+          stopReason: outcome.stopReason,
+          operationId: `execution:${input.executionId}:chat-completed`,
+        })
+      }).then(() => queue.end(), (error) => {
+        if (input.signal?.aborted || consumer.signal.aborted) queue.end()
+        else queue.fail(error)
+      })
+      try {
+        for await (const event of queue) yield event
+        await task
+      } finally {
+        consumer.abort(new Error('model_consumer_closed'))
+        queue.end()
+        await task.catch(() => undefined)
+      }
+    },
     async *analyzeNews(input: AnalyzeNewsInput): AsyncGenerator<ModelEvent> {
       const settings = input.runtimeSettings
       modelGate.setLimit(settings.modelConcurrency)
@@ -951,13 +1027,15 @@ async function* runStructuredSpecialist(config: {
 }
 
 async function runProjectedAgent(config: {
-  role: Role; input: AnalyzeInput | AnalyzeNewsInput | AnalyzeFundamentalInput | AnalyzeTechnicalInput
+  role: Role; input: AnalyzeInput | AnalyzeNewsInput | AnalyzeFundamentalInput | AnalyzeTechnicalInput | FreeConversationInput
   options: ModelOptions; settings: RuntimeSettings
   executionSignal: AbortSignal; activeBudget: ActiveBudget
   modelGate: ReturnType<typeof createConcurrencyGate>; toolGate: ReturnType<typeof createConcurrencyGate>
   provider: ReturnType<typeof createProviderRuntime>; queue: ReturnType<typeof createAsyncQueue<ModelEvent>>
   initialTools: Tool[]; systemPrompt: string; userPrompt: string
+  initialMessages?: PiAgentAdapterMessage[]
   initialStage?: Stage
+  completionMode?: 'report' | 'chat'
   invocationId?: string
   toolRoundLimit?: number
   shouldRejectNextTurn?: () => boolean
@@ -971,6 +1049,7 @@ async function runProjectedAgent(config: {
   onPolicyFailure: (error: Error) => void
 }) {
   const { input } = config
+  const completionMode = config.completionMode ?? 'report'
   let stage: Stage = config.initialStage ?? 'research'
   let turnIndex = 0
   let toolRounds = 0
@@ -1274,6 +1353,7 @@ async function runProjectedAgent(config: {
   adapter = createPiAgentAdapter({
     initialState: {
       systemPrompt: config.systemPrompt, model: config.provider.model,
+      messages: config.initialMessages,
       tools: projectedTools(),
     },
     signal: config.executionSignal,
@@ -1325,7 +1405,7 @@ async function runProjectedAgent(config: {
     afterToolCall: async ({ result, isError }) => ({
       isError: Boolean((result.details as { audit?: ToolAudit } | undefined)?.audit?.isError ?? isError),
     }),
-    shouldStopAfterTurn: async () => Boolean(completedReport),
+    shouldStopAfterTurn: async () => Boolean(completedReport || (completionMode === 'chat' && finalText)),
     prepareNextTurn: async () => {
       if (completedReport || finalText) return undefined
       const hasToolBatch = Boolean(currentBatch)
@@ -1340,23 +1420,22 @@ async function runProjectedAgent(config: {
       if (stage === 'finalization' || config.activeBudget.exhausted() || toolRounds >= limit) {
         if (stage !== 'finalization') {
           stage = 'finalization'
-          if (config.role === 'main') config.queue.push({
+          if (config.role === 'main' && completionMode === 'report') config.queue.push({
             type: 'lifecycle', status: 'budget_exhausted',
             operationId: `execution:${input.executionId}:budget-exhausted`,
           })
         }
         finalizationAttempts += 1
-        if (finalizationAttempts > 2) {
+        if (finalizationAttempts > (completionMode === 'chat' ? 1 : 2)) {
           await completeCurrentBatch()
-          throw new Error(
-            config.role === 'main' ? 'report_tool_required' : 'specialist_finalization_required',
-          )
+          if (completionMode === 'chat') throw new Error('conversation_budget_exhausted')
+          throw new Error(config.role === 'main' ? 'report_tool_required' : 'specialist_finalization_required')
         }
       }
       const causativeEvent = config.beforeNextProjection?.()
       const next = config.role === 'main'
         ? stage === 'finalization'
-          ? config.nextFinalizationTools?.() ?? finalizationModelTools
+          ? completionMode === 'chat' ? [] : config.nextFinalizationTools?.() ?? finalizationModelTools
           : config.nextResearchTools?.() ?? analysisModelTools
         : stage === 'finalization'
           ? toolRegistry.project({ role: config.role, stage: 'finalization' })
@@ -1413,11 +1492,18 @@ async function runProjectedAgent(config: {
       await completeActiveModelRequest(requestStatus, event.message.usage)
       finalUsage = event.message.usage
       finalStopReason = event.message.stopReason
+      config.queue.push(trace({
+        type: 'assistant_message',
+        content: event.message.content.filter((item) => item.type !== 'thinking'),
+        stopReason: event.message.stopReason,
+        usage: event.message.usage,
+        operationId: `execution:${input.executionId}:assistant:${turnIndex}`,
+      }))
       const calls = event.message.content.filter((content) => content.type === 'toolCall')
       lastAssistantHadCalls = calls.length > 0
       if (!calls.length) {
-        if ('runtimeFollowUp' in input && input.runtimeFollowUp
-          && input.runtimeFollowUp.content.updateReport !== true) {
+        if (completionMode === 'chat' || ('runtimeFollowUp' in input
+          && input.runtimeFollowUp && input.runtimeFollowUp.content.updateReport !== true)) {
           finalText = event.message.content.flatMap((content) => (
             content.type === 'text' ? [content.text] : []
           )).join('')
@@ -1605,7 +1691,7 @@ async function compactWithProvider(
 function compactionSummaryContract(
   role: Role,
   goal: string,
-  input: AnalyzeInput | AnalyzeNewsInput | AnalyzeFundamentalInput | AnalyzeTechnicalInput,
+  input: AnalyzeInput | AnalyzeNewsInput | AnalyzeFundamentalInput | AnalyzeTechnicalInput | FreeConversationInput,
   messages: PiAgentAdapterMessage[],
   narrative: string,
 ) {
@@ -1656,7 +1742,7 @@ function parseToolResultRecord(message: Extract<PiAgentAdapterMessage, { role: '
 }
 
 async function beginBudgetedModelRequest(config: {
-  input: AnalyzeInput | AnalyzeNewsInput | AnalyzeFundamentalInput | AnalyzeTechnicalInput
+  input: AnalyzeInput | AnalyzeNewsInput | AnalyzeFundamentalInput | AnalyzeTechnicalInput | FreeConversationInput
   options: ModelOptions; settings: RuntimeSettings
   executionSignal: AbortSignal; activeBudget: ActiveBudget
   modelGate: ReturnType<typeof createConcurrencyGate>
@@ -1841,6 +1927,7 @@ function toolOperationId(
 }
 function isReportSubmit(name: string) {
   return name === 'submit_analysis_report' || name === 'submit_specialist_report'
+    || name === 'create_research_report'
 }
 
 function hasOnlyDeclaredArguments(definition: Tool, value: unknown) {

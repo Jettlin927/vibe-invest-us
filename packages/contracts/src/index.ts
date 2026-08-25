@@ -207,3 +207,28 @@ export function isSystemHealth(value: unknown): value is SystemHealth {
     && typeof (database as Record<string, unknown>).schemaVersion === 'number'
     && isFinancialDataHealth(dependencyValues.financialData)
 }
+
+/**
+ * A durable user-facing conversation.  Research is one capability that can
+ * own a conversation; the runtime itself does not assume a fixed workflow.
+ */
+export type ConversationThread = {
+  id: string
+  capability: string
+  parentThreadId?: string | null
+  title: string | null
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'stopped' | 'interrupted'
+  createdAt: string
+  updatedAt: string
+  sessionId: string
+  executionId: string
+}
+
+export type ConversationRun = {
+  threadId: string
+  sessionId: string
+  executionId: string
+  generation: number
+  status: AgentExecutionStatus
+  created: boolean
+}
