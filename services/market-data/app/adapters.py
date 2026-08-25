@@ -6,6 +6,7 @@ import os
 import re
 import socket
 import ssl
+import threading
 import time
 from hashlib import sha256
 from datetime import datetime, timedelta, timezone
@@ -27,6 +28,7 @@ USER_AGENT = "Mozilla/5.0 vibe-invest-us/0.1"
 
 
 _diagnostics = {"enabled": False, "directory": None, "max_bytes": 65536, "retention_seconds": 86400}
+_diagnostics_lock = threading.Lock()
 
 
 def configure_diagnostics(enabled: bool, directory: Path, max_bytes: int, retention_hours: int):
@@ -231,15 +233,16 @@ def _parse_document_payload(response, connection, safe_url: str, cursor: int, ma
 def _diagnose(target: str, payload: bytes):
     if not _diagnostics["enabled"]:
         return
-    directory = _diagnostics["directory"]
-    directory.mkdir(parents=True, exist_ok=True)
-    now = time.time()
-    for existing in directory.glob("*.sample"):
-        if now - existing.stat().st_mtime > _diagnostics["retention_seconds"]:
-            existing.unlink(missing_ok=True)
-    name = sha256(f"{target}:{now}".encode()).hexdigest()
-    sanitized = _sanitize_diagnostic(payload[:_diagnostics["max_bytes"]])
-    (directory / f"{name}.sample").write_bytes(sanitized)
+    with _diagnostics_lock:
+        directory = _diagnostics["directory"]
+        directory.mkdir(parents=True, exist_ok=True)
+        now = time.time()
+        for existing in directory.glob("*.sample"):
+            if now - existing.stat().st_mtime > _diagnostics["retention_seconds"]:
+                existing.unlink(missing_ok=True)
+        name = sha256(f"{target}:{now}".encode()).hexdigest()
+        sanitized = _sanitize_diagnostic(payload[:_diagnostics["max_bytes"]])
+        (directory / f"{name}.sample").write_bytes(sanitized)
 
 
 def _sanitize_diagnostic(payload: bytes) -> bytes:
