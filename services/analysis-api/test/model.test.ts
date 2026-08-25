@@ -14,6 +14,7 @@ import { createActiveBudget } from '../src/runtime-policy.js'
 import {
   analysisModelTools, financialSpecialistTools, flatResearchTools, flatSubmitAnalysisReportTool,
 } from '../src/tools.js'
+import { conversationResearchTools } from '../src/tools.js'
 
 const facts = [{
   id: 'fact:nvda:price:2026-08-12',
@@ -170,6 +171,99 @@ test('普通追问不向 Provider 投影综合报告提交工具并以聊天文�
   assert.equal(events.some((event) => event.type === 'chat_completed'
     && event.text === '报告仍可作为基准，但应关注持仓变化。'), true)
   assert.equal(events.some((event) => event.type === 'completed'), false)
+})
+
+test('自由对话可以直接回答，不要求结构化报告收口', async () => {
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxText('这是普通研究对话的直接回答。')),
+  ] })
+  const events = []
+  for await (const event of model.analyzeConversation({
+    executionId: 'free-conversation-text', runtimeSettings: runtimeSettings(),
+    systemPrompt: 'system', userPrompt: '请解释一下当前市场风险。', knownFacts: [],
+    toolRuntime: createTestToolRuntime(), tools: [],
+  })) events.push(event)
+
+  assert.equal(events.some((event) => event.type === 'chat_completed'
+    && event.text === '这是普通研究对话的直接回答。'), true)
+  assert.equal(events.some((event) => event.type === 'completed'), false)
+  assert.equal(events.some((event) => event.type === 'trace'
+    && event.entry.type === 'assistant_message'), true)
+})
+
+test('自由对话可以自主调用研究工具后继续回答', async () => {
+  let calls = 0
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall('get_financial_overview', { symbol: 'NVDA' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxText('我已经读取了 NVDA 的财务概览。')),
+  ] })
+  const events = []
+  for await (const event of model.analyzeConversation({
+    executionId: 'free-conversation-tool', runtimeSettings: runtimeSettings(),
+    systemPrompt: 'system', userPrompt: '看一下 NVDA 财务。', knownFacts: [],
+    toolRuntime: createTestToolRuntime(), tools: conversationResearchTools,
+    executeTool: async (name, _params, _signal, onStart) => {
+      await onStart(); calls += 1
+      assert.equal(name, 'get_financial_overview')
+      return { result: { facts: [], overview: { symbol: 'NVDA' } }, isError: false }
+    },
+  })) events.push(event)
+
+  assert.equal(calls, 1)
+  assert.equal(events.some((event) => event.type === 'chat_completed'
+    && event.text === '我已经读取了 NVDA 的财务概览。'), true)
+})
+
+test('自由对话只在显式调用报告 Artifact 工具后保存报告', async () => {
+  assert.equal(conversationResearchTools.some(({ name }) => name === 'create_research_report'), true)
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall('create_research_report', validReport), { stopReason: 'toolUse' }),
+  ] })
+  const events = []
+  for await (const event of model.analyzeConversation({
+    executionId: 'free-conversation-artifact', runtimeSettings: runtimeSettings(),
+    systemPrompt: 'system', userPrompt: '保存成报告。', knownFacts: facts,
+    toolRuntime: createTestToolRuntime(), tools: conversationResearchTools,
+    executeTool: async (name, _params, _signal, onStart) => {
+      await onStart()
+      assert.equal(name, 'create_research_report')
+      return {
+        result: { submitted: true }, isError: false, terminate: true,
+        report: validReport as never, reportVersion: { kind: 'integrated', report: validReport },
+      }
+    },
+  })) events.push(event)
+
+  assert.equal(events.some((event) => event.type === 'artifact_completed'
+    && event.kind === 'research_report'), true)
+  assert.equal(events.some((event) => event.type === 'chat_completed'), true)
+})
+
+test('自由对话在安全 Turn 边界可以 compaction 并继续使用同一上下文', async () => {
+  const model = createPiModel({
+    contextWindow: 1_300,
+    fauxResponses: [
+      fauxAssistantMessage(fauxToolCall('fetch_financial_context', { symbol: 'NVDA' }), { stopReason: 'toolUse' }),
+      fauxAssistantMessage(fauxText('压缩后继续回答。')),
+    ],
+    compact: async () => ({ narrative: '保留用户目标和已取得事实。', usage: {
+      input: 1, cacheRead: 0, cacheWrite: 0, output: 1, totalTokens: 2,
+    } }),
+  })
+  const events = []
+  for await (const event of model.analyzeConversation({
+    executionId: 'free-conversation-compaction', runtimeSettings: runtimeSettings({ compactionReserveTokens: 256 }),
+    systemPrompt: 'system', userPrompt: '请先取数再总结。', knownFacts: [],
+    toolRuntime: createTestToolRuntime(), tools: conversationResearchTools,
+    executeTool: async (_name, _params, _signal, onStart) => {
+      await onStart()
+      return { result: { facts: [], summary: 'large '.repeat(200) }, isError: false }
+    },
+  })) events.push(event)
+
+  assert.equal(events.some((event) => event.type === 'trace' && event.entry.type === 'compaction'), true)
+  assert.equal(events.some((event) => event.type === 'chat_completed'
+    && event.text === '压缩后继续回答。'), true)
 })
 
 test('显式更新报告的追问保留综合报告提交工具并生成新候选', async () => {

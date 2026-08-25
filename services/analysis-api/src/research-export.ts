@@ -15,7 +15,8 @@ const exportHiddenKeys = new Set([
 ])
 
 const exportedTraceTypes = new Set([
-  'user_input', 'runtime_follow_up', 'chat_completed', 'text_delta', 'model_event',
+  'user_input', 'user_message', 'assistant_message', 'artifact_completed',
+  'runtime_follow_up', 'chat_completed', 'text_delta', 'model_event',
   'model_completed', 'tool_call', 'tool_result', 'status', 'compaction', 'context_usage',
   'financial_context',
 ])
@@ -74,6 +75,19 @@ function projectStructuredValue(value: Record<string, unknown>, hidden: Set<stri
   }
   if (value.type === 'tool_result' && typeof value.name === 'string') {
     return { ...value, result: publicToolResult(value.name, value.result) }
+  }
+  if (value.type === 'assistant_message' && Array.isArray(value.content)) {
+    return {
+      ...value,
+      content: value.content.map((item) => {
+        const block = record(item)
+        if (block.type === 'toolCall') return {
+          type: 'toolCall', id: block.id, name: block.name,
+        }
+        if (block.type === 'text') return { type: 'text', text: block.text }
+        return { type: block.type }
+      }),
+    }
   }
   if (typeof value.toolName === 'string' && 'result' in value) {
     return { ...value, result: publicToolResult(value.toolName, value.result) }

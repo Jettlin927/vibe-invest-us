@@ -5,11 +5,12 @@ import {
   defaultRuntimeSettings, formatSseEvent, parseRuntimeSettingsUpdate, type FinancialDataHealth,
 } from '@vibe-invest/contracts'
 import type {
-  AgentEventRepository, AnalysisRepository, PortfolioRepository, RuntimeSettingsRepository,
-  ToolProjectionRepository,
+  AgentEventRepository, AnalysisRepository, ConversationRepository, PortfolioRepository,
+  RuntimeSettingsRepository, ToolProjectionRepository,
 } from '@vibe-invest/product-dao'
 
 import { createAnalysisService } from './analysis.js'
+import { createConversationService } from './conversation.js'
 import type { ModelEvent } from './model.js'
 import {
   MARKET_PRICE_REQUEST_TIMEOUT_MS,
@@ -17,6 +18,8 @@ import {
 } from './financial-data-client.js'
 import { createPortfolio, isValidSymbol, normalizeSymbol } from './portfolio.js'
 import { projectResearchExport, projectResearchView } from './research-export.js'
+import { createResearchToolExecutor } from './research-capability.js'
+import { conversationResearchTools } from './tools.js'
 
 type AppDependencies = {
   productDatabase: {
@@ -28,6 +31,7 @@ type AppDependencies = {
   agentEventRepository: AgentEventRepository
   runtimeSettingsRepository: RuntimeSettingsRepository
   toolProjectionRepository: ToolProjectionRepository
+  conversationRepository?: ConversationRepository
   financialDataHealth: () => Promise<FinancialDataHealth>
   staticDir?: string
   fetchFinancialContext?: (symbol: string, signal: AbortSignal) => Promise<FinancialContext>
@@ -65,6 +69,7 @@ type AppDependencies = {
   marketPriceTimeoutMs?: number
   model?: {
     analyze(input: any): AsyncIterable<ModelEvent>
+    analyzeConversation?: (input: any) => AsyncIterable<ModelEvent>
     analyzeNews?: (input: any) => AsyncIterable<ModelEvent>
     analyzeFundamental?: (input: any) => AsyncIterable<ModelEvent>
     analyzeTechnical?: (input: any) => AsyncIterable<ModelEvent>
@@ -111,9 +116,36 @@ export function buildApp(dependencies: AppDependencies) {
         activeTimeoutSignal: dependencies.activeTimeoutSignal,
         runEnabled: !lifecycleOnly,
       })
+  const conversation = dependencies.conversationRepository && dependencies.model?.analyzeConversation
+    ? createConversationService({
+        repository: dependencies.conversationRepository,
+        eventRepository: dependencies.agentEventRepository,
+        settingsRepository: dependencies.runtimeSettingsRepository,
+        toolProjectionRepository: dependencies.toolProjectionRepository,
+        tools: conversationResearchTools,
+        model: { analyzeConversation: dependencies.model.analyzeConversation },
+        createToolExecutor: ({ threadId, knownFacts }) => createResearchToolExecutor({
+          fetchFinancialContext: dependencies.fetchFinancialContext,
+          searchNewsCandidates: dependencies.searchNewsCandidates,
+          searchWebEvidence: dependencies.searchWebEvidence,
+          readNewsDocument: dependencies.readNewsDocument,
+          listCompanyEvents: dependencies.listCompanyEvents,
+          getFinancialOverview: dependencies.getFinancialOverview,
+          getFinancialMetricSeries: dependencies.getFinancialMetricSeries,
+          getValuationEvidence: dependencies.getValuationEvidence,
+          getTechnicalEvidence: dependencies.getTechnicalEvidence,
+          getPriceWindow: dependencies.getPriceWindow,
+          readFilingDocument: dependencies.readFilingDocument,
+        })({ threadId, knownFacts }),
+        runtimeMinuteMs: dependencies.runtimeMinuteMs,
+        activeNow: dependencies.activeNow,
+        activeTimeoutSignal: dependencies.activeTimeoutSignal,
+      })
+    : undefined
 
   app.addHook('onClose', async () => {
     await analysis?.close()
+    await conversation?.close()
     await dependencies.productDatabase.close()
   })
 
@@ -149,6 +181,8 @@ export function buildApp(dependencies: AppDependencies) {
   })
 
   app.get('/api/positions', async () => ({ positions: await portfolio.list() }))
+
+  app.get('/api/portfolio/stored', async () => portfolio.overview({}))
 
   app.get('/api/migration-verification', async (request, reply) => {
     const token = dependencies.migrationVerificationToken
@@ -306,6 +340,121 @@ export function buildApp(dependencies: AppDependencies) {
     const result = await analysis.create(symbol)
     return reply.status(202).send(result)
   })
+  app.post<{
+    Body: { message?: unknown; messageId?: unknown; title?: unknown }
+  }>('/api/conversations', async (request, reply) => {
+    if (!conversation) return reply.status(404).send({ error: 'conversation_unavailable' })
+    if (typeof request.body?.message !== 'string' || !request.body.message.trim()) {
+      return reply.status(400).send({ error: 'conversation_message_required' })
+    }
+    const messageId = typeof request.body.messageId === 'string' && request.body.messageId.trim()
+      ? request.body.messageId.trim() : undefined
+    if (messageId && messageId.length > 200) return reply.status(400).send({ error: 'conversation_message_id_invalid' })
+    const title = typeof request.body.title === 'string' ? request.body.title.trim() : undefined
+    const result = await conversation.create(request.body.message, messageId, title)
+    return reply.status(202).send(result)
+  })
+  app.get('/api/conversations/capabilities', async (_request, reply) => {
+    if (!conversation) return reply.status(404).send({ error: 'conversation_unavailable' })
+    return {
+      capability: 'research',
+      tools: conversationResearchTools.map(({ name, description, parameters }) => ({
+        name, description, parameters,
+      })),
+    }
+  })
+  app.get('/api/conversations', async (_request, reply) => {
+    if (!conversation) return reply.status(404).send({ error: 'conversation_unavailable' })
+    return { threads: await conversation.list() }
+  })
+  app.get<{ Params: { id: string } }>('/api/conversations/:id', async (request, reply) => {
+    if (!conversation) return reply.status(404).send({ error: 'conversation_unavailable' })
+    const thread = await conversation.get(request.params.id)
+    if (!thread) return reply.status(404).send({ error: 'conversation_not_found' })
+    const lifecycle = await dependencies.agentEventRepository.sessionLifecycle(thread.sessionId)
+    return { thread, lifecycle: lifecycle ? projectResearchView(lifecycle) : null }
+  })
+  app.get<{ Params: { id: string } }>('/api/conversations/:id/children', async (request, reply) => {
+    if (!conversation) return reply.status(404).send({ error: 'conversation_unavailable' })
+    const thread = await conversation.get(request.params.id)
+    if (!thread) return reply.status(404).send({ error: 'conversation_not_found' })
+    return { threads: await conversation.children(request.params.id) }
+  })
+  app.post<{
+    Params: { id: string }
+    Body: { message?: unknown; messageId?: unknown }
+  }>('/api/conversations/:id/messages', async (request, reply) => {
+    if (!conversation) return reply.status(404).send({ error: 'conversation_unavailable' })
+    if (typeof request.body?.message !== 'string' || !request.body.message.trim()) {
+      return reply.status(400).send({ error: 'conversation_message_required' })
+    }
+    const messageId = typeof request.body.messageId === 'string' && request.body.messageId.trim()
+      ? request.body.messageId.trim() : undefined
+    if (messageId && messageId.length > 200) return reply.status(400).send({ error: 'conversation_message_id_invalid' })
+    try {
+      const result = await conversation.sendMessage(request.params.id, request.body.message, messageId)
+      return result ? reply.status(202).send(result) : reply.status(404).send({ error: 'conversation_not_found' })
+    } catch (error) {
+      if (error instanceof Error && ['conversation_run_active', 'agent_operation_conflict'].includes(error.message)) {
+        return reply.status(409).send({ error: error.message })
+      }
+      throw error
+    }
+  })
+  app.post<{ Params: { id: string } }>('/api/conversations/:id/cancel', async (request, reply) => {
+    if (!conversation || !await conversation.cancel(request.params.id)) {
+      return reply.status(409).send({ error: 'conversation_not_cancellable' })
+    }
+    return reply.status(202).send({ status: 'cancelling' })
+  })
+  app.post<{
+    Params: { id: string }; Body: { message?: unknown; messageId?: unknown }
+  }>('/api/conversations/:id/steer', async (request, reply) => {
+    if (!conversation) return reply.status(404).send({ error: 'conversation_unavailable' })
+    if (typeof request.body?.message !== 'string' || !request.body.message.trim()) {
+      return reply.status(400).send({ error: 'conversation_message_required' })
+    }
+    const messageId = typeof request.body.messageId === 'string' && request.body.messageId.trim()
+      ? request.body.messageId.trim() : undefined
+    if (messageId && messageId.length > 200) return reply.status(400).send({ error: 'conversation_message_id_invalid' })
+    const result = await conversation.steer(request.params.id, request.body.message, messageId)
+    return result ? reply.status(202).send(result) : reply.status(404).send({ error: 'conversation_not_found' })
+  })
+  app.post<{ Params: { id: string } }>('/api/conversations/:id/resume', async (request, reply) => {
+    if (!conversation) return reply.status(404).send({ error: 'conversation_unavailable' })
+    const result = await conversation.resume(request.params.id)
+    return result ? reply.status(202).send(result) : reply.status(409).send({ error: 'conversation_not_resumable' })
+  })
+  app.get<{
+    Params: { id: string }
+    Headers: { 'last-event-id'?: string }
+    Querystring: { after?: string }
+  }>(
+    '/api/conversations/:id/events', async (request, reply) => {
+      if (!conversation) return reply.status(404).send({ error: 'conversation_unavailable' })
+      const thread = await conversation.get(request.params.id)
+      if (!thread) return reply.status(404).send({ error: 'conversation_not_found' })
+      const headerCursor = parseLastEventId(request.headers['last-event-id'], thread.sessionId)
+      const queryCursor = request.query.after === undefined
+        ? 0 : parseEventSequence(request.query.after)
+      const cursor = headerCursor === 0 && request.query.after !== undefined ? queryCursor : headerCursor
+      if (cursor === null) return reply.status(400).send({ error: 'invalid_last_event_id' })
+      reply.hijack()
+      reply.raw.writeHead(200, {
+        'content-type': 'text/event-stream; charset=utf-8',
+        'cache-control': 'no-cache', connection: 'keep-alive',
+      })
+      const controller = new AbortController()
+      request.raw.on('close', () => controller.abort())
+      for await (const entry of conversation.streamEvents(thread.sessionId, cursor, controller.signal)) {
+        const payload = projectResearchView(entry.payload)
+        const event = payload.type === 'status' ? payload.status : payload.type
+        reply.raw.write(formatSseEvent({
+          id: `${entry.sessionId}:${entry.sequence}`, event: String(event), data: payload,
+        }))
+      }
+      reply.raw.end()
+    })
   app.get<{ Params: { id: string } }>('/api/analyses/:id', async (request, reply) => {
     const result = await analysis?.get(request.params.id)
     return result ? projectResearchView(result) : reply.status(404).send({ error: 'analysis_not_found' })
@@ -458,6 +607,12 @@ function parseLastEventId(value: string | undefined, sessionId: string) {
   const match = value.match(/^(.+):(0|[1-9]\d*)$/)
   if (!match || match[1] !== sessionId) return null
   const sequence = Number(match[2])
+  return Number.isSafeInteger(sequence) ? sequence : null
+}
+
+function parseEventSequence(value: string) {
+  if (!/^(0|[1-9]\d*)$/.test(value)) return null
+  const sequence = Number(value)
   return Number.isSafeInteger(sequence) ? sequence : null
 }
 

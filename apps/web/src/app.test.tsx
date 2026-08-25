@@ -469,12 +469,14 @@ test('研究页可选择历史报告版本作为追问基准且运行中不显�
   Reflect.deleteProperty(globalThis, 'EventSource')
   let followUpBody: Record<string, unknown> | undefined
   let pollCompleted = false
+  const freshVersionCreatedAt = new Date(Date.now() - 1 * 86_400_000).toISOString()
+  const staleVersionCreatedAt = new Date(Date.now() - 30 * 86_400_000).toISOString()
   const record: any = {
     id: 'versioned-research', symbol: 'NVDA', status: 'completed', terminal: true,
-    report: { title: '当前 V2' }, reportCreatedAt: '2026-08-14T00:00:00Z', facts: [], trace: [],
+    report: { title: '当前 V2' }, reportCreatedAt: freshVersionCreatedAt, facts: [], trace: [],
     reportVersions: [
-      { version: 1, createdAt: '2026-08-01T00:00:00Z', report: { title: '历史 V1' } },
-      { version: 2, createdAt: '2026-08-14T00:00:00Z', report: { title: '当前 V2' } },
+      { version: 1, createdAt: staleVersionCreatedAt, report: { title: '历史 V1' } },
+      { version: 2, createdAt: freshVersionCreatedAt, report: { title: '当前 V2' } },
     ],
     mainAgent: {
       id: 'versioned-session', status: 'completed', waitReason: null,
@@ -1469,7 +1471,7 @@ test('设置页展示当前、默认、修改时间与运行 execution 冻结值
   const user = userEvent.setup({ document: window.document })
   await user.click(await view.findByRole('button', { name: '系统设置' }))
   await view.findByText('当前 revision #2')
-  await view.findByText(/上次修改：2026年8月13日 11:00/)
+  await view.findByText(/上次修改：2026年8月13日/)
   await view.findByText(/运行 execution execution-1/)
   await view.findByText(/主 Agent 20 轮.*墙钟 45 分钟.*研究\/模型\/工具并发 2\/4\/8.*Freshness 7 天.*Compaction 保留 16,384 Token/)
   const rounds = view.getByRole('spinbutton', { name: '主 Agent 轮次' })

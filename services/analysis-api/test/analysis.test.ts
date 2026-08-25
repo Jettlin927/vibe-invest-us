@@ -103,6 +103,106 @@ async function waitForStatus(app: Awaited<ReturnType<typeof makeApp>>, id: strin
   throw new Error(`analysis_not_${expected}:${JSON.stringify(latest)}`)
 }
 
+async function waitForConversation(app: Awaited<ReturnType<typeof makeApp>>, id: string, expected: string) {
+  let latest: unknown
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const response = await app.inject({ method: 'GET', url: `/api/conversations/${id}` })
+    latest = response.json()
+    if ((latest as { thread?: { status?: string } }).thread?.status === expected) return latest
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  throw new Error(`conversation_not_${expected}:${JSON.stringify(latest)}`)
+}
+
+test('自由对话 Thread 可以创建、回放 SSE 并在同一 Thread 继续发送消息', async () => {
+  const model = {
+    ...fakeModel(),
+    async *analyzeConversation(input: { userPrompt: string }): AsyncGenerator<ModelEvent> {
+      yield { type: 'chat_completed', text: `回答：${input.userPrompt}`, operationId: `chat:${input.userPrompt}` }
+    },
+  }
+  const app = await makeApp(`conversation-${crypto.randomUUID()}`, model)
+  const created = await app.inject({
+    method: 'POST', url: '/api/conversations', payload: { message: '先解释风险，不要生成报告。' },
+  })
+  assert.equal(created.statusCode, 202)
+  const thread = created.json() as { id: string; sessionId: string }
+  const completed = await waitForConversation(app, thread.id, 'completed')
+  assert.match(JSON.stringify(completed), /回答：先解释风险，不要生成报告。/)
+  const events = await app.inject({ method: 'GET', url: `/api/conversations/${thread.id}/events` })
+  assert.equal(events.statusCode, 200)
+  assert.match(events.body, /event: chat_completed/)
+
+  const followUp = await app.inject({
+    method: 'POST', url: `/api/conversations/${thread.id}/messages`,
+    payload: { message: '继续说明失效条件。' },
+  })
+  assert.equal(followUp.statusCode, 202)
+  await waitForConversation(app, thread.id, 'completed')
+  const detail = await app.inject({ method: 'GET', url: `/api/conversations/${thread.id}` })
+  assert.match(JSON.stringify(detail.json()), /继续说明失效条件。/)
+  const followUpEvents = await app.inject({ method: 'GET', url: `/api/conversations/${thread.id}/events` })
+  assert.equal(followUpEvents.statusCode, 200)
+  assert.match(followUpEvents.body, /回答：继续说明失效条件。/)
+})
+
+test('自由对话可以创建并等待受控 subagent', async () => {
+  const model = {
+    ...fakeModel(),
+    async *analyzeConversation(input: {
+      userPrompt: string
+      executeTool: (name: string, params: unknown, signal: AbortSignal, onStart: () => Promise<void>) => Promise<any>
+    }): AsyncGenerator<ModelEvent> {
+      if (input.userPrompt === 'root') {
+        const result = await input.executeTool(
+          'spawn_agent', { goal: 'child', join: 'wait' }, new AbortController().signal, async () => {},
+        )
+        yield { type: 'chat_completed', text: JSON.stringify(result.result), operationId: 'root:completed' }
+        return
+      }
+      yield { type: 'chat_completed', text: 'child result', operationId: 'child:completed' }
+    },
+  }
+  const app = await makeApp(`subagent-${crypto.randomUUID()}`, model)
+  const created = await app.inject({ method: 'POST', url: '/api/conversations', payload: { message: 'root' } })
+  assert.equal(created.statusCode, 202)
+  const thread = created.json() as { id: string }
+  const completed = await waitForConversation(app, thread.id, 'completed')
+  assert.match(JSON.stringify(completed), /child result/)
+})
+
+test('自由对话停止时先 fencing 再 Abort，并可恢复为新 Run', async () => {
+  let startedResolve!: () => void
+  let runCount = 0
+  const started = new Promise<void>((resolve) => { startedResolve = resolve })
+  const model = {
+    ...fakeModel(),
+    async *analyzeConversation(input: { signal?: AbortSignal; userPrompt: string }): AsyncGenerator<ModelEvent> {
+      runCount += 1
+      if (runCount > 1) {
+        yield { type: 'chat_completed', text: 'resumed', operationId: 'resumed:completed' }
+        return
+      }
+      startedResolve()
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(resolve, 1000)
+        input.signal?.addEventListener('abort', () => { clearTimeout(timer); reject(input.signal?.reason) }, { once: true })
+      })
+      yield { type: 'chat_completed', text: input.userPrompt, operationId: 'never-reached' }
+    },
+  }
+  const app = await makeApp(`conversation-stop-${crypto.randomUUID()}`, model)
+  const created = await app.inject({ method: 'POST', url: '/api/conversations', payload: { message: 'running' } })
+  const id = created.json().id as string
+  await started
+  const stopped = await app.inject({ method: 'POST', url: `/api/conversations/${id}/cancel` })
+  assert.equal(stopped.statusCode, 202)
+  const detail = await waitForConversation(app, id, 'stopped')
+  assert.equal(detail.thread.status, 'stopped')
+  const resumed = await app.inject({ method: 'POST', url: `/api/conversations/${id}/resume` })
+  assert.equal(resumed.statusCode, 202)
+})
+
 test('创建分析立即返回标识并自动保存完成报告、快照、事实和轨迹', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'vibe-analysis-'))
   const app = await makeApp(join(dir, 'storage'))

@@ -7,7 +7,7 @@ import {
   type TokenUsageAggregate,
 } from '@vibe-invest/contracts'
 
-type Page = 'overview' | 'analysis' | 'research' | 'portfolio' | 'settings'
+type Page = 'overview' | 'analysis' | 'research' | 'conversation' | 'portfolio' | 'settings'
 type Position = { symbol: string; quantity: number; averageCost: number }
 type PortfolioPosition = Position & {
   costAmount: number; marketPrice: number | null; marketValue: number | null
@@ -96,11 +96,17 @@ type ResearchRecord = ResearchSummary & {
     } }
   }>
 }
+type ConversationThread = {
+  id: string; capability: string; parentThreadId?: string | null; title: string | null
+  status: string; createdAt: string; updatedAt: string; sessionId: string; executionId: string
+}
+type ConversationEvent = { sequence: number; type?: string; createdAt?: string; [key: string]: unknown }
 
 const pages: Array<{ id: Page; label: string }> = [
   { id: 'overview', label: '总览' },
   { id: 'analysis', label: '新建分析' },
   { id: 'research', label: '研究记录' },
+  { id: 'conversation', label: '研究对话' },
   { id: 'portfolio', label: '我的持仓' },
   { id: 'settings', label: '系统设置' },
 ]
@@ -114,8 +120,15 @@ export function App() {
   const [portfolio, setPortfolio] = useState<PortfolioOverview>(emptyPortfolio())
   const [portfolioHistory, setPortfolioHistory] = useState<PortfolioEquitySnapshot[]>([])
   const [portfolioEvents, setPortfolioEvents] = useState<PortfolioEvent[]>([])
+  const [portfolioLoaded, setPortfolioLoaded] = useState(false)
+  const [portfolioLoadFailed, setPortfolioLoadFailed] = useState(false)
+  const [portfolioRefreshing, setPortfolioRefreshing] = useState(true)
+  const portfolioLoadGeneration = useRef(0)
   const [records, setRecords] = useState<ResearchSummary[]>([])
   const [selectedResearch, setSelectedResearch] = useState<ResearchRecord | null>(null)
+  const [conversationThreads, setConversationThreads] = useState<ConversationThread[]>([])
+  const [selectedConversation, setSelectedConversation] = useState<ConversationThread | null>(null)
+  const [conversationEvents, setConversationEvents] = useState<ConversationEvent[]>([])
   const [analysisSymbol, setAnalysisSymbol] = useState('NVDA')
   const [analysisStatus, setAnalysisStatus] = useState('')
   const [analysisStages, setAnalysisStages] = useState<string[]>([])
@@ -124,20 +137,78 @@ export function App() {
   const [error, setError] = useState('')
 
   async function loadPortfolio() {
-    const response = await fetch('/api/portfolio')
-    const next = await response.json() as PortfolioOverview
-    const historyResponse = await fetch('/api/portfolio/history?limit=30')
-    const eventsResponse = await fetch('/api/portfolio/events?limit=50').catch(() => null)
-    setPortfolio(next)
-    setPortfolioHistory((await historyResponse.json() as { snapshots: PortfolioEquitySnapshot[] }).snapshots)
-    setPortfolioEvents(eventsResponse?.ok ? (await eventsResponse.json() as { events: PortfolioEvent[] }).events : [])
-    setPositions(next.positions.map(({ symbol, quantity, averageCost }) => ({ symbol, quantity, averageCost })))
+    const generation = ++portfolioLoadGeneration.current
+    let hasPortfolio = portfolioLoaded
+    setPortfolioLoadFailed(false)
+    setPortfolioRefreshing(true)
+    const storedRequest = fetch('/api/portfolio/stored')
+    const refreshedRequest = fetch('/api/portfolio').catch(() => null)
+    try {
+      const storedResponse = await storedRequest
+      const value: unknown = storedResponse.ok ? await storedResponse.json() : null
+      if (isPortfolioOverview(value) && generation === portfolioLoadGeneration.current) {
+        setPortfolio(value)
+        setPositions(value.positions.map(({ symbol, quantity, averageCost }) => ({ symbol, quantity, averageCost })))
+        setPortfolioLoaded(true)
+        hasPortfolio = true
+      }
+    } catch {
+      // Older instances may not expose the stored projection route yet.
+    }
+    try {
+      const response = await refreshedRequest
+      const value: unknown = response?.ok ? await response.json() : null
+      if (!isPortfolioOverview(value)) throw new Error('portfolio_contract_invalid')
+      if (generation !== portfolioLoadGeneration.current) return
+      setPortfolio(value)
+      setPositions(value.positions.map(({ symbol, quantity, averageCost }) => ({ symbol, quantity, averageCost })))
+      setPortfolioLoaded(true)
+      setPortfolioLoadFailed(false)
+      hasPortfolio = true
+    } catch {
+      if (generation === portfolioLoadGeneration.current) {
+        setError('组合行情刷新失败')
+        if (!hasPortfolio) setPortfolioLoadFailed(true)
+      }
+    } finally {
+      if (generation === portfolioLoadGeneration.current) setPortfolioRefreshing(false)
+    }
+    if (generation !== portfolioLoadGeneration.current) return
+    try {
+      const historyResponse = await fetch('/api/portfolio/history?limit=30')
+      const value: unknown = historyResponse.ok ? await historyResponse.json() : null
+      if (!isPortfolioHistoryResponse(value)) throw new Error('portfolio_history_contract_invalid')
+      if (generation === portfolioLoadGeneration.current) setPortfolioHistory(value.snapshots)
+    } catch {
+      if (generation === portfolioLoadGeneration.current) setError('组合权益历史读取失败')
+    }
+    if (generation !== portfolioLoadGeneration.current) return
+    try {
+      const eventsResponse = await fetch('/api/portfolio/events?limit=50')
+      if (eventsResponse.ok) {
+        const value = await eventsResponse.json() as { events?: PortfolioEvent[] }
+        if (generation === portfolioLoadGeneration.current) setPortfolioEvents(value.events ?? [])
+      }
+    } catch {
+      // Event ledger is supplementary to the portfolio projection.
+    }
   }
   async function loadResearch() {
     const response = await fetch('/api/research')
     const next = (await response.json()).records as ResearchSummary[]
     setRecords(next)
     if (!selectedResearch && next[0]) void openResearch(next[0].id)
+  }
+  async function loadConversations() {
+    try {
+      const response = await fetch('/api/conversations')
+      if (!response.ok) return
+      const next = await response.json() as { threads?: ConversationThread[] }
+      setConversationThreads(next.threads ?? [])
+      if (!selectedConversation && next.threads?.[0]) void openConversation(next.threads[0].id)
+    } catch {
+      // Older instances may not expose the conversation route yet.
+    }
   }
   async function loadSettings() {
     const value: unknown = await fetch('/api/settings').then((response) => response.json())
@@ -152,7 +223,7 @@ export function App() {
         setHealth(value)
       }),
       loadSettings(),
-      loadPortfolio(), loadResearch(),
+      loadPortfolio(), loadResearch(), loadConversations(),
     ]).catch((cause) => setError(cause instanceof Error ? cause.message : String(cause)))
   }, [])
   useEffect(() => {
@@ -298,6 +369,72 @@ export function App() {
     const response = await fetch(`/api/research/${id}`)
     if (response.ok) setSelectedResearch(await response.json())
   }
+  async function openConversation(id: string) {
+    const response = await fetch(`/api/conversations/${id}`)
+    if (!response.ok) return
+    const value = await response.json() as {
+      thread?: ConversationThread; lifecycle?: { events?: ConversationEvent[] }
+    }
+    if (!value.thread) return
+    setSelectedConversation(value.thread)
+    setConversationEvents(value.lifecycle?.events ?? [])
+  }
+  function streamConversation(sessionId: string, threadId: string, afterSequence = 0) {
+    if (!('EventSource' in globalThis)) return
+    const suffix = afterSequence > 0 ? `?after=${afterSequence}` : ''
+    const source = new EventSource(`/api/conversations/${threadId}/events${suffix}`)
+    const names = ['user_message', 'assistant_message', 'text_delta', 'tool_call', 'tool_result',
+      'running_model', 'running_tools', 'completed', 'failed', 'stopped', 'interrupted']
+    for (const name of names) source.addEventListener(name, (event) => {
+      const message = event as MessageEvent
+      const sequence = Number(message.lastEventId.split(':').at(-1))
+      if (Number.isInteger(sequence) && sequence <= afterSequence) return
+      const payload = JSON.parse(message.data) as ConversationEvent
+      if (Number.isInteger(sequence)) setConversationEvents((current) => (
+        current.some((entry) => entry.sequence === sequence)
+          ? current : [...current, { ...payload, sequence }]
+      ))
+      if (['completed', 'failed', 'stopped', 'interrupted'].includes(name)) {
+        source.close()
+        void openConversation(threadId).then(() => loadConversations())
+      }
+    })
+    source.onerror = () => { source.close(); void openConversation(threadId) }
+    void sessionId
+  }
+  async function startConversation(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const form = event.currentTarget
+    const message = String(new FormData(form).get('message') ?? '').trim()
+    if (!message) return
+    const response = await fetch('/api/conversations', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ message, messageId: crypto.randomUUID() }),
+    })
+    const result = await response.json() as ConversationThread
+    if (!response.ok || !result.id) { setError('研究对话创建失败'); return }
+    form.reset(); setSelectedConversation(result); setConversationEvents([]); setPage('conversation')
+    streamConversation(result.sessionId, result.id)
+    await loadConversations()
+  }
+  async function sendConversationMessage(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!selectedConversation) return
+    const form = event.currentTarget
+    const message = String(new FormData(form).get('message') ?? '').trim()
+    if (!message) return
+    const afterSequence = conversationEvents.reduce((latest, item) => Math.max(latest, item.sequence), 0)
+    const response = await fetch(`/api/conversations/${selectedConversation.id}/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ message, messageId: crypto.randomUUID() }),
+    })
+    const result = await response.json() as { sessionId?: string }
+    if (!response.ok || !result.sessionId) { setError('研究消息发送失败'); return }
+    form.reset(); streamConversation(result.sessionId, selectedConversation.id, afterSequence)
+  }
+  async function cancelConversation() {
+    if (selectedConversation) await fetch(`/api/conversations/${selectedConversation.id}/cancel`, { method: 'POST' })
+  }
   async function cancelAnalysis() {
     if (activeAnalysisId) await fetch(`/api/analyses/${activeAnalysisId}/cancel`, { method: 'POST' })
   }
@@ -397,7 +534,8 @@ export function App() {
       {page === 'overview' && <Overview records={records} selected={selectedResearch} positions={positions} health={health} modelConfigured={modelConfigured} onNavigate={navigate} onOpen={async (id) => { await openResearch(id); navigate('research') }} />}
       {page === 'analysis' && <AnalysisPage symbol={analysisSymbol} setSymbol={setAnalysisSymbol} status={analysisStatus} stages={analysisStages} active={Boolean(activeAnalysisId)} onStart={startAnalysis} onCancel={cancelAnalysis} health={health} modelConfigured={modelConfigured} records={records} onOpen={async (id) => { await openResearch(id); navigate('research') }} />}
       {page === 'research' && <ResearchPage records={records} record={selectedResearch} onOpen={openResearch} onUpdate={updateResearch} onDelete={removeResearch} deleting={deletingResearchId === selectedResearch?.id} onResume={resumeResearch} onFollowUp={sendFollowUp} onReanalyze={reanalyzeResearch} freshnessDays={runtimeSettings?.current.values.reportFreshnessDays ?? null} />}
-      {page === 'portfolio' && <PortfolioPage portfolio={portfolio} history={portfolioHistory} events={portfolioEvents} onSave={savePosition} onSaveCash={saveCash} onBuy={buyPosition} onReduce={reducePosition} onDelete={removePosition} />}
+      {page === 'conversation' && <ConversationPage threads={conversationThreads} thread={selectedConversation} events={conversationEvents} onOpen={openConversation} onCreate={startConversation} onSend={sendConversationMessage} onCancel={cancelConversation} />}
+      {page === 'portfolio' && <PortfolioPage portfolio={portfolio} history={portfolioHistory} events={portfolioEvents} loaded={portfolioLoaded} loadFailed={portfolioLoadFailed} refreshing={portfolioRefreshing} onSave={savePosition} onSaveCash={saveCash} onBuy={buyPosition} onReduce={reducePosition} onDelete={removePosition} />}
       {page === 'settings' && <SettingsPage health={health} modelConfigured={modelConfigured} settings={runtimeSettings} onReload={loadSettings} />}
     </main>
   </div>
@@ -440,6 +578,38 @@ function AnalysisPage({ symbol, setSymbol, status, stages, active, onStart, onCa
       <section className="pipeline"><p className="micro">02 / 分析进度</p>{pipeline.map((stage, index) => <div className={index < current ? 'done' : index === current ? 'active' : ''} key={stage}><i>{index + 1}</i><span>{pipelineLabel(stage)}</span><small>{index < current ? '完成' : index === current ? statusLabel(status) : '等待'}</small></div>)}</section>
       <section className="capabilities"><p className="micro">本次所需能力</p><StatusRow label="行情与历史数据" ready={health?.dependencies.financialData.status === 'ok'} /><StatusRow label="新闻与财报材料" ready={health?.dependencies.financialData.status === 'ok'} /><StatusRow label="确定性指标与估值" ready={health?.dependencies.financialData.status === 'ok'} /><StatusRow label="AI 综合分析" ready={modelConfigured} /><p className="callout">数据缺失时，依赖该数据的结论会关闭，并在报告中明确说明。</p></section>
       <section className="analysis-history" aria-label="分析历史"><header><div><p className="micro">分析历史</p><h2>继续之前的研究</h2></div><span>{records.length} 份记录</span></header>{records.length ? <div className="analysis-history-list">{records.map((record) => { const title = record.report?.title ?? `${record.symbol} · ${statusLabel(record.status)}`; return <button key={record.id} aria-label={`打开 ${title}`} onClick={() => void onOpen(record.id)}><strong>{record.symbol}</strong><span>{title}</span><small>{formatAnalysisDate(record.createdAt)} · {statusLabel(record.status)}</small><i aria-hidden="true">→</i></button> })}</div> : <p className="analysis-history-empty">还没有分析记录。完成第一份分析后，可从这里重新打开。</p>}</section>
+    </div>
+  </>
+}
+
+function ConversationPage({ threads, thread, events, onOpen, onCreate, onSend, onCancel }: {
+  threads: ConversationThread[]; thread: ConversationThread | null; events: ConversationEvent[]
+  onOpen: (id: string) => Promise<void>
+  onCreate: (event: React.FormEvent<HTMLFormElement>) => Promise<void>
+  onSend: (event: React.FormEvent<HTMLFormElement>) => Promise<void>
+  onCancel: () => Promise<void>
+}) {
+  const messages = events.reduce<Array<{ key: string; role: 'user' | 'assistant'; text: string }>>((all, event) => {
+    if (event.type === 'user_message' && typeof event.message === 'string') {
+      all.push({ key: `user-${event.sequence}`, role: 'user', text: event.message })
+    } else if (event.type === 'chat_completed' && typeof event.text === 'string') {
+      all.push({ key: `assistant-${event.sequence}`, role: 'assistant', text: event.text })
+    } else if (event.type === 'artifact_completed') {
+      all.push({ key: `artifact-${event.sequence}`, role: 'assistant', text: '研究报告 Artifact 已保存，可在研究记录中继续查看。' })
+    }
+    return all
+  }, [])
+  return <>
+    <PageHeader eyebrow="RESEARCH CONVERSATION" title="自由研究对话" description="先说你的问题，再决定是否取数、调用工具、委派子 Agent 或保存报告。" />
+    <div className="conversation-layout">
+      <aside className="conversation-threads"><p className="micro">会话 · {threads.length}</p>{threads.map((item) => <button key={item.id} className={item.id === thread?.id ? 'active' : ''} onClick={() => void onOpen(item.id)}><strong>{item.title || '未命名研究'}</strong><small>{statusLabel(item.status)}</small></button>)}</aside>
+      <section className="conversation-panel">
+        {!thread ? <><p className="conversation-empty">输入一个问题，创建第一条长期研究 Thread。</p><form className="conversation-composer" onSubmit={(event) => void onCreate(event)}><textarea name="message" aria-label="开始研究对话" placeholder="例如：比较 NVDA 和 MU 最近的财报风险，不要生成正式报告。" required /><button type="submit">开始对话</button></form></> : <>
+          <header className="conversation-header"><div><p className="micro">{thread.title || '研究 Thread'}</p><strong>{statusLabel(thread.status)}</strong></div>{['queued', 'running'].includes(thread.status) && <button className="quiet danger" onClick={() => void onCancel()}>停止</button>}</header>
+          <div className="conversation-messages">{messages.map((message) => <p key={message.key} className={message.role}><strong>{message.role === 'user' ? '你' : 'Agent'}</strong>{message.text}</p>)}{events.filter((event) => event.type === 'tool_call').map((event) => <details key={`tool-${event.sequence}`} className="conversation-tool"><summary>调用工具：{String(event.name ?? 'tool')}</summary><small>工具结果和参数按当前权限投影。</small></details>)}</div>
+          <form className="conversation-composer" onSubmit={(event) => void onSend(event)}><textarea name="message" aria-label="继续研究对话" placeholder="继续追问…" required /><button type="submit" disabled={['queued', 'running'].includes(thread.status)}>发送</button></form>
+        </>}
+      </section>
     </div>
   </>
 }
@@ -1143,10 +1313,13 @@ function ResearchReport({ record, onUpdate, onDelete, deleting, onResume, onFoll
   </article>
 }
 
-function PortfolioPage({ portfolio, history, events, onSave, onSaveCash, onBuy, onReduce, onDelete }: {
+function PortfolioPage({ portfolio, history, events, loaded, loadFailed, refreshing, onSave, onSaveCash, onBuy, onReduce, onDelete }: {
   portfolio: PortfolioOverview
   history: PortfolioEquitySnapshot[]
   events: PortfolioEvent[]
+  loaded: boolean
+  loadFailed: boolean
+  refreshing: boolean
   onSave: (event: React.FormEvent<HTMLFormElement>) => Promise<void>
   onSaveCash: (event: React.FormEvent<HTMLFormElement>) => Promise<void>
   onBuy: (symbol: string, quantity: number, price: number) => Promise<boolean>
@@ -1155,12 +1328,13 @@ function PortfolioPage({ portfolio, history, events, onSave, onSaveCash, onBuy, 
 }) {
   const [reducing, setReducing] = useState<PortfolioPosition | null>(null)
   const [buying, setBuying] = useState<PortfolioPosition | null>(null)
+  if (!loaded) return <><PageHeader eyebrow="PRIVATE PORTFOLIO" title="我的持仓" description="现金、持仓市值和盈亏共同构成你的组合语境；行情缺失时不猜测组合总值。" />{loadFailed ? <p className="error-banner" role="alert" aria-label="持仓读取失败，请稍后重试。">持仓读取失败，请稍后重试。</p> : <p className="chart-empty" role="status" aria-label="正在读取已保存的持仓…">正在读取已保存的持仓…</p>}</>
   return <><PageHeader eyebrow="PRIVATE PORTFOLIO" title="我的持仓" description="现金、持仓市值和盈亏共同构成你的组合语境；行情缺失时不猜测组合总值。" />
     <div className="portfolio-kpis">
       <PortfolioKpi label="组合总值" value={formatNullableMoney(portfolio.totalEquity)} note="持仓市值 + USD 现金" />
-      <PortfolioKpi label="持仓市值" value={formatNullableMoney(portfolio.totalMarketValue)} note={`${portfolio.pricedPositionCount}/${portfolio.positions.length} 项有行情`} />
+      <PortfolioKpi label="持仓市值" value={formatNullableMoney(portfolio.totalMarketValue)} note={refreshing ? '行情刷新中' : `${portfolio.pricedPositionCount}/${portfolio.positions.length} 项有行情`} />
       <PortfolioKpi label="USD 现金" value={formatMoney(portfolio.cash)} note={portfolio.totalEquity ? `占组合 ${formatPercent(portfolio.cash / portfolio.totalEquity)}` : '独立手工维护'} />
-      <PortfolioKpi label="未实现盈亏" value={formatSignedMoney(portfolio.totalUnrealizedProfitLoss)} note={portfolio.totalUnrealizedReturn === null ? '行情不可用' : formatSignedPercent(portfolio.totalUnrealizedReturn)} tone={portfolio.totalUnrealizedProfitLoss} />
+      <PortfolioKpi label="未实现盈亏" value={formatSignedMoney(portfolio.totalUnrealizedProfitLoss)} note={refreshing ? '行情刷新中' : portfolio.totalUnrealizedReturn === null ? '行情不可用' : formatSignedPercent(portfolio.totalUnrealizedReturn)} tone={portfolio.totalUnrealizedProfitLoss} />
     </div>
     <div className="portfolio-visuals">
       <PortfolioDonut portfolio={portfolio} />
@@ -1169,7 +1343,7 @@ function PortfolioPage({ portfolio, history, events, onSave, onSaveCash, onBuy, 
     </div>
     <EquityHistory history={history} />
     <section className="portfolio-holdings">
-      <header><div><p className="micro">当前持仓 · {portfolio.positions.length}</p><h2>组合明细</h2></div>{portfolio.unpricedPositionCount > 0 && <p className="data-warning">{portfolio.unpricedPositionCount} 项行情缺失，组合汇总已关闭。</p>}</header>
+      <header><div><p className="micro">当前持仓 · {portfolio.positions.length}</p><h2>组合明细</h2></div>{refreshing ? <p className="data-warning">正在刷新 {portfolio.positions.length} 项行情…</p> : portfolio.unpricedPositionCount > 0 && <p className="data-warning">{portfolio.unpricedPositionCount} 项行情缺失，组合汇总已关闭。</p>}</header>
       <div className="portfolio-table-scroll"><div className="portfolio-table-row head"><span>标的</span><span>数量</span><span>平均成本</span><span>当前价</span><span>市值</span><span>仓位</span><span>未实现盈亏</span><span /></div>
         {portfolio.positions.map((item) => <div className="portfolio-table-row" key={item.symbol}><strong>{item.symbol}</strong><span>{formatNumber(item.quantity)}</span><span>{formatMoney(item.averageCost)}</span><span>{formatNullableMoney(item.marketPrice)}</span><span>{formatNullableMoney(item.marketValue)}</span><span>{item.portfolioWeight === null ? '—' : formatPercent(item.portfolioWeight)}</span><span className={valueTone(item.unrealizedProfitLoss)}>{formatSignedMoney(item.unrealizedProfitLoss)}<small>{item.unrealizedReturn === null ? '' : formatSignedPercent(item.unrealizedReturn)}</small></span><span className="position-actions"><button className="quiet" onClick={() => setBuying(item)}>加仓</button><button className="quiet" onClick={() => setReducing(item)}>减仓</button><button className="text-button" onClick={() => void onDelete(item.symbol)}>删除</button></span></div>)}
         {!portfolio.positions.length && <p className="empty-row">尚未录入持仓。</p>}
@@ -1465,6 +1639,42 @@ function formatSignedPercent(value: number) { return `${value > 0 ? '+' : ''}${(
 function formatSignedPercentOrDash(value: number | null) { return value === null ? '—' : formatSignedPercent(value) }
 function valueTone(value?: number | null) { return value === undefined || value === null || value === 0 ? '' : value > 0 ? 'positive' : 'negative' }
 function emptyPortfolio(): PortfolioOverview { return { cash: 0, totalCost: 0, totalMarketValue: 0, totalEquity: 0, totalUnrealizedProfitLoss: 0, totalUnrealizedReturn: null, pricedPositionCount: 0, unpricedPositionCount: 0, positions: [] } }
+
+function isPortfolioOverview(value: unknown): value is PortfolioOverview {
+  if (!value || typeof value !== 'object') return false
+  const candidate = value as Record<string, unknown>
+  const requiredNumbers = ['cash', 'totalCost', 'pricedPositionCount', 'unpricedPositionCount']
+  const nullableNumbers = [
+    'totalMarketValue', 'totalEquity', 'totalUnrealizedProfitLoss', 'totalUnrealizedReturn',
+  ]
+  return requiredNumbers.every((key) => typeof candidate[key] === 'number' && Number.isFinite(candidate[key]))
+    && nullableNumbers.every((key) => candidate[key] === null || (typeof candidate[key] === 'number' && Number.isFinite(candidate[key])))
+    && Array.isArray(candidate.positions)
+    && candidate.positions.every((position) => {
+      if (!position || typeof position !== 'object') return false
+      const item = position as Record<string, unknown>
+      return typeof item.symbol === 'string'
+        && ['quantity', 'averageCost', 'costAmount'].every((key) => typeof item[key] === 'number' && Number.isFinite(item[key]))
+        && ['marketPrice', 'marketValue', 'unrealizedProfitLoss', 'unrealizedReturn', 'portfolioWeight']
+          .every((key) => item[key] === null || (typeof item[key] === 'number' && Number.isFinite(item[key])))
+    })
+}
+
+function isPortfolioHistoryResponse(value: unknown): value is { snapshots: PortfolioEquitySnapshot[] } {
+  if (!value || typeof value !== 'object') return false
+  const snapshots = (value as Record<string, unknown>).snapshots
+  return Array.isArray(snapshots) && snapshots.every((snapshot) => {
+    if (!snapshot || typeof snapshot !== 'object') return false
+    const item = snapshot as Record<string, unknown>
+    return typeof item.marketDay === 'string'
+      && typeof item.observedAt === 'string'
+      && typeof item.afterClose === 'boolean'
+      && ['totalEquity', 'totalMarketValue', 'cash', 'holdingsCount', 'pricedCount']
+        .every((key) => typeof item[key] === 'number' && Number.isFinite(item[key]))
+      && ['dailyChange', 'dailyReturn']
+        .every((key) => item[key] === null || (typeof item[key] === 'number' && Number.isFinite(item[key])))
+  })
+}
 function friendlyError(value: string) { if (value.startsWith('unknown_evidence:')) return 'AI 引用了一条不存在的报告依据，本次报告已被拒绝。'; if (value.includes('report_tool_required')) return 'AI 没有返回规定格式的报告，本次分析未保存为完成报告。'; if (value.includes('model_not_configured')) return '尚未配置 AI 模型，暂时不能创建新分析。'; if (value.includes('model_request_conflict')) return '模型请求审计发生冲突，请重新发起分析；这不表示 API Key 缺失。'; if (value.includes('model_')) return 'AI 模型调用失败，请检查模型配置后重试。'; if (value.includes('financial_context')) return '金融数据格式不完整，本次分析已停止以避免生成错误结论。'; return `分析没有完成：${value}` }
 
 function isReportOlderThan(createdAt: string | null | undefined, freshnessDays: number) {

@@ -3,7 +3,7 @@ import type { RuntimeSettings } from '@vibe-invest/contracts'
 
 import type { ActiveBudget } from './runtime-policy.js'
 import { createProjectedPiModel } from './projected-pi-model.js'
-import type { PiAgentAdapterMessage } from './agent-runtime/pi-agent-adapter.js'
+import type { PiAgentAdapterContent, PiAgentAdapterMessage } from './agent-runtime/pi-agent-adapter.js'
 
 type Fact = {
   id: string
@@ -39,6 +39,13 @@ type TraceEntry =
   | { type: 'runtime_resume'; content: RuntimeResume; operationId?: string }
   | { type: 'runtime_follow_up'; content: RuntimeFollowUp; operationId?: string }
   | { type: 'runtime_policy'; settings: RuntimeSettings; operationId?: string }
+  | {
+    type: 'assistant_message'
+    content: PiAgentAdapterContent[]
+    stopReason: string
+    usage: unknown
+    operationId: string
+  }
   | { type: 'model_event'; event: unknown; operationId?: string }
   | {
     type: 'tool_call'; name: string; toolCallId: string
@@ -104,6 +111,10 @@ export type ModelEvent =
   | {
     type: 'chat_completed'; text: string; usage?: unknown; stopReason?: string
     operationId?: string
+  }
+  | {
+    type: 'artifact_completed'; kind: 'research_report'
+    report: Record<string, unknown>; operationId?: string
   }
 
 export type AnalyzeInput = {
@@ -400,6 +411,39 @@ export type ToolRuntime = {
     id: string; executionId: string; attempt: number
     status: 'failed' | 'cancelled'; durationMs: number; usage: unknown; createdAt: string
   }): Promise<void>
+}
+
+export type ConversationToolExecutor = (
+  name: string,
+  params: unknown,
+  signal: AbortSignal,
+  onStart: () => Promise<void>,
+) => Promise<{
+  result: Record<string, unknown>
+  isError: boolean
+  terminate?: boolean
+  report?: AnalysisReport
+  reportVersion?: { kind: 'integrated' | 'specialist'; report: Record<string, unknown> }
+}>
+
+export type FreeConversationInput = {
+  executionId: string
+  runtimeSettings: RuntimeSettings
+  systemPrompt: string
+  userPrompt: string
+  symbol?: string
+  knownFacts: Fact[]
+  initialMessages?: PiAgentAdapterMessage[]
+  runtimeContext?: RuntimeContext
+  runtimeResume?: RuntimeResume
+  signal?: AbortSignal
+  executionDeadlineSignal?: AbortSignal
+  activeBudget?: ActiveBudget
+  acquireModelSlot?: (signal: AbortSignal) => Promise<() => void>
+  acquireToolSlot?: (signal: AbortSignal) => Promise<() => void>
+  toolRuntime: ToolRuntime
+  tools: Tool[]
+  executeTool: ConversationToolExecutor
 }
 
 export type ModelOptions = {
