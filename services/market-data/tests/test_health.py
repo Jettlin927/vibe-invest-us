@@ -38,6 +38,46 @@ def test_financial_data_runtime_disables_access_logs_that_can_include_tool_param
     assert "docker compose logs --no-color financial-data analysis-api" in verifier
 
 
+def test_financial_context_fetches_capabilities_concurrently(monkeypatch):
+    from app.models import DailyBar, NewsItem
+
+    barrier = threading.Barrier(4, timeout=0.5)
+    state = {"barrier_broken": False}
+    now = datetime(2026, 8, 12, tzinfo=timezone.utc)
+
+    class Source:
+        def __init__(self, name, value):
+            self.name = name
+            self.value = value
+
+        def fetch(self, _symbol):
+            try:
+                barrier.wait()
+            except threading.BrokenBarrierError:
+                state["barrier_broken"] = True
+            return self.value
+
+    sources = {
+        "quote": [Source("quote", Quote(price=123.5, observed_at=now, source_reference="quote://NVDA"))],
+        "history": [Source("history", [DailyBar(
+            date="2026-08-11", open=1, high=2, low=1, close=1.5, volume=100,
+        )])],
+        "news": [Source("news", [NewsItem(
+            title="NVDA update", source="test", published_at=now, fetched_at=now,
+            url="https://example.com/nvda", summary="update", symbols=["NVDA"],
+        )])],
+        "fundamentals": [Source("fundamentals", {})],
+        "valuation": [],
+    }
+    monkeypatch.setattr("app.main.build_sources", lambda _config, capability: sources[capability])
+
+    response = TestClient(app).post("/v1/financial-context", params={"symbol": "nvda"})
+
+    assert response.status_code == 200
+    assert state["barrier_broken"] is False
+    assert response.json()["symbol"] == "NVDA"
+
+
 def test_openapi_contract_matches_application():
     contract_path = Path(__file__).parents[3] / "contracts/market-data/openapi.json"
     contract = json.loads(contract_path.read_text())

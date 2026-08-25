@@ -1,5 +1,6 @@
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from hashlib import sha256
 from typing import Any, Iterable, List, Optional
@@ -30,6 +31,11 @@ from app.models import (
 from app.valuation import valuation_evidence
 
 
+_FINANCIAL_CONTEXT_EXECUTOR = ThreadPoolExecutor(
+    max_workers=8, thread_name_prefix="financial-context",
+)
+
+
 def build_financial_context(
     symbol: str,
     now: datetime,
@@ -40,34 +46,37 @@ def build_financial_context(
     valuation_source: Optional[Any] = None,
 ) -> FinancialContext:
     normalized_symbol = symbol.upper()
-    quote = _first_available(quote_sources, normalized_symbol)
-    history = _first_available(history_sources, normalized_symbol)
-    news = _collect_news(news_sources, normalized_symbol, now)
-    fundamentals = _first_available(
+    quote_future = _FINANCIAL_CONTEXT_EXECUTOR.submit(
+        _first_available, list(quote_sources), normalized_symbol,
+    )
+    history_future = _FINANCIAL_CONTEXT_EXECUTOR.submit(
+        _first_available, list(history_sources), normalized_symbol,
+    )
+    news_future = _FINANCIAL_CONTEXT_EXECUTOR.submit(
+        _collect_news, list(news_sources), normalized_symbol, now,
+    )
+    fundamentals_future = _FINANCIAL_CONTEXT_EXECUTOR.submit(
+        _first_available,
         [] if fundamentals_source is None else [fundamentals_source], normalized_symbol,
     )
-    valuation = None
-    valuation_sources = []
-    valuation_gap = DataGap(capability="valuation", reason="source_disabled") if valuation_source is None else None
+
+    quote = quote_future.result()
+    valuation_future = None
     if valuation_source is not None:
-        try:
-            quote_value = quote.value if isinstance(quote.value, Quote) else None
-            if hasattr(valuation_source, "fetch_with_market_price"):
-                valuation = valuation_source.fetch_with_market_price(
-                    normalized_symbol,
-                    quote_value.price if quote_value else None,
-                    quote_value.observed_at.isoformat() if quote_value else None,
-                )
-            else:
-                valuation = valuation_source.fetch(normalized_symbol)
-            valuation_sources.append(SourceStatus(
-                source=valuation_source.name, status="ok", item_count=1,
-            ))
-        except Exception as error:
-            valuation_gap = DataGap(capability="valuation", reason="source_unavailable")
-            valuation_sources.append(SourceStatus(
-                source=valuation_source.name, status="failed", error=_safe_error(error), item_count=0,
-            ))
+        quote_value = quote.value if isinstance(quote.value, Quote) else None
+        valuation_future = _FINANCIAL_CONTEXT_EXECUTOR.submit(
+            _fetch_valuation, valuation_source, normalized_symbol, quote_value,
+        )
+
+    history = history_future.result()
+    news = news_future.result()
+    fundamentals = fundamentals_future.result()
+    if valuation_future is None:
+        valuation = None
+        valuation_sources = []
+        valuation_gap = DataGap(capability="valuation", reason="source_disabled")
+    else:
+        valuation, valuation_sources, valuation_gap = valuation_future.result()
     gaps = []
     for capability, result in (("quote", quote), ("history", history), ("news", news), ("fundamentals", fundamentals)):
         if result.value is None and not result.items:
@@ -680,6 +689,23 @@ def _append_financial_facts(facts, symbol, now, fundamentals):
 
 def _first_available(sources: Iterable[Any], symbol: str) -> CapabilityResult:
     return _capability_result([_fetch_source(source, symbol) for source in sources])
+
+
+def _fetch_valuation(source, symbol: str, quote: Optional[Quote]):
+    try:
+        if hasattr(source, "fetch_with_market_price"):
+            value = source.fetch_with_market_price(
+                symbol,
+                quote.price if quote else None,
+                quote.observed_at.isoformat() if quote else None,
+            )
+        else:
+            value = source.fetch(symbol)
+        return value, [SourceStatus(source=source.name, status="ok", item_count=1)], None
+    except Exception as error:
+        return None, [SourceStatus(
+            source=source.name, status="failed", error=_safe_error(error), item_count=0,
+        )], DataGap(capability="valuation", reason="source_unavailable")
 
 
 def _first_available_batch(source_groups, scheduler) -> List[CapabilityResult]:
