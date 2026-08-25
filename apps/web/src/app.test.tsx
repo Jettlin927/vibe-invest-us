@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { JSDOM } from 'jsdom'
 import React from 'react'
-import { cleanup, render, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { defaultRuntimeSettings } from '@vibe-invest/contracts'
 
@@ -36,6 +36,24 @@ function portfolioResponse(positions: Array<{ symbol: string; quantity: number; 
     totalUnrealizedProfitLoss: 0, totalUnrealizedReturn: 0,
     pricedPositionCount: detailed.length, unpricedPositionCount: 0,
     positions: detailed.map((position) => ({ ...position, portfolioWeight: totalEquity ? position.marketValue / totalEquity : 0 })),
+  }
+}
+
+function storedPortfolioResponse(positions: Array<{ symbol: string; quantity: number; averageCost: number }>, cash = 0) {
+  const detailed = positions.map((position) => ({
+    ...position, costAmount: position.quantity * position.averageCost,
+    marketPrice: null, marketValue: null, unrealizedProfitLoss: null,
+    unrealizedReturn: null, portfolioWeight: null,
+  }))
+  const totalCost = detailed.reduce((sum, position) => sum + position.costAmount, 0)
+  return {
+    cash, totalCost,
+    totalMarketValue: detailed.length ? null : 0,
+    totalEquity: detailed.length ? null : cash,
+    totalUnrealizedProfitLoss: detailed.length ? null : 0,
+    totalUnrealizedReturn: null,
+    pricedPositionCount: 0, unpricedPositionCount: detailed.length,
+    positions: detailed,
   }
 }
 
@@ -76,6 +94,183 @@ test('用户保存持仓后能在持仓列表看到它', async () => {
   await user.click(view.getByRole('button', { name: '校准持仓' }))
   await view.findAllByText('NVDA')
   await view.findAllByText('US$1,260.00')
+})
+
+test('完整行情仍在刷新时持仓页先显示已保存的持仓', async () => {
+  setupDom()
+  let finishRefresh!: (response: Response) => void
+  const refreshedPortfolio = new Promise<Response>((resolve) => { finishRefresh = resolve })
+  let finishHistory!: (response: Response) => void
+  const portfolioHistory = new Promise<Response>((resolve) => { finishHistory = resolve })
+  let finishStored!: (response: Response) => void
+  const storedPortfolioRequest = new Promise<Response>((resolve) => { finishStored = resolve })
+  const storedPositions = ['NVDA', 'AMD', 'MSFT', 'AAPL', 'MU', 'AVGO', 'QCOM'].map((symbol) => ({
+    symbol, quantity: 10, averageCost: 100,
+  }))
+  const storedPortfolio = storedPortfolioResponse(storedPositions, 500)
+  globalThis.fetch = async (input) => {
+    const url = String(input)
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok', engine: 'postgresql', schemaVersion: 25 }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/settings') return Response.json(settingsResponse())
+    if (url === '/api/research') return Response.json({ records: [] })
+    if (url === '/api/portfolio/history?limit=30') return portfolioHistory
+    if (url === '/api/portfolio/events?limit=50') return Response.json({ events: [] })
+    if (url === '/api/portfolio/stored') return storedPortfolioRequest
+    if (url === '/api/portfolio') return refreshedPortfolio
+    throw new Error(`unexpected_fetch:${url}`)
+  }
+  const view = render(React.createElement(App))
+  const user = userEvent.setup({ document: window.document })
+  await user.click(await view.findByRole('button', { name: '我的持仓' }))
+
+  let storedFinished = false
+  let refreshFinished = false
+  let historyFinished = false
+  try {
+    await view.findByRole('status', { name: '正在读取已保存的持仓…' })
+    assert.equal(view.queryByText('尚未录入持仓。'), null)
+    assert.equal(view.queryByText('US$0.00'), null)
+    finishStored(Response.json(storedPortfolio))
+    storedFinished = true
+    await view.findAllByText('NVDA', {}, { timeout: 300 })
+    await view.findAllByText('10')
+    await view.findAllByText('US$100.00')
+    await view.findByText('当前持仓 · 7')
+    await view.findByText('正在刷新 7 项行情…')
+    finishRefresh(Response.json(portfolioResponse(storedPositions, 500)))
+    refreshFinished = true
+    await view.findByText('US$7,500.00')
+    await waitFor(() => assert.equal(view.queryByText('正在刷新 7 项行情…'), null))
+    finishHistory(Response.json({ currency: 'USD', snapshots: [{
+      marketDay: '2026-08-24', totalEquity: 7500, totalMarketValue: 7000, cash: 500,
+      holdingsCount: 7, pricedCount: 7, observedAt: '2026-08-24T20:05:00Z',
+      afterClose: true, dailyChange: null, dailyReturn: null,
+    }] }))
+    historyFinished = true
+    await view.findByText('2026-08-24')
+  } finally {
+    if (!storedFinished) finishStored(Response.json(storedPortfolio))
+    if (!refreshFinished) finishRefresh(Response.json(portfolioResponse(storedPositions, 500)))
+    if (!historyFinished) finishHistory(Response.json({ currency: 'USD', snapshots: [] }))
+  }
+})
+
+test('较早的慢行情不能覆盖写入后的新持仓', async () => {
+  setupDom()
+  const before = [{ symbol: 'NVDA', quantity: 10, averageCost: 100 }]
+  const after = [...before, { symbol: 'AMD', quantity: 5, averageCost: 80 }]
+  let storedCalls = 0
+  let liveCalls = 0
+  let finishOldLive!: (response: Response) => void
+  const oldLive = new Promise<Response>((resolve) => { finishOldLive = resolve })
+  let finishNewLive!: (response: Response) => void
+  const newLive = new Promise<Response>((resolve) => { finishNewLive = resolve })
+  globalThis.fetch = async (input, init) => {
+    const url = String(input)
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok', engine: 'postgresql', schemaVersion: 25 }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/settings') return Response.json(settingsResponse())
+    if (url === '/api/research') return Response.json({ records: [] })
+    if (url === '/api/portfolio/stored') {
+      storedCalls += 1
+      return Response.json(storedPortfolioResponse(storedCalls === 1 ? before : after, 500))
+    }
+    if (url === '/api/portfolio') {
+      liveCalls += 1
+      return liveCalls === 1 ? oldLive : newLive
+    }
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+    if (url === '/api/portfolio/events?limit=50') return Response.json({ events: [] })
+    if (url === '/api/positions/AMD' && init?.method === 'PUT') return Response.json(after[1])
+    throw new Error(`unexpected_fetch:${url}`)
+  }
+  const view = render(React.createElement(App))
+  const user = userEvent.setup({ document: window.document })
+  await user.click(await view.findByRole('button', { name: '我的持仓' }))
+  await view.findAllByText('NVDA')
+  await user.type(view.getByLabelText('股票代码'), 'AMD')
+  await user.type(view.getByLabelText('数量'), '5')
+  await user.type(view.getByLabelText('平均成本'), '80')
+  fireEvent.click(view.getByRole('button', { name: '校准持仓' }))
+  await view.findAllByText('AMD')
+  await view.findByText('正在刷新 2 项行情…')
+
+  let markOldJsonRead!: () => void
+  const oldJsonRead = new Promise<void>((resolve) => { markOldJsonRead = resolve })
+  let allowOldJsonReturn!: () => void
+  const oldJsonReturn = new Promise<void>((resolve) => { allowOldJsonReturn = resolve })
+  finishOldLive({
+    ok: true,
+    json: async () => {
+      markOldJsonRead()
+      await oldJsonReturn
+      return portfolioResponse(before, 500)
+    },
+  } as Response)
+  await oldJsonRead
+  allowOldJsonReturn()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+
+  assert.match(view.getByText(/当前持仓 ·/).textContent ?? '', /2/)
+  assert.ok(view.getAllByText('AMD').length > 0)
+  await view.findByText('正在刷新 2 项行情…')
+
+  let markNewJsonRead!: () => void
+  const newJsonRead = new Promise<void>((resolve) => { markNewJsonRead = resolve })
+  finishNewLive({
+    ok: true,
+    json: async () => {
+      markNewJsonRead()
+      return portfolioResponse(after, 500)
+    },
+  } as Response)
+  await newJsonRead
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.equal(view.queryByText('正在刷新 2 项行情…'), null)
+})
+
+test('实时行情失败时保留已保存的持仓', async () => {
+  setupDom()
+  const stored = storedPortfolioResponse([{ symbol: 'NVDA', quantity: 10, averageCost: 100 }], 500)
+  globalThis.fetch = async (input) => {
+    const url = String(input)
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok', engine: 'postgresql', schemaVersion: 25 }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/settings') return Response.json(settingsResponse())
+    if (url === '/api/research') return Response.json({ records: [] })
+    if (url === '/api/portfolio/stored') return Response.json(stored)
+    if (url === '/api/portfolio') return Response.json({ error: 'unavailable' }, { status: 503 })
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+    if (url === '/api/portfolio/events?limit=50') return Response.json({ events: [] })
+    throw new Error(`unexpected_fetch:${url}`)
+  }
+  const view = render(React.createElement(App))
+  const user = userEvent.setup({ document: window.document })
+  await user.click(await view.findByRole('button', { name: '我的持仓' }))
+
+  await view.findAllByText('NVDA')
+  await view.findByText('组合行情刷新失败')
+  assert.match(view.getByText(/当前持仓 ·/).textContent ?? '', /1/)
+})
+
+test('持仓和行情都失败时结束加载态', async () => {
+  setupDom()
+  globalThis.fetch = async (input) => {
+    const url = String(input)
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok', engine: 'postgresql', schemaVersion: 25 }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/settings') return Response.json(settingsResponse())
+    if (url === '/api/research') return Response.json({ records: [] })
+    if (url === '/api/portfolio/stored' || url === '/api/portfolio') {
+      return Response.json({ error: 'unavailable' }, { status: 503 })
+    }
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+    if (url === '/api/portfolio/events?limit=50') return Response.json({ events: [] })
+    throw new Error(`unexpected_fetch:${url}`)
+  }
+  const view = render(React.createElement(App))
+  const user = userEvent.setup({ document: window.document })
+  await user.click(await view.findByRole('button', { name: '我的持仓' }))
+
+  await view.findByRole('alert', { name: '持仓读取失败，请稍后重试。' })
+  assert.equal(view.queryByRole('status', { name: '正在读取已保存的持仓…' }), null)
 })
 
 test('持仓页展示现金、盈亏和仓位，并能减仓后把卖出所得计入现金', async () => {

@@ -1,5 +1,7 @@
 import json
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from email.message import Message
 from pathlib import Path
 
@@ -254,6 +256,147 @@ def test_quote_batch_uses_fallback_without_exposing_provider_payload(monkeypatch
     }
 
 
+def test_quote_batch_refreshes_symbols_concurrently(monkeypatch):
+    refresh_barrier = threading.Barrier(4, timeout=0.5)
+
+    class QuoteSource:
+        name = "quote"
+        def __init__(self, timeout=15):
+            self.timeout = timeout
+        def fetch(self, symbol):
+            refresh_barrier.wait()
+            return Quote(
+                price=123.5,
+                observed_at=datetime(2026, 8, 12, tzinfo=timezone.utc),
+                source_reference=f"https://example.com/{symbol}",
+            )
+
+    monkeypatch.setitem(__import__("app.main", fromlist=["source_config"]).source_config, "quote", [
+        {"name": "quote", "enabled": True, "priority": 10},
+    ])
+    monkeypatch.setitem(__import__("app.source_config", fromlist=["SOURCE_CLASSES"]).SOURCE_CLASSES, "quote", {
+        "quote": QuoteSource,
+    })
+
+    response = TestClient(app).post("/v1/quotes", json=["nvda", "amd", "msft", "aapl"])
+
+    assert response.status_code == 200
+    assert [quote["price"] for quote in response.json()["quotes"]] == [123.5] * 4
+
+
+def test_quote_batch_refreshes_sources_concurrently_without_dropping_diagnostics(monkeypatch):
+    source_barrier = threading.Barrier(2, timeout=0.5)
+
+    class PrimarySource:
+        name = "primary"
+        def __init__(self, timeout=15):
+            self.timeout = timeout
+        def fetch(self, symbol):
+            source_barrier.wait()
+            return Quote(
+                price=123.5,
+                observed_at=datetime(2026, 8, 12, tzinfo=timezone.utc),
+                source_reference=f"https://primary.example.com/{symbol}",
+            )
+
+    class BackupSource:
+        name = "backup"
+        def __init__(self, timeout=15):
+            self.timeout = timeout
+        def fetch(self, symbol):
+            source_barrier.wait()
+            return Quote(
+                price=999,
+                observed_at=datetime(2026, 8, 12, tzinfo=timezone.utc),
+                source_reference=f"https://backup.example.com/{symbol}",
+            )
+
+    monkeypatch.setitem(__import__("app.main", fromlist=["source_config"]).source_config, "quote", [
+        {"name": "primary", "enabled": True, "priority": 10},
+        {"name": "backup", "enabled": True, "priority": 20},
+    ])
+    monkeypatch.setitem(__import__("app.source_config", fromlist=["SOURCE_CLASSES"]).SOURCE_CLASSES, "quote", {
+        "primary": PrimarySource,
+        "backup": BackupSource,
+    })
+
+    response = TestClient(app).post("/v1/quotes", json=["nvda"])
+
+    assert response.status_code == 200
+    assert response.json()["quotes"][0] == {
+        "symbol": "NVDA", "price": 123.5,
+        "observed_at": "2026-08-12T00:00:00Z", "source": "primary",
+        "degraded": False,
+        "sources": [
+            {"source": "primary", "status": "ok", "error": None, "item_count": 1},
+            {"source": "backup", "status": "ok", "error": None, "item_count": 1},
+        ],
+    }
+
+
+def test_quote_batch_does_not_starve_small_requests_behind_large_batch(monkeypatch):
+    first_wave_started = threading.Event()
+    release_first_wave = threading.Event()
+    hold_remaining = threading.Event()
+    started_lock = threading.Lock()
+    started_count = 0
+    active_count = 0
+    maximum_active = 0
+
+    class QuoteSource:
+        name = "quote"
+        def __init__(self, timeout=15):
+            self.timeout = timeout
+        def fetch(self, symbol):
+            nonlocal active_count, maximum_active, started_count
+            if symbol != "FAST":
+                with started_lock:
+                    started_count += 1
+                    active_count += 1
+                    maximum_active = max(maximum_active, active_count)
+                    task_number = started_count
+                    if started_count == 8:
+                        first_wave_started.set()
+                try:
+                    if task_number <= 8:
+                        release_first_wave.wait(timeout=2)
+                    else:
+                        hold_remaining.wait(timeout=2)
+                finally:
+                    with started_lock:
+                        active_count -= 1
+            return Quote(
+                price=123.5,
+                observed_at=datetime(2026, 8, 12, tzinfo=timezone.utc),
+                source_reference=f"https://example.com/{symbol}",
+            )
+
+    monkeypatch.setitem(__import__("app.main", fromlist=["source_config"]).source_config, "quote", [
+        {"name": "quote", "enabled": True, "priority": 10},
+    ])
+    monkeypatch.setitem(__import__("app.source_config", fromlist=["SOURCE_CLASSES"]).SOURCE_CLASSES, "quote", {
+        "quote": QuoteSource,
+    })
+
+    client = TestClient(app)
+    with ThreadPoolExecutor(max_workers=5) as requests:
+        large = [requests.submit(
+            client.post, "/v1/quotes", json=[f"L{batch}-{index}" for index in range(100)],
+        ) for batch in range(4)]
+        assert first_wave_started.wait(timeout=1)
+        small = requests.submit(client.post, "/v1/quotes", json=["FAST"])
+        while not small.running():
+            time.sleep(0.001)
+        time.sleep(0.05)
+        release_first_wave.set()
+        try:
+            assert small.result(timeout=0.5).json()["quotes"][0]["price"] == 123.5
+        finally:
+            hold_remaining.set()
+        assert all(request.result(timeout=2).status_code == 200 for request in large)
+    assert maximum_active == 8
+
+
 def test_quote_batch_treats_empty_response_as_gap_and_falls_back(monkeypatch):
     class EmptySource:
         name = "primary"
@@ -335,6 +478,28 @@ def test_diagnostic_sample_is_bounded_redacted_and_expires(tmp_path):
     assert "me@example.com" not in content
     assert len(samples[0].read_bytes()) <= 128
     configure_diagnostics(False, tmp_path, max_bytes=128, retention_hours=1)
+
+
+def test_diagnostic_samples_are_safe_during_concurrent_quote_refresh(tmp_path):
+    configure_diagnostics(True, tmp_path, max_bytes=128, retention_hours=1)
+    old_time = time.time() - 7200
+    for index in range(100):
+        expired = tmp_path / f"expired-{index}.sample"
+        expired.write_text("old")
+        __import__("os").utime(expired, (old_time, old_time))
+    first_wave = threading.Barrier(8, timeout=1)
+
+    def write_sample(index):
+        if index < 8:
+            first_wave.wait()
+        _diagnose(f"https://example.com/{index}", b'{"price":123.5}')
+
+    try:
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            list(executor.map(write_sample, range(21)))
+        assert len(list(tmp_path.glob("*.sample"))) == 21
+    finally:
+        configure_diagnostics(False, tmp_path, max_bytes=128, retention_hours=1)
 
 
 def test_document_url_rejects_non_http_and_non_public_addresses(monkeypatch):

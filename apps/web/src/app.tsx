@@ -114,6 +114,10 @@ export function App() {
   const [portfolio, setPortfolio] = useState<PortfolioOverview>(emptyPortfolio())
   const [portfolioHistory, setPortfolioHistory] = useState<PortfolioEquitySnapshot[]>([])
   const [portfolioEvents, setPortfolioEvents] = useState<PortfolioEvent[]>([])
+  const [portfolioLoaded, setPortfolioLoaded] = useState(false)
+  const [portfolioLoadFailed, setPortfolioLoadFailed] = useState(false)
+  const [portfolioRefreshing, setPortfolioRefreshing] = useState(true)
+  const portfolioLoadGeneration = useRef(0)
   const [records, setRecords] = useState<ResearchSummary[]>([])
   const [selectedResearch, setSelectedResearch] = useState<ResearchRecord | null>(null)
   const [analysisSymbol, setAnalysisSymbol] = useState('NVDA')
@@ -124,14 +128,60 @@ export function App() {
   const [error, setError] = useState('')
 
   async function loadPortfolio() {
-    const response = await fetch('/api/portfolio')
-    const next = await response.json() as PortfolioOverview
-    const historyResponse = await fetch('/api/portfolio/history?limit=30')
-    const eventsResponse = await fetch('/api/portfolio/events?limit=50').catch(() => null)
-    setPortfolio(next)
-    setPortfolioHistory((await historyResponse.json() as { snapshots: PortfolioEquitySnapshot[] }).snapshots)
-    setPortfolioEvents(eventsResponse?.ok ? (await eventsResponse.json() as { events: PortfolioEvent[] }).events : [])
-    setPositions(next.positions.map(({ symbol, quantity, averageCost }) => ({ symbol, quantity, averageCost })))
+    const generation = ++portfolioLoadGeneration.current
+    let hasPortfolio = portfolioLoaded
+    setPortfolioLoadFailed(false)
+    setPortfolioRefreshing(true)
+    const storedRequest = fetch('/api/portfolio/stored')
+    const refreshedRequest = fetch('/api/portfolio').catch(() => null)
+    try {
+      const storedResponse = await storedRequest
+      const value: unknown = storedResponse.ok ? await storedResponse.json() : null
+      if (isPortfolioOverview(value) && generation === portfolioLoadGeneration.current) {
+        setPortfolio(value)
+        setPositions(value.positions.map(({ symbol, quantity, averageCost }) => ({ symbol, quantity, averageCost })))
+        setPortfolioLoaded(true)
+        hasPortfolio = true
+      }
+    } catch {
+      // Older instances may not expose the stored projection route yet.
+    }
+    try {
+      const response = await refreshedRequest
+      const value: unknown = response?.ok ? await response.json() : null
+      if (!isPortfolioOverview(value)) throw new Error('portfolio_contract_invalid')
+      if (generation !== portfolioLoadGeneration.current) return
+      setPortfolio(value)
+      setPositions(value.positions.map(({ symbol, quantity, averageCost }) => ({ symbol, quantity, averageCost })))
+      setPortfolioLoaded(true)
+      setPortfolioLoadFailed(false)
+      hasPortfolio = true
+    } catch {
+      if (generation === portfolioLoadGeneration.current) {
+        setError('组合行情刷新失败')
+        if (!hasPortfolio) setPortfolioLoadFailed(true)
+      }
+    } finally {
+      if (generation === portfolioLoadGeneration.current) setPortfolioRefreshing(false)
+    }
+    if (generation !== portfolioLoadGeneration.current) return
+    const [historyResponse, eventsResponse] = await Promise.all([
+      fetch('/api/portfolio/history?limit=30').catch(() => null),
+      fetch('/api/portfolio/events?limit=50').catch(() => null),
+    ])
+    try {
+      const value: unknown = historyResponse?.ok ? await historyResponse.json() : null
+      if (!isPortfolioHistoryResponse(value)) throw new Error('portfolio_history_contract_invalid')
+      if (generation === portfolioLoadGeneration.current) setPortfolioHistory(value.snapshots)
+    } catch {
+      if (generation === portfolioLoadGeneration.current) setError('组合权益历史读取失败')
+    }
+    if (eventsResponse?.ok) {
+      const value: unknown = await eventsResponse.json().catch(() => null)
+      if (isPortfolioEventsResponse(value) && generation === portfolioLoadGeneration.current) {
+        setPortfolioEvents(value.events)
+      }
+    }
   }
   async function loadResearch() {
     const response = await fetch('/api/research')
@@ -397,7 +447,7 @@ export function App() {
       {page === 'overview' && <Overview records={records} selected={selectedResearch} positions={positions} health={health} modelConfigured={modelConfigured} onNavigate={navigate} onOpen={async (id) => { await openResearch(id); navigate('research') }} />}
       {page === 'analysis' && <AnalysisPage symbol={analysisSymbol} setSymbol={setAnalysisSymbol} status={analysisStatus} stages={analysisStages} active={Boolean(activeAnalysisId)} onStart={startAnalysis} onCancel={cancelAnalysis} health={health} modelConfigured={modelConfigured} records={records} onOpen={async (id) => { await openResearch(id); navigate('research') }} />}
       {page === 'research' && <ResearchPage records={records} record={selectedResearch} onOpen={openResearch} onUpdate={updateResearch} onDelete={removeResearch} deleting={deletingResearchId === selectedResearch?.id} onResume={resumeResearch} onFollowUp={sendFollowUp} onReanalyze={reanalyzeResearch} freshnessDays={runtimeSettings?.current.values.reportFreshnessDays ?? null} />}
-      {page === 'portfolio' && <PortfolioPage portfolio={portfolio} history={portfolioHistory} events={portfolioEvents} onSave={savePosition} onSaveCash={saveCash} onBuy={buyPosition} onReduce={reducePosition} onDelete={removePosition} />}
+      {page === 'portfolio' && <PortfolioPage portfolio={portfolio} history={portfolioHistory} events={portfolioEvents} loaded={portfolioLoaded} loadFailed={portfolioLoadFailed} refreshing={portfolioRefreshing} onSave={savePosition} onSaveCash={saveCash} onBuy={buyPosition} onReduce={reducePosition} onDelete={removePosition} />}
       {page === 'settings' && <SettingsPage health={health} modelConfigured={modelConfigured} settings={runtimeSettings} onReload={loadSettings} />}
     </main>
   </div>
@@ -1143,10 +1193,13 @@ function ResearchReport({ record, onUpdate, onDelete, deleting, onResume, onFoll
   </article>
 }
 
-function PortfolioPage({ portfolio, history, events, onSave, onSaveCash, onBuy, onReduce, onDelete }: {
+function PortfolioPage({ portfolio, history, events, loaded, loadFailed, refreshing, onSave, onSaveCash, onBuy, onReduce, onDelete }: {
   portfolio: PortfolioOverview
   history: PortfolioEquitySnapshot[]
   events: PortfolioEvent[]
+  loaded: boolean
+  loadFailed: boolean
+  refreshing: boolean
   onSave: (event: React.FormEvent<HTMLFormElement>) => Promise<void>
   onSaveCash: (event: React.FormEvent<HTMLFormElement>) => Promise<void>
   onBuy: (symbol: string, quantity: number, price: number) => Promise<boolean>
@@ -1155,12 +1208,13 @@ function PortfolioPage({ portfolio, history, events, onSave, onSaveCash, onBuy, 
 }) {
   const [reducing, setReducing] = useState<PortfolioPosition | null>(null)
   const [buying, setBuying] = useState<PortfolioPosition | null>(null)
+  if (!loaded) return <><PageHeader eyebrow="PRIVATE PORTFOLIO" title="我的持仓" description="现金、持仓市值和盈亏共同构成你的组合语境；行情缺失时不猜测组合总值。" />{loadFailed ? <p className="error-banner" role="alert" aria-label="持仓读取失败，请稍后重试。">持仓读取失败，请稍后重试。</p> : <p className="chart-empty" role="status" aria-label="正在读取已保存的持仓…">正在读取已保存的持仓…</p>}</>
   return <><PageHeader eyebrow="PRIVATE PORTFOLIO" title="我的持仓" description="现金、持仓市值和盈亏共同构成你的组合语境；行情缺失时不猜测组合总值。" />
     <div className="portfolio-kpis">
       <PortfolioKpi label="组合总值" value={formatNullableMoney(portfolio.totalEquity)} note="持仓市值 + USD 现金" />
-      <PortfolioKpi label="持仓市值" value={formatNullableMoney(portfolio.totalMarketValue)} note={`${portfolio.pricedPositionCount}/${portfolio.positions.length} 项有行情`} />
+      <PortfolioKpi label="持仓市值" value={formatNullableMoney(portfolio.totalMarketValue)} note={refreshing ? '行情刷新中' : `${portfolio.pricedPositionCount}/${portfolio.positions.length} 项有行情`} />
       <PortfolioKpi label="USD 现金" value={formatMoney(portfolio.cash)} note={portfolio.totalEquity ? `占组合 ${formatPercent(portfolio.cash / portfolio.totalEquity)}` : '独立手工维护'} />
-      <PortfolioKpi label="未实现盈亏" value={formatSignedMoney(portfolio.totalUnrealizedProfitLoss)} note={portfolio.totalUnrealizedReturn === null ? '行情不可用' : formatSignedPercent(portfolio.totalUnrealizedReturn)} tone={portfolio.totalUnrealizedProfitLoss} />
+      <PortfolioKpi label="未实现盈亏" value={formatSignedMoney(portfolio.totalUnrealizedProfitLoss)} note={refreshing ? '行情刷新中' : portfolio.totalUnrealizedReturn === null ? '行情不可用' : formatSignedPercent(portfolio.totalUnrealizedReturn)} tone={portfolio.totalUnrealizedProfitLoss} />
     </div>
     <div className="portfolio-visuals">
       <PortfolioDonut portfolio={portfolio} />
@@ -1169,7 +1223,7 @@ function PortfolioPage({ portfolio, history, events, onSave, onSaveCash, onBuy, 
     </div>
     <EquityHistory history={history} />
     <section className="portfolio-holdings">
-      <header><div><p className="micro">当前持仓 · {portfolio.positions.length}</p><h2>组合明细</h2></div>{portfolio.unpricedPositionCount > 0 && <p className="data-warning">{portfolio.unpricedPositionCount} 项行情缺失，组合汇总已关闭。</p>}</header>
+      <header><div><p className="micro">当前持仓 · {portfolio.positions.length}</p><h2>组合明细</h2></div>{refreshing ? <p className="data-warning">正在刷新 {portfolio.positions.length} 项行情…</p> : portfolio.unpricedPositionCount > 0 && <p className="data-warning">{portfolio.unpricedPositionCount} 项行情缺失，组合汇总已关闭。</p>}</header>
       <div className="portfolio-table-scroll"><div className="portfolio-table-row head"><span>标的</span><span>数量</span><span>平均成本</span><span>当前价</span><span>市值</span><span>仓位</span><span>未实现盈亏</span><span /></div>
         {portfolio.positions.map((item) => <div className="portfolio-table-row" key={item.symbol}><strong>{item.symbol}</strong><span>{formatNumber(item.quantity)}</span><span>{formatMoney(item.averageCost)}</span><span>{formatNullableMoney(item.marketPrice)}</span><span>{formatNullableMoney(item.marketValue)}</span><span>{item.portfolioWeight === null ? '—' : formatPercent(item.portfolioWeight)}</span><span className={valueTone(item.unrealizedProfitLoss)}>{formatSignedMoney(item.unrealizedProfitLoss)}<small>{item.unrealizedReturn === null ? '' : formatSignedPercent(item.unrealizedReturn)}</small></span><span className="position-actions"><button className="quiet" onClick={() => setBuying(item)}>加仓</button><button className="quiet" onClick={() => setReducing(item)}>减仓</button><button className="text-button" onClick={() => void onDelete(item.symbol)}>删除</button></span></div>)}
         {!portfolio.positions.length && <p className="empty-row">尚未录入持仓。</p>}
@@ -1465,6 +1519,46 @@ function formatSignedPercent(value: number) { return `${value > 0 ? '+' : ''}${(
 function formatSignedPercentOrDash(value: number | null) { return value === null ? '—' : formatSignedPercent(value) }
 function valueTone(value?: number | null) { return value === undefined || value === null || value === 0 ? '' : value > 0 ? 'positive' : 'negative' }
 function emptyPortfolio(): PortfolioOverview { return { cash: 0, totalCost: 0, totalMarketValue: 0, totalEquity: 0, totalUnrealizedProfitLoss: 0, totalUnrealizedReturn: null, pricedPositionCount: 0, unpricedPositionCount: 0, positions: [] } }
+
+function isPortfolioOverview(value: unknown): value is PortfolioOverview {
+  if (!value || typeof value !== 'object') return false
+  const candidate = value as Record<string, unknown>
+  const requiredNumbers = ['cash', 'totalCost', 'pricedPositionCount', 'unpricedPositionCount']
+  const nullableNumbers = [
+    'totalMarketValue', 'totalEquity', 'totalUnrealizedProfitLoss', 'totalUnrealizedReturn',
+  ]
+  return requiredNumbers.every((key) => typeof candidate[key] === 'number' && Number.isFinite(candidate[key]))
+    && nullableNumbers.every((key) => candidate[key] === null || (typeof candidate[key] === 'number' && Number.isFinite(candidate[key])))
+    && Array.isArray(candidate.positions)
+    && candidate.positions.every((position) => {
+      if (!position || typeof position !== 'object') return false
+      const item = position as Record<string, unknown>
+      return typeof item.symbol === 'string'
+        && ['quantity', 'averageCost', 'costAmount'].every((key) => typeof item[key] === 'number' && Number.isFinite(item[key]))
+        && ['marketPrice', 'marketValue', 'unrealizedProfitLoss', 'unrealizedReturn', 'portfolioWeight']
+          .every((key) => item[key] === null || (typeof item[key] === 'number' && Number.isFinite(item[key])))
+    })
+}
+
+function isPortfolioHistoryResponse(value: unknown): value is { snapshots: PortfolioEquitySnapshot[] } {
+  if (!value || typeof value !== 'object') return false
+  const snapshots = (value as Record<string, unknown>).snapshots
+  return Array.isArray(snapshots) && snapshots.every((snapshot) => {
+    if (!snapshot || typeof snapshot !== 'object') return false
+    const item = snapshot as Record<string, unknown>
+    return typeof item.marketDay === 'string'
+      && typeof item.observedAt === 'string'
+      && typeof item.afterClose === 'boolean'
+      && ['totalEquity', 'totalMarketValue', 'cash', 'holdingsCount', 'pricedCount']
+        .every((key) => typeof item[key] === 'number' && Number.isFinite(item[key]))
+      && ['dailyChange', 'dailyReturn']
+        .every((key) => item[key] === null || (typeof item[key] === 'number' && Number.isFinite(item[key])))
+  })
+}
+
+function isPortfolioEventsResponse(value: unknown): value is { events: PortfolioEvent[] } {
+  return !!value && typeof value === 'object' && Array.isArray((value as Record<string, unknown>).events)
+}
 function friendlyError(value: string) { if (value.startsWith('unknown_evidence:')) return 'AI 引用了一条不存在的报告依据，本次报告已被拒绝。'; if (value.includes('report_tool_required')) return 'AI 没有返回规定格式的报告，本次分析未保存为完成报告。'; if (value.includes('model_not_configured')) return '尚未配置 AI 模型，暂时不能创建新分析。'; if (value.includes('model_request_conflict')) return '模型请求审计发生冲突，请重新发起分析；这不表示 API Key 缺失。'; if (value.includes('model_')) return 'AI 模型调用失败，请检查模型配置后重试。'; if (value.includes('financial_context')) return '金融数据格式不完整，本次分析已停止以避免生成错误结论。'; return `分析没有完成：${value}` }
 
 function isReportOlderThan(createdAt: string | null | undefined, freshnessDays: number) {
