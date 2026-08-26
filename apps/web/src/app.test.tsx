@@ -18,7 +18,9 @@ function setupDom() {
   Object.assign(dom.window.HTMLElement.prototype, { attachEvent() {}, detachEvent() {} })
   Object.defineProperty(dom.window.HTMLCanvasElement.prototype, 'getContext', { value: () => null, configurable: true })
   Object.defineProperty(dom.window, 'scrollTo', { value: () => undefined, configurable: true })
+  Object.defineProperty(dom.window.crypto, 'randomUUID', { value: undefined, configurable: true })
   Object.defineProperty(globalThis, 'navigator', { value: dom.window.navigator, configurable: true })
+  Object.defineProperty(globalThis, 'crypto', { value: dom.window.crypto, configurable: true })
 }
 
 test.afterEach(() => cleanup())
@@ -68,6 +70,82 @@ function settingsResponse(overrides: Partial<Record<keyof typeof defaultRuntimeS
     activeExecutions: [],
   }
 }
+
+test('普通 HTTP 环境仍能发送研究对话消息', async () => {
+  setupDom()
+  Reflect.deleteProperty(globalThis, 'EventSource')
+  const thread = {
+    id: 'thread-1', capability: 'research', parentThreadId: null, title: '迈威尔研究',
+    status: 'completed', createdAt: '2026-08-25T00:00:00Z', updatedAt: '2026-08-25T00:00:00Z',
+    sessionId: 'session-1', executionId: 'execution-1',
+  }
+  let sentBody: Record<string, unknown> | undefined
+  globalThis.fetch = async (input, init) => {
+    const url = String(input)
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok', engine: 'postgresql', schemaVersion: 26 }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/settings') return Response.json({ ...settingsResponse(), model: { configured: true } })
+    if (url === '/api/portfolio/stored' || url === '/api/portfolio') return Response.json(portfolioResponse([]))
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+    if (url === '/api/portfolio/events?limit=50') return Response.json({ events: [] })
+    if (url === '/api/research') return Response.json({ records: [] })
+    if (url === '/api/conversations') return Response.json({ threads: [thread] })
+    if (url === '/api/conversations/thread-1') return Response.json({ thread, lifecycle: { events: [] } })
+    if (url === '/api/conversations/thread-1/messages' && init?.method === 'POST') {
+      sentBody = JSON.parse(String(init.body))
+      return Response.json({ sessionId: 'session-1', executionId: 'execution-2' }, { status: 202 })
+    }
+    throw new Error(`unexpected_fetch:${url}`)
+  }
+
+  const view = render(React.createElement(App))
+  const user = userEvent.setup({ document: window.document })
+  await user.click(await view.findByRole('button', { name: '研究对话' }))
+  await user.type(await view.findByLabelText('继续研究对话'), '分析 MRVL')
+  await user.click(view.getByRole('button', { name: '发送' }))
+  await waitFor(() => {
+    assert.equal(sentBody?.message, '分析 MRVL')
+    assert.match(String(sentBody?.messageId), /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+  })
+})
+
+test('已有研究 Thread 时仍能新建对话', async () => {
+  setupDom()
+  Reflect.deleteProperty(globalThis, 'EventSource')
+  const thread = {
+    id: 'thread-1', capability: 'research', parentThreadId: null, title: '旧研究',
+    status: 'completed', createdAt: '2026-08-25T00:00:00Z', updatedAt: '2026-08-25T00:00:00Z',
+    sessionId: 'session-1', executionId: 'execution-1',
+  }
+  let createdBody: Record<string, unknown> | undefined
+  globalThis.fetch = async (input, init) => {
+    const url = String(input)
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok', engine: 'postgresql', schemaVersion: 26 }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/settings') return Response.json({ ...settingsResponse(), model: { configured: true } })
+    if (url === '/api/portfolio/stored' || url === '/api/portfolio') return Response.json(portfolioResponse([]))
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+    if (url === '/api/portfolio/events?limit=50') return Response.json({ events: [] })
+    if (url === '/api/research') return Response.json({ records: [] })
+    if (url === '/api/conversations' && init?.method === 'POST') {
+      createdBody = JSON.parse(String(init.body))
+      return Response.json({ ...thread, id: 'thread-2', title: null, status: 'queued', sessionId: 'session-2', executionId: 'execution-2' }, { status: 202 })
+    }
+    if (url === '/api/conversations') return Response.json({ threads: [thread] })
+    if (url === '/api/conversations/thread-1') return Response.json({ thread, lifecycle: { events: [] } })
+    throw new Error(`unexpected_fetch:${url}`)
+  }
+
+  const view = render(React.createElement(App))
+  const user = userEvent.setup({ document: window.document })
+  await user.click(await view.findByRole('button', { name: '研究对话' }))
+  await view.findByLabelText('继续研究对话')
+  await user.click(view.getByRole('button', { name: '新建对话' }))
+  await user.type(view.getByLabelText('开始研究对话'), '比较 MRVL 最近的财报变化')
+  await user.click(view.getByRole('button', { name: '开始对话' }))
+  await waitFor(() => {
+    assert.equal(createdBody?.message, '比较 MRVL 最近的财报变化')
+    assert.match(String(createdBody?.messageId), /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+  })
+})
 
 test('用户保存持仓后能在持仓列表看到它', async () => {
   setupDom()

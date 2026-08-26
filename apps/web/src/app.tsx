@@ -102,6 +102,15 @@ type ConversationThread = {
 }
 type ConversationEvent = { sequence: number; type?: string; createdAt?: string; [key: string]: unknown }
 
+function createMessageId() {
+  if (typeof crypto.randomUUID === 'function') return crypto.randomUUID()
+  const bytes = crypto.getRandomValues(new Uint8Array(16))
+  bytes[6] = (bytes[6] & 0x0f) | 0x40
+  bytes[8] = (bytes[8] & 0x3f) | 0x80
+  const hex = Array.from(bytes, (value) => value.toString(16).padStart(2, '0')).join('')
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
+}
+
 const pages: Array<{ id: Page; label: string }> = [
   { id: 'overview', label: '总览' },
   { id: 'analysis', label: '新建分析' },
@@ -409,7 +418,7 @@ export function App() {
     if (!message) return
     const response = await fetch('/api/conversations', {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ message, messageId: crypto.randomUUID() }),
+      body: JSON.stringify({ message, messageId: createMessageId() }),
     })
     const result = await response.json() as ConversationThread
     if (!response.ok || !result.id) { setError('研究对话创建失败'); return }
@@ -426,7 +435,7 @@ export function App() {
     const afterSequence = conversationEvents.reduce((latest, item) => Math.max(latest, item.sequence), 0)
     const response = await fetch(`/api/conversations/${selectedConversation.id}/messages`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ message, messageId: crypto.randomUUID() }),
+      body: JSON.stringify({ message, messageId: createMessageId() }),
     })
     const result = await response.json() as { sessionId?: string }
     if (!response.ok || !result.sessionId) { setError('研究消息发送失败'); return }
@@ -464,7 +473,7 @@ export function App() {
     const response = await fetch(`/api/analyses/${selectedResearch.id}/messages`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        messageId: crypto.randomUUID(), message, updateReport,
+        messageId: createMessageId(), message, updateReport,
         ...(Number.isInteger(baseReportVersion) && baseReportVersion > 0
           ? { baseReportVersion } : {}),
       }),
@@ -534,7 +543,7 @@ export function App() {
       {page === 'overview' && <Overview records={records} selected={selectedResearch} positions={positions} health={health} modelConfigured={modelConfigured} onNavigate={navigate} onOpen={async (id) => { await openResearch(id); navigate('research') }} />}
       {page === 'analysis' && <AnalysisPage symbol={analysisSymbol} setSymbol={setAnalysisSymbol} status={analysisStatus} stages={analysisStages} active={Boolean(activeAnalysisId)} onStart={startAnalysis} onCancel={cancelAnalysis} health={health} modelConfigured={modelConfigured} records={records} onOpen={async (id) => { await openResearch(id); navigate('research') }} />}
       {page === 'research' && <ResearchPage records={records} record={selectedResearch} onOpen={openResearch} onUpdate={updateResearch} onDelete={removeResearch} deleting={deletingResearchId === selectedResearch?.id} onResume={resumeResearch} onFollowUp={sendFollowUp} onReanalyze={reanalyzeResearch} freshnessDays={runtimeSettings?.current.values.reportFreshnessDays ?? null} />}
-      {page === 'conversation' && <ConversationPage threads={conversationThreads} thread={selectedConversation} events={conversationEvents} onOpen={openConversation} onCreate={startConversation} onSend={sendConversationMessage} onCancel={cancelConversation} />}
+      {page === 'conversation' && <ConversationPage threads={conversationThreads} thread={selectedConversation} events={conversationEvents} onOpen={openConversation} onNew={() => { setSelectedConversation(null); setConversationEvents([]) }} onCreate={startConversation} onSend={sendConversationMessage} onCancel={cancelConversation} />}
       {page === 'portfolio' && <PortfolioPage portfolio={portfolio} history={portfolioHistory} events={portfolioEvents} loaded={portfolioLoaded} loadFailed={portfolioLoadFailed} refreshing={portfolioRefreshing} onSave={savePosition} onSaveCash={saveCash} onBuy={buyPosition} onReduce={reducePosition} onDelete={removePosition} />}
       {page === 'settings' && <SettingsPage health={health} modelConfigured={modelConfigured} settings={runtimeSettings} onReload={loadSettings} />}
     </main>
@@ -582,9 +591,10 @@ function AnalysisPage({ symbol, setSymbol, status, stages, active, onStart, onCa
   </>
 }
 
-function ConversationPage({ threads, thread, events, onOpen, onCreate, onSend, onCancel }: {
+function ConversationPage({ threads, thread, events, onOpen, onNew, onCreate, onSend, onCancel }: {
   threads: ConversationThread[]; thread: ConversationThread | null; events: ConversationEvent[]
   onOpen: (id: string) => Promise<void>
+  onNew: () => void
   onCreate: (event: React.FormEvent<HTMLFormElement>) => Promise<void>
   onSend: (event: React.FormEvent<HTMLFormElement>) => Promise<void>
   onCancel: () => Promise<void>
@@ -602,7 +612,7 @@ function ConversationPage({ threads, thread, events, onOpen, onCreate, onSend, o
   return <>
     <PageHeader eyebrow="RESEARCH CONVERSATION" title="自由研究对话" description="先说你的问题，再决定是否取数、调用工具、委派子 Agent 或保存报告。" />
     <div className="conversation-layout">
-      <aside className="conversation-threads"><p className="micro">会话 · {threads.length}</p>{threads.map((item) => <button key={item.id} className={item.id === thread?.id ? 'active' : ''} onClick={() => void onOpen(item.id)}><strong>{item.title || '未命名研究'}</strong><small>{statusLabel(item.status)}</small></button>)}</aside>
+      <aside className="conversation-threads"><p className="micro">会话 · {threads.length}</p><button onClick={onNew}><strong>新建对话</strong></button>{threads.map((item) => <button key={item.id} className={item.id === thread?.id ? 'active' : ''} onClick={() => void onOpen(item.id)}><strong>{item.title || '未命名研究'}</strong><small>{statusLabel(item.status)}</small></button>)}</aside>
       <section className="conversation-panel">
         {!thread ? <><p className="conversation-empty">输入一个问题，创建第一条长期研究 Thread。</p><form className="conversation-composer" onSubmit={(event) => void onCreate(event)}><textarea name="message" aria-label="开始研究对话" placeholder="例如：比较 NVDA 和 MU 最近的财报风险，不要生成正式报告。" required /><button type="submit">开始对话</button></form></> : <>
           <header className="conversation-header"><div><p className="micro">{thread.title || '研究 Thread'}</p><strong>{statusLabel(thread.status)}</strong></div>{['queued', 'running'].includes(thread.status) && <button className="quiet danger" onClick={() => void onCancel()}>停止</button>}</header>
