@@ -329,6 +329,76 @@ test('未配置来源返回空 sources 时扫描形成 data gap 而不是成功�
   await app.close()
 })
 
+test('Tracking 首页只返回观测摘要而扫描详情保留完整数据', async () => {
+  const marker = `FULL_TRACKING_PAYLOAD:${'x'.repeat(200_000)}`
+  const data = successfulTrackingData()
+  let quoteVersion = 0
+  const app = buildApp({
+    ...createTestProductDatabase(), trackingRepository: createTestTrackingRepository(),
+    financialDataHealth: healthyFinancialData,
+    ...data,
+    fetchTrackingQuotes: async () => [{
+      symbol: 'NVDA', price: quoteVersion === 0 ? 100 : 106,
+      observedAt: quoteVersion === 0 ? '2026-08-29T20:00:00Z' : '2026-08-30T20:00:00Z',
+      source: 'test-quotes', degraded: false, sources: [],
+    }],
+    getTechnicalEvidence: async (...args: Parameters<typeof data.getTechnicalEvidence>) => ({
+      ...(await data.getTechnicalEvidence(...args)), rawBars: marker,
+    }),
+    getFinancialOverview: async () => ({
+      overview: { symbol: 'NVDA', latestPeriod: '2026-Q2', rawSecPayload: marker },
+      facts: [fact('large-financial', 'reported_financial', '2026-08-28', { raw: marker })],
+      sources: [{ source: 'sec', status: 'failed', error: 'timeout' }],
+    }),
+    listOfficialCompanyEvents: async () => ({
+      facts: [], sources: [{ source: 'sec', status: 'ok' }],
+    }),
+    listCompanyEvents: async () => ({
+      facts: [fact('large-news', 'company_event', '2026-08-30T10:00:00Z', {
+        title: 'Large news payload', summary: marker,
+      })],
+      sources: [{ source: 'news', status: 'ok' }],
+    }),
+  })
+  await app.ready()
+  await app.inject({ method: 'PUT', url: '/api/tracking/watchlist/NVDA', payload: {} })
+  const baseline = await app.inject({ method: 'POST', url: '/api/tracking/scans' })
+  await waitForScan(app, baseline.json().id)
+
+  quoteVersion = 1
+  const created = await app.inject({ method: 'POST', url: '/api/tracking/scans' })
+  const detail = await waitForScan(app, created.json().id)
+  assert.match(detail.body, /FULL_TRACKING_PAYLOAD/)
+  assert.equal(detail.json().events.some(({ kind }: { kind: string }) => kind === 'price_move'), true)
+
+  const overview = await app.inject({ method: 'GET', url: '/api/tracking' })
+
+  assert.doesNotMatch(overview.body, /FULL_TRACKING_PAYLOAD/)
+  assert.ok(overview.body.length < 20_000, `overview bytes: ${overview.body.length}`)
+  assert.deepEqual(
+    overview.json().latestScan.observations.map((observation: {
+      symbol: string; capability: string; status: string; payload: unknown
+    }) => ({
+      symbol: observation.symbol, capability: observation.capability,
+      status: observation.status, payload: observation.payload,
+    })).sort((left: { capability: string }, right: { capability: string }) => (
+      left.capability.localeCompare(right.capability)
+    )),
+    [
+      {
+        symbol: 'NVDA', capability: 'fundamental', status: 'data_gap',
+        payload: { gaps: [{ source: 'fundamental', reason: 'all_sources_failed' }] },
+      },
+      { symbol: 'NVDA', capability: 'news', status: 'success', payload: { gaps: [] } },
+      { symbol: 'NVDA', capability: 'technical', status: 'success', payload: { gaps: [] } },
+    ],
+  )
+  assert.equal(overview.json().events.some(({ kind }: { kind: string }) => kind === 'price_move'), true)
+  assert.equal(overview.json().latestScan.events.length, 0)
+
+  await app.close()
+})
+
 test('失败观测不覆盖上一次成功基线', async () => {
   let step = 1
   const data = successfulTrackingData()

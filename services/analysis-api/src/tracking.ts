@@ -80,7 +80,7 @@ export function createTrackingService(dependencies: {
         watchlist,
         targets: mergeTargets(watchlist, positionSymbols),
         activeScan,
-        latestScan,
+        latestScan: projectLatestScan(latestScan),
         events,
       }
     },
@@ -437,6 +437,27 @@ function event(
   identity = occurredAt,
 ): EventCandidate {
   return { eventKey: `${symbol}:${kind}:${identity}`, kind, severity, occurredAt, payload }
+}
+
+function projectLatestScan(scan: Awaited<ReturnType<TrackingRepository['getLatestRun']>>) {
+  if (!scan) return null
+  return {
+    ...scan,
+    events: [],
+    observations: scan.observations.map((observation) => ({
+      ...observation,
+      payload: {
+        gaps: Array.isArray(observation.payload.gaps)
+          ? observation.payload.gaps.flatMap((gap) => {
+              if (!isRecord(gap)
+                || typeof gap.source !== 'string'
+                || typeof gap.reason !== 'string') return []
+              return [{ source: gap.source, reason: gap.reason }]
+            })
+          : [],
+      },
+    })),
+  }
 }
 
 function mergeTargets(
