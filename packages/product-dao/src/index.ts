@@ -12,7 +12,7 @@ import {
   type WatchlistItem,
 } from '@vibe-invest/contracts'
 
-export const schemaVersion = 27
+export const schemaVersion = 28
 
 const migrationSql = `
 CREATE TABLE IF NOT EXISTS product_schema_migrations (
@@ -44,7 +44,7 @@ CREATE TABLE IF NOT EXISTS portfolio_equity_snapshots (
   cash numeric NOT NULL,
   holdings_count integer NOT NULL,
   priced_count integer NOT NULL,
-  observed_at timestamptz NOT NULL,
+  observed_at text NOT NULL CHECK (observed_at <> ''),
   after_close boolean NOT NULL DEFAULT false
 );
 
@@ -464,12 +464,23 @@ CREATE TABLE IF NOT EXISTS tracking_events (
   capability text NOT NULL CHECK (capability IN ('technical', 'fundamental', 'news')),
   kind text NOT NULL CHECK (kind <> ''),
   severity text NOT NULL CHECK (severity IN ('info', 'warning', 'critical')),
-  occurred_at timestamptz NOT NULL,
+  occurred_at text NOT NULL CHECK (occurred_at <> ''),
   payload_json jsonb NOT NULL CHECK (jsonb_typeof(payload_json) = 'object'),
   created_at timestamptz NOT NULL
 );
 CREATE INDEX IF NOT EXISTS tracking_events_timeline
   ON tracking_events (occurred_at DESC, id DESC);
+
+ALTER TABLE tracking_observations
+  ALTER COLUMN observed_at TYPE text USING observed_at::text;
+ALTER TABLE tracking_observations DROP CONSTRAINT IF EXISTS tracking_observations_observed_at_check;
+ALTER TABLE tracking_observations ADD CONSTRAINT tracking_observations_observed_at_check
+  CHECK (observed_at <> '');
+ALTER TABLE tracking_events
+  ALTER COLUMN occurred_at TYPE text USING occurred_at::text;
+ALTER TABLE tracking_events DROP CONSTRAINT IF EXISTS tracking_events_occurred_at_check;
+ALTER TABLE tracking_events ADD CONSTRAINT tracking_events_occurred_at_check
+  CHECK (occurred_at <> '');
 
 ALTER TABLE model_requests DROP CONSTRAINT IF EXISTS model_requests_projection_id_fkey;
 ALTER TABLE model_requests DROP CONSTRAINT IF EXISTS model_requests_projection_id_execution_id_fkey;
@@ -683,6 +694,10 @@ ON CONFLICT (version) DO NOTHING;
 
 INSERT INTO product_schema_migrations (version)
 VALUES (27)
+ON CONFLICT (version) DO NOTHING;
+
+INSERT INTO product_schema_migrations (version)
+VALUES (28)
 ON CONFLICT (version) DO NOTHING;
 
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM vibe_invest_app;
@@ -4008,7 +4023,7 @@ function mapTrackingObservation(row: TrackingObservationRow): TrackingObservatio
     capability: row.capability,
     status: row.status,
     baselineObservationId: row.baseline_observation_id,
-    observedAt: new Date(row.observed_at).toISOString(),
+    observedAt: row.observed_at,
     payload: row.payload_json,
   }
 }
@@ -4024,7 +4039,7 @@ function mapTrackingEvent(row: TrackingEventRow): TrackingEvent {
     capability: row.capability,
     kind: row.kind,
     severity: row.severity,
-    occurredAt: new Date(row.occurred_at).toISOString(),
+    occurredAt: row.occurred_at,
     payload: row.payload_json,
     createdAt: new Date(row.created_at).toISOString(),
   }

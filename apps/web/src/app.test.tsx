@@ -328,7 +328,7 @@ test('研究对话 SSE 短断时保留原生重连并在终态恢复输入', asy
   }
   globalThis.fetch = async (input, init) => {
     const url = String(input)
-    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok', engine: 'postgresql', schemaVersion: 27 }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok', engine: 'postgresql', schemaVersion: 28 }, financialData: { service: 'financial-data', status: 'ok' } } })
     if (url === '/api/settings') return Response.json(settingsResponse())
     if (url === '/api/portfolio/stored' || url === '/api/portfolio') return Response.json(portfolioResponse([]))
     if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
