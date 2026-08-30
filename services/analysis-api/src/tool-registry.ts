@@ -171,16 +171,22 @@ function conversationToolNames(userMessage: string, scopeMessages: string[] = []
 
 function tickerTokens(message: string, nonSymbols: Set<string>) {
   const tokens = new Set<string>()
-  for (const token of message.match(/\b[A-Z]{1,5}\b/g) ?? []) {
+  const hasTickerContext = /(?:股票|标的|代码|ticker|分析|研究|最近|怎么样|走势|形态|K线|k线|财报|估值|新闻|公司)/i
+    .test(message)
+  const cjk = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u
+  for (const match of message.matchAll(/\b[A-Z]{1,5}\b/g)) {
+    const token = match[0]
+    const index = match.index
+    const before = Array.from(message.slice(0, index)).at(-1) ?? ''
+    const after = Array.from(message.slice(index + token.length))[0] ?? ''
+    if (!hasTickerContext && (cjk.test(before) || cjk.test(after))) continue
     if (!nonSymbols.has(token)) tokens.add(token)
   }
   for (const match of message.matchAll(/\$([A-Za-z]{1,5})\b/g)) {
     const token = match[1]!.toUpperCase()
     if (!nonSymbols.has(token)) tokens.add(token)
   }
-  const acceptsLowercase = /(?:股票|标的|代码|ticker|分析|研究|最近|怎么样|走势|形态|K线|k线|财报|估值|新闻|公司)/i
-    .test(message)
-  if (acceptsLowercase) {
+  if (hasTickerContext) {
     for (const token of message.match(/\b[a-z]{2,5}\b/g) ?? []) {
       const normalized = token.toUpperCase()
       if (!nonSymbols.has(normalized)) tokens.add(normalized)

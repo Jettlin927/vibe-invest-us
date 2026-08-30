@@ -258,6 +258,17 @@ test('自由对话识别小写 ticker 和常见技术表达但不把 API 当作�
   )
 })
 
+test('自由对话不把中文格式占位符当作 ticker 且保留单字母标的', () => {
+  const registry = createToolRegistry(registeredToolDefinitions)
+  assert.deepEqual(registry.projectConversation({
+    userMessage: '继续部署流式验收：不要调用工具。请输出20行，每行格式“第N行：流式响应正在工作”',
+  }).map(({ name }) => name), [])
+  assert.deepEqual(
+    registry.projectConversation({ userMessage: '研究F股票最近怎么样。' }).map(({ name }) => name),
+    ['fetch_financial_context'],
+  )
+})
+
 test('Registry 用户投影按具体工具收紧嵌套结果并拒绝未知工具或字段', () => {
   const registry = createToolRegistry(registeredToolDefinitions)
   assert.deepEqual(registry.projectPublicResult('get_financial_overview', {
