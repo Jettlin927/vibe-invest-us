@@ -3,7 +3,7 @@ import { resolve } from 'node:path'
 import {
   checkSchema, createAgentEventRepository, createAnalysisRepository, createConversationRepository, createPool,
   createPortfolioRepository, createRuntimeSettingsRepository,
-  createToolProjectionRepository,
+  createToolProjectionRepository, createTrackingRepository,
 } from '@vibe-invest/product-dao'
 
 import { buildApp } from './app.js'
@@ -44,6 +44,7 @@ const app = buildApp({
   runtimeSettingsRepository: createRuntimeSettingsRepository(productPool),
   toolProjectionRepository: createToolProjectionRepository(productPool),
   conversationRepository: createConversationRepository(productPool),
+  trackingRepository: createTrackingRepository(productPool),
   staticDir,
   financialDataHealth: () => financialData.health(),
   fetchFinancialContext: (symbol, signal) => financialData.context(symbol, signal),
@@ -69,6 +70,7 @@ const app = buildApp({
     financialData.technicalIndicators(symbol, startDate, endDate, signal)
   ),
   fetchMarketPrices: (symbols, signal) => financialData.quotes(symbols, signal),
+  fetchTrackingQuotes: (symbols, signal) => financialData.quoteSnapshots(symbols, signal),
   model,
   modelConfigured: Boolean(
     modelProvider && process.env.MODEL_NAME && process.env.MODEL_BASE_URL && modelApiKey

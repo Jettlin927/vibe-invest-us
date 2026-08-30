@@ -108,6 +108,45 @@ test('普通 HTTP 环境仍能发送研究对话消息', async () => {
   })
 })
 
+test('研究消息提交等待响应时立即回显并禁止重复点击', async () => {
+  setupDom()
+  Reflect.deleteProperty(globalThis, 'EventSource')
+  const thread = {
+    id: 'thread-pending', capability: 'research', parentThreadId: null, title: '等待研究',
+    status: 'completed', createdAt: '2026-08-30T00:00:00Z', updatedAt: '2026-08-30T00:00:00Z',
+    sessionId: 'session-pending', executionId: 'execution-pending',
+  }
+  let finishSend: ((response: Response) => void) | undefined
+  const pendingSend = new Promise<Response>((resolve) => { finishSend = resolve })
+  globalThis.fetch = async (input, init) => {
+    const url = String(input)
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok', engine: 'postgresql', schemaVersion: 26 }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/settings') return Response.json(settingsResponse())
+    if (url === '/api/portfolio/stored' || url === '/api/portfolio') return Response.json(portfolioResponse([]))
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+    if (url === '/api/portfolio/events?limit=50') return Response.json({ events: [] })
+    if (url === '/api/research') return Response.json({ records: [] })
+    if (url === '/api/conversations') return Response.json({ threads: [thread] })
+    if (url === '/api/conversations/thread-pending') return Response.json({ thread, lifecycle: { events: [] } })
+    if (url === '/api/conversations/thread-pending/messages' && init?.method === 'POST') return pendingSend
+    throw new Error(`unexpected_fetch:${url}`)
+  }
+
+  const view = render(React.createElement(App))
+  const user = userEvent.setup({ document: window.document })
+  await user.click(await view.findByRole('button', { name: '研究对话' }))
+  const input = await view.findByLabelText('继续研究对话') as HTMLTextAreaElement
+  await user.type(input, '分析 MRVL')
+  await user.click(view.getByRole('button', { name: '发送' }))
+
+  const pendingButton = await view.findByRole('button', { name: '正在发送…' })
+  assert.equal((pendingButton as HTMLButtonElement).disabled, true)
+  assert.equal(input.value, '')
+  assert.match(view.getByRole('log', { name: '研究对话内容' }).textContent ?? '', /你分析 MRVL/)
+
+  finishSend!(Response.json({ sessionId: thread.sessionId, executionId: 'execution-next' }, { status: 202 }))
+})
+
 test('已有研究 Thread 时仍能新建对话', async () => {
   setupDom()
   Reflect.deleteProperty(globalThis, 'EventSource')
@@ -145,6 +184,182 @@ test('已有研究 Thread 时仍能新建对话', async () => {
     assert.equal(createdBody?.message, '比较 MRVL 最近的财报变化')
     assert.match(String(createdBody?.messageId), /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
   })
+})
+
+test('研究对话输入框从单行开始并随内容增长到上限', async () => {
+  setupDom()
+  Reflect.deleteProperty(globalThis, 'EventSource')
+  globalThis.fetch = async (input) => {
+    const url = String(input)
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok', engine: 'postgresql', schemaVersion: 26 }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/settings') return Response.json(settingsResponse())
+    if (url === '/api/portfolio/stored' || url === '/api/portfolio') return Response.json(portfolioResponse([]))
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+    if (url === '/api/portfolio/events?limit=50') return Response.json({ events: [] })
+    if (url === '/api/research') return Response.json({ records: [] })
+    if (url === '/api/conversations') return Response.json({ threads: [] })
+    throw new Error(`unexpected_fetch:${url}`)
+  }
+
+  const view = render(React.createElement(App))
+  const user = userEvent.setup({ document: window.document })
+  await user.click(await view.findByRole('button', { name: '研究对话' }))
+  const input = await view.findByLabelText('开始研究对话') as HTMLTextAreaElement
+  let scrollHeight = 28
+  Object.defineProperty(input, 'scrollHeight', { get: () => scrollHeight, configurable: true })
+  await user.type(input, '短问题')
+  assert.equal(input.getAttribute('rows'), '1')
+  assert.equal(input.style.height, '28px')
+  assert.equal(input.style.overflowY, 'hidden')
+
+  scrollHeight = 220
+  fireEvent.input(input)
+  assert.equal(input.style.height, '160px')
+  assert.equal(input.style.overflowY, 'auto')
+})
+
+test('自由研究对话在最终回答前持续展示文本增量', async (t) => {
+  setupDom()
+  let stream: {
+    emit: (name: string, payload: Record<string, unknown>, sequence: number) => void
+  } | undefined
+  class TestEventSource {
+    listeners = new Map<string, Array<(event: MessageEvent) => void>>()
+    onerror: (() => void) | null = null
+    constructor(_url: string) { stream = this }
+    addEventListener(name: string, listener: EventListenerOrEventListenerObject) {
+      const callback = typeof listener === 'function'
+        ? listener as (event: MessageEvent) => void
+        : (event: MessageEvent) => listener.handleEvent(event)
+      this.listeners.set(name, [...(this.listeners.get(name) ?? []), callback])
+    }
+    emit(name: string, payload: Record<string, unknown>, sequence: number) {
+      const event = new MessageEvent(name, {
+        data: JSON.stringify(payload), lastEventId: `conversation-session:${sequence}`,
+      })
+      for (const listener of this.listeners.get(name) ?? []) listener(event)
+    }
+    close() {}
+  }
+  Object.assign(globalThis, { EventSource: TestEventSource })
+  t.after(() => { Reflect.deleteProperty(globalThis, 'EventSource') })
+  const thread = {
+    id: 'conversation-live', capability: 'research', parentThreadId: null, title: '实时研究',
+    status: 'completed', createdAt: '2026-08-30T00:00:00Z', updatedAt: '2026-08-30T00:00:00Z',
+    sessionId: 'conversation-session', executionId: 'conversation-execution',
+  }
+  let sentMessageId = ''
+  globalThis.fetch = async (input, init) => {
+    const url = String(input)
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok', engine: 'postgresql', schemaVersion: 26 }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/settings') return Response.json(settingsResponse())
+    if (url === '/api/portfolio/stored' || url === '/api/portfolio') return Response.json(portfolioResponse([]))
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+    if (url === '/api/portfolio/events?limit=50') return Response.json({ events: [] })
+    if (url === '/api/research') return Response.json({ records: [] })
+    if (url === '/api/conversations') return Response.json({ threads: [thread] })
+    if (url === '/api/conversations/conversation-live') return Response.json({ thread, lifecycle: { events: [] } })
+    if (url === '/api/conversations/conversation-live/messages' && init?.method === 'POST') {
+      sentMessageId = String((JSON.parse(String(init.body)) as { messageId?: string }).messageId ?? '')
+      return Response.json({ sessionId: 'conversation-session', executionId: 'conversation-execution-2' }, { status: 202 })
+    }
+    throw new Error(`unexpected_fetch:${url}`)
+  }
+
+  const view = render(React.createElement(App))
+  const user = userEvent.setup({ document: window.document })
+  await user.click(await view.findByRole('button', { name: '研究对话' }))
+  await user.type(await view.findByLabelText('继续研究对话'), '给我实时回答')
+  await user.click(view.getByRole('button', { name: '发送' }))
+  await waitFor(() => assert.ok(stream))
+  stream!.emit('user_message', {
+    type: 'user_message', message: '给我实时回答', messageId: sentMessageId,
+  }, 1)
+  stream!.emit('text_delta', { type: 'text_delta', text: '实时' }, 2)
+  stream!.emit('text_delta', { type: 'text_delta', text: '回答' }, 3)
+  await waitFor(() => assert.match(
+    view.getByRole('log', { name: '研究对话内容' }).textContent ?? '',
+    /你给我实时回答.*AI实时回答/,
+  ))
+  assert.equal(view.getByRole('log', { name: '研究对话内容' }).querySelectorAll('.user').length, 1)
+  stream!.emit('artifact_completed', { type: 'artifact_completed', kind: 'research_report' }, 4)
+  stream!.emit('chat_completed', { type: 'chat_completed', text: '最终回答' }, 5)
+  await waitFor(() => {
+    const assistants = [...view.getByRole('log', { name: '研究对话内容' })
+      .querySelectorAll('.assistant')].map((item) => item.textContent)
+    assert.deepEqual(assistants, [
+      'AI最终回答', 'AI研究报告 Artifact 已保存，可在研究记录中继续查看。',
+    ])
+  })
+})
+
+test('研究对话 SSE 短断时保留原生重连并在终态恢复输入', async (t) => {
+  setupDom()
+  let stream: TestEventSource | undefined
+  class TestEventSource {
+    listeners = new Map<string, Array<(event: MessageEvent) => void>>()
+    onerror: (() => void) | null = null
+    closed = false
+    constructor(_url: string) { stream = this }
+    addEventListener(name: string, listener: EventListenerOrEventListenerObject) {
+      const callback = typeof listener === 'function'
+        ? listener as (event: MessageEvent) => void
+        : (event: MessageEvent) => listener.handleEvent(event)
+      this.listeners.set(name, [...(this.listeners.get(name) ?? []), callback])
+    }
+    emit(name: string, payload: Record<string, unknown>, sequence: number) {
+      if (this.closed) return
+      const event = new MessageEvent(name, {
+        data: JSON.stringify(payload), lastEventId: `reconnect-session:${sequence}`,
+      })
+      for (const listener of this.listeners.get(name) ?? []) listener(event)
+    }
+    fail() { this.onerror?.() }
+    close() { this.closed = true }
+  }
+  Object.assign(globalThis, { EventSource: TestEventSource })
+  t.after(() => { Reflect.deleteProperty(globalThis, 'EventSource') })
+  let currentStatus = 'completed'
+  let detailReads = 0
+  const thread = {
+    id: 'thread-reconnect', capability: 'research', parentThreadId: null, title: '断流恢复',
+    status: currentStatus, createdAt: '2026-08-30T00:00:00Z', updatedAt: '2026-08-30T00:00:00Z',
+    sessionId: 'reconnect-session', executionId: 'reconnect-execution',
+  }
+  globalThis.fetch = async (input, init) => {
+    const url = String(input)
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok', engine: 'postgresql', schemaVersion: 27 }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/settings') return Response.json(settingsResponse())
+    if (url === '/api/portfolio/stored' || url === '/api/portfolio') return Response.json(portfolioResponse([]))
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+    if (url === '/api/portfolio/events?limit=50') return Response.json({ events: [] })
+    if (url === '/api/research') return Response.json({ records: [] })
+    if (url === '/api/conversations') return Response.json({ threads: [{ ...thread, status: currentStatus }] })
+    if (url === '/api/conversations/thread-reconnect') {
+      detailReads += 1
+      return Response.json({ thread: { ...thread, status: currentStatus }, lifecycle: { events: [] } })
+    }
+    if (url === '/api/conversations/thread-reconnect/messages' && init?.method === 'POST') {
+      currentStatus = 'running'
+      return Response.json({ sessionId: 'reconnect-session', executionId: 'reconnect-execution-2' }, { status: 202 })
+    }
+    throw new Error(`unexpected_fetch:${url}`)
+  }
+
+  const view = render(React.createElement(App))
+  const user = userEvent.setup({ document: window.document })
+  await user.click(await view.findByRole('button', { name: '研究对话' }))
+  await user.type(await view.findByLabelText('继续研究对话'), '断流测试')
+  await user.click(view.getByRole('button', { name: '发送' }))
+  await waitFor(() => assert.ok(stream))
+  stream!.fail()
+  await waitFor(() => assert.ok(detailReads >= 2))
+  assert.equal(stream!.closed, false)
+  assert.ok(view.getByRole('button', { name: '正在发送…' }))
+
+  currentStatus = 'completed'
+  stream!.emit('completed', { type: 'status', status: 'completed', terminal: true }, 10)
+  await view.findByRole('button', { name: '发送' })
 })
 
 test('用户保存持仓后能在持仓列表看到它', async () => {

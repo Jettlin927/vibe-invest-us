@@ -6,7 +6,7 @@ import {
 } from '@vibe-invest/contracts'
 import type {
   AgentEventRepository, AnalysisRepository, ConversationRepository, PortfolioRepository,
-  RuntimeSettingsRepository, ToolProjectionRepository,
+  RuntimeSettingsRepository, ToolProjectionRepository, TrackingRepository,
 } from '@vibe-invest/product-dao'
 
 import { createAnalysisService } from './analysis.js'
@@ -14,12 +14,13 @@ import { createConversationService } from './conversation.js'
 import type { ModelEvent } from './model.js'
 import {
   MARKET_PRICE_REQUEST_TIMEOUT_MS,
-  type FactQueryResult, type FinancialContext, type PaginatedFactQueryResult,
+  type FactQueryResult, type FinancialContext, type PaginatedFactQueryResult, type QuoteSnapshot,
 } from './financial-data-client.js'
 import { createPortfolio, isValidSymbol, normalizeSymbol } from './portfolio.js'
 import { projectResearchExport, projectResearchView } from './research-export.js'
 import { createResearchToolExecutor } from './research-capability.js'
 import { conversationResearchTools } from './tools.js'
+import { createTrackingService } from './tracking.js'
 
 type AppDependencies = {
   productDatabase: {
@@ -32,6 +33,7 @@ type AppDependencies = {
   runtimeSettingsRepository: RuntimeSettingsRepository
   toolProjectionRepository: ToolProjectionRepository
   conversationRepository?: ConversationRepository
+  trackingRepository?: TrackingRepository
   financialDataHealth: () => Promise<FinancialDataHealth>
   staticDir?: string
   fetchFinancialContext?: (symbol: string, signal: AbortSignal) => Promise<FinancialContext>
@@ -66,6 +68,8 @@ type AppDependencies = {
     symbol: string, startDate: string, endDate: string, signal: AbortSignal,
   ) => Promise<FactQueryResult>
   fetchMarketPrices?: (symbols: string[], signal: AbortSignal) => Promise<Record<string, number>>
+  fetchTrackingQuotes?: (symbols: string[], signal: AbortSignal) => Promise<QuoteSnapshot[]>
+  trackingConcurrency?: number
   marketPriceTimeoutMs?: number
   model?: {
     analyze(input: any): AsyncIterable<ModelEvent>
@@ -142,11 +146,29 @@ export function buildApp(dependencies: AppDependencies) {
         activeTimeoutSignal: dependencies.activeTimeoutSignal,
       })
     : undefined
+  const tracking = dependencies.trackingRepository
+    ? createTrackingService({
+        repository: dependencies.trackingRepository,
+        listPositionSymbols: async () => (await portfolio.list()).map(({ symbol }) => symbol),
+        fetchTrackingQuotes: dependencies.fetchTrackingQuotes,
+        getTechnicalEvidence: dependencies.getTechnicalEvidence,
+        getFinancialOverview: dependencies.getFinancialOverview,
+        listOfficialCompanyEvents: dependencies.listOfficialCompanyEvents,
+        listCompanyEvents: dependencies.listCompanyEvents,
+        now: dependencies.now,
+        concurrency: dependencies.trackingConcurrency,
+      })
+    : undefined
 
   app.addHook('onClose', async () => {
     await analysis?.close()
     await conversation?.close()
+    await tracking?.close()
     await dependencies.productDatabase.close()
+  })
+
+  app.addHook('onReady', async () => {
+    await tracking?.initialize()
   })
 
   if (dependencies.staticDir) {
@@ -181,6 +203,62 @@ export function buildApp(dependencies: AppDependencies) {
   })
 
   app.get('/api/positions', async () => ({ positions: await portfolio.list() }))
+
+  app.get<{ Querystring: { symbol?: string; limit?: string } }>('/api/tracking', async (request, reply) => {
+    if (!tracking) return reply.status(404).send({ error: 'tracking_unavailable' })
+    const symbol = typeof request.query.symbol === 'string'
+      ? normalizeSymbol(request.query.symbol) : undefined
+    return tracking.state({
+      ...(symbol ? { symbol } : {}),
+      limit: Number(request.query.limit ?? 100),
+    })
+  })
+
+  app.put<{
+    Params: { symbol: string }; Body: { note?: unknown; enabled?: unknown }
+  }>('/api/tracking/watchlist/:symbol', async (request, reply) => {
+    if (!tracking) return reply.status(404).send({ error: 'tracking_unavailable' })
+    const symbol = normalizeSymbol(request.params.symbol)
+    const note = request.body?.note
+    const enabled = request.body?.enabled
+    if (!isValidSymbol(symbol)
+      || (note !== undefined && (typeof note !== 'string' || note.length > 500))
+      || (enabled !== undefined && typeof enabled !== 'boolean')) {
+      return reply.status(400).send({ error: 'invalid_watchlist_item' })
+    }
+    return tracking.putWatchlist(symbol, {
+      ...(typeof note === 'string' ? { note: note.trim() } : {}),
+      ...(typeof enabled === 'boolean' ? { enabled } : {}),
+    })
+  })
+
+  app.delete<{ Params: { symbol: string } }>(
+    '/api/tracking/watchlist/:symbol', async (request, reply) => {
+      if (!tracking) return reply.status(404).send({ error: 'tracking_unavailable' })
+      const symbol = normalizeSymbol(request.params.symbol)
+      if (!isValidSymbol(symbol)) return reply.status(400).send({ error: 'invalid_symbol' })
+      await tracking.removeWatchlist(symbol)
+      return reply.status(204).send()
+    },
+  )
+
+  app.post('/api/tracking/scans', async (_request, reply) => {
+    if (!tracking) return reply.status(404).send({ error: 'tracking_unavailable' })
+    try {
+      return reply.status(202).send(await tracking.startScan())
+    } catch (error) {
+      if (error instanceof Error && error.message === 'tracking_run_active') {
+        return reply.status(409).send({ error: error.message })
+      }
+      throw error
+    }
+  })
+
+  app.get<{ Params: { id: string } }>('/api/tracking/scans/:id', async (request, reply) => {
+    if (!tracking) return reply.status(404).send({ error: 'tracking_unavailable' })
+    const scan = await tracking.getScan(request.params.id)
+    return scan ?? reply.status(404).send({ error: 'tracking_scan_not_found' })
+  })
 
   app.get('/api/portfolio/stored', async () => portfolio.overview({}))
 

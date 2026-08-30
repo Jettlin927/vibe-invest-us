@@ -88,14 +88,19 @@ export function createToolRegistry(definitions: RegisteredToolDefinition[]) {
         && !subagentTool(definition.model.name)
         && definition.model.name !== 'create_research_report')
       .map((definition) => definition.model),
-    projectConversation: () => validated
-      .filter((definition) => definition.allowedStages.includes('research')
-        && ['read_only', 'creates_agent', 'creates_report', 'controls_agent'].includes(definition.sideEffect)
-        && ![
-          'search_web_evidence', 'run_news_analysis', 'run_fundamental_analysis',
-          'run_technical_analysis', 'submit_analysis_report', 'submit_specialist_report',
-        ].includes(definition.model.name))
-      .map((definition) => definition.model),
+    projectConversation: (options?: { userMessage: string; scopeMessages?: string[] }) => {
+      const requested = options
+        ? new Set(conversationToolNames(options.userMessage, options.scopeMessages)) : null
+      return validated
+        .filter((definition) => definition.allowedStages.includes('research')
+          && ['read_only', 'creates_agent', 'creates_report', 'controls_agent'].includes(definition.sideEffect)
+          && ![
+            'search_web_evidence', 'run_news_analysis', 'run_fundamental_analysis',
+            'run_technical_analysis', 'submit_analysis_report', 'submit_specialist_report',
+          ].includes(definition.model.name)
+          && (requested === null || requested.has(definition.model.name)))
+        .map((definition) => definition.model)
+    },
     definition: (name: string) => validated.find((definition) => definition.model.name === name),
     projectResult(name: string, result: Record<string, unknown>) {
       const projection = validated.find((definition) => definition.model.name === name)?.modelProjection
@@ -116,6 +121,72 @@ export function createToolRegistry(definitions: RegisteredToolDefinition[]) {
       return projectPublicToolResult(name, result)
     },
   })
+}
+
+function conversationToolNames(userMessage: string, scopeMessages: string[] = []): string[] {
+  const requested: string[] = []
+  if (/(?:技术面|技术分析|K线|k线|蜡烛图|均线|成交量|量价|支撑|阻力|趋势线|走势|形态|突破|跌破|动量|回撤|波动率|MACD|RSI|KDJ|布林|technical|candlestick|price chart)/i.test(userMessage)) {
+    requested.push('get_technical_evidence', 'get_price_window')
+  }
+  if (/(?:基本面|财报|财务|营收|收入|利润|毛利|净利|现金流|资产负债|估值|市盈率|市净率|\bPE\b|\bPB\b|EPS|EBITDA|DCF|10-K|10-Q|8-K|filing|earnings|valuation|fundamental)/i.test(userMessage)) {
+    requested.push(
+      'get_financial_overview', 'get_financial_metric_series',
+      'get_valuation_evidence', 'read_filing_document',
+    )
+  }
+  if (/(?:消息面|新闻|消息|公司事件|事件|公告|舆情|催化|公司动态|headline|news|event|announcement)/i.test(userMessage)) {
+    requested.push('search_news_candidates', 'read_news_document', 'list_company_events')
+  }
+  const reportDenied = /(?:不要|不用|无需|别|不需要|暂不|先不).{0,12}(?:报告|研报|report)/i
+    .test(userMessage)
+  const reportExplained = /(?:(?:解释|说明|介绍|什么是|是什么意思|如何理解|怎么理解).{0,16}(?:报告|研报|report)|(?:报告|研报|report).{0,16}(?:是什么|是什么意思|怎么理解))/i
+    .test(userMessage)
+  const reportRequested = /(?:(?:生成|创建|写|撰写|整理|保存|输出|形成|制作|更新|给我|做).{0,12}(?:报告|研报)|(?:generate|create|write|save|update).{0,16}report)/i
+    .test(userMessage)
+  if (reportRequested && !reportDenied && !reportExplained) requested.push('create_research_report')
+  const agentDenied = /(?:不要|不用|无需|别|不需要|暂不|先不).{0,12}(?:子\s*Agent|子代理|sub-?agent)/i
+    .test(userMessage)
+  const agentRequested = /(?:派|让|请|创建|启动|调用|委派|安排|等待|读取|查看|停止|终止|取消).{0,12}(?:子\s*Agent|子代理|sub-?agent)/i
+    .test(userMessage)
+  if (agentRequested && !agentDenied) {
+    requested.push('spawn_agent', 'wait_agent', 'read_agent_result', 'stop_agent')
+  }
+  const nonSymbols = new Set([
+    'AI', 'ADR', 'CEO', 'CPI', 'DCF', 'EBITDA', 'EPS', 'ETF', 'FOMC', 'GDP',
+    'KDJ', 'MA', 'MACD', 'PB', 'PCE', 'PE', 'RSI', 'SEC', 'TTM', 'USD',
+    'API', 'CLI', 'CSS', 'HTML', 'HTTP', 'HTTPS', 'JSON', 'MCP', 'SDK', 'SQL', 'SSE', 'URL',
+  ])
+  const hasSymbol = [userMessage, ...scopeMessages].some((message) => (
+    tickerTokens(message, nonSymbols).length > 0
+  ))
+  const nonDataTools = new Set([
+    'create_research_report', 'spawn_agent', 'wait_agent', 'read_agent_result', 'stop_agent',
+  ])
+  const hasDataTool = requested.some((name) => !nonDataTools.has(name))
+  if (hasSymbol && !hasDataTool) {
+    requested.push('fetch_financial_context')
+  }
+  return requested
+}
+
+function tickerTokens(message: string, nonSymbols: Set<string>) {
+  const tokens = new Set<string>()
+  for (const token of message.match(/\b[A-Z]{1,5}\b/g) ?? []) {
+    if (!nonSymbols.has(token)) tokens.add(token)
+  }
+  for (const match of message.matchAll(/\$([A-Za-z]{1,5})\b/g)) {
+    const token = match[1]!.toUpperCase()
+    if (!nonSymbols.has(token)) tokens.add(token)
+  }
+  const acceptsLowercase = /(?:股票|标的|代码|ticker|分析|研究|最近|怎么样|走势|形态|K线|k线|财报|估值|新闻|公司)/i
+    .test(message)
+  if (acceptsLowercase) {
+    for (const token of message.match(/\b[a-z]{2,5}\b/g) ?? []) {
+      const normalized = token.toUpperCase()
+      if (!nonSymbols.has(normalized)) tokens.add(normalized)
+    }
+  }
+  return [...tokens]
 }
 
 const boundedResultKeys = [

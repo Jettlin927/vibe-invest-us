@@ -146,6 +146,76 @@ test('自由对话 Thread 可以创建、回放 SSE 并在同一 Thread 继续�
   assert.match(followUpEvents.body, /回答：继续说明失效条件。/)
 })
 
+test('自由对话每个 Run 按当前用户消息重新投影最小工具集', async () => {
+  const projections: string[][] = []
+  const model = {
+    ...fakeModel(),
+    async *analyzeConversation(input: {
+      userPrompt: string; tools: Array<{ name: string }>
+    }): AsyncGenerator<ModelEvent> {
+      projections.push(input.tools.map(({ name }) => name))
+      yield {
+        type: 'chat_completed', text: `回答：${input.userPrompt}`,
+        operationId: `projection:${projections.length}`,
+      }
+    },
+  }
+  const app = await makeApp(`conversation-projection-${crypto.randomUUID()}`, model)
+  const created = await app.inject({
+    method: 'POST', url: '/api/conversations', payload: { message: '测试测试' },
+  })
+  const id = created.json().id as string
+  await waitForConversation(app, id, 'completed')
+  const followUp = await app.inject({
+    method: 'POST', url: `/api/conversations/${id}/messages`,
+    payload: { message: '看看 NVDA 的 K线和均线。' },
+  })
+  assert.equal(followUp.statusCode, 202)
+  await waitForConversation(app, id, 'completed')
+
+  assert.deepEqual(projections, [
+    [],
+    ['get_technical_evidence', 'get_price_window'],
+  ])
+  await app.close()
+})
+
+test('自由对话省略式追问只继承最近 ticker scope 并由当前消息决定领域工具', async () => {
+  const projections: string[][] = []
+  const model = {
+    ...fakeModel(),
+    async *analyzeConversation(input: {
+      userPrompt: string; tools: Array<{ name: string }>
+    }): AsyncGenerator<ModelEvent> {
+      projections.push(input.tools.map(({ name }) => name))
+      yield {
+        type: 'chat_completed', text: `回答：${input.userPrompt}`,
+        operationId: `scope-projection:${projections.length}`,
+      }
+    },
+  }
+  const app = await makeApp(`conversation-scope-${crypto.randomUUID()}`, model)
+  const created = await app.inject({
+    method: 'POST', url: '/api/conversations', payload: { message: '分析 NVDA 最近怎么样。' },
+  })
+  const id = created.json().id as string
+  await waitForConversation(app, id, 'completed')
+  for (const message of ['再查一下最近变化。', '那技术面呢？']) {
+    const followUp = await app.inject({
+      method: 'POST', url: `/api/conversations/${id}/messages`, payload: { message },
+    })
+    assert.equal(followUp.statusCode, 202)
+    await waitForConversation(app, id, 'completed')
+  }
+
+  assert.deepEqual(projections, [
+    ['fetch_financial_context'],
+    ['fetch_financial_context'],
+    ['get_technical_evidence', 'get_price_window'],
+  ])
+  await app.close()
+})
+
 test('自由对话可以创建并等待受控 subagent', async () => {
   const model = {
     ...fakeModel(),

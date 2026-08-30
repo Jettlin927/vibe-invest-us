@@ -6,7 +6,8 @@ import { defaultRuntimeSettings } from '@vibe-invest/contracts'
 
 import {
   checkSchema, createAgentEventRepository, createAnalysisRepository, createConversationRepository, createPool,
-  createPortfolioRepository, createRuntimeSettingsRepository, createToolProjectionRepository, migrate,
+  createPortfolioRepository, createRuntimeSettingsRepository, createToolProjectionRepository,
+  createTrackingRepository, migrate,
 } from '../src/index.js'
 
 const migrationUrl = process.env.TEST_MIGRATION_DATABASE_URL
@@ -28,6 +29,333 @@ async function removeResearchFixture(pool: Pool, analysisId: string) {
   )
   return createAnalysisRepository(pool).removeResearch(analysisId)
 }
+
+async function removeTrackingFixtures(pool: Pool, runIds: string[]) {
+  const exists = await pool.query<{
+    events_table: string | null; observations_table: string | null; runs_table: string | null
+  }>(
+    `SELECT to_regclass('public.tracking_events')::text AS events_table,
+            to_regclass('public.tracking_observations')::text AS observations_table,
+            to_regclass('public.tracking_runs')::text AS runs_table`,
+  )
+  if (exists.rows[0]?.events_table) {
+    await pool.query('DELETE FROM tracking_events WHERE run_id = ANY($1)', [runIds])
+  }
+  if (exists.rows[0]?.observations_table) {
+    await pool.query('DELETE FROM tracking_observations WHERE run_id = ANY($1)', [runIds])
+  }
+  if (exists.rows[0]?.runs_table) {
+    await pool.query('DELETE FROM tracking_runs WHERE id = ANY($1)', [runIds])
+  }
+}
+
+test('真实 PostgreSQL v27 通过 Tracking Repository 管理自选 CRUD', {
+  skip: !migrationUrl || !applicationUrl,
+  concurrency: false,
+}, async () => {
+  await migrate(migrationUrl!)
+  const pool = createPool(applicationUrl!)
+  const tracking = createTrackingRepository(pool)
+  const symbol = `W${crypto.randomUUID().replaceAll('-', '').slice(0, 8)}`.toUpperCase()
+  try {
+    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 27 })
+    const added = await tracking.addWatchlist({
+      symbol: symbol.toLowerCase(), note: '观察财报', createdAt: '2026-08-30T01:00:00.000Z',
+    })
+    assert.deepEqual(added, {
+      symbol, note: '观察财报', enabled: true,
+      createdAt: '2026-08-30T01:00:00.000Z', updatedAt: '2026-08-30T01:00:00.000Z',
+    })
+    await assert.rejects(
+      tracking.addWatchlist({ symbol, createdAt: '2026-08-30T01:00:01.000Z' }),
+      /tracking_watchlist_item_exists/,
+    )
+    assert.deepEqual(await tracking.updateWatchlist(symbol, {
+      note: '等待下一财期', enabled: false, updatedAt: '2026-08-30T02:00:00.000Z',
+    }), {
+      symbol, note: '等待下一财期', enabled: false,
+      createdAt: '2026-08-30T01:00:00.000Z', updatedAt: '2026-08-30T02:00:00.000Z',
+    })
+    assert.deepEqual((await tracking.listWatchlist()).find((item) => item.symbol === symbol), {
+      symbol, note: '等待下一财期', enabled: false,
+      createdAt: '2026-08-30T01:00:00.000Z', updatedAt: '2026-08-30T02:00:00.000Z',
+    })
+    assert.equal(await tracking.removeWatchlist(symbol), true)
+    assert.equal(await tracking.removeWatchlist(symbol), false)
+    assert.equal(await tracking.updateWatchlist(symbol, { note: '不存在' }), null)
+  } finally {
+    await tracking.removeWatchlist(symbol)
+    await pool.end()
+  }
+})
+
+test('真实 PostgreSQL Tracking Run 原子冻结目标快照且全局只允许一个活跃扫描', {
+  skip: !migrationUrl || !applicationUrl,
+  concurrency: false,
+}, async () => {
+  await migrate(migrationUrl!)
+  const pool = createPool(applicationUrl!)
+  const migrationPool = createPool(migrationUrl!)
+  const tracking = createTrackingRepository(pool)
+  const firstId = `tracking-run-${crypto.randomUUID()}`
+  const secondId = `tracking-run-${crypto.randomUUID()}`
+  try {
+    const attempts = await Promise.allSettled([
+      tracking.beginRun({
+        id: firstId,
+        targets: [{ symbol: 'nvda', sources: ['watchlist'] }],
+        startedAt: '2026-08-30T03:00:00.000Z',
+      }),
+      tracking.beginRun({
+        id: secondId,
+        targets: [{ symbol: 'MU', sources: ['position', 'watchlist'] }],
+        startedAt: '2026-08-30T03:00:00.001Z',
+      }),
+    ])
+    const fulfilled = attempts.filter(
+      (attempt): attempt is PromiseFulfilledResult<Awaited<ReturnType<typeof tracking.beginRun>>> => (
+        attempt.status === 'fulfilled'
+      ),
+    )
+    const rejected = attempts.filter(
+      (attempt): attempt is PromiseRejectedResult => attempt.status === 'rejected',
+    )
+    assert.equal(fulfilled.length, 1)
+    assert.equal(rejected.length, 1)
+    assert.match(String(rejected[0]?.reason), /tracking_run_active/)
+    const active = await tracking.getActiveRun()
+    assert.deepEqual(active, fulfilled[0]?.value)
+    assert.equal(active?.status, 'running')
+    assert.equal(active?.completedAt, null)
+    assert.equal(active?.error, null)
+    assert.deepEqual(active?.targets, active?.id === firstId
+      ? [{ symbol: 'NVDA', sources: ['watchlist'] }]
+      : [{ symbol: 'MU', sources: ['position', 'watchlist'] }])
+  } finally {
+    await migrationPool.query('DELETE FROM tracking_runs WHERE id = ANY($1)', [[firstId, secondId]])
+    await pool.end()
+    await migrationPool.end()
+  }
+})
+
+test('真实 PostgreSQL Tracking 基线跳过 data_gap 且 eventKey 跨扫描幂等', {
+  skip: !migrationUrl || !applicationUrl,
+  concurrency: false,
+}, async () => {
+  await migrate(migrationUrl!)
+  const pool = createPool(applicationUrl!)
+  const migrationPool = createPool(migrationUrl!)
+  const tracking = createTrackingRepository(pool)
+  const suffix = crypto.randomUUID().replaceAll('-', '').slice(0, 8).toUpperCase()
+  const symbol = `B${suffix}`
+  const runIds = [1, 2, 3].map((ordinal) => `tracking-baseline-${suffix}-${ordinal}`)
+  const observationIds = [1, 2, 3].map((ordinal) => `tracking-observation-${suffix}-${ordinal}`)
+  const eventKey = `${symbol}:technical:shared-change`
+  try {
+    await tracking.beginRun({
+      id: runIds[0]!, targets: [{ symbol, sources: ['watchlist'] }],
+      startedAt: '2026-08-30T04:00:00.000Z',
+    })
+    const first = await tracking.completeRun({
+      runId: runIds[0]!, status: 'completed', completedAt: '2026-08-30T04:00:02.000Z',
+      observations: [{
+        id: observationIds[0]!, symbol, capability: 'technical', status: 'success',
+        observedAt: '2026-08-30T04:00:01.000Z', payload: { close: 100 },
+        events: [{
+          eventKey: `${symbol}:technical:first-baseline`, kind: 'ma_cross', severity: 'info',
+          occurredAt: '2026-08-30T04:00:01.000Z', payload: { direction: 'up' },
+        }],
+      }],
+    })
+    assert.equal(first.status, 'completed')
+    assert.equal(first.observations[0]?.baselineObservationId, null)
+    assert.deepEqual(first.events, [])
+
+    await tracking.beginRun({
+      id: runIds[1]!, targets: [{ symbol, sources: ['watchlist'] }],
+      startedAt: '2026-08-30T05:00:00.000Z',
+    })
+    const gap = await tracking.completeRun({
+      runId: runIds[1]!, status: 'partial', completedAt: '2026-08-30T05:00:02.000Z',
+      observations: [{
+        id: observationIds[1]!, symbol, capability: 'technical', status: 'data_gap',
+        observedAt: '2026-08-30T05:00:01.000Z', payload: { reason: 'provider_unavailable' },
+        events: [{
+          eventKey, kind: 'data_gap', severity: 'warning',
+          occurredAt: '2026-08-30T05:00:01.000Z', payload: { reason: 'provider_unavailable' },
+        }],
+      }],
+    })
+    assert.equal(gap.observations[0]?.baselineObservationId, observationIds[0])
+    assert.equal(gap.events.length, 1)
+
+    assert.deepEqual(
+      (await tracking.latestSuccessfulObservations([symbol.toLowerCase()])).map(({ id }) => id),
+      [observationIds[0]],
+    )
+
+    await tracking.beginRun({
+      id: runIds[2]!, targets: [{ symbol, sources: ['watchlist', 'position'] }],
+      startedAt: '2026-08-30T06:00:00.000Z',
+    })
+    const recovered = await tracking.completeRun({
+      runId: runIds[2]!, status: 'completed', completedAt: '2026-08-30T06:00:02.000Z',
+      observations: [{
+        id: observationIds[2]!, symbol, capability: 'technical', status: 'success',
+        observedAt: '2026-08-30T06:00:01.000Z', payload: { close: 105 },
+        events: [{
+          eventKey, kind: 'data_recovered', severity: 'info',
+          occurredAt: '2026-08-30T06:00:01.000Z', payload: { close: 105 },
+        }],
+      }],
+    })
+    assert.equal(recovered.observations[0]?.baselineObservationId, observationIds[0])
+    assert.deepEqual(recovered.events, [])
+    assert.deepEqual(await tracking.getRun(runIds[2]!), recovered)
+    const events = await tracking.listEvents({ symbol, limit: 10 })
+    assert.equal(events.filter((event) => event.eventKey === eventKey).length, 1)
+    assert.equal(events.find((event) => event.eventKey === eventKey)?.observationId, observationIds[1])
+  } finally {
+    await removeTrackingFixtures(migrationPool, runIds)
+    await pool.end()
+    await migrationPool.end()
+  }
+})
+
+test('真实 PostgreSQL Tracking 在事实时间相同时选择最近完成扫描作为基线', {
+  skip: !migrationUrl || !applicationUrl,
+  concurrency: false,
+}, async () => {
+  await migrate(migrationUrl!)
+  const pool = createPool(applicationUrl!)
+  const migrationPool = createPool(migrationUrl!)
+  const tracking = createTrackingRepository(pool)
+  const suffix = crypto.randomUUID().replaceAll('-', '').slice(0, 8).toUpperCase()
+  const symbol = `T${suffix}`
+  const runIds = ['older', 'newer', 'probe'].map((name) => `tracking-tie-${suffix}-${name}`)
+  const observationIds = [
+    `z-tracking-tie-${suffix}-older`,
+    `a-tracking-tie-${suffix}-newer`,
+    `tracking-tie-${suffix}-probe`,
+  ]
+  const observedAt = '2026-08-30T20:00:00.000Z'
+  try {
+    for (const [index, completedAt] of [
+      '2026-08-30T20:01:00.000Z', '2026-08-30T20:02:00.000Z',
+    ].entries()) {
+      await tracking.beginRun({
+        id: runIds[index]!, targets: [{ symbol, sources: ['watchlist'] }],
+        startedAt: index === 0 ? '2026-08-30T20:00:30.000Z' : '2026-08-30T20:01:30.000Z',
+      })
+      await tracking.completeRun({
+        runId: runIds[index]!, status: 'completed', completedAt,
+        observations: [{
+          id: observationIds[index]!, symbol, capability: 'technical', status: 'success',
+          observedAt, payload: { version: index + 1 }, events: [],
+        }],
+      })
+    }
+
+    assert.deepEqual(
+      (await tracking.latestSuccessfulObservations([symbol])).map(({ id }) => id),
+      [observationIds[1]],
+    )
+
+    await tracking.beginRun({
+      id: runIds[2]!, targets: [{ symbol, sources: ['watchlist'] }],
+      startedAt: '2026-08-30T20:03:00.000Z',
+    })
+    const probe = await tracking.completeRun({
+      runId: runIds[2]!, status: 'completed', completedAt: '2026-08-30T20:03:01.000Z',
+      observations: [{
+        id: observationIds[2]!, symbol, capability: 'technical', status: 'success',
+        observedAt, payload: { version: 3 }, events: [],
+      }],
+    })
+    assert.equal(probe.observations[0]?.baselineObservationId, observationIds[1])
+    assert.equal((await tracking.getLatestRun())?.id, runIds[2])
+  } finally {
+    await removeTrackingFixtures(migrationPool, runIds)
+    await pool.end()
+    await migrationPool.end()
+  }
+})
+
+test('真实 PostgreSQL completeRun 原子提交且 Tracking 历史与目标快照不可改写', {
+  skip: !migrationUrl || !applicationUrl,
+  concurrency: false,
+}, async () => {
+  await migrate(migrationUrl!)
+  const pool = createPool(applicationUrl!)
+  const migrationPool = createPool(migrationUrl!)
+  const tracking = createTrackingRepository(pool)
+  const suffix = crypto.randomUUID().replaceAll('-', '').slice(0, 8).toUpperCase()
+  const symbol = `A${suffix}`
+  const runIds = [`tracking-atomic-base-${suffix}`, `tracking-atomic-run-${suffix}`]
+  const baselineId = `tracking-atomic-observation-base-${suffix}`
+  const observationId = `tracking-atomic-observation-${suffix}`
+  try {
+    await tracking.beginRun({
+      id: runIds[0]!, targets: [{ symbol, sources: ['watchlist'] }],
+      startedAt: '2026-08-30T07:00:00.000Z',
+    })
+    await tracking.completeRun({
+      runId: runIds[0]!, status: 'completed', completedAt: '2026-08-30T07:00:02.000Z',
+      observations: [{
+        id: baselineId, symbol, capability: 'technical', status: 'success',
+        observedAt: '2026-08-30T07:00:01.000Z', payload: { close: 100 }, events: [],
+      }],
+    })
+    await tracking.beginRun({
+      id: runIds[1]!, targets: [{ symbol, sources: ['watchlist', 'position'] }],
+      startedAt: '2026-08-30T08:00:00.000Z',
+    })
+    const event = {
+      eventKey: `${symbol}:technical:atomic`, kind: 'breakout', severity: 'warning' as const,
+      occurredAt: '2026-08-30T08:00:01.000Z', payload: { previous: 100, current: 110 },
+    }
+    await assert.rejects(tracking.completeRun({
+      runId: runIds[1]!, status: 'completed', completedAt: '2026-08-30T08:00:02.000Z',
+      observations: [{
+        id: observationId, symbol, capability: 'technical', status: 'success',
+        observedAt: '2026-08-30T08:00:01.000Z', payload: { close: 110 }, events: [event],
+      }, {
+        id: observationId, symbol, capability: 'news', status: 'success',
+        observedAt: '2026-08-30T08:00:01.500Z', payload: { stories: 1 }, events: [],
+      }],
+    }), /duplicate key/)
+    assert.deepEqual(await tracking.getRun(runIds[1]!), {
+      id: runIds[1], status: 'running', targets: [{ symbol, sources: ['watchlist', 'position'] }],
+      startedAt: '2026-08-30T08:00:00.000Z', completedAt: null, error: null,
+      observations: [], events: [],
+    })
+    const completed = await tracking.completeRun({
+      runId: runIds[1]!, status: 'completed', completedAt: '2026-08-30T08:00:02.000Z',
+      observations: [{
+        id: observationId, symbol, capability: 'technical', status: 'success',
+        observedAt: '2026-08-30T08:00:01.000Z', payload: { close: 110 }, events: [event],
+      }],
+    })
+    assert.equal(completed.observations.length, 1)
+    assert.equal(completed.events.length, 1)
+    await assert.rejects(
+      pool.query(`UPDATE tracking_observations SET payload_json = '{}' WHERE id = $1`, [observationId]),
+      /permission denied/,
+    )
+    await assert.rejects(
+      pool.query('DELETE FROM tracking_events WHERE id = $1', [completed.events[0]!.id]),
+      /permission denied/,
+    )
+    await assert.rejects(
+      pool.query(`UPDATE tracking_runs SET targets_json = '[]' WHERE id = $1`, [runIds[1]]),
+      /permission denied/,
+    )
+  } finally {
+    await removeTrackingFixtures(migrationPool, runIds)
+    await pool.end()
+    await migrationPool.end()
+  }
+})
 
 test('真实 PostgreSQL 持久化 Tool Projection 版本、模型请求与批次边界并可重放', {
   skip: !migrationUrl || !applicationUrl,
@@ -485,11 +813,11 @@ test('真实 PostgreSQL v21 经当前迁移将未终态模型请求封存为 out
     assert.deepEqual(lifecycle?.modelAttempts[0]?.usage, {
       input: null, cacheRead: null, cacheWrite: null, output: null, total: null,
     })
-    assert.deepEqual(await checkSchema(appPool), { status: 'ok', version: 25 })
+    assert.deepEqual(await checkSchema(appPool), { status: 'ok', version: 27 })
   } finally {
     await removeResearchFixture(appPool, analysisId)
     await migrationPool.query(
-      `INSERT INTO product_schema_migrations (version) VALUES (22), (23), (24), (25)
+      `INSERT INTO product_schema_migrations (version) VALUES (22), (23), (24), (25), (26), (27)
        ON CONFLICT DO NOTHING`,
     )
     await appPool.end()
@@ -523,7 +851,7 @@ test('真实 PostgreSQL v22 接受技术面 Tool Projection 角色', {
       createdAt: '2026-08-14T00:00:01.000Z',
     })
     assert.equal(projection.role, 'technical')
-    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 25 })
+    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 27 })
   } finally {
     const cleanup = createPool(migrationUrl!)
     await cleanup.query('DELETE FROM analyses WHERE id = $1', [analysisId])
@@ -1629,7 +1957,7 @@ test('真实 PostgreSQL migration 幂等且 application role 没有 DDL 权限',
   await migrate(migrationUrl!)
 
   const pool = createPool(applicationUrl!)
-  assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 25 })
+  assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 27 })
   const privileges = await pool.query<{ can_create: boolean; can_temp: boolean }>(
     `SELECT has_schema_privilege(current_user, 'public', 'CREATE') AS can_create,
             has_database_privilege(current_user, current_database(), 'TEMP') AS can_temp`,
@@ -1686,7 +2014,7 @@ test('真实 PostgreSQL migration receipt 为空时按 max=0 升级', {
     )
     await pool.query('DELETE FROM product_schema_migrations')
     await migrate(migrationUrl!)
-    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 25 })
+    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 27 })
     assert.deepEqual((await pool.query<{ sequence: number; provenance: string }>(
       `SELECT sequence, provenance FROM tool_event_migration_provenance WHERE session_id = $1`,
       [sessionId],
@@ -1753,23 +2081,23 @@ test('真实 PostgreSQL 拒绝未来 schema 且不修改数据库', {
   })
   try {
     await pool.query('DROP TABLE tool_event_migration_provenance')
-    await pool.query('INSERT INTO product_schema_migrations (version) VALUES (26)')
+    await pool.query('INSERT INTO product_schema_migrations (version) VALUES (28)')
     const before = await fingerprint()
 
     await assert.rejects(
       migrate(migrationUrl!),
-      /product_schema_future_version_unsupported:26/,
+      /product_schema_future_version_unsupported:28/,
     )
 
     assert.deepEqual(await fingerprint(), before)
   } finally {
-    await pool.query('DELETE FROM product_schema_migrations WHERE version = 26')
+    await pool.query('DELETE FROM product_schema_migrations WHERE version = 28')
     await migrate(migrationUrl!)
     await pool.end()
   }
 })
 
-test('真实 PostgreSQL v12 无 Tool Batch 的历史工具事件原样升级到 v25', {
+test('真实 PostgreSQL v12 无 Tool Batch 的历史工具事件原样升级到 v27', {
   skip: !migrationUrl,
   concurrency: false,
 }, async () => {
@@ -1813,7 +2141,7 @@ test('真实 PostgreSQL v12 无 Tool Batch 的历史工具事件原样升级到 
 
     await migrate(migrationUrl!)
 
-    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 25 })
+    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 27 })
     assert.deepEqual((await pool.query<{ sequence: number; provenance: string }>(
       `SELECT sequence, provenance FROM tool_event_migration_provenance
        WHERE session_id = $1 ORDER BY sequence`, [sessionId],

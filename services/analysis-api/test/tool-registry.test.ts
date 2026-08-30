@@ -160,6 +160,104 @@ test('Registry 只按角色和阶段返回模型定义且不提供隐藏工具 d
   assert.equal('has' in registry, false)
 })
 
+test('自由对话普通闲聊不投影研究工具', () => {
+  const registry = createToolRegistry(registeredToolDefinitions)
+  assert.deepEqual(
+    registry.projectConversation({ userMessage: '测试测试' }).map(({ name }) => name),
+    [],
+  )
+})
+
+test('自由对话含 symbol 的宽泛研究只投影金融上下文工具', () => {
+  const registry = createToolRegistry(registeredToolDefinitions)
+  assert.deepEqual(
+    registry.projectConversation({ userMessage: '请研究一下 NVDA 最近怎么样。' })
+      .map(({ name }) => name),
+    ['fetch_financial_context'],
+  )
+})
+
+test('自由对话技术和 K线意图只投影技术证据与价格窗口', () => {
+  const registry = createToolRegistry(registeredToolDefinitions)
+  assert.deepEqual(
+    registry.projectConversation({ userMessage: '看看 NVDA 的 K线、均线和 RSI。' })
+      .map(({ name }) => name),
+    ['get_technical_evidence', 'get_price_window'],
+  )
+})
+
+test('自由对话基本面估值和财报意图只投影财务与 Filing 工具', () => {
+  const registry = createToolRegistry(registeredToolDefinitions)
+  assert.deepEqual(
+    registry.projectConversation({ userMessage: '分析 NVDA 最新财报、基本面和估值。' })
+      .map(({ name }) => name),
+    [
+      'get_financial_overview', 'get_financial_metric_series',
+      'get_valuation_evidence', 'read_filing_document',
+    ],
+  )
+})
+
+test('自由对话新闻和事件意图只投影消息面工具', () => {
+  const registry = createToolRegistry(registeredToolDefinitions)
+  assert.deepEqual(
+    registry.projectConversation({ userMessage: 'NVDA 最近有什么新闻和公司事件？' })
+      .map(({ name }) => name),
+    ['search_news_candidates', 'read_news_document', 'list_company_events'],
+  )
+})
+
+test('自由对话只在显式请求时投影报告和受控 subagent 工具', () => {
+  const registry = createToolRegistry(registeredToolDefinitions)
+  assert.deepEqual(
+    registry.projectConversation({ userMessage: '解释一下什么是研究报告和 subagent。' })
+      .map(({ name }) => name),
+    [],
+  )
+  assert.deepEqual(
+    registry.projectConversation({ userMessage: '请生成一份 NVDA 研究报告，并派一个子 Agent 并行核对。' })
+      .map(({ name }) => name),
+    [
+      'fetch_financial_context', 'create_research_report', 'spawn_agent', 'wait_agent',
+      'read_agent_result', 'stop_agent',
+    ],
+  )
+  assert.deepEqual(
+    registry.projectConversation({ userMessage: '读取刚才的子 Agent 结果。' })
+      .map(({ name }) => name),
+    ['spawn_agent', 'wait_agent', 'read_agent_result', 'stop_agent'],
+  )
+  assert.deepEqual(
+    registry.projectConversation({ userMessage: '给我解释一下研究报告是什么。' })
+      .map(({ name }) => name),
+    [],
+  )
+  assert.deepEqual(
+    registry.projectConversation({ userMessage: '帮我做一份 NVDA 研究报告，并让子 Agent 分析。' })
+      .map(({ name }) => name),
+    [
+      'fetch_financial_context', 'create_research_report', 'spawn_agent', 'wait_agent',
+      'read_agent_result', 'stop_agent',
+    ],
+  )
+})
+
+test('自由对话识别小写 ticker 和常见技术表达但不把 API 当作标的', () => {
+  const registry = createToolRegistry(registeredToolDefinitions)
+  assert.deepEqual(
+    registry.projectConversation({ userMessage: '看看 nvda 最近怎么样。' }).map(({ name }) => name),
+    ['fetch_financial_context'],
+  )
+  assert.deepEqual(
+    registry.projectConversation({ userMessage: '看看 NVDA 的走势和形态。' }).map(({ name }) => name),
+    ['get_technical_evidence', 'get_price_window'],
+  )
+  assert.deepEqual(
+    registry.projectConversation({ userMessage: '这个 API 怎么使用？' }).map(({ name }) => name),
+    [],
+  )
+})
+
 test('Registry 用户投影按具体工具收紧嵌套结果并拒绝未知工具或字段', () => {
   const registry = createToolRegistry(registeredToolDefinitions)
   assert.deepEqual(registry.projectPublicResult('get_financial_overview', {

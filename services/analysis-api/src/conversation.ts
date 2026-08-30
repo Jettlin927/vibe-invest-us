@@ -15,6 +15,7 @@ import type {
 } from './model.js'
 import type { PiAgentAdapterContent, PiAgentAdapterMessage } from './agent-runtime/pi-agent-adapter.js'
 import { toolRegistry } from './tool-registry.js'
+import { conversationToolsForMessage } from './tools.js'
 import { createActiveBudget } from './runtime-policy.js'
 
 type ConversationModel = {
@@ -357,6 +358,13 @@ export function createConversationService(options: ConversationOptions) {
     const latestCompaction = (lifecycle as {
       compactions?: Array<{ summary?: Record<string, unknown> }>
     }).compactions?.at(-1)
+    const configuredToolNames = new Set(options.tools.map(({ name }) => name))
+    const scopeMessages = events.filter((event) => (
+      event.type === 'user_message' && Number(event.sequence) < userSequence
+        && typeof event.message === 'string'
+    )).reverse().map((event) => String(event.message))
+    const tools = conversationToolsForMessage(String(currentUser.message), scopeMessages)
+      .filter(({ name }) => configuredToolNames.has(name))
     const input: FreeConversationInput = {
       executionId, runtimeSettings: settings.values, systemPrompt: options.systemPrompt ?? defaultPrompt,
       userPrompt: String(currentUser.message), symbol: undefined,
@@ -365,7 +373,7 @@ export function createConversationService(options: ConversationOptions) {
         summary: latestCompaction?.summary,
       }),
       signal: executionSignal, executionDeadlineSignal: wallDeadline, activeBudget: budget,
-      toolRuntime, tools: options.tools,
+      toolRuntime, tools,
       executeTool,
     }
     try {

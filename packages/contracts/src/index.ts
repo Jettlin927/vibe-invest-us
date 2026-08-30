@@ -175,6 +175,87 @@ export type SystemHealth = {
   }
 }
 
+export type WatchlistItem = {
+  symbol: string
+  note: string
+  enabled: boolean
+  createdAt: string
+  updatedAt: string
+}
+
+export const trackingTargetSources = ['watchlist', 'position'] as const
+export type TrackingTargetSource = typeof trackingTargetSources[number]
+
+export type TrackingTarget = {
+  symbol: string
+  sources: TrackingTargetSource[]
+}
+
+export const trackingRunStatuses = ['running', 'completed', 'partial', 'failed'] as const
+export type TrackingRunStatus = typeof trackingRunStatuses[number]
+
+export type TrackingRun = {
+  id: string
+  status: TrackingRunStatus
+  targets: TrackingTarget[]
+  startedAt: string
+  completedAt: string | null
+  error: string | null
+}
+
+export const trackingCapabilities = ['technical', 'fundamental', 'news'] as const
+export type TrackingCapability = typeof trackingCapabilities[number]
+
+export const trackingObservationStatuses = ['success', 'data_gap'] as const
+export type TrackingObservationStatus = typeof trackingObservationStatuses[number]
+
+export type TrackingObservation = {
+  id: string
+  runId: string
+  symbol: string
+  capability: TrackingCapability
+  status: TrackingObservationStatus
+  baselineObservationId: string | null
+  observedAt: string
+  payload: Record<string, unknown>
+}
+
+export const trackingEventSeverities = ['info', 'warning', 'critical'] as const
+export type TrackingEventSeverity = typeof trackingEventSeverities[number]
+
+export type TrackingEventCandidate = {
+  eventKey: string
+  kind: string
+  severity: TrackingEventSeverity
+  occurredAt: string
+  payload: Record<string, unknown>
+}
+
+export type TrackingEvent = TrackingEventCandidate & {
+  id: string
+  runId: string
+  observationId: string
+  baselineObservationId: string
+  symbol: string
+  capability: TrackingCapability
+  createdAt: string
+}
+
+export type TrackingRunDetail = TrackingRun & {
+  observations: TrackingObservation[]
+  events: TrackingEvent[]
+}
+
+export type TrackingObservationInput = {
+  id: string
+  symbol: string
+  capability: TrackingCapability
+  status: TrackingObservationStatus
+  observedAt: string
+  payload: Record<string, unknown>
+  events: TrackingEventCandidate[]
+}
+
 export type SseEventEnvelope = {
   id: string
   event: string

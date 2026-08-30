@@ -4,10 +4,12 @@ import {
   aggregateModelTokenUsage, isRuntimeSettingsResponse, isSystemHealth,
   isTerminalAgentExecutionStatus, runtimeSettingLimits,
   type RuntimeSettings, type RuntimeSettingsResponse, type SystemHealth,
-  type TokenUsageAggregate,
+  type TokenUsageAggregate, type TrackingRunDetail,
 } from '@vibe-invest/contracts'
 
-type Page = 'overview' | 'analysis' | 'research' | 'conversation' | 'portfolio' | 'settings'
+import { TrackingPage, type TrackingOverview } from './tracking-page.js'
+
+type Page = 'overview' | 'tracking' | 'analysis' | 'research' | 'conversation' | 'portfolio' | 'settings'
 type Position = { symbol: string; quantity: number; averageCost: number }
 type PortfolioPosition = Position & {
   costAmount: number; marketPrice: number | null; marketValue: number | null
@@ -113,6 +115,7 @@ function createMessageId() {
 
 const pages: Array<{ id: Page; label: string }> = [
   { id: 'overview', label: '总览' },
+  { id: 'tracking', label: '追踪' },
   { id: 'analysis', label: '新建分析' },
   { id: 'research', label: '研究记录' },
   { id: 'conversation', label: '研究对话' },
@@ -138,10 +141,18 @@ export function App() {
   const [conversationThreads, setConversationThreads] = useState<ConversationThread[]>([])
   const [selectedConversation, setSelectedConversation] = useState<ConversationThread | null>(null)
   const [conversationEvents, setConversationEvents] = useState<ConversationEvent[]>([])
+  const [conversationBusy, setConversationBusy] = useState(false)
+  const [trackingOverview, setTrackingOverview] = useState<TrackingOverview | null>(null)
+  const [trackingAvailable, setTrackingAvailable] = useState<boolean | null>(null)
+  const [trackingLastScan, setTrackingLastScan] = useState<TrackingRunDetail | null>(null)
+  const [trackingLoading, setTrackingLoading] = useState(false)
+  const [trackingScanning, setTrackingScanning] = useState(false)
+  const trackingPollingRunId = useRef<string | null>(null)
   const [analysisSymbol, setAnalysisSymbol] = useState('NVDA')
   const [analysisStatus, setAnalysisStatus] = useState('')
   const [analysisStages, setAnalysisStages] = useState<string[]>([])
   const [activeAnalysisId, setActiveAnalysisId] = useState<string | null>(null)
+  const [analysisSubmitting, setAnalysisSubmitting] = useState(false)
   const [deletingResearchId, setDeletingResearchId] = useState<string | null>(null)
   const [error, setError] = useState('')
 
@@ -225,6 +236,31 @@ export function App() {
     setModelConfigured(value.model.configured)
     setRuntimeSettings(value)
   }
+  async function loadTracking(): Promise<TrackingOverview | null> {
+    setTrackingLoading(true)
+    try {
+      const response = await fetch('/api/tracking?limit=100')
+      if (response.ok) {
+        const next = await response.json() as TrackingOverview
+        setTrackingAvailable(true)
+        setTrackingOverview(next)
+        if (next.activeScan?.id && trackingPollingRunId.current === null) {
+          void pollTrackingScan(next.activeScan.id)
+        }
+        return next
+      } else {
+        setTrackingAvailable(false)
+        setTrackingOverview(null)
+        return null
+      }
+    } catch {
+      setTrackingAvailable(false)
+      setTrackingOverview(null)
+      return null
+    } finally {
+      setTrackingLoading(false)
+    }
+  }
   useEffect(() => {
     void Promise.all([
       fetch('/api/health').then((response) => response.json()).then((value: unknown) => {
@@ -232,7 +268,7 @@ export function App() {
         setHealth(value)
       }),
       loadSettings(),
-      loadPortfolio(), loadResearch(), loadConversations(),
+      loadPortfolio(), loadResearch(), loadConversations(), loadTracking(),
     ]).catch((cause) => setError(cause instanceof Error ? cause.message : String(cause)))
   }, [])
   useEffect(() => {
@@ -299,15 +335,30 @@ export function App() {
   }
   async function startAnalysis(event: React.FormEvent) {
     event.preventDefault()
+    await startAnalysisForSymbol(analysisSymbol)
+  }
+  async function startAnalysisForSymbol(symbolInput: string) {
+    if (analysisSubmitting || activeAnalysisId) return
     setError('')
-    const response = await fetch('/api/analyses', {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ symbol: analysisSymbol.trim().toUpperCase() }),
-    })
-    const { analysisId, sessionId } = await response.json()
-    if (!response.ok || !analysisId) { setError('分析任务创建失败'); return }
+    const symbol = symbolInput.trim().toUpperCase()
+    setAnalysisSymbol(symbol)
+    setPage('analysis')
     setAnalysisStatus('queued')
     setAnalysisStages(['queued'])
+    setAnalysisSubmitting(true)
+    let response: Response
+    try {
+      response = await fetch('/api/analyses', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ symbol }),
+      })
+    } catch {
+      setAnalysisSubmitting(false); setAnalysisStatus(''); setError('分析任务创建失败')
+      return
+    }
+    const { analysisId, sessionId } = await response.json()
+    setAnalysisSubmitting(false)
+    if (!response.ok || !analysisId) { setAnalysisStatus(''); setError('分析任务创建失败'); return }
     setActiveAnalysisId(analysisId)
     if (!modelConfigured) {
       await openResearch(analysisId)
@@ -379,6 +430,10 @@ export function App() {
     if (response.ok) setSelectedResearch(await response.json())
   }
   async function openConversation(id: string) {
+    const summary = conversationThreads.find((thread) => thread.id === id)
+    if (summary && summary.id !== selectedConversation?.id) {
+      setSelectedConversation(summary); setConversationEvents([]); setConversationBusy(false)
+    }
     const response = await fetch(`/api/conversations/${id}`)
     if (!response.ok) return
     const value = await response.json() as {
@@ -387,59 +442,89 @@ export function App() {
     if (!value.thread) return
     setSelectedConversation(value.thread)
     setConversationEvents(value.lifecycle?.events ?? [])
+    setConversationBusy(['queued', 'running'].includes(value.thread.status))
   }
   function streamConversation(sessionId: string, threadId: string, afterSequence = 0) {
-    if (!('EventSource' in globalThis)) return
+    if (!('EventSource' in globalThis)) return false
     const suffix = afterSequence > 0 ? `?after=${afterSequence}` : ''
     const source = new EventSource(`/api/conversations/${threadId}/events${suffix}`)
-    const names = ['user_message', 'assistant_message', 'text_delta', 'tool_call', 'tool_result',
-      'running_model', 'running_tools', 'completed', 'failed', 'stopped', 'interrupted']
+    const names = ['user_message', 'assistant_message', 'text_delta', 'chat_completed',
+      'artifact_completed', 'tool_call', 'tool_result', 'running_model', 'running_tools',
+      'completed', 'failed', 'stopped', 'interrupted']
     for (const name of names) source.addEventListener(name, (event) => {
       const message = event as MessageEvent
       const sequence = Number(message.lastEventId.split(':').at(-1))
       if (Number.isInteger(sequence) && sequence <= afterSequence) return
       const payload = JSON.parse(message.data) as ConversationEvent
-      if (Number.isInteger(sequence)) setConversationEvents((current) => (
-        current.some((entry) => entry.sequence === sequence)
-          ? current : [...current, { ...payload, sequence }]
-      ))
+      if (Number.isInteger(sequence)) setConversationEvents((current) => {
+        const withoutOptimistic = payload.type === 'user_message' && typeof payload.messageId === 'string'
+          ? current.filter((entry) => !(entry.sequence < 0 && entry.messageId === payload.messageId))
+          : current
+        return withoutOptimistic.some((entry) => entry.sequence === sequence)
+          ? withoutOptimistic : [...withoutOptimistic, { ...payload, sequence }]
+      })
       if (['completed', 'failed', 'stopped', 'interrupted'].includes(name)) {
         source.close()
+        setConversationBusy(false)
         void openConversation(threadId).then(() => loadConversations())
       }
     })
-    source.onerror = () => { source.close(); void openConversation(threadId) }
+    source.onerror = () => { void openConversation(threadId) }
     void sessionId
+    return true
   }
   async function startConversation(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
     const form = event.currentTarget
     const message = String(new FormData(form).get('message') ?? '').trim()
     if (!message) return
-    const response = await fetch('/api/conversations', {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ message, messageId: createMessageId() }),
-    })
-    const result = await response.json() as ConversationThread
-    if (!response.ok || !result.id) { setError('研究对话创建失败'); return }
-    form.reset(); setSelectedConversation(result); setConversationEvents([]); setPage('conversation')
-    streamConversation(result.sessionId, result.id)
-    await loadConversations()
+    const messageId = createMessageId()
+    setError(''); setConversationBusy(true); form.reset(); setSelectedConversation(null)
+    setConversationEvents([{ sequence: -Date.now(), type: 'user_message', message, messageId }])
+    setPage('conversation')
+    try {
+      const response = await fetch('/api/conversations', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ message, messageId }),
+      })
+      const result = await response.json() as ConversationThread
+      if (!response.ok || !result.id) throw new Error('conversation_create_failed')
+      setSelectedConversation(result)
+      if (!streamConversation(result.sessionId, result.id)) setConversationBusy(false)
+      await loadConversations()
+    } catch {
+      setConversationBusy(false); setConversationEvents([]); setError('研究对话创建失败')
+      const input = form.elements.namedItem('message')
+      if (input instanceof window.HTMLTextAreaElement) input.value = message
+    }
   }
   async function sendConversationMessage(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
     if (!selectedConversation) return
     const form = event.currentTarget
     const message = String(new FormData(form).get('message') ?? '').trim()
-    if (!message) return
+    if (!message || conversationBusy) return
+    const messageId = createMessageId()
     const afterSequence = conversationEvents.reduce((latest, item) => Math.max(latest, item.sequence), 0)
-    const response = await fetch(`/api/conversations/${selectedConversation.id}/messages`, {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ message, messageId: createMessageId() }),
-    })
-    const result = await response.json() as { sessionId?: string }
-    if (!response.ok || !result.sessionId) { setError('研究消息发送失败'); return }
-    form.reset(); streamConversation(result.sessionId, selectedConversation.id, afterSequence)
+    setError(''); setConversationBusy(true); form.reset()
+    setConversationEvents((current) => [
+      ...current, { sequence: -Date.now(), type: 'user_message', message, messageId },
+    ])
+    try {
+      const response = await fetch(`/api/conversations/${selectedConversation.id}/messages`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ message, messageId }),
+      })
+      const result = await response.json() as { sessionId?: string }
+      if (!response.ok || !result.sessionId) throw new Error('conversation_send_failed')
+      if (!streamConversation(result.sessionId, selectedConversation.id, afterSequence)) setConversationBusy(false)
+    } catch {
+      setConversationBusy(false)
+      setConversationEvents((current) => current.filter((entry) => entry.messageId !== messageId))
+      setError('研究消息发送失败')
+      const input = form.elements.namedItem('message')
+      if (input instanceof window.HTMLTextAreaElement) input.value = message
+    }
   }
   async function cancelConversation() {
     if (selectedConversation) await fetch(`/api/conversations/${selectedConversation.id}/cancel`, { method: 'POST' })
@@ -530,20 +615,96 @@ export function App() {
       setDeletingResearchId(null)
     }
   }
-  function navigate(next: Page) { setPage(next); window.scrollTo({ top: 0, behavior: 'smooth' }) }
+  async function watchSymbol(symbol: string, note: string) {
+    let response: Response
+    try {
+      response = await fetch(`/api/tracking/watchlist/${encodeURIComponent(symbol)}`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ note }),
+      })
+    } catch {
+      setError('添加自选失败')
+      return false
+    }
+    if (!response.ok) { setError('添加自选失败'); return false }
+    await loadTracking()
+    return true
+  }
+  async function unwatchSymbol(symbol: string) {
+    const response = await fetch(`/api/tracking/watchlist/${encodeURIComponent(symbol)}`, { method: 'DELETE' })
+    if (!response.ok) { setError('移除自选失败'); return }
+    await loadTracking()
+  }
+  async function scanTracking() {
+    if (trackingScanning || trackingPollingRunId.current) return
+    setError(''); setTrackingScanning(true)
+    try {
+      const response = await fetch('/api/tracking/scans', { method: 'POST' })
+      if (!response.ok) {
+        const body = await response.json().catch(() => null) as { error?: string } | null
+        if (body?.error === 'tracking_run_active') {
+          const state = await loadTracking()
+          if (state?.activeScan?.id) await pollTrackingScan(state.activeScan.id)
+          return
+        }
+        throw new Error('tracking_scan_create_failed')
+      }
+      const run = await response.json() as { id?: string }
+      if (!run.id) throw new Error('tracking_scan_id_missing')
+      await loadTracking()
+      await pollTrackingScan(run.id)
+    } catch {
+      setError('追踪扫描失败，请查看数据缺口后重试。')
+    } finally {
+      setTrackingScanning(false)
+    }
+  }
+  async function pollTrackingScan(runId: string) {
+    if (trackingPollingRunId.current === runId) return
+    if (trackingPollingRunId.current) return
+    trackingPollingRunId.current = runId
+    setTrackingScanning(true)
+    try {
+      for (let attempt = 0; attempt < 240; attempt += 1) {
+        const scanResponse = await fetch(`/api/tracking/scans/${runId}`)
+        if (!scanResponse.ok) throw new Error('tracking_scan_read_failed')
+        const scan = await scanResponse.json() as TrackingRunDetail
+        if (scan.status !== 'running') {
+          setTrackingLastScan(scan)
+          await loadTracking()
+          return
+        }
+        await new Promise((resolve) => setTimeout(resolve, 500))
+      }
+      throw new Error('tracking_scan_timeout')
+    } catch {
+      setError('追踪扫描状态读取失败，请刷新后重试。')
+    } finally {
+      if (trackingPollingRunId.current === runId) trackingPollingRunId.current = null
+      setTrackingScanning(false)
+    }
+  }
+  async function analyzeTrackingSymbol(symbol: string) {
+    await startAnalysisForSymbol(symbol)
+  }
+  function navigate(next: Page) {
+    setPage(next)
+    if (next === 'tracking') void loadTracking()
+    window.scrollTo({ top: 0, behavior: 'smooth' })
+  }
 
-  return <div className="app-shell">
+  return <div className={`app-shell${page === 'conversation' ? ' conversation-shell' : ''}`}>
     <header className="topbar">
       <button className="brand" onClick={() => navigate('overview')}><strong>vibe<i>.</i>invest</strong><span>SELF-HOSTED</span></button>
       <nav aria-label="主导航">{pages.map((item) => <button className={page === item.id ? 'active' : ''} key={item.id} onClick={() => navigate(item.id)}>{item.label}</button>)}</nav>
       <SystemBadge health={health} modelConfigured={modelConfigured} />
     </header>
-    <main className="page-main">
+    <main className={`page-main${page === 'conversation' ? ' conversation-main' : ''}`}>
       {error && <p role="alert" className="error-banner">{error}</p>}
       {page === 'overview' && <Overview records={records} selected={selectedResearch} positions={positions} health={health} modelConfigured={modelConfigured} onNavigate={navigate} onOpen={async (id) => { await openResearch(id); navigate('research') }} />}
-      {page === 'analysis' && <AnalysisPage symbol={analysisSymbol} setSymbol={setAnalysisSymbol} status={analysisStatus} stages={analysisStages} active={Boolean(activeAnalysisId)} onStart={startAnalysis} onCancel={cancelAnalysis} health={health} modelConfigured={modelConfigured} records={records} onOpen={async (id) => { await openResearch(id); navigate('research') }} />}
+      {page === 'tracking' && <TrackingPage overview={trackingOverview} available={trackingAvailable} lastScan={trackingLastScan} loading={trackingLoading} scanning={trackingScanning} onWatch={watchSymbol} onUnwatch={unwatchSymbol} onScan={scanTracking} onAnalyze={analyzeTrackingSymbol} />}
+      {page === 'analysis' && <AnalysisPage symbol={analysisSymbol} setSymbol={setAnalysisSymbol} status={analysisStatus} stages={analysisStages} active={analysisSubmitting || Boolean(activeAnalysisId)} onStart={startAnalysis} onCancel={cancelAnalysis} health={health} modelConfigured={modelConfigured} records={records} onOpen={async (id) => { await openResearch(id); navigate('research') }} />}
       {page === 'research' && <ResearchPage records={records} record={selectedResearch} onOpen={openResearch} onUpdate={updateResearch} onDelete={removeResearch} deleting={deletingResearchId === selectedResearch?.id} onResume={resumeResearch} onFollowUp={sendFollowUp} onReanalyze={reanalyzeResearch} freshnessDays={runtimeSettings?.current.values.reportFreshnessDays ?? null} />}
-      {page === 'conversation' && <ConversationPage threads={conversationThreads} thread={selectedConversation} events={conversationEvents} onOpen={openConversation} onNew={() => { setSelectedConversation(null); setConversationEvents([]) }} onCreate={startConversation} onSend={sendConversationMessage} onCancel={cancelConversation} />}
+      {page === 'conversation' && <ConversationPage threads={conversationThreads} thread={selectedConversation} events={conversationEvents} busy={conversationBusy} onOpen={openConversation} onNew={() => { setSelectedConversation(null); setConversationEvents([]); setConversationBusy(false) }} onCreate={startConversation} onSend={sendConversationMessage} onCancel={cancelConversation} />}
       {page === 'portfolio' && <PortfolioPage portfolio={portfolio} history={portfolioHistory} events={portfolioEvents} loaded={portfolioLoaded} loadFailed={portfolioLoadFailed} refreshing={portfolioRefreshing} onSave={savePosition} onSaveCash={saveCash} onBuy={buyPosition} onReduce={reducePosition} onDelete={removePosition} />}
       {page === 'settings' && <SettingsPage health={health} modelConfigured={modelConfigured} settings={runtimeSettings} onReload={loadSettings} />}
     </main>
@@ -591,37 +752,107 @@ function AnalysisPage({ symbol, setSymbol, status, stages, active, onStart, onCa
   </>
 }
 
-function ConversationPage({ threads, thread, events, onOpen, onNew, onCreate, onSend, onCancel }: {
+function ConversationPage({ threads, thread, events, busy, onOpen, onNew, onCreate, onSend, onCancel }: {
   threads: ConversationThread[]; thread: ConversationThread | null; events: ConversationEvent[]
+  busy: boolean
   onOpen: (id: string) => Promise<void>
   onNew: () => void
   onCreate: (event: React.FormEvent<HTMLFormElement>) => Promise<void>
   onSend: (event: React.FormEvent<HTMLFormElement>) => Promise<void>
   onCancel: () => Promise<void>
 }) {
-  const messages = events.reduce<Array<{ key: string; role: 'user' | 'assistant'; text: string }>>((all, event) => {
+  const messageListRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    const list = messageListRef.current
+    if (list) list.scrollTop = list.scrollHeight
+  }, [events.length])
+  const messages = events.reduce<Array<{
+    key: string; role: 'user' | 'assistant'; text: string; streaming?: boolean
+  }>>((all, event) => {
     if (event.type === 'user_message' && typeof event.message === 'string') {
       all.push({ key: `user-${event.sequence}`, role: 'user', text: event.message })
+    } else if (event.type === 'text_delta' && typeof event.text === 'string') {
+      const previous = all.at(-1)
+      if (previous?.role === 'assistant' && previous.streaming) previous.text += event.text
+      else all.push({ key: `assistant-stream-${event.sequence}`, role: 'assistant', text: event.text, streaming: true })
     } else if (event.type === 'chat_completed' && typeof event.text === 'string') {
-      all.push({ key: `assistant-${event.sequence}`, role: 'assistant', text: event.text })
+      let streamingIndex = -1
+      for (let index = all.length - 1; index >= 0; index -= 1) {
+        if (all[index]?.role === 'assistant' && all[index]?.streaming) {
+          streamingIndex = index
+          break
+        }
+      }
+      if (streamingIndex >= 0) {
+        all[streamingIndex] = {
+          key: `assistant-${event.sequence}`, role: 'assistant', text: event.text,
+        }
+      } else all.push({ key: `assistant-${event.sequence}`, role: 'assistant', text: event.text })
     } else if (event.type === 'artifact_completed') {
       all.push({ key: `artifact-${event.sequence}`, role: 'assistant', text: '研究报告 Artifact 已保存，可在研究记录中继续查看。' })
     }
     return all
   }, [])
-  return <>
-    <PageHeader eyebrow="RESEARCH CONVERSATION" title="自由研究对话" description="先说你的问题，再决定是否取数、调用工具、委派子 Agent 或保存报告。" />
-    <div className="conversation-layout">
-      <aside className="conversation-threads"><p className="micro">会话 · {threads.length}</p><button onClick={onNew}><strong>新建对话</strong></button>{threads.map((item) => <button key={item.id} className={item.id === thread?.id ? 'active' : ''} onClick={() => void onOpen(item.id)}><strong>{item.title || '未命名研究'}</strong><small>{statusLabel(item.status)}</small></button>)}</aside>
-      <section className="conversation-panel">
-        {!thread ? <><p className="conversation-empty">输入一个问题，创建第一条长期研究 Thread。</p><form className="conversation-composer" onSubmit={(event) => void onCreate(event)}><textarea name="message" aria-label="开始研究对话" placeholder="例如：比较 NVDA 和 MU 最近的财报风险，不要生成正式报告。" required /><button type="submit">开始对话</button></form></> : <>
-          <header className="conversation-header"><div><p className="micro">{thread.title || '研究 Thread'}</p><strong>{statusLabel(thread.status)}</strong></div>{['queued', 'running'].includes(thread.status) && <button className="quiet danger" onClick={() => void onCancel()}>停止</button>}</header>
-          <div className="conversation-messages">{messages.map((message) => <p key={message.key} className={message.role}><strong>{message.role === 'user' ? '你' : 'Agent'}</strong>{message.text}</p>)}{events.filter((event) => event.type === 'tool_call').map((event) => <details key={`tool-${event.sequence}`} className="conversation-tool"><summary>调用工具：{String(event.name ?? 'tool')}</summary><small>工具结果和参数按当前权限投影。</small></details>)}</div>
-          <form className="conversation-composer" onSubmit={(event) => void onSend(event)}><textarea name="message" aria-label="继续研究对话" placeholder="继续追问…" required /><button type="submit" disabled={['queued', 'running'].includes(thread.status)}>发送</button></form>
-        </>}
-      </section>
-    </div>
-  </>
+  const active = busy || Boolean(thread && ['queued', 'running'].includes(thread.status))
+  return <div className="conversation-layout">
+    <aside className="conversation-threads">
+      <header><p className="micro">研究会话 · {threads.length}</p><button className="conversation-new" aria-label="新建对话" onClick={onNew} disabled={active}>＋ 新对话</button></header>
+      <div className="conversation-thread-list">{threads.map((item) => <button key={item.id} disabled={active && item.id !== thread?.id} className={item.id === thread?.id ? 'active' : ''} onClick={() => void onOpen(item.id)}><strong>{item.title || '未命名研究'}</strong><small>{statusLabel(item.status)}</small></button>)}</div>
+    </aside>
+    <section className="conversation-panel" aria-label="自由研究对话">
+      <header className="conversation-header">
+        <div><p className="micro">RESEARCH THREAD</p><strong>{thread?.title || '新研究对话'}</strong><small>{active ? 'AI 正在研究并组织回答' : thread ? statusLabel(thread.status) : '先提出问题，AI 再决定是否调用研究工具'}</small></div>
+        {active && thread && <button className="quiet danger" onClick={() => void onCancel()}>停止</button>}
+      </header>
+      <div ref={messageListRef} className="conversation-messages" role="log" aria-live="polite" aria-label="研究对话内容">
+        {messages.length === 0 && <div className="conversation-empty"><strong>你想弄清楚什么？</strong><span>可以直接问标的、财报、估值、K线结构或组合风险。</span></div>}
+        {messages.map((message) => <article key={message.key} className={message.role}><strong>{message.role === 'user' ? '你' : 'AI'}</strong><p>{message.text}</p></article>)}
+        {events.filter((event) => event.type === 'tool_call').map((event) => <details key={`tool-${event.sequence}`} className="conversation-tool"><summary>调用工具：{String(event.name ?? 'tool')}</summary><small>工具结果和参数按当前权限投影。</small></details>)}
+      </div>
+      <div className="conversation-input-dock">
+        <ConversationComposer mode={thread ? 'send' : 'create'} busy={active} onSubmit={thread ? onSend : onCreate} />
+        <small>Enter 发送 · Shift + Enter 换行</small>
+      </div>
+    </section>
+  </div>
+}
+
+function ConversationComposer({ mode, busy, onSubmit }: {
+  mode: 'create' | 'send'; busy: boolean
+  onSubmit: (event: React.FormEvent<HTMLFormElement>) => Promise<void>
+}) {
+  const inputRef = useRef<HTMLTextAreaElement>(null)
+  const label = busy
+    ? mode === 'create' ? '正在开始…' : '正在发送…'
+    : mode === 'create' ? '开始对话' : '发送'
+  function resize(input: HTMLTextAreaElement) {
+    input.style.height = '0px'
+    input.style.height = `${Math.min(Math.max(input.scrollHeight, 28), 160)}px`
+    input.style.overflowY = input.scrollHeight > 160 ? 'auto' : 'hidden'
+  }
+  function submit(event: React.FormEvent<HTMLFormElement>) {
+    void onSubmit(event)
+    queueMicrotask(() => {
+      if (inputRef.current && !inputRef.current.value) {
+        inputRef.current.style.height = ''
+        inputRef.current.style.overflowY = 'hidden'
+      }
+    })
+  }
+  function handleKeyDown(event: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key !== 'Enter' || event.shiftKey || event.nativeEvent.isComposing) return
+    event.preventDefault()
+    event.currentTarget.form?.requestSubmit()
+  }
+  return <form className="conversation-composer" onSubmit={submit}>
+    <textarea
+      ref={inputRef} rows={1} name="message"
+      aria-label={mode === 'create' ? '开始研究对话' : '继续研究对话'}
+      placeholder={mode === 'create' ? '问一只股票、一份财报，或一个需要验证的判断…' : '继续追问…'}
+      required disabled={busy} onInput={(event) => resize(event.currentTarget)} onKeyDown={handleKeyDown}
+    />
+    <button type="submit" aria-label={label} disabled={busy}><span aria-hidden="true">{busy ? '…' : '↑'}</span></button>
+  </form>
 }
 
 function ResearchPage({ records, record, onOpen, onUpdate, onDelete, deleting, onResume, onFollowUp, onReanalyze, freshnessDays }: {
