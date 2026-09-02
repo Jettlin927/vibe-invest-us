@@ -207,3 +207,41 @@ test('TS 客户端读取基本面高层工具并完整保留分页元数据', as
   assert.match(requests.join('\n'), /official-company-events.*symbol=NVDA/)
   assert.match(requests.join('\n'), /valuation-evidence.*symbol=NVDA/)
 })
+
+test('TS 客户端为追踪保留批量行情的事实时间、来源和缺口', async (t) => {
+  const server = createServer((_request, response) => {
+    response.writeHead(200, { 'content-type': 'application/json' })
+    response.end(JSON.stringify({
+      quotes: [
+        {
+          symbol: 'NVDA', price: 121.5, observed_at: '2026-08-30T20:00:00Z',
+          source: 'alpaca-iex', degraded: false,
+          sources: [{ source: 'alpaca-iex', status: 'ok', item_count: 1 }],
+        },
+        {
+          symbol: 'MU', price: null, observed_at: null, source: null, degraded: false,
+          sources: [{ source: 'alpaca-iex', status: 'failed', error: 'timeout', item_count: 0 }],
+        },
+      ],
+    }))
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  t.after(() => new Promise<void>((resolve, reject) => server.close(
+    (error) => error ? reject(error) : resolve(),
+  )))
+  const address = server.address()
+  assert.ok(address && typeof address !== 'string')
+  const client = createFinancialDataClient(`http://127.0.0.1:${address.port}`)
+
+  assert.deepEqual(await client.quoteSnapshots(['NVDA', 'MU']), [
+    {
+      symbol: 'NVDA', price: 121.5, observedAt: '2026-08-30T20:00:00Z',
+      source: 'alpaca-iex', degraded: false,
+      sources: [{ source: 'alpaca-iex', status: 'ok', item_count: 1 }],
+    },
+    {
+      symbol: 'MU', price: null, observedAt: null, source: null, degraded: false,
+      sources: [{ source: 'alpaca-iex', status: 'failed', error: 'timeout', item_count: 0 }],
+    },
+  ])
+})

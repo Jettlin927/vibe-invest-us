@@ -43,6 +43,15 @@ export type PriceWindowQueryResult = PaginatedFactQueryResult & {
   sampling: 'daily' | 'weekly'
 }
 
+export type QuoteSnapshot = {
+  symbol: string
+  price: number | null
+  observedAt: string | null
+  source: string | null
+  degraded: boolean
+  sources: unknown[]
+}
+
 export const MARKET_PRICE_REQUEST_TIMEOUT_MS = 30_000
 
 export function createFinancialDataClient(baseUrl: string) {
@@ -185,24 +194,39 @@ export function createFinancialDataClient(baseUrl: string) {
         totalBarCount: value.totalBarCount as number, sampling: value.sampling,
       }
     },
+    quoteSnapshots,
     async quotes(symbols: string[], signal?: AbortSignal): Promise<Record<string, number>> {
-      const response = await fetch(new URL('/v1/quotes', baseUrl), {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(symbols),
-        signal: signal
-          ? AbortSignal.any([signal, AbortSignal.timeout(MARKET_PRICE_REQUEST_TIMEOUT_MS)])
-          : AbortSignal.timeout(MARKET_PRICE_REQUEST_TIMEOUT_MS),
-      })
-      if (!response.ok) throw new Error(`financial_data_quotes_http_${response.status}`)
-      const value = await response.json() as { quotes?: Array<{ symbol?: unknown; price?: unknown }> }
-      if (!Array.isArray(value.quotes)) throw new Error('financial_data_quotes_contract_invalid')
-      return Object.fromEntries(value.quotes.flatMap((quote) => (
-        typeof quote.symbol === 'string' && typeof quote.price === 'number'
-          ? [[quote.symbol, quote.price] as const]
-          : []
+      const snapshots = await quoteSnapshots(symbols, signal)
+      return Object.fromEntries(snapshots.flatMap((quote) => (
+        typeof quote.price === 'number' ? [[quote.symbol, quote.price] as const] : []
       )))
     },
+  }
+
+  async function quoteSnapshots(
+    symbols: string[], signal?: AbortSignal,
+  ): Promise<QuoteSnapshot[]> {
+    const response = await fetch(new URL('/v1/quotes', baseUrl), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(symbols),
+      signal: signal
+        ? AbortSignal.any([signal, AbortSignal.timeout(MARKET_PRICE_REQUEST_TIMEOUT_MS)])
+        : AbortSignal.timeout(MARKET_PRICE_REQUEST_TIMEOUT_MS),
+    })
+    if (!response.ok) throw new Error(`financial_data_quotes_http_${response.status}`)
+    const value = await response.json() as { quotes?: unknown }
+    if (!Array.isArray(value.quotes) || !value.quotes.every(isQuoteSnapshot)) {
+      throw new Error('financial_data_quotes_contract_invalid')
+    }
+    return value.quotes.map((quote) => ({
+      symbol: quote.symbol,
+      price: quote.price,
+      observedAt: quote.observed_at,
+      source: quote.source,
+      degraded: quote.degraded,
+      sources: quote.sources,
+    }))
   }
 
   async function factQuery(path: string, signal?: AbortSignal): Promise<FactQueryResult> {
@@ -270,4 +294,23 @@ function isFinancialFact(value: unknown): value is FinancialFact {
   return ['id', 'type', 'observedAt', 'fetchedAt', 'source', 'sourceReference']
     .every((field) => typeof candidate[field] === 'string' && candidate[field] !== '')
     && 'value' in candidate
+}
+
+function isQuoteSnapshot(value: unknown): value is {
+  symbol: string
+  price: number | null
+  observed_at: string | null
+  source: string | null
+  degraded: boolean
+  sources: unknown[]
+} {
+  if (!value || typeof value !== 'object') return false
+  const candidate = value as Record<string, unknown>
+  return typeof candidate.symbol === 'string' && candidate.symbol !== ''
+    && (candidate.price === null
+      || (typeof candidate.price === 'number' && Number.isFinite(candidate.price)))
+    && (candidate.observed_at === null || typeof candidate.observed_at === 'string')
+    && (candidate.source === null || typeof candidate.source === 'string')
+    && typeof candidate.degraded === 'boolean'
+    && Array.isArray(candidate.sources)
 }

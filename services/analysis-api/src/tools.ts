@@ -45,3 +45,6 @@ export const flatFinalizationTools = [flatSubmitAnalysisReportTool]
 
 export const webSearchEvidenceTool = toolRegistry.definition('search_web_evidence')!.model
 export const conversationResearchTools = toolRegistry.projectConversation()
+export function conversationToolsForMessage(userMessage: string, scopeMessages: string[] = []) {
+  return toolRegistry.projectConversation({ userMessage, scopeMessages })
+}

@@ -174,6 +174,13 @@ test('普通追问不向 Provider 投影综合报告提交工具并以聊天文�
 })
 
 test('自由对话可以直接回答，不要求结构化报告收口', async () => {
+  const projections: string[][] = []
+  const toolRuntime = createTestToolRuntime()
+  const ensureProjection = toolRuntime.ensureProjection.bind(toolRuntime)
+  toolRuntime.ensureProjection = async (input) => {
+    projections.push(input.tools.map(({ name }) => name))
+    return ensureProjection(input)
+  }
   const model = createPiModel({ fauxResponses: [
     fauxAssistantMessage(fauxText('这是普通研究对话的直接回答。')),
   ] })
@@ -181,9 +188,10 @@ test('自由对话可以直接回答，不要求结构化报告收口', async ()
   for await (const event of model.analyzeConversation({
     executionId: 'free-conversation-text', runtimeSettings: runtimeSettings(),
     systemPrompt: 'system', userPrompt: '请解释一下当前市场风险。', knownFacts: [],
-    toolRuntime: createTestToolRuntime(), tools: [],
+    toolRuntime, tools: [],
   })) events.push(event)
 
+  assert.deepEqual(projections[0], [])
   assert.equal(events.some((event) => event.type === 'chat_completed'
     && event.text === '这是普通研究对话的直接回答。'), true)
   assert.equal(events.some((event) => event.type === 'completed'), false)

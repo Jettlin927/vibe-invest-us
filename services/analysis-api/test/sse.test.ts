@@ -130,7 +130,7 @@ test('SSE 在 PostgreSQL catch-up 与 live 交接窗口不会漏掉终态', asyn
   closeCatchUpWindow = true
   try {
     const response = await fetch(`${baseUrl}/api/agent-sessions/${created.sessionId}/events`)
-    assert.match(await response.text(), /event: partial/)
+    assert.match(await response.text(), /event: completed/)
   } finally {
     finishModel!()
     await app.close()

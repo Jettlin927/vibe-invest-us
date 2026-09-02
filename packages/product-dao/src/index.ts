@@ -7,9 +7,12 @@ import {
   type AgentExecutionStatus,
   type ConversationThread,
   type ExecutionSettingsSnapshot, type RuntimeSettings, type RuntimeSettingsRevision,
+  type TrackingEvent, type TrackingObservation, type TrackingObservationInput,
+  type TrackingRun, type TrackingRunDetail, type TrackingTarget, type TrackingTargetSource,
+  type WatchlistItem,
 } from '@vibe-invest/contracts'
 
-export const schemaVersion = 26
+export const schemaVersion = 28
 
 const migrationSql = `
 CREATE TABLE IF NOT EXISTS product_schema_migrations (
@@ -41,7 +44,7 @@ CREATE TABLE IF NOT EXISTS portfolio_equity_snapshots (
   cash numeric NOT NULL,
   holdings_count integer NOT NULL,
   priced_count integer NOT NULL,
-  observed_at timestamptz NOT NULL,
+  observed_at text NOT NULL CHECK (observed_at <> ''),
   after_close boolean NOT NULL DEFAULT false
 );
 
@@ -413,6 +416,72 @@ CREATE TABLE IF NOT EXISTS tool_event_migration_provenance (
   FOREIGN KEY (session_id, sequence) REFERENCES agent_events(session_id, sequence) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS watchlist_items (
+  symbol text PRIMARY KEY CHECK (symbol <> '' AND symbol = upper(symbol)),
+  note text NOT NULL DEFAULT '',
+  enabled boolean NOT NULL DEFAULT true,
+  created_at timestamptz NOT NULL,
+  updated_at timestamptz NOT NULL CHECK (updated_at >= created_at)
+);
+
+CREATE TABLE IF NOT EXISTS tracking_runs (
+  id text PRIMARY KEY,
+  status text NOT NULL CHECK (status IN ('running', 'completed', 'partial', 'failed')),
+  targets_json jsonb NOT NULL CHECK (jsonb_typeof(targets_json) = 'array'),
+  started_at timestamptz NOT NULL,
+  completed_at timestamptz,
+  error text,
+  CONSTRAINT tracking_runs_completion_check CHECK (
+    (status = 'running' AND completed_at IS NULL AND error IS NULL)
+    OR (status <> 'running' AND completed_at IS NOT NULL)
+  )
+);
+CREATE UNIQUE INDEX IF NOT EXISTS tracking_runs_one_active
+  ON tracking_runs ((true)) WHERE status = 'running';
+
+CREATE TABLE IF NOT EXISTS tracking_observations (
+  id text PRIMARY KEY,
+  run_id text NOT NULL REFERENCES tracking_runs(id),
+  symbol text NOT NULL CHECK (symbol <> '' AND symbol = upper(symbol)),
+  capability text NOT NULL CHECK (capability IN ('technical', 'fundamental', 'news')),
+  status text NOT NULL CHECK (status IN ('success', 'data_gap')),
+  baseline_observation_id text REFERENCES tracking_observations(id),
+  observed_at timestamptz NOT NULL,
+  payload_json jsonb NOT NULL CHECK (jsonb_typeof(payload_json) = 'object'),
+  UNIQUE (run_id, symbol, capability)
+);
+CREATE INDEX IF NOT EXISTS tracking_observations_success_baseline
+  ON tracking_observations (symbol, capability, observed_at DESC, id DESC)
+  WHERE status = 'success';
+
+CREATE TABLE IF NOT EXISTS tracking_events (
+  id text PRIMARY KEY,
+  run_id text NOT NULL REFERENCES tracking_runs(id),
+  observation_id text NOT NULL REFERENCES tracking_observations(id),
+  baseline_observation_id text NOT NULL REFERENCES tracking_observations(id),
+  event_key text NOT NULL UNIQUE CHECK (event_key <> ''),
+  symbol text NOT NULL CHECK (symbol <> '' AND symbol = upper(symbol)),
+  capability text NOT NULL CHECK (capability IN ('technical', 'fundamental', 'news')),
+  kind text NOT NULL CHECK (kind <> ''),
+  severity text NOT NULL CHECK (severity IN ('info', 'warning', 'critical')),
+  occurred_at text NOT NULL CHECK (occurred_at <> ''),
+  payload_json jsonb NOT NULL CHECK (jsonb_typeof(payload_json) = 'object'),
+  created_at timestamptz NOT NULL
+);
+CREATE INDEX IF NOT EXISTS tracking_events_timeline
+  ON tracking_events (occurred_at DESC, id DESC);
+
+ALTER TABLE tracking_observations
+  ALTER COLUMN observed_at TYPE text USING observed_at::text;
+ALTER TABLE tracking_observations DROP CONSTRAINT IF EXISTS tracking_observations_observed_at_check;
+ALTER TABLE tracking_observations ADD CONSTRAINT tracking_observations_observed_at_check
+  CHECK (observed_at <> '');
+ALTER TABLE tracking_events
+  ALTER COLUMN occurred_at TYPE text USING occurred_at::text;
+ALTER TABLE tracking_events DROP CONSTRAINT IF EXISTS tracking_events_occurred_at_check;
+ALTER TABLE tracking_events ADD CONSTRAINT tracking_events_occurred_at_check
+  CHECK (occurred_at <> '');
+
 ALTER TABLE model_requests DROP CONSTRAINT IF EXISTS model_requests_projection_id_fkey;
 ALTER TABLE model_requests DROP CONSTRAINT IF EXISTS model_requests_projection_id_execution_id_fkey;
 ALTER TABLE tool_call_batches DROP CONSTRAINT IF EXISTS tool_call_batches_projection_id_fkey;
@@ -623,6 +692,14 @@ INSERT INTO product_schema_migrations (version)
 VALUES (26)
 ON CONFLICT (version) DO NOTHING;
 
+INSERT INTO product_schema_migrations (version)
+VALUES (27)
+ON CONFLICT (version) DO NOTHING;
+
+INSERT INTO product_schema_migrations (version)
+VALUES (28)
+ON CONFLICT (version) DO NOTHING;
+
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM vibe_invest_app;
 REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM vibe_invest_app;
 GRANT SELECT ON product_schema_migrations TO vibe_invest_app;
@@ -645,6 +722,10 @@ GRANT UPDATE (
   output_tokens, total_tokens, completed_at
 ) ON model_requests TO vibe_invest_app;
 GRANT SELECT, INSERT ON report_versions TO vibe_invest_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON watchlist_items TO vibe_invest_app;
+GRANT SELECT, INSERT ON tracking_runs TO vibe_invest_app;
+GRANT UPDATE (status, completed_at, error) ON tracking_runs TO vibe_invest_app;
+GRANT SELECT, INSERT ON tracking_observations, tracking_events TO vibe_invest_app;
 GRANT UPDATE (status, started_at, completed_at, completion_order, result_payload_json)
   ON tool_batch_calls TO vibe_invest_app;
 GRANT UPDATE (status, completed_at) ON tool_call_batches TO vibe_invest_app;
@@ -1419,8 +1500,21 @@ export function createAnalysisRepository(pool: Pool) {
         [JSON.stringify(snapshot), id, terminal],
       )
     },
-    async research(id: string) {
-      const analysis = await this.get(id)
+    async research(id: string, projection: 'view' | 'export' = 'export') {
+      const analysis = projection === 'export' ? await this.get(id) : await pool.query<AnalysisRow>(
+        `SELECT analysis.id, analysis.symbol, analysis.status,
+                analysis.created_at, analysis.updated_at,
+                NULL::jsonb AS snapshot_json, analysis.report_json,
+                analysis.report_created_at, analysis.error, analysis.starred, analysis.note,
+           CASE WHEN event.payload_json->>'terminal' IS NULL THEN NULL
+             ELSE (event.payload_json->>'terminal')::boolean END AS terminal
+         FROM analyses analysis
+         LEFT JOIN agent_sessions session
+           ON session.analysis_id = analysis.id AND session.is_primary
+         LEFT JOIN agent_events event
+           ON event.session_id = session.id AND event.sequence = session.latest_sequence
+         WHERE analysis.id = $1 AND analysis.kind = 'research'`, [id],
+      ).then((result) => result.rows[0] ? mapAnalysisRow(result.rows[0]) : null)
       if (!analysis) return null
       const facts = await pool.query<{ payload_json: unknown }>(
         `SELECT f.payload_json FROM atomic_facts f
@@ -1435,9 +1529,19 @@ export function createAnalysisRepository(pool: Pool) {
         : "kind = 'research' AND status = ANY($1)"
       if (symbol) params.push(symbol.toUpperCase())
       const result = await pool.query<AnalysisRow>(
-        `SELECT * FROM analyses WHERE ${condition} ORDER BY created_at DESC`, params,
+        `SELECT id, symbol, status, created_at, updated_at,
+                NULL::jsonb AS snapshot_json,
+                CASE WHEN report_json IS NULL THEN NULL ELSE jsonb_build_object(
+                  'title', report_json->'title', 'trend', report_json->'trend'
+                ) END AS report_json,
+                report_created_at,
+                error, starred, note
+         FROM analyses WHERE ${condition} ORDER BY created_at DESC`, params,
       )
-      return result.rows.map(mapAnalysisRow)
+      return result.rows.map((row) => {
+        const { snapshot: _snapshot, ...summary } = mapAnalysisRow(row)
+        return summary
+      })
     },
     async updateResearch(id: string, values: { starred?: boolean; note?: string }, updatedAt: string) {
       const result = await pool.query<AnalysisRow>(
@@ -2867,6 +2971,17 @@ export function createAgentEventRepository(pool: Pool) {
       )
       return result.rows.map(mapAgentEventRow)
     },
+    async listByTypes(sessionId: string, types: string[]): Promise<AgentEvent[]> {
+      if (!types.length) return []
+      const result = await pool.query<AgentEventRow>(
+        `SELECT session_id, sequence, operation_id, payload_json, created_at::text
+         FROM agent_events
+         WHERE session_id = $1 AND payload_json->>'type' = ANY($2::text[])
+         ORDER BY sequence`,
+        [sessionId, types],
+      )
+      return result.rows.map(mapAgentEventRow)
+    },
     async listByExecution(executionId: string, afterSequence: number): Promise<AgentEvent[]> {
       const result = await pool.query<AgentEventRow>(
         `SELECT event.session_id, event.sequence, event.operation_id, event.payload_json,
@@ -3850,6 +3965,344 @@ export function createToolProjectionRepository(pool: Pool) {
 }
 
 export type ToolProjectionRepository = ReturnType<typeof createToolProjectionRepository>
+
+type WatchlistItemRow = {
+  symbol: string
+  note: string
+  enabled: boolean
+  created_at: string
+  updated_at: string
+}
+
+type TrackingRunRow = {
+  id: string
+  status: TrackingRun['status']
+  targets_json: TrackingTarget[]
+  started_at: string
+  completed_at: string | null
+  error: string | null
+}
+
+type TrackingObservationRow = {
+  id: string
+  run_id: string
+  symbol: string
+  capability: TrackingObservation['capability']
+  status: TrackingObservation['status']
+  baseline_observation_id: string | null
+  observed_at: string
+  payload_json: Record<string, unknown>
+}
+
+type TrackingEventRow = {
+  id: string
+  run_id: string
+  observation_id: string
+  baseline_observation_id: string
+  event_key: string
+  symbol: string
+  capability: TrackingEvent['capability']
+  kind: string
+  severity: TrackingEvent['severity']
+  occurred_at: string
+  payload_json: Record<string, unknown>
+  created_at: string
+}
+
+function normalizeTrackingSymbol(symbol: string) {
+  const normalized = symbol.trim().toUpperCase()
+  if (!normalized) throw new Error('invalid_tracking_symbol')
+  return normalized
+}
+
+function mapWatchlistItem(row: WatchlistItemRow): WatchlistItem {
+  return {
+    symbol: row.symbol,
+    note: row.note,
+    enabled: row.enabled,
+    createdAt: new Date(row.created_at).toISOString(),
+    updatedAt: new Date(row.updated_at).toISOString(),
+  }
+}
+
+function normalizeTrackingTargets(targets: TrackingTarget[]): TrackingTarget[] {
+  return targets.map((target) => {
+    const sources = [...new Set(target.sources)]
+    if (sources.some((source) => source !== 'watchlist' && source !== 'position')) {
+      throw new Error('invalid_tracking_target_source')
+    }
+    return {
+      symbol: normalizeTrackingSymbol(target.symbol),
+      sources: sources as TrackingTargetSource[],
+    }
+  })
+}
+
+function mapTrackingRun(row: TrackingRunRow): TrackingRun {
+  return {
+    id: row.id,
+    status: row.status,
+    targets: row.targets_json,
+    startedAt: new Date(row.started_at).toISOString(),
+    completedAt: row.completed_at ? new Date(row.completed_at).toISOString() : null,
+    error: row.error,
+  }
+}
+
+function mapTrackingObservation(row: TrackingObservationRow): TrackingObservation {
+  return {
+    id: row.id,
+    runId: row.run_id,
+    symbol: row.symbol,
+    capability: row.capability,
+    status: row.status,
+    baselineObservationId: row.baseline_observation_id,
+    observedAt: row.observed_at,
+    payload: row.payload_json,
+  }
+}
+
+function mapTrackingEvent(row: TrackingEventRow): TrackingEvent {
+  return {
+    id: row.id,
+    runId: row.run_id,
+    observationId: row.observation_id,
+    baselineObservationId: row.baseline_observation_id,
+    eventKey: row.event_key,
+    symbol: row.symbol,
+    capability: row.capability,
+    kind: row.kind,
+    severity: row.severity,
+    occurredAt: row.occurred_at,
+    payload: row.payload_json,
+    createdAt: new Date(row.created_at).toISOString(),
+  }
+}
+
+const trackingRunColumns = `
+  id, status, targets_json, started_at::text, completed_at::text, error
+`
+
+const trackingObservationColumns = `
+  id, run_id, symbol, capability, status, baseline_observation_id,
+  observed_at::text, payload_json
+`
+
+const trackingEventColumns = `
+  id, run_id, observation_id, baseline_observation_id, event_key, symbol,
+  capability, kind, severity, occurred_at::text, payload_json, created_at::text
+`
+
+async function readTrackingRunDetail(
+  database: Pool | PoolClient, runId: string,
+): Promise<TrackingRunDetail | null> {
+  const [run, observations, events] = await Promise.all([
+    database.query<TrackingRunRow>(
+      `SELECT ${trackingRunColumns} FROM tracking_runs WHERE id = $1`, [runId],
+    ),
+    database.query<TrackingObservationRow>(
+      `SELECT ${trackingObservationColumns} FROM tracking_observations
+       WHERE run_id = $1 ORDER BY symbol, capability, observed_at, id`, [runId],
+    ),
+    database.query<TrackingEventRow>(
+      `SELECT ${trackingEventColumns} FROM tracking_events
+       WHERE run_id = $1 ORDER BY occurred_at, id`, [runId],
+    ),
+  ])
+  if (!run.rows[0]) return null
+  return {
+    ...mapTrackingRun(run.rows[0]),
+    observations: observations.rows.map(mapTrackingObservation),
+    events: events.rows.map(mapTrackingEvent),
+  }
+}
+
+export function createTrackingRepository(pool: Pool) {
+  return {
+    async listWatchlist(): Promise<WatchlistItem[]> {
+      const result = await pool.query<WatchlistItemRow>(
+        `SELECT symbol, note, enabled, created_at::text, updated_at::text
+         FROM watchlist_items ORDER BY symbol`,
+      )
+      return result.rows.map(mapWatchlistItem)
+    },
+    async addWatchlist(input: {
+      symbol: string; note?: string; enabled?: boolean; createdAt?: string
+    }): Promise<WatchlistItem> {
+      const createdAt = input.createdAt ?? new Date().toISOString()
+      const result = await pool.query<WatchlistItemRow>(
+        `INSERT INTO watchlist_items (symbol, note, enabled, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $4)
+         ON CONFLICT (symbol) DO NOTHING
+         RETURNING symbol, note, enabled, created_at::text, updated_at::text`,
+        [normalizeTrackingSymbol(input.symbol), input.note ?? '', input.enabled ?? true, createdAt],
+      )
+      if (!result.rows[0]) throw new Error('tracking_watchlist_item_exists')
+      return mapWatchlistItem(result.rows[0])
+    },
+    async updateWatchlist(
+      symbol: string,
+      input: { note?: string; enabled?: boolean; updatedAt?: string },
+    ): Promise<WatchlistItem | null> {
+      const result = await pool.query<WatchlistItemRow>(
+        `UPDATE watchlist_items SET
+           note = COALESCE($2, note), enabled = COALESCE($3, enabled), updated_at = $4
+         WHERE symbol = $1
+         RETURNING symbol, note, enabled, created_at::text, updated_at::text`,
+        [normalizeTrackingSymbol(symbol), input.note ?? null, input.enabled ?? null,
+          input.updatedAt ?? new Date().toISOString()],
+      )
+      return result.rows[0] ? mapWatchlistItem(result.rows[0]) : null
+    },
+    async removeWatchlist(symbol: string): Promise<boolean> {
+      const result = await pool.query(
+        'DELETE FROM watchlist_items WHERE symbol = $1',
+        [normalizeTrackingSymbol(symbol)],
+      )
+      return (result.rowCount ?? 0) > 0
+    },
+    async getActiveRun(): Promise<TrackingRun | null> {
+      const result = await pool.query<TrackingRunRow>(
+        `SELECT ${trackingRunColumns} FROM tracking_runs WHERE status = 'running'`,
+      )
+      return result.rows[0] ? mapTrackingRun(result.rows[0]) : null
+    },
+    async getRun(id: string): Promise<TrackingRunDetail | null> {
+      return readTrackingRunDetail(pool, id)
+    },
+    async getLatestRun(): Promise<TrackingRunDetail | null> {
+      const result = await pool.query<{ id: string }>(
+        `SELECT id FROM tracking_runs ORDER BY started_at DESC, id DESC LIMIT 1`,
+      )
+      return result.rows[0] ? readTrackingRunDetail(pool, result.rows[0].id) : null
+    },
+    async beginRun(input: {
+      id: string; targets: TrackingTarget[]; startedAt?: string
+    }): Promise<TrackingRun> {
+      const startedAt = input.startedAt ?? new Date().toISOString()
+      try {
+        const result = await pool.query<TrackingRunRow>(
+          `INSERT INTO tracking_runs (id, status, targets_json, started_at)
+           VALUES ($1, 'running', $2, $3)
+           RETURNING ${trackingRunColumns}`,
+          [input.id, JSON.stringify(normalizeTrackingTargets(input.targets)), startedAt],
+        )
+        return mapTrackingRun(result.rows[0]!)
+      } catch (error) {
+        const databaseError = error as { code?: string; constraint?: string }
+        if (databaseError.code === '23505'
+          && databaseError.constraint === 'tracking_runs_one_active') {
+          throw new Error('tracking_run_active')
+        }
+        if (databaseError.code === '23505') throw new Error('tracking_run_exists')
+        throw error
+      }
+    },
+    async latestSuccessfulObservations(symbols?: string[]): Promise<TrackingObservation[]> {
+      const normalized = symbols?.map(normalizeTrackingSymbol)
+      if (normalized?.length === 0) return []
+      const result = await pool.query<TrackingObservationRow>(
+        `SELECT DISTINCT ON (observation.symbol, observation.capability)
+           observation.id, observation.run_id, observation.symbol, observation.capability,
+           observation.status, observation.baseline_observation_id,
+           observation.observed_at::text, observation.payload_json
+         FROM tracking_observations observation
+         JOIN tracking_runs run ON run.id = observation.run_id
+         WHERE observation.status = 'success'
+           AND run.status IN ('completed', 'partial')
+           AND ($1::text[] IS NULL OR observation.symbol = ANY($1))
+         ORDER BY observation.symbol, observation.capability,
+           observation.observed_at DESC, run.completed_at DESC,
+           run.id DESC, observation.id DESC`,
+        [normalized ?? null],
+      )
+      return result.rows.map(mapTrackingObservation)
+    },
+    async completeRun(input: {
+      runId: string
+      status: 'completed' | 'partial' | 'failed'
+      observations: TrackingObservationInput[]
+      completedAt?: string
+      error?: string
+    }): Promise<TrackingRunDetail> {
+      const completedAt = input.completedAt ?? new Date().toISOString()
+      const client = await pool.connect()
+      try {
+        await client.query('BEGIN')
+        const run = await client.query<Pick<TrackingRunRow, 'status' | 'targets_json'>>(
+          `SELECT status, targets_json FROM tracking_runs WHERE id = $1 FOR UPDATE`,
+          [input.runId],
+        )
+        if (!run.rows[0]) throw new Error('tracking_run_not_found')
+        if (run.rows[0].status !== 'running') throw new Error('tracking_run_not_active')
+        const targets = new Set(run.rows[0].targets_json.map(({ symbol }) => symbol))
+        for (const observation of input.observations) {
+          const symbol = normalizeTrackingSymbol(observation.symbol)
+          if (!targets.has(symbol)) throw new Error('tracking_observation_outside_targets')
+          const baseline = await client.query<{ id: string }>(
+            `SELECT observation.id FROM tracking_observations observation
+             JOIN tracking_runs run ON run.id = observation.run_id
+             WHERE observation.symbol = $1 AND observation.capability = $2
+               AND observation.status = 'success'
+               AND run.status IN ('completed', 'partial')
+             ORDER BY observation.observed_at DESC, run.completed_at DESC,
+               run.id DESC, observation.id DESC LIMIT 1`,
+            [symbol, observation.capability],
+          )
+          const baselineObservationId = baseline.rows[0]?.id ?? null
+          await client.query(
+            `INSERT INTO tracking_observations (
+               id, run_id, symbol, capability, status, baseline_observation_id,
+               observed_at, payload_json
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+            [observation.id, input.runId, symbol, observation.capability, observation.status,
+              baselineObservationId, observation.observedAt, JSON.stringify(observation.payload)],
+          )
+          if (baselineObservationId === null) continue
+          for (const event of observation.events) {
+            await client.query(
+              `INSERT INTO tracking_events (
+                 id, run_id, observation_id, baseline_observation_id, event_key, symbol,
+                 capability, kind, severity, occurred_at, payload_json, created_at
+               ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+               ON CONFLICT (event_key) DO NOTHING`,
+              [randomUUID(), input.runId, observation.id, baselineObservationId, event.eventKey,
+                symbol, observation.capability, event.kind, event.severity, event.occurredAt,
+                JSON.stringify(event.payload), completedAt],
+            )
+          }
+        }
+        await client.query(
+          `UPDATE tracking_runs SET status = $2, completed_at = $3, error = $4
+           WHERE id = $1 AND status = 'running'`,
+          [input.runId, input.status, completedAt, input.error ?? null],
+        )
+        await client.query('COMMIT')
+        const detail = await readTrackingRunDetail(pool, input.runId)
+        if (!detail) throw new Error('tracking_run_not_found')
+        return detail
+      } catch (error) {
+        await client.query('ROLLBACK')
+        throw error
+      } finally {
+        client.release()
+      }
+    },
+    async listEvents(options: { symbol?: string; limit?: number } = {}): Promise<TrackingEvent[]> {
+      const safeLimit = Number.isInteger(options.limit)
+        ? Math.max(1, Math.min(options.limit!, 500)) : 100
+      const result = await pool.query<TrackingEventRow>(
+        `SELECT ${trackingEventColumns} FROM tracking_events
+         WHERE ($1::text IS NULL OR symbol = $1)
+         ORDER BY occurred_at DESC, id DESC LIMIT $2`,
+        [options.symbol ? normalizeTrackingSymbol(options.symbol) : null, safeLimit],
+      )
+      return result.rows.map(mapTrackingEvent)
+    },
+  }
+}
+
+export type TrackingRepository = ReturnType<typeof createTrackingRepository>
 
 async function cancelRunningToolBatches(
   database: PoolClient, sessionId: string, executionId: string,

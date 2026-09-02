@@ -27,7 +27,6 @@ import { toolRegistry } from './tool-registry.js'
 import {
   analysisModelTools, finalizationModelTools, financialSpecialistTools, flatFinalizationTools,
   flatResearchTools, newsSpecialistTools, technicalSpecialistTools, webSearchEvidenceTool,
-  conversationResearchTools,
 } from './tools.js'
 import { validateReportCandidate } from './report-validation.js'
 
@@ -636,10 +635,10 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
       const main = runProjectedAgent({
         role: 'main', input, options, settings, executionSignal: agentSignal, activeBudget,
         modelGate, toolGate, provider, queue,
-        initialTools: input.tools.length ? input.tools : conversationResearchTools,
+        initialTools: input.tools,
         initialStage: 'research', completionMode: 'chat',
         initialMessages: input.initialMessages,
-        nextResearchTools: () => input.tools.length ? input.tools : conversationResearchTools,
+        nextResearchTools: () => input.tools,
         nextFinalizationTools: () => [],
         systemPrompt: securedSystemPrompt(input.systemPrompt), userPrompt: input.userPrompt,
         execute: input.executeTool,

@@ -6,6 +6,7 @@ import { WorkbenchPrototype } from './prototype/workbench-prototype.js'
 import './prototype/workbench-prototype.css'
 import './styles.css'
 import './trace.css'
+import './tracking.css'
 
 const prototypeRoutes: Record<string, ComponentType> = {
   '/prototype/workbench': WorkbenchPrototype,
