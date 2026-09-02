@@ -234,10 +234,27 @@ function buildObservations(
   const baselineFor = (capability: Capability) => baselines.find((candidate) => (
     candidate.symbol === symbol && candidate.capability === capability
   ))
+  const quoteRecord = quote.ok && isRecord(quote.value) ? quote.value : null
+  const technicalRecord = technical.ok && isRecord(technical.value) ? technical.value : null
+  const indicatorRecord = recordAt(technicalRecord, 'indicators')
+  const volumeRecord = recordAt(technicalRecord, 'volumePrice')
 
   const technicalPayload: Record<string, unknown> = {
-    quote: quote.ok ? quote.value : null,
-    technical: technical.ok ? technical.value : null,
+    quote: quoteRecord ? {
+      price: numberValue(quoteRecord.price), observedAt: stringValue(quoteRecord.observedAt),
+      source: stringValue(quoteRecord.source),
+      sourceReference: stringValue(quoteRecord.sourceReference),
+    } : null,
+    technical: technicalRecord ? {
+      actualEnd: stringValue(technicalRecord.actualEnd),
+      indicators: {
+        ma_5: numberValue(indicatorRecord?.ma_5),
+        ma_20: numberValue(indicatorRecord?.ma_20),
+        rsi_14: numberValue(indicatorRecord?.rsi_14),
+      },
+      volumePrice: { volumeRatio5To20: numberValue(volumeRecord?.volumeRatio5To20) },
+      facts: asFacts(technicalRecord.facts).slice(0, 1).map((fact) => compactFact(fact)),
+    } : null,
     gaps: gapsFromSources({ quote, technical }),
   }
   const technicalStatus = sourceAvailable(quote) && sourceAvailable(technical)
@@ -248,14 +265,23 @@ function buildObservations(
     : technical.ok && isRecord(technical.value) && typeof technical.value.actualEnd === 'string'
       ? technical.value.actualEnd : fallbackObservedAt
 
+  const fundamentalRecord = fundamental.ok && isRecord(fundamental.value)
+    ? fundamental.value : null
+  const overviewRecord = fundamentalRecord && isRecord(fundamentalRecord.overview)
+    ? fundamentalRecord.overview : null
   const fundamentalPayload: Record<string, unknown> = {
-    overview: fundamental.ok && isRecord(fundamental.value) ? fundamental.value.overview ?? null : null,
-    facts: fundamental.ok && isRecord(fundamental.value) ? fundamental.value.facts ?? [] : [],
-    officialEvents: official.ok && isRecord(official.value) ? official.value.facts ?? [] : [],
-    sources: {
-      fundamental: fundamental.ok && isRecord(fundamental.value) ? fundamental.value.sources ?? [] : [],
-      official: official.ok && isRecord(official.value) ? official.value.sources ?? [] : [],
-    },
+    overview: overviewRecord ? {
+      latestPeriod: stringValue(overviewRecord.latestPeriod),
+      qualityFlags: arrayAt(overviewRecord, 'qualityFlags').filter(isRecord).map((flag) => ({
+        flag_type: stringValue(flag.flag_type ?? flag.flagType),
+        severity: stringValue(flag.severity), period: stringValue(flag.period),
+      })),
+    } : null,
+    facts: asFacts(fundamentalRecord?.facts).map((fact) => compactFact(fact)),
+    officialEvents: official.ok && isRecord(official.value)
+      ? asFacts(official.value.facts).map((fact) => compactFact(
+          fact, ['filingId', 'form', 'title'],
+        )) : [],
     gaps: gapsFromSources({ fundamental, official }, true),
   }
   const fundamentalStatus = sourceAvailable(fundamental, true) && sourceAvailable(official, true)
@@ -266,8 +292,8 @@ function buildObservations(
   )
 
   const newsPayload: Record<string, unknown> = {
-    headlines: news.ok && isRecord(news.value) ? news.value.facts ?? [] : [],
-    sources: news.ok && isRecord(news.value) ? news.value.sources ?? [] : [],
+    headlines: news.ok && isRecord(news.value)
+      ? asFacts(news.value.facts).map((fact) => compactFact(fact, ['title'])) : [],
     gaps: gapsFromSources({ news }, true),
   }
   const newsStatus = sourceAvailable(news, true) ? 'success' : 'data_gap'
@@ -571,6 +597,21 @@ function asFacts(value: unknown): FinancialFact[] {
 
 function stringValue(value: unknown) {
   return typeof value === 'string' && value ? value : null
+}
+
+function numberValue(value: unknown) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+function compactFact(fact: FinancialFact, valueKeys: string[] = []) {
+  const value = isRecord(fact.value) ? fact.value : {}
+  return {
+    id: fact.id, type: fact.type, observedAt: fact.observedAt,
+    fetchedAt: fact.fetchedAt, source: fact.source, sourceReference: fact.sourceReference,
+    value: Object.fromEntries(valueKeys.flatMap((key) => (
+      value[key] === undefined ? [] : [[key, value[key]]]
+    ))),
+  }
 }
 
 function rsiZone(value: number) {

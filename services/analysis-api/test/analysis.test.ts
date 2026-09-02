@@ -103,6 +103,19 @@ async function waitForStatus(app: Awaited<ReturnType<typeof makeApp>>, id: strin
   throw new Error(`analysis_not_${expected}:${JSON.stringify(latest)}`)
 }
 
+async function waitForTerminalStatus(
+  app: Awaited<ReturnType<typeof makeApp>>, id: string, expected: string,
+) {
+  let latest: unknown
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    latest = (await app.inject({ method: 'GET', url: `/api/analyses/${id}` })).json()
+    if ((latest as { status?: string; terminal?: boolean }).status === expected
+      && (latest as { terminal?: boolean }).terminal === true) return latest
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  throw new Error(`analysis_not_terminal_${expected}:${JSON.stringify(latest)}`)
+}
+
 async function waitForConversation(app: Awaited<ReturnType<typeof makeApp>>, id: string, expected: string) {
   let latest: unknown
   for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -1793,8 +1806,8 @@ test('Runtime processing 单独耗尽 active budget 后进入确定性收口', a
   })
   await app.ready()
   const created = (await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'ABORT' } })).json()
-  const partial = await waitForStatus(app as any, created.analysisId, 'partial')
-  assert.equal(partial.report.title, report.title)
+  const completed = await waitForTerminalStatus(app as any, created.analysisId, 'budget_exhausted')
+  assert.equal((completed as any).report.title, report.title)
   assert.equal(toolCalls, 1)
   assert.equal(modelCalls, 1)
   await app.close()
@@ -1957,12 +1970,10 @@ test('专项已有 V1 后主预算耗尽的二次收口保留真实状态与精�
   const created = (await app.inject({
     method: 'POST', url: '/api/analyses', payload: { symbol: 'BUDGETV1' },
   })).json()
-  const completed = await waitForStatus(app as any, created.analysisId, 'partial').catch(async (error) => {
-    const research = (await app.inject({
-      method: 'GET', url: `/api/research/${created.analysisId}`,
-    })).json()
-    throw new Error(`${String(error)}:${JSON.stringify(research)}`)
-  })
+  const completed = await waitForTerminalStatus(
+    app as any, created.analysisId, 'budget_exhausted',
+  ) as Record<string, unknown>
+  assert.equal((completed.report as { title?: string }).title, closingReport.title)
   assert.equal(attempts, 2)
   const versions = (await app.inject({
     method: 'GET', url: `/api/research/${created.analysisId}/report-versions`,

@@ -1129,9 +1129,13 @@ export function createAnalysisService(options: {
                     finalizedSnapshot,
                   )
                 : undefined
-              await setStatus(sessionId, executionId, operationId('status-partial'), 'partial', {
-                report, snapshot: finalizedSnapshot, ...(reportVersion ? { reportVersion } : {}),
-              })
+              await setStatus(
+                sessionId, executionId, operationId('status-budget-exhausted-closed'),
+                'budget_exhausted', {
+                  report, snapshot: finalizedSnapshot, terminal: true,
+                  ...(reportVersion ? { reportVersion } : {}),
+                },
+              )
               return
             }
           }
@@ -1362,47 +1366,11 @@ export function createAnalysisService(options: {
         ...(reportVersion ? { reportVersion } : {}),
       } : null
     }))
-    const specialistDecision = (toolName: string) => trace.find((event) => {
-      if (event.type !== 'tool_result' || event.name !== toolName) return false
-      const result = event.result as Record<string, unknown> | undefined
-      return result?.launched === false
-    })
-    const newsDecision = specialistDecision('run_news_analysis')
-    const newsResult = newsDecision?.result as Record<string, unknown> | undefined
-    const projectedSpecialists: Array<Record<string, unknown>> = specialistAgents.filter(
-      (specialist): specialist is NonNullable<typeof specialist> => specialist !== null,
+    const projectedSpecialists = completeSpecialistProjection(
+      specialistAgents.filter(
+        (specialist): specialist is NonNullable<typeof specialist> => specialist !== null,
+      ), trace, notStartedReason,
     )
-    if (!projectedSpecialists.some((specialist) => specialist?.domain === 'news')) {
-      projectedSpecialists.push(newsResult ? {
-        domain: 'news', status: 'not_started',
-        researchQuestion: newsResult.researchQuestion, reason: newsResult.reason,
-      } : {
-        domain: 'news', status: 'not_started',
-        reason: notStartedReason('消息面'),
-      })
-    }
-    const fundamentalDecision = specialistDecision('run_fundamental_analysis')
-    const fundamentalResult = fundamentalDecision?.result as Record<string, unknown> | undefined
-    if (!projectedSpecialists.some((specialist) => specialist?.domain === 'fundamental_valuation')) {
-      projectedSpecialists.push(fundamentalResult ? {
-        domain: 'fundamental_valuation', status: 'not_started',
-        researchQuestion: fundamentalResult.researchQuestion, reason: fundamentalResult.reason,
-      } : {
-        domain: 'fundamental_valuation', status: 'not_started',
-        reason: notStartedReason('基本面'),
-      })
-    }
-    const technicalDecision = specialistDecision('run_technical_analysis')
-    const technicalResult = technicalDecision?.result as Record<string, unknown> | undefined
-    if (!projectedSpecialists.some((specialist) => specialist?.domain === 'technical')) {
-      projectedSpecialists.push(technicalResult ? {
-        domain: 'technical', status: 'not_started',
-        researchQuestion: technicalResult.researchQuestion, reason: technicalResult.reason,
-      } : {
-        domain: 'technical', status: 'not_started',
-        reason: notStartedReason('技术面'),
-      })
-    }
     return {
       ...record, trace,
       mainAgent: await options.eventRepository.primaryLifecycle(analysisId),
@@ -1429,7 +1397,7 @@ export function createAnalysisService(options: {
     )).map((event) => ({
           sequence: event.sequence, createdAt: event.createdAt, ...event.payload,
         }))
-    const specialistAgents: Array<Record<string, unknown>> = await Promise.all(
+    const specialistAgents = await Promise.all(
       sessions.filter(({ isPrimary }) => !isPrimary).map(async (session) => {
         const context = (await options.eventRepository.listByTypes(
           session.id, ['specialist_context'],
@@ -1451,32 +1419,16 @@ export function createAnalysisService(options: {
         .then((snapshot) => (snapshot?.values.agentModeFlat ?? 0) === 1)
         .catch(() => false)
       : false
-    for (const decision of [
-      { domain: 'news', label: '消息面', toolName: 'run_news_analysis' },
-      { domain: 'fundamental_valuation', label: '基本面', toolName: 'run_fundamental_analysis' },
-      { domain: 'technical', label: '技术面', toolName: 'run_technical_analysis' },
-    ]) {
-      if (specialistAgents.some(({ domain }) => domain === decision.domain)) continue
-      const event = primaryEvents.find(({ payload }) => (
-        payload.type === 'tool_result' && payload.name === decision.toolName
-        && (payload.result as Record<string, unknown> | undefined)?.launched === false
-      ))?.payload
-      const result = event?.result as Record<string, unknown> | undefined
-      specialistAgents.push({
-        domain: decision.domain, status: 'not_started',
-        ...(result ? {
-          researchQuestion: result.researchQuestion, reason: result.reason,
-        } : {
-          reason: flatMode
-            ? '扁平模式：本研究不使用专项 Agent。'
-            : `主 Agent 尚未作出${decision.label}专项启动决定。`,
-        }),
-      })
-    }
+    const projectedSpecialists = completeSpecialistProjection(
+      specialistAgents, primaryEvents.map(({ payload }) => payload),
+      (label) => flatMode
+        ? '扁平模式：本研究不使用专项 Agent。'
+        : `主 Agent 尚未作出${label}专项启动决定。`,
+    )
     return {
       ...visibleRecord, messages,
       ...(primary ? { mainAgent: { id: primary.id, status: primary.status } } : {}),
-      specialistAgents,
+      specialistAgents: projectedSpecialists,
       reportVersions: reportVersions.filter(({ sessionId, kind }) => (
         sessionId === primary?.id && kind === 'integrated'
       )).map(({ version, createdAt, report }) => ({
@@ -1595,6 +1547,33 @@ export function createAnalysisService(options: {
     listResearch, updateResearch, removeResearch,
     streamEvents, close, updateRuntimePolicy,
   }
+}
+
+function completeSpecialistProjection(
+  specialists: Array<Record<string, unknown>>,
+  events: Array<Record<string, unknown>>,
+  defaultReason: (label: string) => string,
+) {
+  const projected = [...specialists]
+  for (const decision of [
+    { domain: 'news', label: '消息面', toolName: 'run_news_analysis' },
+    { domain: 'fundamental_valuation', label: '基本面', toolName: 'run_fundamental_analysis' },
+    { domain: 'technical', label: '技术面', toolName: 'run_technical_analysis' },
+  ]) {
+    if (projected.some(({ domain }) => domain === decision.domain)) continue
+    const event = events.find((candidate) => (
+      candidate.type === 'tool_result' && candidate.name === decision.toolName
+      && (candidate.result as Record<string, unknown> | undefined)?.launched === false
+    ))
+    const result = event?.result as Record<string, unknown> | undefined
+    projected.push({
+      domain: decision.domain, status: 'not_started',
+      ...(result ? {
+        researchQuestion: result.researchQuestion, reason: result.reason,
+      } : { reason: defaultReason(decision.label) }),
+    })
+  }
+  return projected
 }
 
 function isExecutionStatus(value: string): value is import('@vibe-invest/contracts').AgentExecutionStatus {

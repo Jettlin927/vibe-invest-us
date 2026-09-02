@@ -329,7 +329,7 @@ test('未配置来源返回空 sources 时扫描形成 data gap 而不是成功�
   await app.close()
 })
 
-test('Tracking 首页只返回观测摘要而扫描详情保留完整数据', async () => {
+test('Tracking 首页和扫描详情都只返回紧凑观测', async () => {
   const marker = `FULL_TRACKING_PAYLOAD:${'x'.repeat(200_000)}`
   const data = successfulTrackingData()
   let quoteVersion = 0
@@ -368,7 +368,7 @@ test('Tracking 首页只返回观测摘要而扫描详情保留完整数据', as
   quoteVersion = 1
   const created = await app.inject({ method: 'POST', url: '/api/tracking/scans' })
   const detail = await waitForScan(app, created.json().id)
-  assert.match(detail.body, /FULL_TRACKING_PAYLOAD/)
+  assert.doesNotMatch(detail.body, /FULL_TRACKING_PAYLOAD/)
   assert.equal(detail.json().events.some(({ kind }: { kind: string }) => kind === 'price_move'), true)
 
   const overview = await app.inject({ method: 'GET', url: '/api/tracking' })
