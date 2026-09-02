@@ -1051,13 +1051,13 @@ export function createAnalysisService(options: {
             conditionalSuggestion: null,
           }
           const report = enforceDataGaps(personalized, gaps)
-          const status = report.limitations.length ? 'partial' : 'completed'
+          const reportStatus = report.limitations.length ? 'partial' : 'completed'
           const finalizedSnapshot = terminalSnapshot()
           const reportVersion = event.reportVersion
             ? finalReportVersion(
-                executionId, event.reportVersion, report, status, gaps, finalizedSnapshot,
+                executionId, event.reportVersion, report, reportStatus, gaps, finalizedSnapshot,
               ) : undefined
-          await setStatus(sessionId, executionId, operationId(`status-${status}`), status, {
+          await setStatus(sessionId, executionId, operationId('status-completed'), 'completed', {
             report, snapshot: finalizedSnapshot, ...(reportVersion ? { reportVersion } : {}),
           })
           return
@@ -1412,6 +1412,84 @@ export function createAnalysisService(options: {
       )).map(({ snapshot: _snapshot, ...version }) => version),
     }
   }
+  async function researchView(analysisId: string) {
+    await initialized
+    const record = await repository.research(analysisId, 'view')
+    if (!record) return null
+    const { snapshot: _snapshot, ...visibleRecord } = record
+    const sessions = await options.eventRepository.listSessions(analysisId)
+    const primary = sessions.find(({ isPrimary }) => isPrimary)
+    const reportVersions = await options.eventRepository.listReportVersions(analysisId)
+    const primaryEvents = primary
+      ? await options.eventRepository.listByTypes(
+          primary.id, ['runtime_follow_up', 'chat_completed', 'tool_result'],
+        ) : []
+    const messages = primaryEvents.filter(({ payload }) => (
+      payload.type === 'runtime_follow_up' || payload.type === 'chat_completed'
+    )).map((event) => ({
+          sequence: event.sequence, createdAt: event.createdAt, ...event.payload,
+        }))
+    const specialistAgents: Array<Record<string, unknown>> = await Promise.all(
+      sessions.filter(({ isPrimary }) => !isPrimary).map(async (session) => {
+        const context = (await options.eventRepository.listByTypes(
+          session.id, ['specialist_context'],
+        )).at(-1)?.payload
+        const reportVersion = reportVersions.filter(({ sessionId }) => (
+          sessionId === session.id
+        )).at(-1)
+        return {
+          id: session.id, domain: context?.domain ?? 'unknown', status: session.status,
+          researchQuestion: context?.researchQuestion, reason: context?.reason,
+          ...(reportVersion ? {
+            reportVersion: (({ snapshot: _reportSnapshot, ...version }) => version)(reportVersion),
+          } : {}),
+        }
+      }),
+    )
+    const flatMode = primary
+      ? await options.settingsRepository.getExecutionSnapshot(primary.executionId)
+        .then((snapshot) => (snapshot?.values.agentModeFlat ?? 0) === 1)
+        .catch(() => false)
+      : false
+    for (const decision of [
+      { domain: 'news', label: '消息面', toolName: 'run_news_analysis' },
+      { domain: 'fundamental_valuation', label: '基本面', toolName: 'run_fundamental_analysis' },
+      { domain: 'technical', label: '技术面', toolName: 'run_technical_analysis' },
+    ]) {
+      if (specialistAgents.some(({ domain }) => domain === decision.domain)) continue
+      const event = primaryEvents.find(({ payload }) => (
+        payload.type === 'tool_result' && payload.name === decision.toolName
+        && (payload.result as Record<string, unknown> | undefined)?.launched === false
+      ))?.payload
+      const result = event?.result as Record<string, unknown> | undefined
+      specialistAgents.push({
+        domain: decision.domain, status: 'not_started',
+        ...(result ? {
+          researchQuestion: result.researchQuestion, reason: result.reason,
+        } : {
+          reason: flatMode
+            ? '扁平模式：本研究不使用专项 Agent。'
+            : `主 Agent 尚未作出${decision.label}专项启动决定。`,
+        }),
+      })
+    }
+    return {
+      ...visibleRecord, messages,
+      ...(primary ? { mainAgent: { id: primary.id, status: primary.status } } : {}),
+      specialistAgents,
+      reportVersions: reportVersions.filter(({ sessionId, kind }) => (
+        sessionId === primary?.id && kind === 'integrated'
+      )).map(({ version, createdAt, report }) => ({
+        version, createdAt,
+        report: { title: (report as Record<string, unknown>).title },
+      })),
+    }
+  }
+  async function researchTrace(analysisId: string) {
+    const record = await research(analysisId)
+    if (!record) return null
+    return { mainAgent: record.mainAgent, specialistAgents: record.specialistAgents }
+  }
   async function listResearch(symbol?: string) {
     await initialized
     return repository.listResearch(symbol)
@@ -1513,7 +1591,8 @@ export function createAnalysisService(options: {
     queueMicrotask(() => void schedule())
   }
   return {
-    create, get, cancel, resume, followUp, research, listResearch, updateResearch, removeResearch,
+    create, get, cancel, resume, followUp, research, researchView, researchTrace,
+    listResearch, updateResearch, removeResearch,
     streamEvents, close, updateRuntimePolicy,
   }
 }

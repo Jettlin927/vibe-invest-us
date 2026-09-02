@@ -199,11 +199,11 @@ export function createTestProductDatabase() {
       if (record && !['completed', 'partial', 'failed', 'stopped', 'interrupted', 'budget_exhausted']
         .includes(record.status)) analyses.set(id, { ...record, snapshot })
     },
-    async research(id) {
+    async research(id, projection = 'export') {
       const record = analyses.get(id)
       if (!record) return null
       return {
-        ...record,
+        ...record, ...(projection === 'view' ? { snapshot: null } : {}),
         facts: [...(analysisFacts.get(id) ?? [])].flatMap((factId) => facts.get(factId) ?? []),
       }
     },
@@ -211,7 +211,14 @@ export function createTestProductDatabase() {
       return [...analyses.values()].filter((record) => (
         ['completed', 'partial', 'failed', 'stopped', 'interrupted', 'budget_exhausted'].includes(record.status)
         && (!symbol || record.symbol === symbol.toUpperCase())
-      )).sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+      )).sort((left, right) => right.createdAt.localeCompare(left.createdAt)).map((record) => {
+        const { snapshot: _snapshot, ...summary } = record
+        const candidate = summary.report as Record<string, unknown> | null
+        return {
+          ...summary,
+          ...(candidate ? { report: { title: candidate.title, trend: candidate.trend } } : {}),
+        }
+      })
     },
     async updateResearch(id, values, updatedAt) {
       const record = analyses.get(id)
@@ -674,6 +681,11 @@ export function createTestProductDatabase() {
     },
     async list(sessionId, afterSequence) {
       return (agentEvents.get(sessionId) ?? []).filter(({ sequence }) => sequence > afterSequence)
+    },
+    async listByTypes(sessionId, types) {
+      return (agentEvents.get(sessionId) ?? []).filter(({ payload }) => (
+        types.includes(String(payload.type ?? ''))
+      ))
     },
     async listByExecution(executionId, afterSequence) {
       const session = [...agentSessions.values()].find((candidate) => (

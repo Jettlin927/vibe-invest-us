@@ -635,7 +635,11 @@ export function buildApp(dependencies: AppDependencies) {
     }
   })
   app.get<{ Params: { id: string } }>('/api/research/:id', async (request, reply) => {
-    const result = await analysis?.research(request.params.id)
+    const result = await analysis?.researchView(request.params.id)
+    return result ? projectResearchView(result) : reply.status(404).send({ error: 'research_not_found' })
+  })
+  app.get<{ Params: { id: string } }>('/api/research/:id/trace', async (request, reply) => {
+    const result = await analysis?.researchTrace(request.params.id)
     return result ? projectResearchView(result) : reply.status(404).send({ error: 'research_not_found' })
   })
   app.get<{ Params: { id: string } }>('/api/research/:id/export', async (request, reply) => {

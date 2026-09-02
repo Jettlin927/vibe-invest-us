@@ -51,30 +51,35 @@ type ModelAttempt = {
   durationMs: number | null; createdAt: string; completedAt: string | null
 }
 type TokenUsage = TokenUsageAggregate
+type MainAgentEvent = {
+  sequence: number; type?: string; status?: string; createdAt: string
+  previousExecutionId?: string; executionId?: string
+  message?: string; messageId?: string; text?: string
+  contextTokens?: number; contextWindow?: number; reserveTokens?: number
+  keepRecentTokens?: number; durationMs?: number; tokensAfter?: number
+  estimated?: boolean
+  usage?: { input?: number; output?: number; totalTokens?: number }
+  waitReason?: { kind: string; target: string; startedAt: string } | null
+  [key: string]: unknown
+}
 type ResearchRecord = ResearchSummary & {
   report?: Report
   facts: Fact[]
-  trace: Array<Record<string, unknown>>
+  trace?: Array<Record<string, unknown>>
+  messages?: Array<{
+    sequence: number; type?: string; createdAt: string
+    message?: string; messageId?: string; text?: string
+  }>
   reportVersions?: Array<{ version: number; createdAt: string; report: { title?: string } }>
   snapshot?: { gaps?: Array<{ capability?: string; reason?: string }> }
   mainAgent?: {
     id: string; status: string
     waitReason: { kind: string; target: string; startedAt: string } | null
-    execution: { id: string; generation: number; status: string }
-    segments: Array<{
+    execution?: { id: string; generation: number; status: string }
+    segments?: Array<{
       id: string; ordinal: number; parentSegmentId?: string | null; createdAt: string
     }>
-    events: Array<{
-      sequence: number; type?: string; status?: string; createdAt: string
-      previousExecutionId?: string; executionId?: string
-      message?: string; messageId?: string; text?: string
-      contextTokens?: number; contextWindow?: number; reserveTokens?: number
-      keepRecentTokens?: number; durationMs?: number
-      tokensAfter?: number
-      estimated?: boolean
-      usage?: { input?: number; output?: number; totalTokens?: number }
-      waitReason?: { kind: string; target: string; startedAt: string } | null
-    }>
+    events?: MainAgentEvent[]
     compactionAttempts?: Array<{
       compactionId: string; attempt: number; status: string; durationMs: number
       usage: { input?: number; cacheRead?: number; cacheWrite?: number; output?: number; totalTokens?: number } | null
@@ -87,7 +92,7 @@ type ResearchRecord = ResearchSummary & {
     researchQuestion?: string; reason?: string
     execution?: { id: string; generation: number; status: string }
     segments?: NonNullable<ResearchRecord['mainAgent']>['segments']
-    events?: Array<NonNullable<ResearchRecord['mainAgent']>['events'][number] & { name?: string }>
+    events?: Array<MainAgentEvent & { name?: string }>
     compactionAttempts?: NonNullable<ResearchRecord['mainAgent']>['compactionAttempts']
     modelAttempts?: ModelAttempt[]
     tokenUsage?: TokenUsage
@@ -381,17 +386,16 @@ export function App() {
         const cursor = (event as MessageEvent).lastEventId.split(':').at(-1)
         const sequence = Number(cursor)
         if (Number.isInteger(sequence)) setSelectedResearch((current) => {
-          if (current?.id !== analysisId || !current.mainAgent
-            || current.mainAgent.events.some((candidate) => candidate.sequence === sequence)) return current
-          return { ...current, mainAgent: {
-            ...current.mainAgent,
-            events: [...current.mainAgent.events, {
+          if (current?.id !== analysisId
+            || current.messages?.some((candidate) => candidate.sequence === sequence)) return current
+          return { ...current,
+            messages: [...(current.messages ?? []), {
               sequence, type: name, createdAt: new Date().toISOString(),
               ...(typeof entry.message === 'string' ? { message: entry.message } : {}),
               ...(typeof entry.messageId === 'string' ? { messageId: entry.messageId } : {}),
               ...(typeof entry.text === 'string' ? { text: entry.text } : {}),
             }],
-          } }
+          }
         })
       }
       if (!['runtime_follow_up', 'chat_completed', 'text_delta'].includes(name)) addStage(name)
@@ -428,6 +432,15 @@ export function App() {
   async function openResearch(id: string) {
     const response = await fetch(`/api/research/${id}`)
     if (response.ok) setSelectedResearch(await response.json())
+  }
+  async function openResearchTrace(id: string) {
+    if (selectedResearch?.id === id && (
+      Array.isArray(selectedResearch.mainAgent?.events) || Array.isArray(selectedResearch.trace)
+    )) return
+    const response = await fetch(`/api/research/${id}/trace`)
+    if (!response.ok) return
+    const audit = await response.json() as Pick<ResearchRecord, 'mainAgent' | 'specialistAgents'>
+    setSelectedResearch((current) => current?.id === id ? { ...current, ...audit } : current)
   }
   async function openConversation(id: string) {
     const summary = conversationThreads.find((thread) => thread.id === id)
@@ -703,7 +716,7 @@ export function App() {
       {page === 'overview' && <Overview records={records} selected={selectedResearch} positions={positions} health={health} modelConfigured={modelConfigured} onNavigate={navigate} onOpen={async (id) => { await openResearch(id); navigate('research') }} />}
       {page === 'tracking' && <TrackingPage overview={trackingOverview} available={trackingAvailable} lastScan={trackingLastScan} loading={trackingLoading} scanning={trackingScanning} onWatch={watchSymbol} onUnwatch={unwatchSymbol} onScan={scanTracking} onAnalyze={analyzeTrackingSymbol} />}
       {page === 'analysis' && <AnalysisPage symbol={analysisSymbol} setSymbol={setAnalysisSymbol} status={analysisStatus} stages={analysisStages} active={analysisSubmitting || Boolean(activeAnalysisId)} onStart={startAnalysis} onCancel={cancelAnalysis} health={health} modelConfigured={modelConfigured} records={records} onOpen={async (id) => { await openResearch(id); navigate('research') }} />}
-      {page === 'research' && <ResearchPage records={records} record={selectedResearch} onOpen={openResearch} onUpdate={updateResearch} onDelete={removeResearch} deleting={deletingResearchId === selectedResearch?.id} onResume={resumeResearch} onFollowUp={sendFollowUp} onReanalyze={reanalyzeResearch} freshnessDays={runtimeSettings?.current.values.reportFreshnessDays ?? null} />}
+      {page === 'research' && <ResearchPage records={records} record={selectedResearch} onOpen={openResearch} onOpenTrace={openResearchTrace} onUpdate={updateResearch} onDelete={removeResearch} deleting={deletingResearchId === selectedResearch?.id} onResume={resumeResearch} onFollowUp={sendFollowUp} onReanalyze={reanalyzeResearch} freshnessDays={runtimeSettings?.current.values.reportFreshnessDays ?? null} />}
       {page === 'conversation' && <ConversationPage threads={conversationThreads} thread={selectedConversation} events={conversationEvents} busy={conversationBusy} onOpen={openConversation} onNew={() => { setSelectedConversation(null); setConversationEvents([]); setConversationBusy(false) }} onCreate={startConversation} onSend={sendConversationMessage} onCancel={cancelConversation} />}
       {page === 'portfolio' && <PortfolioPage portfolio={portfolio} history={portfolioHistory} events={portfolioEvents} loaded={portfolioLoaded} loadFailed={portfolioLoadFailed} refreshing={portfolioRefreshing} onSave={savePosition} onSaveCash={saveCash} onBuy={buyPosition} onReduce={reducePosition} onDelete={removePosition} />}
       {page === 'settings' && <SettingsPage health={health} modelConfigured={modelConfigured} settings={runtimeSettings} onReload={loadSettings} />}
@@ -855,8 +868,9 @@ function ConversationComposer({ mode, busy, onSubmit }: {
   </form>
 }
 
-function ResearchPage({ records, record, onOpen, onUpdate, onDelete, deleting, onResume, onFollowUp, onReanalyze, freshnessDays }: {
+function ResearchPage({ records, record, onOpen, onOpenTrace, onUpdate, onDelete, deleting, onResume, onFollowUp, onReanalyze, freshnessDays }: {
   records: ResearchSummary[]; record: ResearchRecord | null; onOpen: (id: string) => Promise<void>
+  onOpenTrace: (id: string) => Promise<void>
   onUpdate: (event: React.FormEvent<HTMLFormElement>) => Promise<void>; onDelete: () => Promise<void>
   deleting: boolean
   onResume: () => Promise<void>
@@ -873,7 +887,10 @@ function ResearchPage({ records, record, onOpen, onUpdate, onDelete, deleting, o
       <div className="research-tabcol">
         <div className="research-tabs" role="tablist" aria-label="研究记录视图切换">
           <button role="tab" aria-selected={researchTab === 'report'} className={researchTab === 'report' ? 'active' : ''} onClick={() => setResearchTab('report')}>研究</button>
-          <button role="tab" aria-selected={researchTab === 'trace'} className={researchTab === 'trace' ? 'active' : ''} onClick={() => setResearchTab('trace')}>轨迹</button>
+          <button role="tab" aria-selected={researchTab === 'trace'} className={researchTab === 'trace' ? 'active' : ''} onClick={() => {
+            setResearchTab('trace')
+            if (record) void onOpenTrace(record.id)
+          }}>轨迹</button>
         </div>
         {researchTab === 'report'
           ? <ResearchReport record={record} onUpdate={onUpdate} onDelete={onDelete} deleting={deleting} onResume={onResume} onFollowUp={onFollowUp} onReanalyze={onReanalyze} freshnessDays={freshnessDays} />
@@ -907,9 +924,9 @@ function SpecialistDecisions({ agents = [] }: { agents?: ResearchRecord['special
 function IncidentPanel({ record }: { record: ResearchRecord | null }) {
   if (!record) return null
   const incidents: Array<{ tone: 'error' | 'warn'; text: string }> = []
-  const trace = record.trace ?? []
+  const trace = mainTrace(record)
   const abnormal = ['failed', 'interrupted', 'budget_exhausted', 'stopped']
-  const mainStatus = record.mainAgent?.execution.status ?? record.mainAgent?.status
+  const mainStatus = record.mainAgent?.execution?.status ?? record.mainAgent?.status
   const lastError = [...trace].reverse().find((entry) => (
     entry.type === 'status' && typeof entry.error === 'string'
   ))
@@ -1005,6 +1022,7 @@ const traceEventTitle: Record<string, string> = {
 }
 const traceFeedSkip = new Set([
   'text_delta', 'chat_completed', 'runtime_follow_up', 'model_event', 'context_usage',
+  'financial_context',
 ])
 // 主 Agent 启动各专项的工具名 → 专项 domain（轨迹分组的嵌入锚点）。
 const launchToolDomain: Record<string, string> = {
@@ -1047,7 +1065,9 @@ function toolStateOf(result: Record<string, unknown> | null) {
   return { tone: 'ok', label: '成功' }
 }
 
-function buildAgentFeed(actor: string, agent: MainAgent | SpecialistAgent): TraceFeedItem[] {
+function buildAgentFeed(actor: string, agent: {
+  events?: MainAgentEvent[]; modelAttempts?: ModelAttempt[]
+}): TraceFeedItem[] {
   const feed: TraceFeedItem[] = []
   const events = (agent.events ?? []) as Array<Record<string, unknown>>
   for (const { call, result, durationMs } of pairToolEvents(events)) {
@@ -1105,6 +1125,12 @@ function buildAgentFeed(actor: string, agent: MainAgent | SpecialistAgent): Trac
   return feed.sort((a, b) => a.at.localeCompare(b.at))
 }
 
+function mainTrace(record: ResearchRecord | null) {
+  if (record?.trace?.length) return record.trace as MainAgentEvent[]
+  const events = record?.mainAgent?.events
+  return events?.length ? events : []
+}
+
 function ResearchTraceView({ record }: { record: ResearchRecord | null }) {
   const main = record?.mainAgent
   const allAttempts = [
@@ -1127,7 +1153,7 @@ function ResearchTraceView({ record }: { record: ResearchRecord | null }) {
     </header>
     <TraceContextLine agent={main} />
     <TraceTimeline record={record} />
-    <FinancialContextTrace trace={record?.trace ?? []} />
+    <FinancialContextTrace trace={mainTrace(record)} />
     <TraceFeed record={record} />
     <TokenUsageTable record={record} />
     <TraceDeveloperInfo record={record} />
@@ -1200,15 +1226,6 @@ function TraceTimeline({ record }: { record: ResearchRecord | null }) {
           start, end, label: String(call.name ?? '工具'), failed: result?.isError === true,
         })
       }
-    }
-  }
-  for (const { call, result } of pairToolEvents(record?.trace ?? [])) {
-    const start = Date.parse(String(call.startedAt ?? ''))
-    const end = Date.parse(String(result?.completedAt ?? ''))
-    if (Number.isFinite(start) && Number.isFinite(end)) {
-      lanes[1].spans.push({
-        start, end, label: String(call.name ?? '工具'), failed: result?.isError === true,
-      })
     }
   }
   const all = lanes.flatMap((lane) => lane.spans)
@@ -1296,20 +1313,10 @@ function TraceFeed({ record }: { record: ResearchRecord | null }) {
         tone: 'muted',
       })
     }
-    mainItems.push(...buildAgentFeed('main', main))
   }
-  // 主 Agent 的工具调用（含专项启动）保存在研究 trace 中。
-  for (const { call, result, durationMs } of pairToolEvents(record?.trace ?? [])) {
-    const name = String(call.name ?? '工具')
-    const state = toolStateOf(result)
-    mainItems.push({
-      at: String(call.startedAt ?? ''), actor: 'main', kind: '工具',
-      text: `调用 ${name}`,
-      tone: state.tone === 'error' ? 'error' : result ? 'ok' : 'muted',
-      ...(launchToolDomain[name] ? { anchorDomain: launchToolDomain[name] } : {}),
-      tool: { call, result, durationMs },
-    })
-  }
+  mainItems.push(...buildAgentFeed('main', {
+    events: mainTrace(record), modelAttempts: main?.modelAttempts,
+  }))
   mainItems.sort((a, b) => a.at.localeCompare(b.at))
   const groups = (record?.specialistAgents ?? []).flatMap((agent) => {
     if (!agent.domain) return []
@@ -1438,12 +1445,13 @@ function TokenUsageTable({ record }: { record: ResearchRecord | null }) {
 
 function TraceDeveloperInfo({ record }: { record: ResearchRecord | null }) {
   const main = record?.mainAgent
+  const segments = main?.segments ?? []
   return <details className="trace-dev">
     <summary>开发者信息</summary>
-    {main && <p>Session {main.id} · Execution {main.execution.id} · Generation {main.execution.generation}</p>}
-    {!!main?.segments?.length && <p>{main.segments.map((segment) => (
+    {main?.execution && <p>Session {main.id} · Execution {main.execution.id} · Generation {main.execution.generation}</p>}
+    {!!segments.length && <p>{segments.map((segment) => (
       `Segment ${segment.ordinal}${segment.parentSegmentId
-        ? `（源自 Segment ${main.segments.find(({ id }) => id === segment.parentSegmentId)?.ordinal ?? '?'}）` : ''}`
+        ? `（源自 Segment ${segments.find(({ id }) => id === segment.parentSegmentId)?.ordinal ?? '?'}）` : ''}`
     )).join(' · ')}</p>}
     {!!main?.compactionAttempts?.length && <ol>{main.compactionAttempts.map((attempt) => (
       <li key={`${attempt.compactionId}:${attempt.attempt}`}>
@@ -1456,7 +1464,7 @@ function TraceDeveloperInfo({ record }: { record: ResearchRecord | null }) {
       <p key={agent.id}>{specialistLabel(agent.domain)}专项 · Session {agent.id}
         {agent.execution ? ` · Execution ${agent.execution.id}` : ''}</p>
     ))}
-    <p>底层共保存 {record?.trace.length ?? 0} 条原始事件，用于排查和审计；此处不逐条渲染模型 token。完整工具输入与结果请使用研究导出。</p>
+    <p>底层共保存 {mainTrace(record).length} 条原始事件，用于排查和审计；此处不逐条渲染模型 token。完整工具输入与结果请使用研究导出。</p>
   </details>
 }
 
@@ -1498,7 +1506,7 @@ function ResearchReport({ record, onUpdate, onDelete, deleting, onResume, onFoll
   const stale = freshnessDays !== null && isReportOlderThan(
     selectedVersion?.createdAt ?? record.reportCreatedAt, freshnessDays,
   )
-  const conversation = (record.mainAgent?.events ?? []).reduce<Array<{
+  const conversation = (record.messages ?? record.mainAgent?.events ?? []).reduce<Array<{
     key: string; role: 'user' | 'assistant'; text: string; streaming?: boolean
   }>>((messages, event) => {
     if (event.type === 'runtime_follow_up' && event.message) {

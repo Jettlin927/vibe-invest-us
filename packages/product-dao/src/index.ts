@@ -1500,8 +1500,21 @@ export function createAnalysisRepository(pool: Pool) {
         [JSON.stringify(snapshot), id, terminal],
       )
     },
-    async research(id: string) {
-      const analysis = await this.get(id)
+    async research(id: string, projection: 'view' | 'export' = 'export') {
+      const analysis = projection === 'export' ? await this.get(id) : await pool.query<AnalysisRow>(
+        `SELECT analysis.id, analysis.symbol, analysis.status,
+                analysis.created_at, analysis.updated_at,
+                NULL::jsonb AS snapshot_json, analysis.report_json,
+                analysis.report_created_at, analysis.error, analysis.starred, analysis.note,
+           CASE WHEN event.payload_json->>'terminal' IS NULL THEN NULL
+             ELSE (event.payload_json->>'terminal')::boolean END AS terminal
+         FROM analyses analysis
+         LEFT JOIN agent_sessions session
+           ON session.analysis_id = analysis.id AND session.is_primary
+         LEFT JOIN agent_events event
+           ON event.session_id = session.id AND event.sequence = session.latest_sequence
+         WHERE analysis.id = $1 AND analysis.kind = 'research'`, [id],
+      ).then((result) => result.rows[0] ? mapAnalysisRow(result.rows[0]) : null)
       if (!analysis) return null
       const facts = await pool.query<{ payload_json: unknown }>(
         `SELECT f.payload_json FROM atomic_facts f
@@ -1516,9 +1529,19 @@ export function createAnalysisRepository(pool: Pool) {
         : "kind = 'research' AND status = ANY($1)"
       if (symbol) params.push(symbol.toUpperCase())
       const result = await pool.query<AnalysisRow>(
-        `SELECT * FROM analyses WHERE ${condition} ORDER BY created_at DESC`, params,
+        `SELECT id, symbol, status, created_at, updated_at,
+                NULL::jsonb AS snapshot_json,
+                CASE WHEN report_json IS NULL THEN NULL ELSE jsonb_build_object(
+                  'title', report_json->'title', 'trend', report_json->'trend'
+                ) END AS report_json,
+                report_created_at,
+                error, starred, note
+         FROM analyses WHERE ${condition} ORDER BY created_at DESC`, params,
       )
-      return result.rows.map(mapAnalysisRow)
+      return result.rows.map((row) => {
+        const { snapshot: _snapshot, ...summary } = mapAnalysisRow(row)
+        return summary
+      })
     },
     async updateResearch(id: string, values: { starred?: boolean; note?: string }, updatedAt: string) {
       const result = await pool.query<AnalysisRow>(
@@ -2945,6 +2968,17 @@ export function createAgentEventRepository(pool: Pool) {
         `SELECT session_id, sequence, operation_id, payload_json, created_at::text
          FROM agent_events WHERE session_id = $1 AND sequence > $2 ORDER BY sequence`,
         [sessionId, afterSequence],
+      )
+      return result.rows.map(mapAgentEventRow)
+    },
+    async listByTypes(sessionId: string, types: string[]): Promise<AgentEvent[]> {
+      if (!types.length) return []
+      const result = await pool.query<AgentEventRow>(
+        `SELECT session_id, sequence, operation_id, payload_json, created_at::text
+         FROM agent_events
+         WHERE session_id = $1 AND payload_json->>'type' = ANY($2::text[])
+         ORDER BY sequence`,
+        [sessionId, types],
       )
       return result.rows.map(mapAgentEventRow)
     },

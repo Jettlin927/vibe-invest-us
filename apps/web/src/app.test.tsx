@@ -950,6 +950,49 @@ test('研究页重新分析同一标的时创建全新研究而不是更新旧�
   ))
 })
 
+test('研究轨迹只在用户点击轨迹页签后按需加载', async () => {
+  setupDom()
+  Reflect.deleteProperty(globalThis, 'EventSource')
+  const requested: string[] = []
+  const record: any = {
+    id: 'lazy-trace', symbol: 'NVDA', status: 'completed', terminal: true,
+    report: { title: '按需轨迹测试', trend: '中性' }, facts: [], messages: [],
+    mainAgent: { id: 'lazy-main', status: 'completed' }, specialistAgents: [],
+  }
+  globalThis.fetch = async (input) => {
+    const url = String(input)
+    requested.push(url)
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok' }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/settings') return Response.json({ ...settingsResponse(), model: { configured: true } })
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+    if (url === '/api/portfolio') return Response.json(portfolioResponse([]))
+    if (url === '/api/research') return Response.json({ records: [{ id: record.id, symbol: record.symbol, status: record.status, report: record.report }] })
+    if (url === '/api/research/lazy-trace') return Response.json(record)
+    if (url === '/api/research/lazy-trace/trace') return Response.json({
+      mainAgent: {
+        id: 'lazy-main', status: 'completed', waitReason: null,
+        execution: { id: 'lazy-execution', generation: 1, status: 'completed' },
+        segments: [], events: [{ sequence: 1, type: 'status', status: 'completed', createdAt: '2026-09-02T00:00:00Z' }],
+        compactionAttempts: [], modelAttempts: [],
+      }, specialistAgents: [],
+    })
+    throw new Error(`unexpected_fetch:${url}`)
+  }
+
+  const view = render(React.createElement(App))
+  const user = userEvent.setup({ document: window.document })
+  await user.click(await view.findByRole('button', { name: '研究记录' }))
+  await view.findByRole('heading', { name: '按需轨迹测试' })
+  assert.equal(requested.filter((url) => url.endsWith('/trace')).length, 0)
+  await user.click(view.getByRole('tab', { name: '轨迹' }))
+  await waitFor(() => assert.equal(
+    requested.filter((url) => url === '/api/research/lazy-trace/trace').length, 1,
+  ))
+  await waitFor(() => assert.match(
+    view.getByRole('region', { name: '研究轨迹' }).textContent ?? '', /研究轨迹/,
+  ))
+})
+
 test('研究页可选择历史报告版本作为追问基准且运行中不显示重新分析', async () => {
   setupDom()
   Reflect.deleteProperty(globalThis, 'EventSource')

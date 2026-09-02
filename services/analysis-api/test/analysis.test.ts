@@ -114,6 +114,18 @@ async function waitForConversation(app: Awaited<ReturnType<typeof makeApp>>, id:
   throw new Error(`conversation_not_${expected}:${JSON.stringify(latest)}`)
 }
 
+async function readResearchWithTrace(
+  app: Awaited<ReturnType<typeof makeApp>>, analysisId: string,
+) {
+  const [detail, trace] = await Promise.all([
+    app.inject({ method: 'GET', url: `/api/research/${analysisId}` }),
+    app.inject({ method: 'GET', url: `/api/research/${analysisId}/trace` }),
+  ])
+  assert.equal(detail.statusCode, 200)
+  assert.equal(trace.statusCode, 200)
+  return { ...detail.json(), ...trace.json() }
+}
+
 test('自由对话 Thread 可以创建、回放 SSE 并在同一 Thread 继续发送消息', async () => {
   const model = {
     ...fakeModel(),
@@ -284,12 +296,14 @@ test('创建分析立即返回标识并自动保存完成报告、快照、事�
 
   const research = await app.inject({ method: 'GET', url: `/api/research/${analysisId}` })
   assert.equal(research.statusCode, 200)
-  assert.equal(research.json().snapshot.symbol, 'NVDA')
-  assert.equal(research.json().snapshot.portfolioContext.position, null)
   assert.equal(typeof research.json().reportCreatedAt, 'string')
   const reportCreatedAt = research.json().reportCreatedAt
   assert.equal(research.json().facts[0].source, 'sina')
-  assert.ok(research.json().trace.some((entry: { type: string }) => entry.type === 'status'))
+  const trace = await app.inject({ method: 'GET', url: `/api/research/${analysisId}/trace` })
+  assert.ok(trace.json().mainAgent.events.some((entry: { type: string }) => entry.type === 'status'))
+  const exported = await app.inject({ method: 'GET', url: `/api/research/${analysisId}/export` })
+  assert.equal(exported.json().snapshot.symbol, 'NVDA')
+  assert.equal(exported.json().snapshot.portfolioContext.position, null)
 
   const versions = await app.inject({
     method: 'GET', url: `/api/research/${analysisId}/report-versions`,
@@ -313,15 +327,104 @@ test('创建分析立即返回标识并自动保存完成报告、快照、事�
   await app.close()
 })
 
+test('研究列表只返回阅读摘要而不携带冻结快照或审计数据', async () => {
+  const app = await makeApp(`research-list-summary-${crypto.randomUUID()}`)
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' },
+  })).json() as { analysisId: string }
+  await waitForStatus(app, created.analysisId, 'completed')
+
+  const response = await app.inject({ method: 'GET', url: '/api/research' })
+  assert.equal(response.statusCode, 200)
+  const [summary] = response.json().records as Array<Record<string, unknown>>
+  assert.equal(summary?.id, created.analysisId)
+  assert.equal((summary?.report as { title?: string })?.title, report.title)
+  assert.equal('snapshot' in summary, false)
+  assert.equal('facts' in summary, false)
+  assert.equal('trace' in summary, false)
+  assert.equal('mainAgent' in summary, false)
+  assert.equal('specialistAgents' in summary, false)
+  await app.close()
+})
+
+test('研究正文不携带审计账本且轨迹只通过独立接口按需读取', async () => {
+  const app = await makeApp(`research-detail-without-audit-${crypto.randomUUID()}`)
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' },
+  })).json() as { analysisId: string }
+  await waitForStatus(app, created.analysisId, 'completed')
+
+  const detail = await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}`,
+  })
+  assert.equal(detail.statusCode, 200)
+  const record = detail.json() as Record<string, unknown>
+  assert.equal((record.report as { title?: string })?.title, report.title)
+  assert.ok(Array.isArray(record.facts))
+  assert.equal('snapshot' in record, false)
+  assert.equal('trace' in record, false)
+  assert.equal('events' in (record.mainAgent as Record<string, unknown>), false)
+
+  const trace = await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}/trace`,
+  })
+  assert.equal(trace.statusCode, 200)
+  const audit = trace.json() as {
+    mainAgent?: { events?: Array<{ type?: string }> }
+  }
+  assert.ok(audit.mainAgent?.events?.some(({ type }) => type === 'status'))
+  assert.equal('snapshot' in trace.json(), false)
+  assert.equal('facts' in trace.json(), false)
+  await app.close()
+})
+
+test('报告成功落库但存在数据限制时执行仍为已完成', async () => {
+  const limitedReport = { ...report, limitations: ['近期新闻不可用'] }
+  const app = await makeApp(`completed-with-limitations-${crypto.randomUUID()}`, {
+    async *analyze(): AsyncGenerator<ModelEvent> {
+      yield {
+        type: 'completed', report: limitedReport,
+        reportVersion: {
+          kind: 'integrated',
+          report: {
+            ...reportCandidate, availability: 'partial', status: 'partial',
+            limitations: limitedReport.limitations,
+            gaps: [{ capability: 'news', reason: 'source_unavailable', impact: '无法核验近期事件' }],
+          },
+        },
+      }
+    },
+  })
+  const created = (await app.inject({
+    method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' },
+  })).json() as { analysisId: string }
+
+  let terminal: Record<string, unknown> = {}
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    terminal = (await app.inject({
+      method: 'GET', url: `/api/analyses/${created.analysisId}`,
+    })).json()
+    if (terminal.terminal === true) break
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  assert.equal(terminal.status, 'completed')
+  assert.deepEqual((terminal.report as { limitations?: string[] }).limitations, ['近期新闻不可用'])
+
+  const versions = (await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}/report-versions`,
+  })).json() as { items: Array<{ report: { status: string; availability: string } }> }
+  assert.equal(versions.items[0]?.report.status, 'partial')
+  assert.equal(versions.items[0]?.report.availability, 'partial')
+  await app.close()
+})
+
 test('报告后每条用户消息在原主 Session 创建独立 execution 并冻结基准报告版本', async () => {
   const app = await makeApp(crypto.randomUUID())
   const created = (await app.inject({
     method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' },
   })).json()
   await waitForStatus(app, created.analysisId, 'completed')
-  const before = (await app.inject({
-    method: 'GET', url: `/api/research/${created.analysisId}`,
-  })).json()
+  const before = await readResearchWithTrace(app, created.analysisId)
   const messagePayload = { messageId: 'message-1', message: '这份报告现在还有效吗？' }
   const [response, replay] = await Promise.all([app.inject({
     method: 'POST', url: `/api/analyses/${created.analysisId}/messages`, payload: messagePayload,
@@ -353,9 +456,7 @@ test('重新分析同一标的会创建全新的研究、主 Session 与 executi
     method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' },
   })).json()
   await waitForStatus(app, first.analysisId, 'completed')
-  const firstBefore = (await app.inject({
-    method: 'GET', url: `/api/research/${first.analysisId}`,
-  })).json()
+  const firstBefore = await readResearchWithTrace(app, first.analysisId)
 
   const secondResponse = await app.inject({
     method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' },
@@ -366,9 +467,7 @@ test('重新分析同一标的会创建全新的研究、主 Session 与 executi
   const firstAfter = (await app.inject({
     method: 'GET', url: `/api/research/${first.analysisId}`,
   })).json()
-  const secondResearch = (await app.inject({
-    method: 'GET', url: `/api/research/${second.analysisId}`,
-  })).json()
+  const secondResearch = await readResearchWithTrace(app, second.analysisId)
 
   assert.notEqual(second.analysisId, first.analysisId)
   assert.notEqual(second.sessionId, first.sessionId)
@@ -456,7 +555,7 @@ test('普通追问只注入紧凑报告语境并保留 active report', async () 
     method: 'GET', url: `/api/research/${created.analysisId}/report-versions`,
   })).json().items
   assert.equal(versions.length, 1)
-  assert.ok(after.trace.some((event: any) => event.type === 'chat_completed'))
+  assert.ok(after.messages.some((event: any) => event.type === 'chat_completed'))
   await app.close()
 })
 
@@ -703,7 +802,7 @@ test('显式更新报告的用户消息通过同一报告校验路径生成综�
   })).json().items
   assert.equal(research.report.title, updatedReport.title)
   assert.deepEqual(versions.map(({ version }: { version: number }) => version), [1, 2])
-  const updateRequest = research.trace.find((event: { type?: string; messageId?: string }) => (
+  const updateRequest = research.messages.find((event: { type?: string; messageId?: string }) => (
     event.type === 'runtime_follow_up' && event.messageId === 'update-report-v2'
   ))
   assert.equal(updateRequest.intent, 'request_report_update')
@@ -898,9 +997,7 @@ test('主 Agent 启动的消息面 Agent 拥有独立 Session、轨迹和不可�
   })).json()
   await waitForStatus(app as any, created.analysisId, 'completed')
 
-  const research = (await app.inject({
-    method: 'GET', url: `/api/research/${created.analysisId}`,
-  })).json()
+  const research = await readResearchWithTrace(app as any, created.analysisId)
   const newsAgent = research.specialistAgents.find((agent: any) => agent.domain === 'news')
   assert.equal(newsAgent.domain, 'news')
   assert.equal(newsAgent.isPrimary, false)
@@ -931,9 +1028,7 @@ test('主 Agent 启动的消息面 Agent 拥有独立 Session、轨迹和不可�
   }
   await saveUsage(research.mainAgent.execution.id, 'main', 100, 20)
   await saveUsage(newsAgent.execution.id, 'news', 40, 10)
-  const usageResearch = (await app.inject({
-    method: 'GET', url: `/api/research/${created.analysisId}`,
-  })).json()
+  const usageResearch = await readResearchWithTrace(app as any, created.analysisId)
   assert.deepEqual(usageResearch.mainAgent.tokenUsage, {
     attempts: 1, reportedAttempts: 1, coverage: 1,
     input: 100, cacheRead: 20, cacheWrite: 3, output: 4, total: 127,
@@ -1022,9 +1117,7 @@ test('主 Agent 启动的基本面 Agent 拥有独立 Session、受限工具和�
   })).json()
   await waitForStatus(app as any, created.analysisId, 'completed')
 
-  const research = (await app.inject({
-    method: 'GET', url: `/api/research/${created.analysisId}`,
-  })).json()
+  const research = await readResearchWithTrace(app as any, created.analysisId)
   const specialist = research.specialistAgents.find((agent: any) => agent.domain === 'fundamental_valuation')
   assert.equal(specialist.execution.status, 'completed')
   assert.match(JSON.stringify(specialist.events), /最新财务质量是否改变方向/)
@@ -1102,9 +1195,7 @@ test('主 Agent 启动的技术面 Agent 拥有独立 Session、受限工具和�
   })).json()
   await waitForStatus(app as any, created.analysisId, 'completed')
 
-  const research = (await app.inject({
-    method: 'GET', url: `/api/research/${created.analysisId}`,
-  })).json()
+  const research = await readResearchWithTrace(app as any, created.analysisId)
   const specialist = research.specialistAgents.find((agent: any) => agent.domain === 'technical')
   assert.equal(specialist.execution.status, 'completed')
   assert.match(JSON.stringify(specialist.events), /多周期结构是否一致/)
@@ -1181,9 +1272,7 @@ test('专项批次单项失败不取消其余专项且主 Agent 在全部终态�
     method: 'POST', url: '/api/analyses', payload: { symbol: 'BATCHFAIL' },
   })).json()
   await waitForStatus(app as any, created.analysisId, 'completed')
-  const research = (await app.inject({
-    method: 'GET', url: `/api/research/${created.analysisId}`,
-  })).json()
+  const research = await readResearchWithTrace(app as any, created.analysisId)
 
   assert.equal(mainContinued, true)
   assert.deepEqual(new Set(research.specialistAgents.map((agent: any) => agent.execution.status)),
@@ -1231,9 +1320,7 @@ test('专项取消落为 stopped 且主 Agent 收到 cancelled 紧凑结果', as
     method: 'POST', url: '/api/analyses', payload: { symbol: 'CANCELSP' },
   })).json()
   await waitForStatus(app as any, created.analysisId, 'completed')
-  const research = (await app.inject({
-    method: 'GET', url: `/api/research/${created.analysisId}`,
-  })).json()
+  const research = await readResearchWithTrace(app as any, created.analysisId)
   assert.equal(compactStatus, 'cancelled')
   assert.equal(research.specialistAgents[0].execution.status, 'stopped')
   assert.equal(research.specialistAgents[0].events.some((event: any) => event.status === 'failed'), false)
@@ -1289,9 +1376,7 @@ test('主 Agent 跨 Turn 追问同一领域时复用长期专项 Session 并创�
     })).json()
     throw new Error(`${String(error)}:${JSON.stringify(state)}`)
   })
-  const research = (await app.inject({
-    method: 'GET', url: `/api/research/${created.analysisId}`,
-  })).json()
+  const research = await readResearchWithTrace(app as any, created.analysisId)
   const newsAgents = research.specialistAgents.filter((agent: any) => agent.domain === 'news')
   const versions = (await app.inject({
     method: 'GET', url: `/api/research/${created.analysisId}/report-versions`,
@@ -1356,9 +1441,7 @@ test('报告后用户追问复用长期专项 Session 并创建专项新 executi
     payload: { messageId: 'news-follow-up', message: '请更新消息面判断。' },
   })).statusCode, 202)
   await waitForStatus(app as any, created.analysisId, 'completed')
-  const research = (await app.inject({
-    method: 'GET', url: `/api/research/${created.analysisId}`,
-  })).json()
+  const research = await readResearchWithTrace(app as any, created.analysisId)
   const news = research.specialistAgents.filter((agent: any) => agent.domain === 'news')
   const versions = (await app.inject({
     method: 'GET', url: `/api/research/${created.analysisId}/report-versions`,
@@ -1407,7 +1490,7 @@ test('没有有效综合报告的终态研究仍允许继续聊天', async () =>
     method: 'GET', url: `/api/research/${created.analysisId}`,
   })).json()
   assert.equal(research.report, null)
-  assert.ok(research.trace.some((event: any) => event.type === 'chat_completed'))
+  assert.ok(research.messages.some((event: any) => event.type === 'chat_completed'))
   assert.equal((await app.inject({
     method: 'POST', url: `/api/analyses/${created.analysisId}/messages`,
     payload: { messageId: 'retry-report', message: '重新生成报告。', updateReport: true },
@@ -1542,9 +1625,7 @@ test('模型尚未接入也能创建并读取主 Agent 完整初始生命周期'
   const body = created.json()
   assert.equal(body.existing, false)
 
-  const research = await app.inject({ method: 'GET', url: `/api/research/${body.analysisId}` })
-  assert.equal(research.statusCode, 200)
-  const record = research.json()
+  const record = await readResearchWithTrace(app as any, body.analysisId)
   assert.equal(record.mainAgent.status, 'planning')
   assert.equal(record.mainAgent.execution.generation, 1)
   assert.equal(record.mainAgent.segments.length, 1)
@@ -1568,7 +1649,7 @@ test('Runtime 状态事件与 waitReason 投影使用同一确定性值', async 
   })
   const created = (await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'WAIT' } })).json()
   await new Promise((resolve) => setTimeout(resolve, 2))
-  const record = (await app.inject({ method: 'GET', url: `/api/research/${created.analysisId}` })).json()
+  const record = await readResearchWithTrace(app as any, created.analysisId)
   const running = record.mainAgent.events.find((event: { status?: string }) => event.status === 'running_model')
   assert.deepEqual(running.waitReason, record.mainAgent.waitReason)
   assert.equal(running.waitReason.target, '主模型响应')
@@ -1792,9 +1873,7 @@ test('8 分钟 Runtime 加 8 分钟 provider 共用 10 分钟 active budget 并�
   const completed = await waitForStatus(app as any, created.analysisId, 'completed')
   assert.equal(completed.report.title, report.title)
   assert.equal(requests, 2)
-  const research = (await app.inject({
-    method: 'GET', url: `/api/research/${created.analysisId}`,
-  })).json()
+  const research = await readResearchWithTrace(app as any, created.analysisId)
   const states = research.mainAgent.events
     .filter((event: { type?: string }) => event.type === 'status')
     .map((event: { status: string }) => event.status)
@@ -1889,9 +1968,7 @@ test('专项已有 V1 后主预算耗尽的二次收口保留真实状态与精�
     method: 'GET', url: `/api/research/${created.analysisId}/report-versions`,
   })).json().items
   assert.deepEqual(versions.at(-1).report.specialistReferences, closingReport.specialistReferences)
-  const lifecycle = (await app.inject({
-    method: 'GET', url: `/api/research/${created.analysisId}`,
-  })).json().mainAgent
+  const lifecycle = (await readResearchWithTrace(app as any, created.analysisId)).mainAgent
   const requestIds = lifecycle.modelAttempts.map(({ id }: { id: string }) => id)
   assert.ok(requestIds.length >= 2)
   assert.equal(new Set(requestIds).size, requestIds.length)
@@ -2177,12 +2254,12 @@ test('取消运行任务会以 stopping → stopped 统一收敛模型与生命�
   ])
   assert.equal(cancelled.statusCode, 202)
   await waitForStatus(app, analysisId, 'stopped')
-  const research = await app.inject({ method: 'GET', url: `/api/research/${analysisId}` })
-  assert.deepEqual(research.json().trace
+  const research = await readResearchWithTrace(app as any, analysisId)
+  assert.deepEqual(research.mainAgent.events
     .filter((entry: { status?: string }) => ['stopping', 'stopped'].includes(entry.status ?? ''))
     .map((entry: { status: string }) => entry.status), ['stopping', 'stopped'])
-  assert.equal(research.json().status, 'stopped')
-  assert.equal(research.json().mainAgent.status, 'stopped')
+  assert.equal(research.status, 'stopped')
+  assert.equal(research.mainAgent.status, 'stopped')
   await app.close()
 })
 
@@ -2497,9 +2574,7 @@ test('取消并行专项时先 fence 整棵 Agent 树再统一 stopped', async (
     method: 'POST', url: `/api/analyses/${created.analysisId}/cancel`,
   })
   assert.equal(response.statusCode, 202)
-  const research = (await app.inject({
-    method: 'GET', url: `/api/research/${created.analysisId}`,
-  })).json()
+  const research = await readResearchWithTrace(app as any, created.analysisId)
   assert.equal(research.mainAgent.execution.status, 'stopped')
   const news = research.specialistAgents.find((agent: any) => agent.domain === 'news')
   assert.equal(news.execution.status, 'stopped')
@@ -2540,10 +2615,8 @@ test('取消已领取但尚未登记 controller 的任务会停止且不启动�
   await waitForStatus(app as any, created.analysisId, 'stopped')
   await new Promise((resolve) => setTimeout(resolve, 10))
   assert.equal(externalCalls, 0)
-  const research = (await app.inject({
-    method: 'GET', url: `/api/research/${created.analysisId}`,
-  })).json()
-  assert.deepEqual(research.trace
+  const research = await readResearchWithTrace(app as any, created.analysisId)
+  assert.deepEqual(research.mainAgent.events
     .filter((event: { status?: string }) => ['stopping', 'stopped'].includes(event.status ?? ''))
     .map((event: { status: string }) => event.status), ['stopping', 'stopped'])
   await app.close()
@@ -2658,9 +2731,7 @@ test('用户手动恢复 stopped 研究会复用主 Session 并创建新 executi
     method: 'POST', url: `/api/analyses/${created.analysisId}/cancel`,
   })).statusCode, 202)
   await waitForStatus(app as any, created.analysisId, 'stopped')
-  const stopped = (await app.inject({
-    method: 'GET', url: `/api/research/${created.analysisId}`,
-  })).json()
+  const stopped = await readResearchWithTrace(app as any, created.analysisId)
   const stoppedExecutionId = stopped.mainAgent.execution.id
   assert.equal(stopped.mainAgent.id, created.sessionId)
   assert.equal(stopped.mainAgent.execution.generation, 2)
@@ -2674,13 +2745,11 @@ test('用户手动恢复 stopped 研究会复用主 Session 并创建新 executi
   assert.equal(resumed.generation, 3)
   assert.notEqual(resumed.executionId, stoppedExecutionId)
   await waitForStatus(app as any, created.analysisId, 'completed')
-  const completed = (await app.inject({
-    method: 'GET', url: `/api/research/${created.analysisId}`,
-  })).json()
+  const completed = await readResearchWithTrace(app as any, created.analysisId)
   assert.equal(completed.mainAgent.id, created.sessionId)
   assert.equal(completed.mainAgent.execution.id, resumed.executionId)
   assert.equal(completed.mainAgent.execution.generation, 3)
-  assert.ok(completed.trace.some((event: Record<string, unknown>) => (
+  assert.ok(completed.mainAgent.events.some((event: Record<string, unknown>) => (
     event.resumed === true
       && event.previousExecutionId === stoppedExecutionId
       && event.executionId === resumed.executionId
@@ -2754,9 +2823,7 @@ test('恢复研究直接复用已完成专项 V1 而不创建新专项 execution
     method: 'POST', url: `/api/analyses/${created.analysisId}/resume`,
   })).statusCode, 202)
   await waitForStatus(app as any, created.analysisId, 'completed')
-  const research = (await app.inject({
-    method: 'GET', url: `/api/research/${created.analysisId}`,
-  })).json()
+  const research = await readResearchWithTrace(app as any, created.analysisId)
   const news = research.specialistAgents.find((agent: any) => agent.domain === 'news')
   assert.equal(news.execution.generation, 1)
   assert.equal(news.reportVersion.version, 1)
@@ -2873,9 +2940,7 @@ test('恢复未完成专项时创建新 generation 并注入旧专项成功结�
     method: 'POST', url: `/api/analyses/${created.analysisId}/resume`,
   })).statusCode, 202)
   await waitForStatus(app as any, created.analysisId, 'completed')
-  const research = (await app.inject({
-    method: 'GET', url: `/api/research/${created.analysisId}`,
-  })).json()
+  const research = await readResearchWithTrace(app as any, created.analysisId)
   const news = research.specialistAgents.find((agent: any) => agent.domain === 'news')
   assert.equal(news.execution.generation, 2)
   assert.equal(newsRuns, 2)
@@ -2943,7 +3008,7 @@ test('研究记录可以查询、标记、备注并按共享引用安全删除�
   await app.close()
 })
 
-test('无持仓时宿主移除个性化建议且限制报告保存为部分完成', async () => {
+test('无持仓时宿主移除个性化建议且限制保留在已完成报告中', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'vibe-analysis-partial-'))
   const partialReport = {
     ...report,
@@ -2955,7 +3020,7 @@ test('无持仓时宿主移除个性化建议且限制报告保存为部分完�
     async *analyze() { yield { type: 'completed' as const, report: partialReport } },
   })
   const { analysisId } = (await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' } })).json()
-  const completed = await waitForStatus(app, analysisId, 'partial')
+  const completed = await waitForStatus(app, analysisId, 'completed')
   assert.equal(completed.report.personalImpact, null)
   assert.equal(completed.report.conditionalSuggestion, null)
   assert.deepEqual(completed.report.limitations, ['财报输入缺失'])
@@ -3008,7 +3073,7 @@ test('组合辅助行情失败时保留当前标的分析并明确个性化限�
   await app.inject({ method: 'PUT', url: '/api/positions/NVDA', payload: { quantity: 2, averageCost: 100 } })
   await app.inject({ method: 'PUT', url: '/api/positions/AMD', payload: { quantity: 6, averageCost: 80 } })
   const created = await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' } })
-  const result = await waitForStatus(app as any, created.json().analysisId, 'partial')
+  const result = await waitForStatus(app as any, created.json().analysisId, 'completed')
   assert.ok(result.report.limitations.some((item: string) => item.includes('组合内部分持仓')))
   assert.equal(result.snapshot.portfolioContext.position.marketValue, 435)
   assert.equal(result.snapshot.portfolioContext.position.portfolioWeight, null)
@@ -3028,7 +3093,7 @@ test('关键行情、财报和新闻缺失时宿主强制形成受限报告', as
   })
   await app.ready()
   const created = await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' } })
-  const result = await waitForStatus(app as any, created.json().analysisId, 'partial')
+  const result = await waitForStatus(app as any, created.json().analysisId, 'completed')
   assert.equal(result.report.trend, '无法生成走势判断')
   assert.equal(result.report.valuation, null)
   assert.ok(result.report.limitations.some((item: string) => item.includes('新闻')))
@@ -3090,9 +3155,7 @@ test('Runtime 按模型请求、工具批次与报告收口持久化真实状态
     method: 'POST', url: '/api/analyses', payload: { symbol: 'SEQUENCE' },
   })).json()
   await waitForStatus(app as any, created.analysisId, 'completed')
-  const research = (await app.inject({
-    method: 'GET', url: `/api/research/${created.analysisId}`,
-  })).json()
+  const research = await readResearchWithTrace(app as any, created.analysisId)
   assert.deepEqual(research.mainAgent.events
     .filter((event: { type?: string }) => event.type === 'status')
     .map((event: { status: string }) => event.status), [
@@ -3130,10 +3193,8 @@ test('Runtime 重放同一 operationId 不追加第二条业务事件', async ()
     method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' },
   })).json() as { analysisId: string }
   await waitForStatus(app as any, created.analysisId, 'completed')
-  const research = (await app.inject({
-    method: 'GET', url: `/api/research/${created.analysisId}`,
-  })).json()
-  assert.equal(research.trace.filter((entry: { operationId?: string }) => (
+  const research = await readResearchWithTrace(app as any, created.analysisId)
+  assert.equal(research.mainAgent.events.filter((entry: { operationId?: string }) => (
     entry.operationId === 'tool:provider-call-1:call'
   )).length, 1)
   await app.close()
@@ -3159,12 +3220,12 @@ test('分析轨迹永久保存系统指令、用户语境、模型用量和最�
   await app.ready()
   const created = await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' } })
   await waitForStatus(app as any, created.json().analysisId, 'completed')
-  const research = (await app.inject({ method: 'GET', url: `/api/research/${created.json().analysisId}` })).json()
-  assert.ok(research.trace.some((entry: { type: string }) => entry.type === 'system_prompt'))
-  assert.ok(research.trace.some((entry: { type: string }) => entry.type === 'user_input'))
-  assert.ok(research.trace.some((entry: { type: string; stopReason?: string }) => entry.type === 'model_completed' && entry.stopReason === 'toolUse'))
-  assert.equal(JSON.stringify(research.trace).includes('"cost":0.01'), true)
-  assert.equal(JSON.stringify(research.trace).includes('隐藏推理'), false)
+  const research = await readResearchWithTrace(app as any, created.json().analysisId)
+  assert.ok(research.mainAgent.events.some((entry: { type: string }) => entry.type === 'system_prompt'))
+  assert.ok(research.mainAgent.events.some((entry: { type: string }) => entry.type === 'user_input'))
+  assert.ok(research.mainAgent.events.some((entry: { type: string; stopReason?: string }) => entry.type === 'model_completed' && entry.stopReason === 'toolUse'))
+  assert.equal(JSON.stringify(research.mainAgent.events).includes('"cost":0.01'), true)
+  assert.equal(JSON.stringify(research.mainAgent.events).includes('隐藏推理'), false)
   await app.close()
 })
 
@@ -3361,11 +3422,16 @@ test('研究详情展开视图保留受控工具摘要但字段级脱敏内部�
 
   assert.equal(response.statusCode, 200)
   const serialized = response.body
-  assert.match(serialized, /用户可见摘要/)
+  assert.doesNotMatch(serialized, /用户可见摘要/)
   assert.doesNotMatch(serialized, /privateDiagnostic|快照内部诊断|工具内部诊断/)
   assert.doesNotMatch(serialized, /providerRaw|raw-secret|authorization|Bearer secret/i)
   assert.doesNotMatch(serialized, /cookie|sid=secret|reasoning|hidden-chain/i)
   assert.doesNotMatch(serialized, /sk-view-secret/)
+  const traceResponse = await app.inject({
+    method: 'GET', url: `/api/research/${created.analysisId}/trace`,
+  })
+  assert.match(traceResponse.body, /用户可见摘要/)
+  assert.doesNotMatch(traceResponse.body, /privateDiagnostic|工具内部诊断|raw-secret|hidden-chain/)
   const statusResponse = await app.inject({
     method: 'GET', url: `/api/analyses/${created.analysisId}`,
   })
@@ -3486,9 +3552,7 @@ test('首次研究把系统生成的 Runtime Context 追加到上下文末尾且
 
   const created = await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' } })
   await waitForStatus(app as any, created.json().analysisId, 'completed')
-  const research = (await app.inject({
-    method: 'GET', url: `/api/research/${created.json().analysisId}`,
-  })).json()
+  const research = await readResearchWithTrace(app as any, created.json().analysisId)
 
   assert.match(String(modelInput?.systemPrompt), /^你是个人美股研究助手/)
   assert.equal(modelInput?.userPrompt, undefined)
@@ -3500,8 +3564,8 @@ test('首次研究把系统生成的 Runtime Context 追加到上下文末尾且
   }, {
     role: 'runtime_context', generatedBy: 'product_runtime', isUserInput: false, symbol: 'NVDA',
   })
-  assert.ok(research.trace.some((entry: { type: string }) => entry.type === 'runtime_context'))
-  assert.equal(research.trace.some((entry: { type: string }) => entry.type === 'user_input'), false)
+  assert.ok(research.mainAgent.events.some((entry: { type: string }) => entry.type === 'runtime_context'))
+  assert.equal(research.mainAgent.events.some((entry: { type: string }) => entry.type === 'user_input'), false)
   await app.close()
 })
 
@@ -3530,7 +3594,7 @@ test('首次研究起始资料完整描述能力、工具与报告目标且不�
   })
   await app.ready()
   const created = await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' } })
-  await waitForStatus(app as any, created.json().analysisId, 'partial')
+  await waitForStatus(app as any, created.json().analysisId, 'completed')
 
   assert.equal(runtimeContext.symbol, 'NVDA')
   assert.equal(runtimeContext.analysisPeriod, '未来一至四周')
@@ -3578,7 +3642,7 @@ test('完整历史写入冻结快照且首次研究起始资料提供最近二�
   await app.ready()
   const created = await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' } })
   await waitForStatus(app as any, created.json().analysisId, 'completed')
-  const research = (await app.inject({ method: 'GET', url: `/api/research/${created.json().analysisId}` })).json()
+  const research = (await app.inject({ method: 'GET', url: `/api/research/${created.json().analysisId}/export` })).json()
   assert.equal(research.snapshot.facts.filter((item: { type: string }) => item.type === 'daily_bar').length, 180)
   assert.equal(modelFactCount, 20)
   await app.close()
@@ -3626,7 +3690,7 @@ test('完整多期财报写入快照但模型只收到决策窗口和可追溯�
   await app.ready()
   const created = await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' } })
   await waitForStatus(app as any, created.json().analysisId, 'completed')
-  const research = (await app.inject({ method: 'GET', url: `/api/research/${created.json().analysisId}` })).json()
+  const research = (await app.inject({ method: 'GET', url: `/api/research/${created.json().analysisId}/export` })).json()
 
   assert.equal(research.snapshot.fundamentals.value.quarters.length, 6)
   assert.deepEqual(modelContext.financials.quarters.map((item: any) => item.period), ['CY2026Q1', 'CY2025Q4', 'CY2025Q1'])
@@ -3651,8 +3715,8 @@ test('金融上下文事件包含主备来源切换信息', async () => {
   await app.ready()
   const created = await app.inject({ method: 'POST', url: '/api/analyses', payload: { symbol: 'NVDA' } })
   await waitForStatus(app as any, created.json().analysisId, 'completed')
-  const research = (await app.inject({ method: 'GET', url: `/api/research/${created.json().analysisId}` })).json()
-  const contextEvent = research.trace.find((entry: { type: string }) => entry.type === 'financial_context')
+  const research = await readResearchWithTrace(app as any, created.json().analysisId)
+  const contextEvent = research.mainAgent.events.find((entry: { type: string }) => entry.type === 'financial_context')
   assert.deepEqual(contextEvent.degradedSources, [{
     capability: 'quote', sources: [{ source: 'primary', status: 'failed' }, { source: 'backup', status: 'ok' }],
   }])
