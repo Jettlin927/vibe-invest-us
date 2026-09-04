@@ -51,3 +51,35 @@ export const stopAgentDefinition: RegisteredToolDefinition = {
   externalNetwork: 'none', hostAccess: 'none', resultRetention: 'research_record',
   modelProjection: 'bounded_summary', executionMode: 'sequential', countsAsToolRound: true,
 }
+
+export const delegateResearchDefinition: RegisteredToolDefinition = {
+  model: {
+    name: 'delegate_research',
+    description: '把一个明确的研究子问题委派给受控子 Agent；默认异步返回，也可等待紧凑结果',
+    parameters: Type.Object({
+      goal: Type.String({ minLength: 1, maxLength: 4000 }),
+      wait: Type.Optional(Type.Boolean()),
+      contextRefs: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { maxItems: 20 })),
+    }),
+  },
+  resultSchema: Type.Object({ agentId: Type.String(), runId: Type.String(), status: Type.String() }),
+  allowedRoles: ['main'], allowedStages: ['research'], sideEffect: 'creates_agent',
+  externalNetwork: 'none', hostAccess: 'none', resultRetention: 'research_record',
+  modelProjection: 'bounded_summary', executionMode: 'sequential', countsAsToolRound: true,
+  surfaces: ['conversation'],
+}
+
+export const collectResearchDefinition: RegisteredToolDefinition = {
+  model: {
+    name: 'collect_research',
+    description: '等待或读取已委派研究的紧凑状态、摘要和 Artifact 引用；默认等待到终态',
+    parameters: Type.Object({ runId, wait: Type.Optional(Type.Boolean()) }),
+  },
+  resultSchema: Type.Object({
+    runId: Type.String(), status: Type.String(), summary: Type.Optional(Type.String()),
+  }),
+  allowedRoles: ['main'], allowedStages: ['research'], sideEffect: 'read_only',
+  externalNetwork: 'none', hostAccess: 'none', resultRetention: 'research_record',
+  modelProjection: 'bounded_summary', executionMode: 'sequential', countsAsToolRound: true,
+  surfaces: ['conversation'],
+}

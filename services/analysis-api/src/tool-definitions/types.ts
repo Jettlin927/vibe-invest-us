@@ -2,6 +2,7 @@ import type { Tool } from '@earendil-works/pi-ai'
 
 export type ToolRole = 'main' | 'fundamental' | 'news' | 'technical'
 export type ToolStage = 'research' | 'finalization'
+export type ToolSurface = 'analysis' | 'conversation'
 
 export type RegisteredToolDefinition = {
   model: Tool
@@ -15,4 +16,5 @@ export type RegisteredToolDefinition = {
   modelProjection: 'full_result' | 'bounded_summary' | 'acknowledgement'
   executionMode: 'sequential' | 'parallel'
   countsAsToolRound: boolean
+  surfaces?: ToolSurface[]
 }

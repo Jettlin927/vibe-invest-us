@@ -200,9 +200,59 @@ test('自由对话每个 Run 按当前用户消息重新投影最小工具集', 
 
   assert.deepEqual(projections, [
     [],
-    ['get_technical_evidence', 'get_price_window'],
+    ['get_market_structure'],
   ])
   await app.close()
+})
+
+test('自由对话只在配置 Web Search adapter 时声明条件工具', async () => {
+  const observed: string[][] = []
+  const app = buildApp({
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [], indicators: {} }),
+    searchWebEvidence: async () => ({ facts: [] }),
+    model: {
+      ...fakeModel(),
+      async *analyzeConversation(input: {
+        conditionalTools?: Array<{ name: string }>
+      }): AsyncGenerator<ModelEvent> {
+        observed.push((input.conditionalTools ?? []).map(({ name }) => name))
+        yield { type: 'chat_completed', text: '回答', operationId: 'conditional-tool:completed' }
+      },
+    },
+  })
+  await app.ready()
+  const capabilities = await app.inject({ method: 'GET', url: '/api/conversations/capabilities' })
+  const webSearch = capabilities.json().tools.find(({ name }: { name: string }) => (
+    name === 'search_web_evidence'
+  ))
+  assert.equal(webSearch?.availability, 'conditional')
+
+  const created = await app.inject({
+    method: 'POST', url: '/api/conversations', payload: { message: 'NVDA 最近有什么新闻？' },
+  })
+  await waitForConversation(app as any, created.json().id, 'completed')
+  assert.deepEqual(observed, [['search_web_evidence']])
+  await app.close()
+
+  const withoutAdapter = buildApp({
+    financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
+    fetchFinancialContext: async (symbol) => ({ symbol, facts: [fact], gaps: [], indicators: {} }),
+    model: {
+      ...fakeModel(),
+      async *analyzeConversation(): AsyncGenerator<ModelEvent> {
+        yield { type: 'chat_completed', text: '回答', operationId: 'without-web:completed' }
+      },
+    },
+  })
+  await withoutAdapter.ready()
+  const withoutCapabilities = await withoutAdapter.inject({
+    method: 'GET', url: '/api/conversations/capabilities',
+  })
+  assert.equal(withoutCapabilities.json().tools.some(({ name }: { name: string }) => (
+    name === 'search_web_evidence'
+  )), false)
+  await withoutAdapter.close()
 })
 
 test('自由对话省略式追问只继承最近 ticker scope 并由当前消息决定领域工具', async () => {
@@ -234,14 +284,14 @@ test('自由对话省略式追问只继承最近 ticker scope 并由当前消息
   }
 
   assert.deepEqual(projections, [
-    ['fetch_financial_context'],
-    ['fetch_financial_context'],
-    ['get_technical_evidence', 'get_price_window'],
+    ['get_research_context'],
+    ['get_research_context'],
+    ['get_market_structure'],
   ])
   await app.close()
 })
 
-test('自由对话可以创建并等待受控 subagent', async () => {
+test('自由对话通过统一委派接口创建并等待受控 subagent', async () => {
   const model = {
     ...fakeModel(),
     async *analyzeConversation(input: {
@@ -250,7 +300,8 @@ test('自由对话可以创建并等待受控 subagent', async () => {
     }): AsyncGenerator<ModelEvent> {
       if (input.userPrompt === 'root') {
         const result = await input.executeTool(
-          'spawn_agent', { goal: 'child', join: 'wait' }, new AbortController().signal, async () => {},
+          'delegate_research', { goal: 'child', wait: true },
+          new AbortController().signal, async () => {},
         )
         yield { type: 'chat_completed', text: JSON.stringify(result.result), operationId: 'root:completed' }
         return

@@ -39,6 +39,7 @@ type ConversationOptions = {
   settingsRepository: RuntimeSettingsRepository
   toolProjectionRepository: ToolProjectionRepository
   tools: Tool[]
+  conditionalTools?: Tool[]
   model: ConversationModel
   createToolExecutor: (input: {
     threadId: string
@@ -315,7 +316,7 @@ export function createConversationService(options: ConversationOptions) {
     const executeTool: ConversationToolExecutor = async (name, params, signal, onStart) => {
       const record = params && typeof params === 'object' && !Array.isArray(params)
         ? params as Record<string, unknown> : {}
-      if (name === 'spawn_agent') {
+      if (name === 'spawn_agent' || name === 'delegate_research') {
         await onStart()
         try {
           const goal = typeof record.goal === 'string' ? record.goal.trim() : ''
@@ -327,7 +328,9 @@ export function createConversationService(options: ConversationOptions) {
             : []
           if (contextRefs.length) throw new Error('subagent_context_refs_not_supported')
           const child = await createChild(threadId, goal)
-          const join = record.join === 'wait' ? 'wait' : 'async'
+          const join = name === 'delegate_research'
+            ? record.wait === true ? 'wait' : 'async'
+            : record.join === 'wait' ? 'wait' : 'async'
           const result = join === 'wait'
             ? await waitForThread(child.id, signal)
             : { agentId: child.id, runId: child.executionId, status: child.status }
@@ -336,14 +339,18 @@ export function createConversationService(options: ConversationOptions) {
           return { result: { error: error instanceof Error ? error.message : String(error), facts: [] }, isError: true }
         }
       }
-      if (['wait_agent', 'read_agent_result', 'stop_agent'].includes(name)) {
+      if (['wait_agent', 'read_agent_result', 'stop_agent', 'collect_research'].includes(name)) {
         await onStart()
         try {
           const runId = typeof record.runId === 'string' ? record.runId : ''
           const child = await findThreadByRun(threadId, runId)
           if (!child) throw new Error('subagent_not_found')
-          if (name === 'wait_agent') return { result: await waitForThread(child.id, signal), isError: false }
-          if (name === 'read_agent_result') return { result: await summarizeThread(child), isError: false }
+          if (name === 'wait_agent' || (name === 'collect_research' && record.wait !== false)) {
+            return { result: await waitForThread(child.id, signal), isError: false }
+          }
+          if (name === 'read_agent_result' || name === 'collect_research') {
+            return { result: await summarizeThread(child), isError: false }
+          }
           const stopped = await cancel(child.id)
           return { result: { runId, stopped }, isError: false }
         } catch (error) {
@@ -374,6 +381,7 @@ export function createConversationService(options: ConversationOptions) {
       }),
       signal: executionSignal, executionDeadlineSignal: wallDeadline, activeBudget: budget,
       toolRuntime, tools,
+      conditionalTools: options.conditionalTools,
       executeTool,
     }
     try {

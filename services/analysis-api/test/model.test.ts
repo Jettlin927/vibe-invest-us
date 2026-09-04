@@ -14,7 +14,9 @@ import { createActiveBudget } from '../src/runtime-policy.js'
 import {
   analysisModelTools, financialSpecialistTools, flatResearchTools, flatSubmitAnalysisReportTool,
 } from '../src/tools.js'
-import { conversationResearchTools } from '../src/tools.js'
+import {
+  conversationResearchTools, conversationToolsForMessage, webSearchEvidenceTool,
+} from '../src/tools.js'
 
 const facts = [{
   id: 'fact:nvda:price:2026-08-12',
@@ -202,7 +204,7 @@ test('自由对话可以直接回答，不要求结构化报告收口', async ()
 test('自由对话可以自主调用研究工具后继续回答', async () => {
   let calls = 0
   const model = createPiModel({ fauxResponses: [
-    fauxAssistantMessage(fauxToolCall('get_financial_overview', { symbol: 'NVDA' }), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall('get_company_dossier', { symbol: 'NVDA' }), { stopReason: 'toolUse' }),
     fauxAssistantMessage(fauxText('我已经读取了 NVDA 的财务概览。')),
   ] })
   const events = []
@@ -212,7 +214,7 @@ test('自由对话可以自主调用研究工具后继续回答', async () => {
     toolRuntime: createTestToolRuntime(), tools: conversationResearchTools,
     executeTool: async (name, _params, _signal, onStart) => {
       await onStart(); calls += 1
-      assert.equal(name, 'get_financial_overview')
+      assert.equal(name, 'get_company_dossier')
       return { result: { facts: [], overview: { symbol: 'NVDA' } }, isError: false }
     },
   })) events.push(event)
@@ -220,6 +222,127 @@ test('自由对话可以自主调用研究工具后继续回答', async () => {
   assert.equal(calls, 1)
   assert.equal(events.some((event) => event.type === 'chat_completed'
     && event.text === '我已经读取了 NVDA 的财务概览。'), true)
+})
+
+test('自由对话仅在结构化新闻来源不合格后的下一轮投影 Web Search', async () => {
+  const visible: string[][] = []
+  const model = createPiModel({ fauxResponses: [
+    (context) => {
+      visible.push(context.tools.map(({ name }) => name))
+      return fauxAssistantMessage(fauxToolCall(
+        'search_evidence', { query: 'NVDA event', symbol: 'NVDA' },
+      ), { stopReason: 'toolUse' })
+    },
+    (context) => {
+      visible.push(context.tools.map(({ name }) => name))
+      return fauxAssistantMessage(fauxToolCall(
+        'search_web_evidence', { query: 'NVDA event' },
+      ), { stopReason: 'toolUse' })
+    },
+    fauxAssistantMessage(fauxText('我已用补充网页线索核对最近事件。')),
+  ] })
+  const calls: string[] = []
+  const events = []
+  for await (const event of model.analyzeConversation({
+    executionId: 'free-conversation-web-fallback', runtimeSettings: runtimeSettings(),
+    systemPrompt: 'system', userPrompt: 'NVDA 最近有什么新闻和公司事件？', knownFacts: [],
+    toolRuntime: createTestToolRuntime(),
+    tools: conversationToolsForMessage('NVDA 最近有什么新闻和公司事件？'),
+    conditionalTools: [webSearchEvidenceTool],
+    executeTool: async (name, _params, _signal, onStart) => {
+      await onStart(); calls.push(name)
+      if (name === 'search_evidence') return { result: {
+        facts: [], eligibility: { eligible: true, normalizedQuery: 'NVDA event', reasons: [
+          { source: 'yahoo', reason: 'empty' },
+          { source: 'google-news', reason: 'title_only' },
+          { source: 'alpaca', reason: 'unavailable' },
+        ] },
+      }, isError: false }
+      return { result: { facts: [{ id: 'fact:web-lead', evidenceLevel: 'lead' }] }, isError: false }
+    },
+  })) events.push(event)
+
+  assert.equal(visible[0]?.includes('search_web_evidence'), false)
+  assert.equal(visible[1]?.includes('search_web_evidence'), true)
+  assert.deepEqual(calls, ['search_evidence', 'search_web_evidence'])
+  assert.equal(events.some((event) => event.type === 'chat_completed'
+    && event.text === '我已用补充网页线索核对最近事件。'), true)
+})
+
+test('自由对话 Web Search 解锁后仍拒绝替换规范化查询', async () => {
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall(
+      'search_evidence', { query: 'NVDA event', symbol: 'NVDA' },
+    ), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall(
+      'search_web_evidence', { query: 'AMD event' },
+    ), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxText('没有执行越界搜索。')),
+  ] })
+  const calls: string[] = []
+  const events = []
+  for await (const event of model.analyzeConversation({
+    executionId: 'free-conversation-web-query-fence', runtimeSettings: runtimeSettings(),
+    systemPrompt: 'system', userPrompt: 'NVDA 最近有什么新闻？', knownFacts: [],
+    toolRuntime: createTestToolRuntime(),
+    tools: conversationToolsForMessage('NVDA 最近有什么新闻？'),
+    conditionalTools: [webSearchEvidenceTool],
+    executeTool: async (name, _params, _signal, onStart) => {
+      await onStart(); calls.push(name)
+      return { result: { facts: [], eligibility: {
+        eligible: true, normalizedQuery: 'NVDA event', reasons: [
+          { source: 'yahoo', reason: 'empty' },
+          { source: 'google-news', reason: 'title_only' },
+          { source: 'alpaca', reason: 'unavailable' },
+        ],
+      } }, isError: false }
+    },
+  })) events.push(event)
+
+  assert.deepEqual(calls, ['search_evidence'])
+  assert.match(JSON.stringify(events), /query 必须与该次 search_evidence 的查询一致/)
+})
+
+test('自由对话核实结构化新闻正文后撤销 Web Search', async () => {
+  const candidate = { ...facts[0]!, id: 'fact:conversation-candidate', evidenceLevel: 'title_only' }
+  const verified = { ...candidate, id: 'fact:conversation-verified', evidenceLevel: 'verified_news' }
+  const visible: string[][] = []
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall(
+      'search_evidence', { query: 'NVDA event', symbol: 'NVDA' },
+    ), { stopReason: 'toolUse' }),
+    (context) => {
+      visible.push(context.tools.map(({ name }) => name))
+      return fauxAssistantMessage(fauxToolCall(
+        'read_evidence', { evidenceId: candidate.id },
+      ), { stopReason: 'toolUse' })
+    },
+    (context) => {
+      visible.push(context.tools.map(({ name }) => name))
+      return fauxAssistantMessage(fauxText('结构化正文已经足以回答。'))
+    },
+  ] })
+  for await (const _event of model.analyzeConversation({
+    executionId: 'free-conversation-web-revoked', runtimeSettings: runtimeSettings(),
+    systemPrompt: 'system', userPrompt: 'NVDA 最近有什么新闻？', knownFacts: [],
+    toolRuntime: createTestToolRuntime(),
+    tools: conversationToolsForMessage('NVDA 最近有什么新闻？'),
+    conditionalTools: [webSearchEvidenceTool],
+    executeTool: async (name, _params, _signal, onStart) => {
+      await onStart()
+      if (name === 'search_evidence') return { result: {
+        facts: [candidate], eligibility: { eligible: true, normalizedQuery: 'NVDA event', reasons: [
+          { source: 'yahoo', reason: 'title_only' },
+          { source: 'google-news', reason: 'empty' },
+          { source: 'alpaca', reason: 'unavailable' },
+        ] },
+      }, isError: false }
+      return { result: { facts: [verified] }, isError: false }
+    },
+  })) { /* consume */ }
+
+  assert.equal(visible[0]?.includes('search_web_evidence'), true)
+  assert.equal(visible[1]?.includes('search_web_evidence'), false)
 })
 
 test('自由对话只在显式调用报告 Artifact 工具后保存报告', async () => {
@@ -251,7 +374,7 @@ test('自由对话在安全 Turn 边界可以 compaction 并继续使用同一�
   const model = createPiModel({
     contextWindow: 1_300,
     fauxResponses: [
-      fauxAssistantMessage(fauxToolCall('fetch_financial_context', { symbol: 'NVDA' }), { stopReason: 'toolUse' }),
+      fauxAssistantMessage(fauxToolCall('get_research_context', { symbol: 'NVDA' }), { stopReason: 'toolUse' }),
       fauxAssistantMessage(fauxText('压缩后继续回答。')),
     ],
     compact: async () => ({ narrative: '保留用户目标和已取得事实。', usage: {
@@ -265,7 +388,7 @@ test('自由对话在安全 Turn 边界可以 compaction 并继续使用同一�
     toolRuntime: createTestToolRuntime(), tools: conversationResearchTools,
     executeTool: async (_name, _params, _signal, onStart) => {
       await onStart()
-      return { result: { facts: [], summary: 'large '.repeat(200) }, isError: false }
+      return { result: { facts: [], summary: 'large '.repeat(400) }, isError: false }
     },
   })) events.push(event)
 
