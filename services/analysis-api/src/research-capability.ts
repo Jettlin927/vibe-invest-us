@@ -76,7 +76,10 @@ export function createResearchToolExecutor(
       if (name === 'fetch_financial_context' && options.fetchFinancialContext) {
         return run(() => options.fetchFinancialContext!(symbol, signal))
       }
-      if (name === 'get_research_context' && options.fetchFinancialContext) {
+      if (name === 'get_research_context') {
+        if (!options.fetchFinancialContext) return run(async () => ({
+          facts: [], gaps: [{ capability: name, reason: 'tool_not_available' }],
+        }))
         return run(() => options.fetchFinancialContext!(symbol, signal))
       }
       if (name === 'compare_securities') {
@@ -85,6 +88,9 @@ export function createResearchToolExecutor(
             typeof item === 'string' && item.trim() ? [item.trim().toUpperCase()] : []
           )))] : []
         if (symbols.length < 2 || symbols.length > 5) throw new Error('comparison_symbols_invalid')
+        if (allowedSymbols.size && symbols.some((item) => !allowedSymbols.has(item))) {
+          throw new Error('tool_symbol_not_allowed')
+        }
         return run(async () => {
           const rows = await Promise.all(symbols.map(async (comparisonSymbol) => {
             const tasks = [
@@ -173,17 +179,33 @@ export function createResearchToolExecutor(
           }))
           const results = settled.flatMap((item) => item.result ? [item.result] : [])
           const newsResult = settled.find(({ capability }) => capability === 'structured_news')?.result
+          const rawEligibility = asRecord(newsResult?.eligibility)
+          const hasOfficialEvent = results.some((result) => result.facts.some((fact) => (
+            fact.evidenceLevel === 'official_company_event'
+          )))
+          const eligibility = Object.keys(rawEligibility).length
+            ? hasOfficialEvent ? {
+                ...rawEligibility, eligible: false,
+                reasons: [
+                  ...(Array.isArray(rawEligibility.reasons) ? rawEligibility.reasons : []),
+                  { source: 'official_company_events', reason: 'qualified' },
+                ],
+              } : rawEligibility
+            : undefined
           const gaps = [
             ...(!options.searchNewsCandidates
               ? [{ capability: 'structured_news', reason: 'tool_not_available' }] : []),
+            ...(symbol && !options.listOfficialCompanyEvents
+              ? [{ capability: 'official_company_events', reason: 'tool_not_available' }] : []),
             ...settled.flatMap((item) => item.error
               ? [{ capability: item.capability, reason: item.error }] : []),
+            ...results.flatMap((result) => resultGaps(result)),
           ]
           return {
             facts: results.flatMap(({ facts }) => facts),
             sources: results.flatMap(({ sources }) => sources ?? []),
             gaps,
-            ...(newsResult?.eligibility ? { eligibility: newsResult.eligibility } : {}),
+            ...(eligibility ? { eligibility } : {}),
           }
         })
       }
@@ -252,8 +274,11 @@ export function createResearchToolExecutor(
                 ? [{ capability: 'fundamentals', reason: 'tool_not_available' }] : []),
               ...(!options.getValuationEvidence
                 ? [{ capability: 'valuation', reason: 'tool_not_available' }] : []),
+              ...(!options.listOfficialCompanyEvents
+                ? [{ capability: 'official_company_events', reason: 'tool_not_available' }] : []),
               ...settled.flatMap((item) => item.error
                 ? [{ capability: item.capability, reason: item.error }] : []),
+              ...available.flatMap((result) => resultGaps(result)),
             ],
             ...(fundamentals?.overview && typeof fundamentals.overview === 'object'
               ? { overview: selectFields(asRecord(fundamentals.overview), overviewKeys) } : {}),
@@ -272,7 +297,10 @@ export function createResearchToolExecutor(
       if (name === 'get_technical_evidence' && options.getTechnicalEvidence) {
         return run(() => options.getTechnicalEvidence!(symbol, signal))
       }
-      if (name === 'get_market_structure' && options.getTechnicalEvidence) {
+      if (name === 'get_market_structure') {
+        if (!options.getTechnicalEvidence) return run(async () => ({
+          facts: [], gaps: [{ capability: name, reason: 'tool_not_available' }],
+        }))
         return run(() => options.getTechnicalEvidence!(symbol, signal))
       }
       if (name === 'get_price_window' && options.getPriceWindow) {
@@ -349,4 +377,9 @@ const marketStructureKeys = [
 function selectFields(value: Record<string, unknown> | undefined, keys: string[]) {
   if (!value) return {}
   return Object.fromEntries(keys.flatMap((key) => key in value ? [[key, value[key]]] : []))
+}
+
+function resultGaps(value: unknown) {
+  const gaps = asRecord(value).gaps
+  return Array.isArray(gaps) ? gaps : []
 }

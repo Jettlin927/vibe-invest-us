@@ -145,7 +145,7 @@ export function buildApp(dependencies: AppDependencies) {
         tools: conversationResearchTools,
         conditionalTools: dependencies.searchWebEvidence ? conversationConditionalTools : [],
         model: { analyzeConversation: dependencies.model.analyzeConversation },
-        createToolExecutor: ({ threadId, knownFacts }) => createResearchToolExecutor({
+        createToolExecutor: ({ threadId, knownFacts, symbols }) => createResearchToolExecutor({
           fetchFinancialContext: dependencies.fetchFinancialContext,
           searchNewsCandidates: dependencies.searchNewsCandidates,
           searchWebEvidence: dependencies.searchWebEvidence,
@@ -161,7 +161,7 @@ export function buildApp(dependencies: AppDependencies) {
           listPortfolioSymbols: async () => (await portfolio.list()).map(({ symbol }) => symbol),
           fetchMarketPrices: dependencies.fetchMarketPrices,
           getPortfolioContext: (symbol, marketPrices) => portfolio.context(symbol, marketPrices),
-        })({ threadId, knownFacts }),
+        }, { symbols })({ threadId, knownFacts }),
         runtimeMinuteMs: dependencies.runtimeMinuteMs,
         activeNow: dependencies.activeNow,
         activeTimeoutSignal: dependencies.activeTimeoutSignal,

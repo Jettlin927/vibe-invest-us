@@ -1,8 +1,6 @@
 import AjvModule from 'ajv'
 import addFormatsModule from 'ajv-formats'
-import {
-  FREE_RESEARCH_TOOL_NAMES, selectFreeResearchToolNames,
-} from './free-research-tool-pack.js'
+import { selectFreeResearchToolNames } from './free-research-tool-pack.js'
 
 import { fetchFinancialContextDefinition } from './tool-definitions/fetch-financial-context.js'
 import { getFinancialMetricSeriesDefinition } from './tool-definitions/get-financial-metric-series.js'
@@ -103,6 +101,10 @@ export function createToolRegistry(definitions: RegisteredToolDefinition[]) {
       || !definition.surfaces.every((surface) => oneOf(surface, ['analysis', 'conversation'])))) {
       invalid(name, 'surfaces')
     }
+    if (definition.surfaces?.includes('conversation')
+      && !oneOf(definition.handlerOwner, ['research_capability', 'conversation_runtime'])) {
+      invalid(name, 'handler_owner')
+    }
     if (!validReportPolicy(definition)) invalid(name, 'report_policy')
     return Object.freeze({ ...definition })
   })
@@ -111,19 +113,17 @@ export function createToolRegistry(definitions: RegisteredToolDefinition[]) {
     project: ({ role, stage }: { role: ToolRole; stage: ToolStage }) => validated
       .filter((definition) => definition.allowedRoles.includes(role)
         && definition.allowedStages.includes(stage)
-        && (definition.surfaces?.includes('analysis') ?? true)
+        && (definition.surfaces ?? ['analysis']).includes('analysis')
         && !subagentTool(definition.model.name)
         && definition.model.name !== 'create_research_report')
       .map((definition) => definition.model),
     projectConversation: (options?: { userMessage: string; scopeMessages?: string[] }) => {
       const requested = options
         ? new Set(selectFreeResearchToolNames(options.userMessage, options.scopeMessages)) : null
-      const capabilityTools = new Set<string>(FREE_RESEARCH_TOOL_NAMES)
       return validated
         .filter((definition) => definition.allowedStages.includes('research')
-          && (definition.surfaces?.includes('conversation') ?? true)
+          && definition.surfaces?.includes('conversation') === true
           && ['read_only', 'creates_agent', 'creates_report', 'controls_agent'].includes(definition.sideEffect)
-          && capabilityTools.has(definition.model.name)
           && (requested === null || requested.has(definition.model.name)))
         .map((definition) => definition.model)
     },
@@ -139,6 +139,10 @@ export function createToolRegistry(definitions: RegisteredToolDefinition[]) {
       }
       if (result.modelProjection && typeof result.modelProjection === 'object') {
         return result.modelProjection as Record<string, unknown>
+      }
+      if (['get_company_dossier', 'get_market_structure', 'compare_securities',
+        'get_portfolio_exposure'].includes(name)) {
+        return projectPublicToolResult(name, result)
       }
       return selectResult(result, boundedResultKeys)
     },
@@ -178,13 +182,17 @@ function projectPublicToolResult(name: string, result: Record<string, unknown>) 
     'delegate_research', 'collect_research'].includes(name)) return {
     ...selectTyped(result, ['agentId', 'runId', 'status', 'summary', 'stopped'], 'string'),
     ...selectTyped(result, ['stopped'], 'boolean'),
+    ...optionalArray('factIds', result.factIds, stringValue),
+    ...optionalArray('artifactRefs', result.artifactRefs, (entry) => selectTyped(
+      record(entry), ['kind', 'operationId'], 'string',
+    )),
   }
   if (['fetch_financial_context', 'get_research_context', 'search_news_candidates', 'search_web_evidence',
     'read_news_document', 'list_company_events', 'search_evidence', 'read_evidence'].includes(name)) {
     return { ...common, ...(name === 'read_evidence' ? projectPagination(result) : {}) }
   }
   if (name === 'compare_securities') return {
-    ...common, ...optionalArray('comparisons', result.comparisons, identity),
+    ...common, ...optionalArray('comparisons', result.comparisons, projectSecurityComparison),
   }
   if (name === 'get_portfolio_exposure') return {
     ...common,
@@ -219,19 +227,7 @@ function projectPublicToolResult(name: string, result: Record<string, unknown>) 
     ...optionalObject('methods', projectValuationMethods(result.methods)),
   }
   if (name === 'get_technical_evidence' || name === 'get_market_structure') return {
-    ...common, ...selectTyped(result, ['symbol', 'actualStart', 'actualEnd'], 'string'),
-    ...selectTyped(result, ['totalBarCount'], 'number'),
-    ...optionalObject('structures', projectTechnicalStructures(result.structures)),
-    ...optionalObject('indicators', projectIndicators(result.indicators)),
-    ...optionalObject('volatility', selectTyped(record(result.volatility), ['annualized'], 'number')),
-    ...optionalObject('drawdown', selectTyped(record(result.drawdown), ['maximum'], 'number')),
-    ...optionalObject('volumePrice', selectTyped(
-      record(result.volumePrice), ['volumeRatio5To20'], 'number',
-    )),
-    ...optionalObject('keyLevels', selectTyped(
-      record(result.keyLevels), ['support', 'resistance'], 'number',
-    )),
-    ...optionalArray('conflicts', result.conflicts, stringValue),
+    ...common, ...projectMarketStructure(result),
   }
   if (name === 'get_price_window') return {
     ...common, ...projectPagination(result),
@@ -245,6 +241,39 @@ function projectPublicToolResult(name: string, result: Record<string, unknown>) 
     return projectReportSubmission(result)
   }
   return {}
+}
+
+function projectMarketStructure(result: Record<string, unknown>) {
+  return {
+    ...selectTyped(result, ['symbol', 'actualStart', 'actualEnd', 'sampling'], 'string'),
+    ...selectTyped(result, ['totalBarCount'], 'number'),
+    ...optionalObject('structures', projectTechnicalStructures(result.structures)),
+    ...optionalObject('indicators', projectIndicators(result.indicators)),
+    ...optionalObject('volatility', selectTyped(record(result.volatility), ['annualized'], 'number')),
+    ...optionalObject('drawdown', selectTyped(record(result.drawdown), ['maximum'], 'number')),
+    ...optionalObject('volumePrice', selectTyped(
+      record(result.volumePrice), ['volumeRatio5To20'], 'number',
+    )),
+    ...optionalObject('keyLevels', selectTyped(
+      record(result.keyLevels), ['support', 'resistance'], 'number',
+    )),
+    ...optionalArray('conflicts', result.conflicts, stringValue),
+  }
+}
+
+function projectSecurityComparison(value: unknown) {
+  const item = record(value)
+  return {
+    ...selectTyped(item, ['symbol'], 'string'),
+    ...optionalObject('overview', projectFinancialOverview(item.overview)),
+    ...optionalArray('authorizedComparables', item.authorizedComparables, stringValue),
+    ...optionalArray('comparables', item.comparables, projectComparable),
+    ...optionalArray('excludedComparables', item.excludedComparables, projectExcludedComparable),
+    ...optionalObject('currentMultiples', projectNumericRecord(item.currentMultiples)),
+    ...optionalObject('historicalRanges', projectNumericRangeRecord(item.historicalRanges)),
+    ...optionalObject('methods', projectValuationMethods(item.methods)),
+    ...optionalObject('marketStructure', projectMarketStructure(record(item.marketStructure))),
+  }
 }
 
 function projectCommonResult(result: Record<string, unknown>) {

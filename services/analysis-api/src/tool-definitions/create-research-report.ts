@@ -11,4 +11,6 @@ export const createResearchReportDefinition: RegisteredToolDefinition = {
   allowedRoles: ['main'], allowedStages: ['research'], sideEffect: 'creates_report',
   externalNetwork: 'none', hostAccess: 'none', resultRetention: 'report_version',
   modelProjection: 'acknowledgement', executionMode: 'sequential', countsAsToolRound: true,
+  surfaces: ['conversation'],
+  handlerOwner: 'research_capability',
 }

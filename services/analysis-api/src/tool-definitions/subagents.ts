@@ -67,19 +67,29 @@ export const delegateResearchDefinition: RegisteredToolDefinition = {
   externalNetwork: 'none', hostAccess: 'none', resultRetention: 'research_record',
   modelProjection: 'bounded_summary', executionMode: 'sequential', countsAsToolRound: true,
   surfaces: ['conversation'],
+  handlerOwner: 'conversation_runtime',
 }
 
 export const collectResearchDefinition: RegisteredToolDefinition = {
   model: {
     name: 'collect_research',
     description: '等待或读取已委派研究的紧凑状态、摘要和 Artifact 引用；默认等待到终态',
-    parameters: Type.Object({ runId, wait: Type.Optional(Type.Boolean()) }),
+    parameters: Type.Object({
+      runId,
+      action: Type.Optional(Type.Union([
+        Type.Literal('wait'), Type.Literal('read'), Type.Literal('stop'),
+      ])),
+    }),
   },
   resultSchema: Type.Object({
     runId: Type.String(), status: Type.String(), summary: Type.Optional(Type.String()),
+    stopped: Type.Optional(Type.Boolean()),
+    factIds: Type.Optional(Type.Array(Type.String())),
+    artifactRefs: Type.Optional(Type.Array(Type.Unknown())),
   }),
   allowedRoles: ['main'], allowedStages: ['research'], sideEffect: 'read_only',
   externalNetwork: 'none', hostAccess: 'none', resultRetention: 'research_record',
   modelProjection: 'bounded_summary', executionMode: 'sequential', countsAsToolRound: true,
   surfaces: ['conversation'],
+  handlerOwner: 'conversation_runtime',
 }

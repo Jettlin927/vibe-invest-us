@@ -1,11 +1,3 @@
-export const FREE_RESEARCH_TOOL_NAMES = [
-  'create_research_report',
-  'search_evidence', 'read_evidence',
-  'get_company_dossier', 'get_market_structure', 'get_research_context',
-  'compare_securities', 'get_portfolio_exposure',
-  'delegate_research', 'collect_research',
-] as const
-
 export function selectFreeResearchToolNames(
   userMessage: string, scopeMessages: string[] = [],
 ): string[] {
@@ -43,7 +35,7 @@ export function selectFreeResearchToolNames(
   if (/(?:我的持仓|当前持仓|组合|仓位|集中度|风险暴露|portfolio|exposure|position weight)/i.test(userMessage)) {
     requested.push('get_portfolio_exposure')
   }
-  const hasSymbol = [userMessage, ...scopeMessages].some((message) => tickerTokens(message).length > 0)
+  const hasSymbol = extractFreeResearchSymbols([userMessage, ...scopeMessages]).length > 0
   const nonDataTools = new Set([
     'create_research_report', 'delegate_research', 'collect_research',
   ])
@@ -51,6 +43,10 @@ export function selectFreeResearchToolNames(
     requested.push('get_research_context')
   }
   return requested
+}
+
+export function extractFreeResearchSymbols(messages: string[]) {
+  return [...new Set(messages.flatMap((message) => tickerTokens(message)))]
 }
 
 function tickerTokens(message: string) {

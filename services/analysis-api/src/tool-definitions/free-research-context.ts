@@ -8,6 +8,7 @@ const readOnlyMetadata: Omit<RegisteredToolDefinition, 'model' | 'resultSchema'>
   modelProjection: 'bounded_summary', executionMode: 'parallel',
   countsAsToolRound: true,
   surfaces: ['conversation'],
+  handlerOwner: 'research_capability',
 }
 
 export const getResearchContextDefinition: RegisteredToolDefinition = {

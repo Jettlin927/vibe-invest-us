@@ -593,6 +593,7 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
         name === 'search_web_evidence'
       ))
       const regularCandidateFactIds = new Set<string>()
+      const pendingWebEvidenceIds = new Set<string>()
       const webSearchGate = createWebSearchGate(
         input.executionId, () => Boolean(conditionalWebSearch),
       )
@@ -627,6 +628,8 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
         nextFinalizationTools: () => [],
         beforeNextProjection: () => webSearchGate.consumeDecision(),
         systemPrompt: securedSystemPrompt(input.systemPrompt), userPrompt: input.userPrompt,
+        chatCompletionBlocker: () => pendingWebEvidenceIds.size
+          ? 'web_evidence_verification_required' : undefined,
         execute: async (name, params, signal, onStart) => {
           if (name === 'search_web_evidence') {
             const query = stringParam(params, 'query')
@@ -640,6 +643,12 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
             }
           }
           const result = await input.executeTool(name, params, signal, onStart)
+          if (name === 'search_web_evidence' && !result.isError) {
+            const facts = asRecord(result.result).facts
+            if (Array.isArray(facts)) for (const fact of facts as Fact[]) {
+              if (fact.evidenceLevel === 'lead') pendingWebEvidenceIds.add(fact.id)
+            }
+          }
           if (name === 'search_evidence') {
             const facts = asRecord(result.result).facts
             if (Array.isArray(facts)) for (const fact of facts as Fact[]) {
@@ -650,6 +659,11 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
           if (name === 'read_evidence') {
             const factId = stringParam(params, 'evidenceId')
             const facts = asRecord(result.result).facts
+            if (!result.isError && Array.isArray(facts)
+              && (facts as Fact[]).some((fact) => fact.evidenceLevel === 'verified_news'
+                || fact.evidenceLevel === 'official_filing')) {
+              pendingWebEvidenceIds.delete(factId)
+            }
             if (regularCandidateFactIds.has(factId) && Array.isArray(facts)
               && (facts as Fact[]).some((fact) => fact.evidenceLevel === 'verified_news')) {
               webSearchGate.revoke('structured_news')
@@ -1033,6 +1047,7 @@ async function runProjectedAgent(config: {
   invocationId?: string
   toolRoundLimit?: number
   shouldRejectNextTurn?: () => boolean
+  chatCompletionBlocker?: () => string | undefined
   nextResearchTools?: () => Tool[]
   nextFinalizationTools?: () => Tool[]
   beforeNextProjection?: () => Extract<ModelEvent, { type: 'trace' }>['entry'] | undefined
@@ -1060,6 +1075,7 @@ async function runProjectedAgent(config: {
   let finalText = ''
   let finalUsage: unknown
   let finalStopReason: string | undefined
+  let chatCompletionBlocked = false
   let requestPolicyFailure: Error | undefined
   let toolAuditFailure: Error | undefined
   let lastAssistantHadCalls = false
@@ -1399,7 +1415,10 @@ async function runProjectedAgent(config: {
     afterToolCall: async ({ result, isError }) => ({
       isError: Boolean((result.details as { audit?: ToolAudit } | undefined)?.audit?.isError ?? isError),
     }),
-    shouldStopAfterTurn: async () => Boolean(completedReport || (completionMode === 'chat' && finalText)),
+    shouldStopAfterTurn: async () => Boolean(
+      completedReport || (completionMode === 'chat'
+        && (finalText || chatCompletionBlocked)),
+    ),
     prepareNextTurn: async () => {
       if (completedReport || finalText) return undefined
       const hasToolBatch = Boolean(currentBatch)
@@ -1475,10 +1494,12 @@ async function runProjectedAgent(config: {
         type: 'model_event', event: compactAdapterEvent(item),
         operationId: `execution:${input.executionId}:${roleScope}:model:${turnIndex}:event:${++modelEventIndex}`,
       }))
-      if (item.type === 'text_delta') config.queue.push({
-        type: 'text_delta', text: item.delta,
-        operationId: `execution:${input.executionId}:${roleScope}:model:${turnIndex}:text:${++textDeltaIndex}`,
-      })
+      if (item.type === 'text_delta' && !config.chatCompletionBlocker?.()) {
+        config.queue.push({
+          type: 'text_delta', text: item.delta,
+          operationId: `execution:${input.executionId}:${roleScope}:model:${turnIndex}:text:${++textDeltaIndex}`,
+        })
+      }
     }
     if (event.type === 'message_end' && event.message.role === 'assistant') {
       const requestStatus = event.message.stopReason === 'aborted'
@@ -1498,6 +1519,13 @@ async function runProjectedAgent(config: {
       if (!calls.length) {
         if (completionMode === 'chat' || ('runtimeFollowUp' in input
           && input.runtimeFollowUp && input.runtimeFollowUp.content.updateReport !== true)) {
+          const blocker = config.chatCompletionBlocker?.()
+          if (blocker) {
+            requestPolicyFailure ??= new Error(blocker)
+            config.onPolicyFailure(requestPolicyFailure)
+            chatCompletionBlocked = true
+            return
+          }
           finalText = event.message.content.flatMap((content) => (
             content.type === 'text' ? [content.text] : []
           )).join('')

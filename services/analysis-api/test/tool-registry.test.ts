@@ -110,6 +110,9 @@ test('Registry 启动校验 fail closed 拒绝重复名称、缺失 schema 和�
   assert.throws(() => createToolRegistry([definition('illegal-effect', {
     sideEffect: 'arbitrary' as never,
   })]), /tool_registry_invalid:side_effect/)
+  assert.throws(() => createToolRegistry([definition('conversation-without-handler', {
+    surfaces: ['conversation'],
+  })]), /tool_registry_invalid:handler_owner:conversation-without-handler/)
 })
 
 test('Registry 启动时拒绝 Shell、命令执行和任意文件能力', () => {
@@ -327,6 +330,33 @@ test('Registry 用户投影按具体工具收紧嵌套结果并拒绝未知工�
     },
   })
   assert.deepEqual(registry.projectPublicResult('unknown-tool', { summary: '不得出现' }), {})
+})
+
+test('自由研究比较的模型与用户投影都递归移除未知嵌套字段', () => {
+  const registry = createToolRegistry(registeredToolDefinitions)
+  const result = {
+    facts: [], gaps: [], comparisons: [{
+      symbol: 'NVDA',
+      overview: { symbol: 'NVDA', latestPeriod: 'CY2026Q2', qualityFlags: [], secret: 'overview' },
+      comparables: [{ symbol: 'AMD', pe: 20, providerEnvelope: 'comparable' }],
+      methods: { pe: { status: 'available', targetPrice: 180, hidden: 'method' } },
+      marketStructure: {
+        symbol: 'NVDA', totalBarCount: 252,
+        structures: { '20d': { status: 'up', barCount: 20, internal: 'structure' } },
+        indicators: { rsi14: 55, providerRaw: 'indicator' },
+        volatility: { annualized: 0.4, raw: 'volatility' },
+        conflicts: ['none'], providerEnvelope: 'market',
+      },
+    }],
+  }
+  for (const projection of [
+    registry.projectResult('compare_securities', result),
+    registry.projectPublicResult('compare_securities', result),
+  ]) {
+    const serialized = JSON.stringify(projection)
+    assert.match(serialized, /NVDA|CY2026Q2|targetPrice|totalBarCount/)
+    assert.doesNotMatch(serialized, /secret|providerEnvelope|hidden|internal|providerRaw|raw/)
+  }
 })
 
 test('消息面 Agent 只获得新闻候选、文档、公司事件和专项报告工具', () => {

@@ -20,6 +20,7 @@ export const searchEvidenceDefinition: RegisteredToolDefinition = {
   externalNetwork: 'financial_data', hostAccess: 'none', resultRetention: 'research_record',
   modelProjection: 'bounded_summary', executionMode: 'parallel', countsAsToolRound: true,
   surfaces: ['conversation'],
+  handlerOwner: 'research_capability',
 }
 
 export const readEvidenceDefinition: RegisteredToolDefinition = {
@@ -44,4 +45,5 @@ export const readEvidenceDefinition: RegisteredToolDefinition = {
   externalNetwork: 'financial_data', hostAccess: 'none', resultRetention: 'research_record',
   modelProjection: 'bounded_summary', executionMode: 'parallel', countsAsToolRound: true,
   surfaces: ['conversation'],
+  handlerOwner: 'research_capability',
 }

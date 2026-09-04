@@ -23,10 +23,10 @@ test('自由研究统一搜索并按证据类型读取新闻正文或官方 Fili
     searchNewsCandidates: async (query) => {
       calls.push(`search:${query}`)
       return { facts: [news], sources: [{ source: 'news-source', status: 'ok' }], eligibility: {
-        eligible: false, normalizedQuery: query, reasons: [
-          { source: 'one', reason: 'qualified' },
+        eligible: true, normalizedQuery: query, reasons: [
+          { source: 'one', reason: 'title_only' },
           { source: 'two', reason: 'empty' },
-          { source: 'three', reason: 'empty' },
+          { source: 'three', reason: 'unavailable' },
         ],
       } }
     },
@@ -57,6 +57,7 @@ test('自由研究统一搜索并按证据类型读取新闻正文或官方 Fili
   assert.deepEqual(search.result.sources, [
     { source: 'news-source', status: 'ok' }, { source: 'sec', status: 'ok' },
   ])
+  assert.equal((search.result.eligibility as { eligible: boolean }).eligible, false)
 
   const newsDocument = await execute(
     'read_evidence', { evidenceId: news.id }, signal, async () => {},
@@ -167,4 +168,52 @@ test('自由研究提供紧凑起始资料、同口径标的比较和私有组�
     symbol: 'NVDA', quantity: 2, marketPrice: 100, portfolioWeight: 0.4,
   })
   assert.deepEqual(exposure.result.portfolio, { totalMarketValue: 500, positionCount: 2 })
+})
+
+test('自由研究比较拒绝越过当前对话授权的标的范围', async () => {
+  const execute = createResearchToolExecutor({
+    getFinancialOverview: async () => ({ facts: [], overview: {}, sources: [] }),
+  }, { symbols: ['NVDA'] })({ threadId: 'thread-scoped', knownFacts: new Map() })
+  const result = await execute(
+    'compare_securities', { symbols: ['NVDA', 'AMD'] },
+    new AbortController().signal, async () => {},
+  )
+  assert.equal(result.isError, true)
+  assert.equal(result.result.error, 'tool_symbol_not_allowed')
+})
+
+test('自由研究深工具把缺失 adapter 和子能力缺口统一投影为 partial gaps', async () => {
+  const execute = createResearchToolExecutor({
+    searchNewsCandidates: async () => ({
+      facts: [], gaps: [{ capability: 'news_body', reason: 'unavailable' }],
+    } as any),
+    getFinancialOverview: async () => ({
+      facts: [], overview: { symbol: 'NVDA' }, sources: [],
+      gaps: [{ capability: 'financial_period', reason: 'missing' }],
+    } as any),
+  })({ threadId: 'thread-gaps', knownFacts: new Map() })
+  const signal = new AbortController().signal
+
+  const search = await execute(
+    'search_evidence', { query: 'NVDA event', symbol: 'NVDA' }, signal, async () => {},
+  )
+  assert.deepEqual(search.result.gaps, [
+    { capability: 'official_company_events', reason: 'tool_not_available' },
+    { capability: 'news_body', reason: 'unavailable' },
+  ])
+
+  const dossier = await execute(
+    'get_company_dossier', { symbol: 'NVDA' }, signal, async () => {},
+  )
+  assert.deepEqual(dossier.result.gaps, [
+    { capability: 'valuation', reason: 'tool_not_available' },
+    { capability: 'official_company_events', reason: 'tool_not_available' },
+    { capability: 'financial_period', reason: 'missing' },
+  ])
+
+  for (const name of ['get_research_context', 'get_market_structure']) {
+    const result = await execute(name, { symbol: 'NVDA' }, signal, async () => {})
+    assert.equal(result.isError, false)
+    assert.deepEqual(result.result.gaps, [{ capability: name, reason: 'tool_not_available' }])
+  }
 })

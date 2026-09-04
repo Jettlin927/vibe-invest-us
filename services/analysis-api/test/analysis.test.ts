@@ -299,13 +299,19 @@ test('自由对话通过统一委派接口创建并等待受控 subagent', async
       executeTool: (name: string, params: unknown, signal: AbortSignal, onStart: () => Promise<void>) => Promise<any>
     }): AsyncGenerator<ModelEvent> {
       if (input.userPrompt === 'root') {
+        await input.executeTool(
+          'get_research_context', { symbol: 'NVDA' },
+          new AbortController().signal, async () => {},
+        )
         const result = await input.executeTool(
-          'delegate_research', { goal: 'child', wait: true },
+          'delegate_research', { goal: 'child', wait: true, contextRefs: [fact.id] },
           new AbortController().signal, async () => {},
         )
         yield { type: 'chat_completed', text: JSON.stringify(result.result), operationId: 'root:completed' }
         return
       }
+      assert.match(input.userPrompt, /系统生成的授权研究事实引用/)
+      assert.match(input.userPrompt, new RegExp(fact.id))
       yield { type: 'chat_completed', text: 'child result', operationId: 'child:completed' }
     },
   }
@@ -315,6 +321,51 @@ test('自由对话通过统一委派接口创建并等待受控 subagent', async
   const thread = created.json() as { id: string }
   const completed = await waitForConversation(app, thread.id, 'completed')
   assert.match(JSON.stringify(completed), /child result/)
+})
+
+test('自由对话收集接口可停止委派且拒绝未知上下文引用', async () => {
+  const model = {
+    ...fakeModel(),
+    async *analyzeConversation(input: {
+      userPrompt: string; signal?: AbortSignal
+      executeTool: (name: string, params: unknown, signal: AbortSignal, onStart: () => Promise<void>) => Promise<any>
+    }): AsyncGenerator<ModelEvent> {
+      if (input.userPrompt === 'root-stop') {
+        const rejected = await input.executeTool(
+          'delegate_research', { goal: 'bad-child', contextRefs: ['fact:unknown'] },
+          new AbortController().signal, async () => {},
+        )
+        const delegated = await input.executeTool(
+          'delegate_research', { goal: 'slow-child' },
+          new AbortController().signal, async () => {},
+        )
+        const stopped = await input.executeTool(
+          'collect_research', { runId: delegated.result.runId, action: 'stop' },
+          new AbortController().signal, async () => {},
+        )
+        yield {
+          type: 'chat_completed', text: JSON.stringify({ rejected, delegated, stopped }),
+          operationId: 'root-stop:completed',
+        }
+        return
+      }
+      await new Promise<void>((resolve) => {
+        input.signal?.addEventListener('abort', () => resolve(), { once: true })
+      })
+    },
+  }
+  const app = await makeApp(`subagent-stop-${crypto.randomUUID()}`, model)
+  const created = await app.inject({
+    method: 'POST', url: '/api/conversations', payload: { message: 'root-stop' },
+  })
+  const completed = await waitForConversation(app, created.json().id, 'completed')
+  const serialized = JSON.stringify(completed)
+  assert.match(serialized, /subagent_context_ref_not_found/)
+  const answer = (completed as any).lifecycle.events.find(({ type }: { type: string }) => (
+    type === 'chat_completed'
+  ))
+  assert.equal(JSON.parse(answer.text).stopped.result.stopped, true)
+  await app.close()
 })
 
 test('自由对话停止时先 fencing 再 Abort，并可恢复为新 Run', async () => {

@@ -17,4 +17,5 @@ export type RegisteredToolDefinition = {
   executionMode: 'sequential' | 'parallel'
   countsAsToolRound: boolean
   surfaces?: ToolSurface[]
+  handlerOwner?: 'research_capability' | 'conversation_runtime'
 }

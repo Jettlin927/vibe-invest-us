@@ -239,6 +239,9 @@ test('自由对话仅在结构化新闻来源不合格后的下一轮投影 Web 
         'search_web_evidence', { query: 'NVDA event' },
       ), { stopReason: 'toolUse' })
     },
+    fauxAssistantMessage(fauxToolCall(
+      'read_evidence', { evidenceId: 'fact:web-lead' },
+    ), { stopReason: 'toolUse' }),
     fauxAssistantMessage(fauxText('我已用补充网页线索核对最近事件。')),
   ] })
   const calls: string[] = []
@@ -258,15 +261,56 @@ test('自由对话仅在结构化新闻来源不合格后的下一轮投影 Web 
           { source: 'alpaca', reason: 'unavailable' },
         ] },
       }, isError: false }
-      return { result: { facts: [{ id: 'fact:web-lead', evidenceLevel: 'lead' }] }, isError: false }
+      if (name === 'search_web_evidence') {
+        return { result: { facts: [{ id: 'fact:web-lead', evidenceLevel: 'lead' }] }, isError: false }
+      }
+      return { result: { facts: [{
+        id: 'fact:web-verified', evidenceLevel: 'verified_news',
+      }] }, isError: false }
     },
   })) events.push(event)
 
   assert.equal(visible[0]?.includes('search_web_evidence'), false)
   assert.equal(visible[1]?.includes('search_web_evidence'), true)
-  assert.deepEqual(calls, ['search_evidence', 'search_web_evidence'])
+  assert.deepEqual(calls, ['search_evidence', 'search_web_evidence', 'read_evidence'])
   assert.equal(events.some((event) => event.type === 'chat_completed'
     && event.text === '我已用补充网页线索核对最近事件。'), true)
+})
+
+test('自由对话拒绝在 Web Search 线索未经正文核实时直接回答', async () => {
+  const model = createPiModel({ fauxResponses: [
+    fauxAssistantMessage(fauxToolCall(
+      'search_evidence', { query: 'NVDA event', symbol: 'NVDA' },
+    ), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxToolCall(
+      'search_web_evidence', { query: 'NVDA event' },
+    ), { stopReason: 'toolUse' }),
+    fauxAssistantMessage(fauxText('未经正文核实的回答不应展示。')),
+  ] })
+  const events: ModelEvent[] = []
+  await assert.rejects(async () => {
+    for await (const event of model.analyzeConversation({
+      executionId: 'free-conversation-unverified-web', runtimeSettings: runtimeSettings(),
+      systemPrompt: 'system', userPrompt: 'NVDA 最近有什么新闻？', knownFacts: [],
+      toolRuntime: createTestToolRuntime(),
+      tools: conversationToolsForMessage('NVDA 最近有什么新闻？'),
+      conditionalTools: [webSearchEvidenceTool],
+      executeTool: async (name, _params, _signal, onStart) => {
+        await onStart()
+        if (name === 'search_evidence') return { result: {
+          facts: [], eligibility: { eligible: true, normalizedQuery: 'NVDA event', reasons: [
+            { source: 'yahoo', reason: 'empty' },
+            { source: 'google-news', reason: 'title_only' },
+            { source: 'alpaca', reason: 'unavailable' },
+          ] },
+        }, isError: false }
+        return { result: { facts: [{ id: 'fact:web-lead', evidenceLevel: 'lead' }] }, isError: false }
+      },
+    })) events.push(event)
+  }, /web_evidence_verification_required/)
+  assert.equal(events.some((event) => event.type === 'chat_completed'), false)
+  assert.equal(events.some((event) => event.type === 'text_delta'
+    && event.text.includes('未经正文核实')), false)
 })
 
 test('自由对话 Web Search 解锁后仍拒绝替换规范化查询', async () => {

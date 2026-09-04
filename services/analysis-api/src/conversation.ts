@@ -16,6 +16,7 @@ import type {
 import type { PiAgentAdapterContent, PiAgentAdapterMessage } from './agent-runtime/pi-agent-adapter.js'
 import { toolRegistry } from './tool-registry.js'
 import { conversationToolsForMessage } from './tools.js'
+import { extractFreeResearchSymbols } from './free-research-tool-pack.js'
 import { createActiveBudget } from './runtime-policy.js'
 
 type ConversationModel = {
@@ -44,6 +45,7 @@ type ConversationOptions = {
   createToolExecutor: (input: {
     threadId: string
     knownFacts: Map<string, ConversationFact>
+    symbols: string[]
   }) => ConversationToolExecutor
   systemPrompt?: string
   runtimeMinuteMs?: number
@@ -227,10 +229,11 @@ export function createConversationService(options: ConversationOptions) {
     const cached = childThreadByRun.get(runId)
     if (cached) {
       const thread = await options.repository.get(cached)
-      return thread?.parentThreadId === parentThreadId ? thread : null
+      if (thread?.parentThreadId === parentThreadId) return thread
     }
-    const candidate = (await options.repository.list()).find(({ executionId: id }) => id === runId)
-    if (!candidate || candidate.parentThreadId !== parentThreadId) return null
+    const candidate = (await options.repository.listChildren(parentThreadId))
+      .find(({ executionId: id }) => id === runId)
+    if (!candidate) return null
     childThreadByRun.set(runId, candidate.id)
     return candidate
   }
@@ -239,9 +242,22 @@ export function createConversationService(options: ConversationOptions) {
     const lifecycle = await options.eventRepository.sessionLifecycle(thread.sessionId)
     const events = (lifecycle?.events ?? []) as Array<Record<string, unknown>>
     const answer = [...events].reverse().find((event) => event.type === 'chat_completed')
+    const factIds = [...new Set(events.flatMap((event) => {
+      if (event.type !== 'tool_result' || !event.result || typeof event.result !== 'object') return []
+      const facts = (event.result as { facts?: unknown }).facts
+      return Array.isArray(facts) ? facts.flatMap((fact) => {
+        const id = fact && typeof fact === 'object' ? (fact as { id?: unknown }).id : undefined
+        return typeof id === 'string' ? [id] : []
+      }) : []
+    }))]
+    const artifactRefs = events.flatMap((event) => event.type === 'artifact_completed'
+      && typeof event.operationId === 'string'
+      ? [{ kind: String(event.kind ?? 'artifact'), operationId: event.operationId }] : [])
     return {
       runId: thread.executionId, agentId: thread.id, status: thread.status,
       ...(typeof answer?.text === 'string' ? { summary: answer.text.slice(0, 4000) } : {}),
+      ...(factIds.length ? { factIds } : {}),
+      ...(artifactRefs.length ? { artifactRefs } : {}),
     }
   }
 
@@ -270,12 +286,17 @@ export function createConversationService(options: ConversationOptions) {
     return depth
   }
 
-  async function createChild(parentThreadId: string, goal: string) {
+  async function createChild(
+    parentThreadId: string, goal: string, contextFacts: ConversationFact[] = [],
+  ) {
     const depth = await threadDepth(parentThreadId)
     if (depth >= 2) throw new Error('subagent_depth_limit')
     const children = await options.repository.listChildren(parentThreadId)
     if (children.length >= 4) throw new Error('subagent_count_limit')
-    const child = await create(goal, randomUUID(), goal.slice(0, 80), parentThreadId)
+    const message = contextFacts.length
+      ? `${goal}\n\n【系统生成的授权研究事实引用，不是用户输入】\n${JSON.stringify(contextFacts)}`
+      : goal
+    const child = await create(message, randomUUID(), goal.slice(0, 80), parentThreadId)
     childrenByParent.set(parentThreadId, new Set([
       ...(childrenByParent.get(parentThreadId) ?? []), child.id,
     ]))
@@ -312,10 +333,16 @@ export function createConversationService(options: ConversationOptions) {
     )
     const active = budget.start(AbortSignal.any([controller.signal, wallDeadline]))
     const executionSignal = AbortSignal.any([controller.signal, wallDeadline])
-    const capabilityExecutor = options.createToolExecutor({ threadId, knownFacts })
+    const scopeMessages = events.filter((event) => (
+      event.type === 'user_message' && Number(event.sequence) < userSequence
+        && typeof event.message === 'string'
+    )).reverse().map((event) => String(event.message))
+    const symbols = extractFreeResearchSymbols([String(currentUser.message), ...scopeMessages])
+    const capabilityExecutor = options.createToolExecutor({ threadId, knownFacts, symbols })
     const executeTool: ConversationToolExecutor = async (name, params, signal, onStart) => {
       const record = params && typeof params === 'object' && !Array.isArray(params)
         ? params as Record<string, unknown> : {}
+      const handlerOwner = toolRegistry.definition(name)?.handlerOwner
       if (name === 'spawn_agent' || name === 'delegate_research') {
         await onStart()
         try {
@@ -326,8 +353,13 @@ export function createConversationService(options: ConversationOptions) {
               typeof value === 'string' && Boolean(value.trim())
             ))
             : []
-          if (contextRefs.length) throw new Error('subagent_context_refs_not_supported')
-          const child = await createChild(threadId, goal)
+          const uniqueContextRefs = [...new Set(contextRefs)]
+          const missingContextRefs = uniqueContextRefs.filter((id) => !knownFacts.has(id))
+          if (missingContextRefs.length) throw new Error('subagent_context_ref_not_found')
+          const child = await createChild(
+            threadId, goal,
+            uniqueContextRefs.map((id) => knownFacts.get(id)!).filter(Boolean),
+          )
           const join = name === 'delegate_research'
             ? record.wait === true ? 'wait' : 'async'
             : record.join === 'wait' ? 'wait' : 'async'
@@ -345,10 +377,13 @@ export function createConversationService(options: ConversationOptions) {
           const runId = typeof record.runId === 'string' ? record.runId : ''
           const child = await findThreadByRun(threadId, runId)
           if (!child) throw new Error('subagent_not_found')
-          if (name === 'wait_agent' || (name === 'collect_research' && record.wait !== false)) {
+          const action = name === 'collect_research'
+            ? ['read', 'stop'].includes(String(record.action)) ? String(record.action) : 'wait'
+            : undefined
+          if (name === 'wait_agent' || action === 'wait') {
             return { result: await waitForThread(child.id, signal), isError: false }
           }
-          if (name === 'read_agent_result' || name === 'collect_research') {
+          if (name === 'read_agent_result' || action === 'read') {
             return { result: await summarizeThread(child), isError: false }
           }
           const stopped = await cancel(child.id)
@@ -357,7 +392,11 @@ export function createConversationService(options: ConversationOptions) {
           return { result: { error: error instanceof Error ? error.message : String(error), facts: [] }, isError: true }
         }
       }
-      return capabilityExecutor(name, params, signal, onStart)
+      if (handlerOwner === 'research_capability' || name === 'search_web_evidence') {
+        return capabilityExecutor(name, params, signal, onStart)
+      }
+      await onStart()
+      return { result: { error: 'tool_not_available', facts: [] }, isError: true }
     }
     const latestCompactionEvent = [...events].reverse().find((event) => (
       event.type === 'compaction' && event.status === 'completed'
@@ -366,10 +405,6 @@ export function createConversationService(options: ConversationOptions) {
       compactions?: Array<{ summary?: Record<string, unknown> }>
     }).compactions?.at(-1)
     const configuredToolNames = new Set(options.tools.map(({ name }) => name))
-    const scopeMessages = events.filter((event) => (
-      event.type === 'user_message' && Number(event.sequence) < userSequence
-        && typeof event.message === 'string'
-    )).reverse().map((event) => String(event.message))
     const tools = conversationToolsForMessage(String(currentUser.message), scopeMessages)
       .filter(({ name }) => configuredToolNames.has(name))
     const input: FreeConversationInput = {
