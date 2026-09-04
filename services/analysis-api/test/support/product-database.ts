@@ -18,6 +18,7 @@ export function createTestProductDatabase() {
   const protectionTriggers = new Map<string, ProfitProtectionTriggerRecord>()
   let cash = 0
   const analyses = new Map<string, AnalysisRecord>()
+  const conversationParents = new Map<string, string | null>()
   const analysisTombstones = new Set<string>()
   const facts = new Map<string, Record<string, unknown>>()
   const analysisFacts = new Map<string, Set<string>>()
@@ -1028,6 +1029,7 @@ export function createTestProductDatabase() {
         id: input.id, symbol: '', status: 'queued', createdAt: input.createdAt, updatedAt: input.createdAt,
         snapshot: null, report: null, reportCreatedAt: null, error: null, starred: false, note: input.title ?? '',
       })
+      conversationParents.set(input.id, input.parentThreadId ?? null)
       agentSessions.set(input.sessionId, {
         id: input.sessionId, analysisId: input.id, isPrimary: true, executionId: input.executionId,
         status: 'planning', latestSequence: 1, createdAt: input.createdAt, updatedAt: input.createdAt,
@@ -1049,14 +1051,19 @@ export function createTestProductDatabase() {
       const session = [...agentSessions.values()].find(({ analysisId, isPrimary }) => analysisId === id && isPrimary)
       if (!record || !session) return null
       return {
-        id, capability: 'research', title: record.note, status: ['completed', 'partial'].includes(record.status) ? 'completed' : record.status as never,
+        id, capability: 'research', parentThreadId: conversationParents.get(id) ?? null,
+        title: record.note, status: ['completed', 'partial'].includes(record.status) ? 'completed' : record.status as never,
         createdAt: record.createdAt, updatedAt: record.updatedAt, sessionId: session.id, executionId: session.executionId,
       }
     },
     async list() {
       return (await Promise.all([...analyses.keys()].map((id) => this.get(id)))).filter(Boolean) as never
     },
-    async listChildren() { return [] as never },
+    async listChildren(parentThreadId) {
+      return (await this.list()).filter((thread) => (
+        thread.parentThreadId === parentThreadId
+      )) as never
+    },
     async claimNextQueued(updatedAt) {
       const record = [...analyses.values()].find(({ status }) => status === 'queued')
       if (!record) return null

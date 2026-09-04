@@ -82,10 +82,9 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
       const flatMode = input.agentMode === 'flat'
       const flatCandidateFactIds = new Set<string>()
       const flatRegularCandidateFactIds = new Set<string>()
-      let flatWebSearchEligible = false
-      let flatWebSearchQuery = ''
-      let flatWebSearchDecisionIndex = 0
-      let pendingFlatWebSearchDecision: Extract<ModelEvent, { type: 'trace' }>['entry'] | undefined
+      const flatWebSearchGate = createWebSearchGate(
+        input.executionId, () => Boolean(input.searchWebEvidence),
+      )
       let frozenContext: Awaited<ReturnType<AnalyzeInput['fetchFinancialContext']>> | undefined
       let newsDecisionRecorded = false
       let fundamentalDecisionRecorded = false
@@ -198,8 +197,8 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
       const followUpResearchTools = ordinaryFollowUp
         ? baseResearchTools.filter(({ name }) => name !== 'submit_analysis_report')
         : baseResearchTools
-      const currentResearchTools = () => flatMode && flatWebSearchEligible
-        ? [...followUpResearchTools, webSearchEvidenceTool]
+      const currentResearchTools = () => flatMode
+        ? flatWebSearchGate.project(followUpResearchTools, webSearchEvidenceTool)
         : followUpResearchTools
       const flatDomainTool = async (
         name: string, onStart: () => Promise<void>, signal: AbortSignal,
@@ -237,11 +236,7 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
         nextResearchTools: () => currentResearchTools(),
         nextFinalizationTools: () => ordinaryFollowUp ? [] : baseFinalizationTools,
         toolRoundLimit: flatMode ? settings.flatAgentToolRounds : undefined,
-        beforeNextProjection: flatMode ? () => {
-          const decision = pendingFlatWebSearchDecision
-          pendingFlatWebSearchDecision = undefined
-          return decision
-        } : undefined,
+        beforeNextProjection: flatMode ? () => flatWebSearchGate.consumeDecision() : undefined,
         systemPrompt: effectiveSystemPrompt,
         userPrompt: input.runtimeFollowUp
           ? [input.runtimeFollowUp.content.message, runtimeFollowUpMessage(input.runtimeFollowUp),
@@ -385,23 +380,12 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
             if (Array.isArray(facts)) for (const fact of facts as Fact[]) {
               flatCandidateFactIds.add(fact.id); flatRegularCandidateFactIds.add(fact.id)
             }
-            const eligibility = asRecord(asRecord(result.result).eligibility)
-            const reasons = Array.isArray(eligibility.reasons)
-              ? eligibility.reasons as Array<{ source: string; reason: string }> : []
-            flatWebSearchEligible = validWebSearchReasons(reasons)
-            flatWebSearchQuery = asString(eligibility.normalizedQuery) || query
-            pendingFlatWebSearchDecision = {
-              type: 'web_search_eligibility', query: flatWebSearchQuery,
-              eligible: flatWebSearchEligible, reasons,
-              operationId: 'execution:' + input.executionId
-                + ':web-search-eligibility:' + (++flatWebSearchDecisionIndex),
-            }
+            flatWebSearchGate.record(result.result, query)
             return result
           }
           if (flatMode && name === 'search_web_evidence') {
             const query = stringParam(params, 'query')
-            if (!flatWebSearchEligible || normalizeQuery(query) !== normalizeQuery(flatWebSearchQuery)
-              || !input.searchWebEvidence) {
+            if (!flatWebSearchGate.allows(query) || !input.searchWebEvidence) {
               await onStart()
               return failed(
                 'tool_not_available：search_web_evidence 尚未解锁。'
@@ -435,13 +419,7 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
             const verifiedFacts = asRecord(result.result).facts
             if (flatRegularCandidateFactIds.has(factId) && Array.isArray(verifiedFacts)
               && (verifiedFacts as Fact[]).some((fact) => fact.evidenceLevel === 'verified_news')) {
-              flatWebSearchEligible = false
-              pendingFlatWebSearchDecision = {
-                type: 'web_search_eligibility', query: flatWebSearchQuery,
-                eligible: false, reasons: [{ source: candidate.source, reason: 'qualified' }],
-                operationId: 'execution:' + input.executionId
-                  + ':web-search-eligibility:' + (++flatWebSearchDecisionIndex),
-              }
+              flatWebSearchGate.revoke(candidate.source)
             }
             return result.isError ? result : {
               ...result,
@@ -611,6 +589,14 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
       const agentSignal = AbortSignal.any([executionSignal, consumer.signal])
       const provider = createProviderRuntime(options)
       const queue = createAsyncQueue<ModelEvent>()
+      const conditionalWebSearch = input.conditionalTools?.find(({ name }) => (
+        name === 'search_web_evidence'
+      ))
+      const regularCandidateFactIds = new Set<string>()
+      const pendingWebEvidenceIds = new Set<string>()
+      const webSearchGate = createWebSearchGate(
+        input.executionId, () => Boolean(conditionalWebSearch),
+      )
       let policyFailure: Error | undefined
       queue.push(trace({
         type: 'system_prompt', content: securedSystemPrompt(input.systemPrompt),
@@ -638,10 +624,53 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
         initialTools: input.tools,
         initialStage: 'research', completionMode: 'chat',
         initialMessages: input.initialMessages,
-        nextResearchTools: () => input.tools,
+        nextResearchTools: () => webSearchGate.project(input.tools, conditionalWebSearch),
         nextFinalizationTools: () => [],
+        beforeNextProjection: () => webSearchGate.consumeDecision(),
         systemPrompt: securedSystemPrompt(input.systemPrompt), userPrompt: input.userPrompt,
-        execute: input.executeTool,
+        chatCompletionBlocker: () => pendingWebEvidenceIds.size
+          ? 'web_evidence_verification_required' : undefined,
+        execute: async (name, params, signal, onStart) => {
+          if (name === 'search_web_evidence') {
+            const query = stringParam(params, 'query')
+            if (!webSearchGate.allows(query)) {
+              await onStart()
+              return failed(
+                'tool_not_available：search_web_evidence 尚未解锁。'
+                + '解锁条件：同一规范化查询连续三个既定新闻源均不合格；'
+                + '解锁后 query 必须与该次 search_evidence 的查询一致。',
+              )
+            }
+          }
+          const result = await input.executeTool(name, params, signal, onStart)
+          if (name === 'search_web_evidence' && !result.isError) {
+            const facts = asRecord(result.result).facts
+            if (Array.isArray(facts)) for (const fact of facts as Fact[]) {
+              if (fact.evidenceLevel === 'lead') pendingWebEvidenceIds.add(fact.id)
+            }
+          }
+          if (name === 'search_evidence') {
+            const facts = asRecord(result.result).facts
+            if (Array.isArray(facts)) for (const fact of facts as Fact[]) {
+              regularCandidateFactIds.add(fact.id)
+            }
+            webSearchGate.record(result.result, stringParam(params, 'query'))
+          }
+          if (name === 'read_evidence') {
+            const factId = stringParam(params, 'evidenceId')
+            const facts = asRecord(result.result).facts
+            if (!result.isError && Array.isArray(facts)
+              && (facts as Fact[]).some((fact) => fact.evidenceLevel === 'verified_news'
+                || fact.evidenceLevel === 'official_filing')) {
+              pendingWebEvidenceIds.delete(factId)
+            }
+            if (regularCandidateFactIds.has(factId) && Array.isArray(facts)
+              && (facts as Fact[]).some((fact) => fact.evidenceLevel === 'verified_news')) {
+              webSearchGate.revoke('structured_news')
+            }
+          }
+          return result
+        },
         onPolicyFailure: (error) => { policyFailure ??= error },
       })
       const task = main.then((outcome) => {
@@ -696,10 +725,9 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
           if (reusable.toolName === 'search_news_candidates') regularCandidateFactIds.add(factId)
         }
       }
-      let webSearchEligible = false
-      let webSearchQuery = ''
-      let webSearchDecisionIndex = 0
-      let pendingWebSearchDecision: Extract<ModelEvent, { type: 'trace' }>['entry'] | undefined
+      const webSearchGate = createWebSearchGate(
+        input.executionId, () => Boolean(input.searchWebEvidence),
+      )
       const validationState = { failures: 0, exhausted: false }
       let policyFailure: Error | undefined
       const effectiveSystemPrompt = securedSystemPrompt(input.systemPrompt)
@@ -737,14 +765,10 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
         provider, queue, initialTools: newsSpecialistTools,
         systemPrompt: effectiveSystemPrompt, userPrompt: specialistUserPrompt(input),
         shouldRejectNextTurn: () => validationState.exhausted,
-        nextResearchTools: () => webSearchEligible
-          ? [...newsSpecialistTools, toolRegistry.definition('search_web_evidence')!.model]
-          : newsSpecialistTools,
-        beforeNextProjection: () => {
-          const decision = pendingWebSearchDecision
-          pendingWebSearchDecision = undefined
-          return decision
-        },
+        nextResearchTools: () => webSearchGate.project(
+          newsSpecialistTools, toolRegistry.definition('search_web_evidence')!.model,
+        ),
+        beforeNextProjection: () => webSearchGate.consumeDecision(),
         execute: async (name, params, signal, onStart) => {
           if (name === unavailableToolName) { await onStart(); return failed('tool_not_available') }
           if (name === 'search_news_candidates') {
@@ -756,22 +780,12 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
             if (Array.isArray(facts)) for (const fact of facts as Fact[]) {
               candidateFactIds.add(fact.id); regularCandidateFactIds.add(fact.id)
             }
-            const eligibility = asRecord(asRecord(result.result).eligibility)
-            const reasons = Array.isArray(eligibility.reasons)
-              ? eligibility.reasons as Array<{ source: string; reason: string }> : []
-            webSearchEligible = validWebSearchReasons(reasons)
-            webSearchQuery = asString(eligibility.normalizedQuery) || query
-            pendingWebSearchDecision = {
-              type: 'web_search_eligibility', query: webSearchQuery,
-              eligible: webSearchEligible, reasons,
-              operationId: `execution:${input.executionId}:web-search-eligibility:${++webSearchDecisionIndex}`,
-            }
+            webSearchGate.record(result.result, query)
             return result
           }
           if (name === 'search_web_evidence') {
             const query = stringParam(params, 'query')
-            if (!webSearchEligible || normalizeQuery(query) !== normalizeQuery(webSearchQuery)
-              || !input.searchWebEvidence) {
+            if (!webSearchGate.allows(query) || !input.searchWebEvidence) {
               await onStart()
               return failed(
                 'tool_not_available：search_web_evidence 尚未解锁。'
@@ -805,12 +819,7 @@ export function createProjectedPiModel(options: ModelOptions = {}) {
             const verifiedFacts = asRecord(result.result).facts
             if (regularCandidateFactIds.has(factId) && Array.isArray(verifiedFacts)
               && (verifiedFacts as Fact[]).some((fact) => fact.evidenceLevel === 'verified_news')) {
-              webSearchEligible = false
-              pendingWebSearchDecision = {
-                type: 'web_search_eligibility', query: webSearchQuery,
-                eligible: false, reasons: [{ source: candidate.source, reason: 'qualified' }],
-                operationId: `execution:${input.executionId}:web-search-eligibility:${++webSearchDecisionIndex}`,
-              }
+              webSearchGate.revoke(candidate.source)
             }
             return result.isError ? result : {
               ...result,
@@ -1038,6 +1047,7 @@ async function runProjectedAgent(config: {
   invocationId?: string
   toolRoundLimit?: number
   shouldRejectNextTurn?: () => boolean
+  chatCompletionBlocker?: () => string | undefined
   nextResearchTools?: () => Tool[]
   nextFinalizationTools?: () => Tool[]
   beforeNextProjection?: () => Extract<ModelEvent, { type: 'trace' }>['entry'] | undefined
@@ -1065,6 +1075,7 @@ async function runProjectedAgent(config: {
   let finalText = ''
   let finalUsage: unknown
   let finalStopReason: string | undefined
+  let chatCompletionBlocked = false
   let requestPolicyFailure: Error | undefined
   let toolAuditFailure: Error | undefined
   let lastAssistantHadCalls = false
@@ -1404,7 +1415,10 @@ async function runProjectedAgent(config: {
     afterToolCall: async ({ result, isError }) => ({
       isError: Boolean((result.details as { audit?: ToolAudit } | undefined)?.audit?.isError ?? isError),
     }),
-    shouldStopAfterTurn: async () => Boolean(completedReport || (completionMode === 'chat' && finalText)),
+    shouldStopAfterTurn: async () => Boolean(
+      completedReport || (completionMode === 'chat'
+        && (finalText || chatCompletionBlocked)),
+    ),
     prepareNextTurn: async () => {
       if (completedReport || finalText) return undefined
       const hasToolBatch = Boolean(currentBatch)
@@ -1480,10 +1494,12 @@ async function runProjectedAgent(config: {
         type: 'model_event', event: compactAdapterEvent(item),
         operationId: `execution:${input.executionId}:${roleScope}:model:${turnIndex}:event:${++modelEventIndex}`,
       }))
-      if (item.type === 'text_delta') config.queue.push({
-        type: 'text_delta', text: item.delta,
-        operationId: `execution:${input.executionId}:${roleScope}:model:${turnIndex}:text:${++textDeltaIndex}`,
-      })
+      if (item.type === 'text_delta' && !config.chatCompletionBlocker?.()) {
+        config.queue.push({
+          type: 'text_delta', text: item.delta,
+          operationId: `execution:${input.executionId}:${roleScope}:model:${turnIndex}:text:${++textDeltaIndex}`,
+        })
+      }
     }
     if (event.type === 'message_end' && event.message.role === 'assistant') {
       const requestStatus = event.message.stopReason === 'aborted'
@@ -1503,6 +1519,13 @@ async function runProjectedAgent(config: {
       if (!calls.length) {
         if (completionMode === 'chat' || ('runtimeFollowUp' in input
           && input.runtimeFollowUp && input.runtimeFollowUp.content.updateReport !== true)) {
+          const blocker = config.chatCompletionBlocker?.()
+          if (blocker) {
+            requestPolicyFailure ??= new Error(blocker)
+            config.onPolicyFailure(requestPolicyFailure)
+            chatCompletionBlocked = true
+            return
+          }
           finalText = event.message.content.flatMap((content) => (
             content.type === 'text' ? [content.text] : []
           )).join('')
@@ -1966,6 +1989,46 @@ function validWebSearchReasons(reasons: Array<{ source: string; reason: string }
   return reasons.length === 3
     && new Set(reasons.map(({ source }) => source)).size === 3
     && reasons.every(({ source, reason }) => Boolean(source) && allowed.includes(reason))
+}
+function createWebSearchGate(
+  executionId: string, available: () => boolean,
+) {
+  let eligible = false
+  let query = ''
+  let decisionIndex = 0
+  let pendingDecision: Extract<ModelEvent, { type: 'trace' }>['entry'] | undefined
+  return {
+    project(base: Tool[], webSearchTool: Tool | undefined) {
+      return eligible && available() && webSearchTool ? [...base, webSearchTool] : base
+    },
+    record(result: unknown, fallbackQuery: string) {
+      const eligibility = asRecord(asRecord(result).eligibility)
+      const reasons = Array.isArray(eligibility.reasons)
+        ? eligibility.reasons as Array<{ source: string; reason: string }> : []
+      eligible = available() && validWebSearchReasons(reasons)
+      query = asString(eligibility.normalizedQuery) || fallbackQuery
+      pendingDecision = {
+        type: 'web_search_eligibility', query, eligible, reasons,
+        operationId: `execution:${executionId}:web-search-eligibility:${++decisionIndex}`,
+      }
+    },
+    allows(candidateQuery: string) {
+      return eligible && available() && normalizeQuery(candidateQuery) === normalizeQuery(query)
+    },
+    revoke(source: string) {
+      eligible = false
+      pendingDecision = {
+        type: 'web_search_eligibility', query, eligible: false,
+        reasons: [{ source, reason: 'qualified' }],
+        operationId: `execution:${executionId}:web-search-eligibility:${++decisionIndex}`,
+      }
+    },
+    consumeDecision() {
+      const decision = pendingDecision
+      pendingDecision = undefined
+      return decision
+    },
+  }
 }
 function acquireToolSlot(
   input: AnalyzeInput, gate: ReturnType<typeof createConcurrencyGate>, signal: AbortSignal,

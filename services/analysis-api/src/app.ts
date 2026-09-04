@@ -20,7 +20,7 @@ import { createPortfolio, isValidSymbol, normalizeSymbol } from './portfolio.js'
 import { createProfitProtection } from './profit-protection.js'
 import { projectResearchExport, projectResearchView } from './research-export.js'
 import { createResearchToolExecutor } from './research-capability.js'
-import { conversationResearchTools } from './tools.js'
+import { conversationConditionalTools, conversationResearchTools } from './tools.js'
 import { createTrackingService } from './tracking.js'
 
 type AppDependencies = {
@@ -143,20 +143,25 @@ export function buildApp(dependencies: AppDependencies) {
         settingsRepository: dependencies.runtimeSettingsRepository,
         toolProjectionRepository: dependencies.toolProjectionRepository,
         tools: conversationResearchTools,
+        conditionalTools: dependencies.searchWebEvidence ? conversationConditionalTools : [],
         model: { analyzeConversation: dependencies.model.analyzeConversation },
-        createToolExecutor: ({ threadId, knownFacts }) => createResearchToolExecutor({
+        createToolExecutor: ({ threadId, knownFacts, symbols }) => createResearchToolExecutor({
           fetchFinancialContext: dependencies.fetchFinancialContext,
           searchNewsCandidates: dependencies.searchNewsCandidates,
           searchWebEvidence: dependencies.searchWebEvidence,
           readNewsDocument: dependencies.readNewsDocument,
           listCompanyEvents: dependencies.listCompanyEvents,
+          listOfficialCompanyEvents: dependencies.listOfficialCompanyEvents,
           getFinancialOverview: dependencies.getFinancialOverview,
           getFinancialMetricSeries: dependencies.getFinancialMetricSeries,
           getValuationEvidence: dependencies.getValuationEvidence,
           getTechnicalEvidence: dependencies.getTechnicalEvidence,
           getPriceWindow: dependencies.getPriceWindow,
           readFilingDocument: dependencies.readFilingDocument,
-        })({ threadId, knownFacts }),
+          listPortfolioSymbols: async () => (await portfolio.list()).map(({ symbol }) => symbol),
+          fetchMarketPrices: dependencies.fetchMarketPrices,
+          getPortfolioContext: (symbol, marketPrices) => portfolio.context(symbol, marketPrices),
+        }, { symbols })({ threadId, knownFacts }),
         runtimeMinuteMs: dependencies.runtimeMinuteMs,
         activeNow: dependencies.activeNow,
         activeTimeoutSignal: dependencies.activeTimeoutSignal,
@@ -561,7 +566,9 @@ export function buildApp(dependencies: AppDependencies) {
       capability: 'research',
       tools: conversationResearchTools.map(({ name, description, parameters }) => ({
         name, description, parameters,
-      })),
+      })).concat((dependencies.searchWebEvidence ? conversationConditionalTools : []).map(({
+        name, description, parameters,
+      }) => ({ name, description, parameters, availability: 'conditional' }))),
     }
   })
   app.get('/api/conversations', async (_request, reply) => {

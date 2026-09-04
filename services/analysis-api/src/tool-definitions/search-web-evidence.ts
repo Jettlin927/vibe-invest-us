@@ -8,7 +8,11 @@ export const searchWebEvidenceDefinition: RegisteredToolDefinition = {
     parameters: Type.Object({ query: Type.String({ minLength: 1, maxLength: 500 }) }),
   },
   resultSchema: Type.Object({ facts: Type.Array(Type.Unknown()) }),
-  allowedRoles: ['news'], allowedStages: ['research'], sideEffect: 'read_only',
+  allowedRoles: ['main', 'news'], allowedStages: ['research'], sideEffect: 'read_only',
   externalNetwork: 'financial_data', hostAccess: 'none', resultRetention: 'research_record',
   modelProjection: 'bounded_summary', executionMode: 'parallel', countsAsToolRound: true,
+  handlerFactory: ({ researchCapability }) => (params, signal, onStart) => (
+    researchCapability('search_web_evidence', params, signal, onStart)
+  ),
+  surfaces: ['analysis', 'conversation'], conversationAvailability: 'conditional',
 }

@@ -11,4 +11,8 @@ export const createResearchReportDefinition: RegisteredToolDefinition = {
   allowedRoles: ['main'], allowedStages: ['research'], sideEffect: 'creates_report',
   externalNetwork: 'none', hostAccess: 'none', resultRetention: 'report_version',
   modelProjection: 'acknowledgement', executionMode: 'sequential', countsAsToolRound: true,
+  surfaces: ['conversation'],
+  handlerFactory: ({ researchCapability }) => (params, signal, onStart) => (
+    researchCapability('create_research_report', params, signal, onStart)
+  ),
 }

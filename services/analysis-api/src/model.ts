@@ -443,6 +443,7 @@ export type FreeConversationInput = {
   acquireToolSlot?: (signal: AbortSignal) => Promise<() => void>
   toolRuntime: ToolRuntime
   tools: Tool[]
+  conditionalTools?: Tool[]
   executeTool: ConversationToolExecutor
 }
 

@@ -1,5 +1,6 @@
 import AjvModule from 'ajv'
 import addFormatsModule from 'ajv-formats'
+import { selectFreeResearchToolNames } from './free-research-tool-pack.js'
 
 import { fetchFinancialContextDefinition } from './tool-definitions/fetch-financial-context.js'
 import { getFinancialMetricSeriesDefinition } from './tool-definitions/get-financial-metric-series.js'
@@ -19,7 +20,17 @@ import { submitSpecialistReportDefinition } from './tool-definitions/submit-spec
 import { submitAnalysisReportDefinition } from './tool-definitions/submit-analysis-report.js'
 import { createResearchReportDefinition } from './tool-definitions/create-research-report.js'
 import {
-  readAgentResultDefinition, spawnAgentDefinition, stopAgentDefinition, waitAgentDefinition,
+  readEvidenceDefinition, searchEvidenceDefinition,
+} from './tool-definitions/free-research-evidence.js'
+import {
+  getCompanyDossierDefinition, getMarketStructureDefinition,
+} from './tool-definitions/free-research-company.js'
+import {
+  compareSecuritiesDefinition, getPortfolioExposureDefinition, getResearchContextDefinition,
+} from './tool-definitions/free-research-context.js'
+import {
+  collectResearchDefinition, delegateResearchDefinition, readAgentResultDefinition,
+  spawnAgentDefinition, stopAgentDefinition, waitAgentDefinition,
 } from './tool-definitions/subagents.js'
 import type {
   RegisteredToolDefinition, ToolRole, ToolStage,
@@ -49,6 +60,15 @@ export const registeredToolDefinitions = [
   readNewsDocumentDefinition,
   listCompanyEventsDefinition,
   submitSpecialistReportDefinition,
+  searchEvidenceDefinition,
+  readEvidenceDefinition,
+  getCompanyDossierDefinition,
+  getMarketStructureDefinition,
+  getResearchContextDefinition,
+  compareSecuritiesDefinition,
+  getPortfolioExposureDefinition,
+  delegateResearchDefinition,
+  collectResearchDefinition,
 ]
 
 export function createToolRegistry(definitions: RegisteredToolDefinition[]) {
@@ -77,6 +97,26 @@ export function createToolRegistry(definitions: RegisteredToolDefinition[]) {
     }
     if (!oneOf(definition.executionMode, ['sequential', 'parallel'])) invalid(name, 'execution_mode')
     if (typeof definition.countsAsToolRound !== 'boolean') invalid(name, 'round_behavior')
+    if (definition.surfaces && (!definition.surfaces.length
+      || !definition.surfaces.every((surface) => oneOf(surface, ['analysis', 'conversation'])))) {
+      invalid(name, 'surfaces')
+    }
+    if (definition.surfaces?.includes('conversation')
+      && typeof definition.handlerFactory !== 'function') {
+      invalid(name, 'handler_factory')
+    }
+    if (definition.handlerFactory) {
+      const probe = async () => ({ result: {}, isError: false })
+      try {
+        if (typeof definition.handlerFactory({
+          researchCapability: probe, conversationRuntime: probe,
+        }) !== 'function') invalid(name, 'handler_factory')
+      } catch { invalid(name, 'handler_factory') }
+    }
+    if (definition.conversationAvailability
+      && !oneOf(definition.conversationAvailability, ['direct', 'conditional'])) {
+      invalid(name, 'conversation_availability')
+    }
     if (!validReportPolicy(definition)) invalid(name, 'report_policy')
     return Object.freeze({ ...definition })
   })
@@ -85,22 +125,28 @@ export function createToolRegistry(definitions: RegisteredToolDefinition[]) {
     project: ({ role, stage }: { role: ToolRole; stage: ToolStage }) => validated
       .filter((definition) => definition.allowedRoles.includes(role)
         && definition.allowedStages.includes(stage)
+        && (definition.surfaces ?? ['analysis']).includes('analysis')
+        && !(definition.conversationAvailability === 'conditional' && role === 'main')
         && !subagentTool(definition.model.name)
         && definition.model.name !== 'create_research_report')
       .map((definition) => definition.model),
     projectConversation: (options?: { userMessage: string; scopeMessages?: string[] }) => {
       const requested = options
-        ? new Set(conversationToolNames(options.userMessage, options.scopeMessages)) : null
+        ? new Set(selectFreeResearchToolNames(options.userMessage, options.scopeMessages)) : null
       return validated
         .filter((definition) => definition.allowedStages.includes('research')
+          && definition.surfaces?.includes('conversation') === true
+          && definition.conversationAvailability !== 'conditional'
           && ['read_only', 'creates_agent', 'creates_report', 'controls_agent'].includes(definition.sideEffect)
-          && ![
-            'search_web_evidence', 'run_news_analysis', 'run_fundamental_analysis',
-            'run_technical_analysis', 'submit_analysis_report', 'submit_specialist_report',
-          ].includes(definition.model.name)
           && (requested === null || requested.has(definition.model.name)))
         .map((definition) => definition.model)
     },
+    projectConversationConditional: () => validated
+      .filter((definition) => definition.allowedRoles.includes('main')
+        && definition.allowedStages.includes('research')
+        && definition.surfaces?.includes('conversation') === true
+        && definition.conversationAvailability === 'conditional')
+      .map((definition) => definition.model),
     definition: (name: string) => validated.find((definition) => definition.model.name === name),
     projectResult(name: string, result: Record<string, unknown>) {
       const projection = validated.find((definition) => definition.model.name === name)?.modelProjection
@@ -110,6 +156,11 @@ export function createToolRegistry(definitions: RegisteredToolDefinition[]) {
           return projectReportSubmission(result)
         }
         return { submitted: result.submitted === true, ...(result.error ? { error: result.error } : {}) }
+      }
+      if (['get_research_context', 'get_company_dossier', 'get_market_structure',
+        'search_evidence', 'search_web_evidence', 'read_evidence', 'compare_securities',
+        'get_portfolio_exposure'].includes(name)) {
+        return projectPublicToolResult(name, result)
       }
       if (result.modelProjection && typeof result.modelProjection === 'object') {
         return result.modelProjection as Record<string, unknown>
@@ -123,78 +174,6 @@ export function createToolRegistry(definitions: RegisteredToolDefinition[]) {
   })
 }
 
-function conversationToolNames(userMessage: string, scopeMessages: string[] = []): string[] {
-  const requested: string[] = []
-  if (/(?:技术面|技术分析|K线|k线|蜡烛图|均线|成交量|量价|支撑|阻力|趋势线|走势|形态|突破|跌破|动量|回撤|波动率|MACD|RSI|KDJ|布林|technical|candlestick|price chart)/i.test(userMessage)) {
-    requested.push('get_technical_evidence', 'get_price_window')
-  }
-  if (/(?:基本面|财报|财务|营收|收入|利润|毛利|净利|现金流|资产负债|估值|市盈率|市净率|\bPE\b|\bPB\b|EPS|EBITDA|DCF|10-K|10-Q|8-K|filing|earnings|valuation|fundamental)/i.test(userMessage)) {
-    requested.push(
-      'get_financial_overview', 'get_financial_metric_series',
-      'get_valuation_evidence', 'read_filing_document',
-    )
-  }
-  if (/(?:消息面|新闻|消息|公司事件|事件|公告|舆情|催化|公司动态|headline|news|event|announcement)/i.test(userMessage)) {
-    requested.push('search_news_candidates', 'read_news_document', 'list_company_events')
-  }
-  const reportDenied = /(?:不要|不用|无需|别|不需要|暂不|先不).{0,12}(?:报告|研报|report)/i
-    .test(userMessage)
-  const reportExplained = /(?:(?:解释|说明|介绍|什么是|是什么意思|如何理解|怎么理解).{0,16}(?:报告|研报|report)|(?:报告|研报|report).{0,16}(?:是什么|是什么意思|怎么理解))/i
-    .test(userMessage)
-  const reportRequested = /(?:(?:生成|创建|写|撰写|整理|保存|输出|形成|制作|更新|给我|做).{0,12}(?:报告|研报)|(?:generate|create|write|save|update).{0,16}report)/i
-    .test(userMessage)
-  if (reportRequested && !reportDenied && !reportExplained) requested.push('create_research_report')
-  const agentDenied = /(?:不要|不用|无需|别|不需要|暂不|先不).{0,12}(?:子\s*Agent|子代理|sub-?agent)/i
-    .test(userMessage)
-  const agentRequested = /(?:派|让|请|创建|启动|调用|委派|安排|等待|读取|查看|停止|终止|取消).{0,12}(?:子\s*Agent|子代理|sub-?agent)/i
-    .test(userMessage)
-  if (agentRequested && !agentDenied) {
-    requested.push('spawn_agent', 'wait_agent', 'read_agent_result', 'stop_agent')
-  }
-  const nonSymbols = new Set([
-    'AI', 'ADR', 'CEO', 'CPI', 'DCF', 'EBITDA', 'EPS', 'ETF', 'FOMC', 'GDP',
-    'KDJ', 'MA', 'MACD', 'PB', 'PCE', 'PE', 'RSI', 'SEC', 'TTM', 'USD',
-    'API', 'CLI', 'CSS', 'HTML', 'HTTP', 'HTTPS', 'JSON', 'MCP', 'SDK', 'SQL', 'SSE', 'URL',
-  ])
-  const hasSymbol = [userMessage, ...scopeMessages].some((message) => (
-    tickerTokens(message, nonSymbols).length > 0
-  ))
-  const nonDataTools = new Set([
-    'create_research_report', 'spawn_agent', 'wait_agent', 'read_agent_result', 'stop_agent',
-  ])
-  const hasDataTool = requested.some((name) => !nonDataTools.has(name))
-  if (hasSymbol && !hasDataTool) {
-    requested.push('fetch_financial_context')
-  }
-  return requested
-}
-
-function tickerTokens(message: string, nonSymbols: Set<string>) {
-  const tokens = new Set<string>()
-  const hasTickerContext = /(?:股票|标的|代码|ticker|分析|研究|最近|怎么样|走势|形态|K线|k线|财报|估值|新闻|公司)/i
-    .test(message)
-  const cjk = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u
-  for (const match of message.matchAll(/\b[A-Z]{1,5}\b/g)) {
-    const token = match[0]
-    const index = match.index
-    const before = Array.from(message.slice(0, index)).at(-1) ?? ''
-    const after = Array.from(message.slice(index + token.length))[0] ?? ''
-    if (!hasTickerContext && (cjk.test(before) || cjk.test(after))) continue
-    if (!nonSymbols.has(token)) tokens.add(token)
-  }
-  for (const match of message.matchAll(/\$([A-Za-z]{1,5})\b/g)) {
-    const token = match[1]!.toUpperCase()
-    if (!nonSymbols.has(token)) tokens.add(token)
-  }
-  if (hasTickerContext) {
-    for (const token of message.match(/\b[a-z]{2,5}\b/g) ?? []) {
-      const normalized = token.toUpperCase()
-      if (!nonSymbols.has(normalized)) tokens.add(normalized)
-    }
-  }
-  return [...tokens]
-}
-
 const boundedResultKeys = [
   'facts', 'gaps', 'summary', 'analysis', 'error', 'source', 'sources',
   'launched', 'status', 'sessionId', 'executionId', 'reportId', 'reportVersion',
@@ -206,6 +185,7 @@ const boundedResultKeys = [
   'currentMultiples', 'historicalRanges', 'methods',
   'actualStart', 'actualEnd', 'totalBarCount', 'sampling', 'structures',
   'indicators', 'volatility', 'drawdown', 'volumePrice', 'keyLevels', 'conflicts',
+  'comparisons', 'position', 'portfolio',
 ]
 
 function selectResult(result: Record<string, unknown>, allowed: string[]) {
@@ -213,19 +193,45 @@ function selectResult(result: Record<string, unknown>, allowed: string[]) {
 }
 
 function subagentTool(name: string) {
-  return ['spawn_agent', 'wait_agent', 'read_agent_result', 'stop_agent'].includes(name)
+  return ['spawn_agent', 'wait_agent', 'read_agent_result', 'stop_agent',
+    'delegate_research', 'collect_research'].includes(name)
 }
 
 function projectPublicToolResult(name: string, result: Record<string, unknown>) {
   const common = projectCommonResult(result)
-  if (['spawn_agent', 'wait_agent', 'read_agent_result', 'stop_agent'].includes(name)) return {
+  if (['spawn_agent', 'wait_agent', 'read_agent_result', 'stop_agent',
+    'delegate_research', 'collect_research'].includes(name)) return {
     ...selectTyped(result, ['agentId', 'runId', 'status', 'summary', 'stopped'], 'string'),
     ...selectTyped(result, ['stopped'], 'boolean'),
+    ...optionalArray('factIds', result.factIds, stringValue),
+    ...optionalArray('artifactRefs', result.artifactRefs, (entry) => selectTyped(
+      record(entry), ['kind', 'operationId'], 'string',
+    )),
   }
-  if (['fetch_financial_context', 'search_news_candidates', 'search_web_evidence',
-    'read_news_document', 'list_company_events'].includes(name)) return common
+  if (['fetch_financial_context', 'get_research_context', 'search_news_candidates', 'search_web_evidence',
+    'read_news_document', 'list_company_events', 'search_evidence', 'read_evidence'].includes(name)) {
+    return { ...common, ...(name === 'read_evidence' ? projectPagination(result) : {}) }
+  }
+  if (name === 'compare_securities') return {
+    ...common, ...optionalArray('comparisons', result.comparisons, projectSecurityComparison),
+  }
+  if (name === 'get_portfolio_exposure') return {
+    ...common,
+    ...(result.position === null
+      ? { position: null } : optionalObject('position', projectPortfolioPosition(result.position))),
+    ...optionalObject('portfolio', projectPortfolioSummary(result.portfolio)),
+  }
   if (name === 'get_financial_overview') return {
     ...common, ...optionalObject('overview', projectFinancialOverview(result.overview)),
+  }
+  if (name === 'get_company_dossier') return {
+    ...common, ...optionalObject('overview', projectFinancialOverview(result.overview)),
+    ...optionalArray('authorizedComparables', result.authorizedComparables, stringValue),
+    ...optionalArray('comparables', result.comparables, projectComparable),
+    ...optionalArray('excludedComparables', result.excludedComparables, projectExcludedComparable),
+    ...optionalObject('currentMultiples', projectNumericRecord(result.currentMultiples)),
+    ...optionalObject('historicalRanges', projectNumericRangeRecord(result.historicalRanges)),
+    ...optionalObject('methods', projectValuationMethods(result.methods)),
   }
   if (name === 'get_financial_metric_series') return { ...common, ...projectPagination(result) }
   if (name === 'read_filing_document') return {
@@ -242,20 +248,8 @@ function projectPublicToolResult(name: string, result: Record<string, unknown>) 
     ...optionalObject('historicalRanges', projectNumericRangeRecord(result.historicalRanges)),
     ...optionalObject('methods', projectValuationMethods(result.methods)),
   }
-  if (name === 'get_technical_evidence') return {
-    ...common, ...selectTyped(result, ['symbol', 'actualStart', 'actualEnd'], 'string'),
-    ...selectTyped(result, ['totalBarCount'], 'number'),
-    ...optionalObject('structures', projectTechnicalStructures(result.structures)),
-    ...optionalObject('indicators', projectIndicators(result.indicators)),
-    ...optionalObject('volatility', selectTyped(record(result.volatility), ['annualized'], 'number')),
-    ...optionalObject('drawdown', selectTyped(record(result.drawdown), ['maximum'], 'number')),
-    ...optionalObject('volumePrice', selectTyped(
-      record(result.volumePrice), ['volumeRatio5To20'], 'number',
-    )),
-    ...optionalObject('keyLevels', selectTyped(
-      record(result.keyLevels), ['support', 'resistance'], 'number',
-    )),
-    ...optionalArray('conflicts', result.conflicts, stringValue),
+  if (name === 'get_technical_evidence' || name === 'get_market_structure') return {
+    ...common, ...projectMarketStructure(result),
   }
   if (name === 'get_price_window') return {
     ...common, ...projectPagination(result),
@@ -269,6 +263,39 @@ function projectPublicToolResult(name: string, result: Record<string, unknown>) 
     return projectReportSubmission(result)
   }
   return {}
+}
+
+function projectMarketStructure(result: Record<string, unknown>) {
+  return {
+    ...selectTyped(result, ['symbol', 'actualStart', 'actualEnd', 'sampling'], 'string'),
+    ...selectTyped(result, ['totalBarCount'], 'number'),
+    ...optionalObject('structures', projectTechnicalStructures(result.structures)),
+    ...optionalObject('indicators', projectIndicators(result.indicators)),
+    ...optionalObject('volatility', selectTyped(record(result.volatility), ['annualized'], 'number')),
+    ...optionalObject('drawdown', selectTyped(record(result.drawdown), ['maximum'], 'number')),
+    ...optionalObject('volumePrice', selectTyped(
+      record(result.volumePrice), ['volumeRatio5To20'], 'number',
+    )),
+    ...optionalObject('keyLevels', selectTyped(
+      record(result.keyLevels), ['support', 'resistance'], 'number',
+    )),
+    ...optionalArray('conflicts', result.conflicts, stringValue),
+  }
+}
+
+function projectSecurityComparison(value: unknown) {
+  const item = record(value)
+  return {
+    ...selectTyped(item, ['symbol'], 'string'),
+    ...optionalObject('overview', projectFinancialOverview(item.overview)),
+    ...optionalArray('authorizedComparables', item.authorizedComparables, stringValue),
+    ...optionalArray('comparables', item.comparables, projectComparable),
+    ...optionalArray('excludedComparables', item.excludedComparables, projectExcludedComparable),
+    ...optionalObject('currentMultiples', projectNumericRecord(item.currentMultiples)),
+    ...optionalObject('historicalRanges', projectNumericRangeRecord(item.historicalRanges)),
+    ...optionalObject('methods', projectValuationMethods(item.methods)),
+    ...optionalObject('marketStructure', projectMarketStructure(record(item.marketStructure))),
+  }
 }
 
 function projectCommonResult(result: Record<string, unknown>) {
@@ -288,6 +315,24 @@ function projectFinancialOverview(value: unknown) {
       record(entry), ['flag_type', 'severity', 'period'], 'string',
     )),
   }
+}
+
+function projectPortfolioPosition(value: unknown) {
+  const position = record(value)
+  return {
+    ...selectTyped(position, ['symbol'], 'string'),
+    ...selectTyped(position, [
+      'quantity', 'averageCost', 'marketPrice', 'marketValue',
+      'unrealizedProfitLoss', 'portfolioWeight',
+    ], 'number'),
+  }
+}
+
+function projectPortfolioSummary(value: unknown) {
+  return selectTyped(record(value), [
+    'totalMarketValue', 'largestPositionWeight', 'topThreeWeight',
+    'positionCount', 'pricedPositionCount', 'unpricedPositionCount',
+  ], 'number')
 }
 
 function projectPagination(result: Record<string, unknown>) {
