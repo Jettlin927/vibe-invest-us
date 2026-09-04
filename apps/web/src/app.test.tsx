@@ -108,6 +108,43 @@ test('普通 HTTP 环境仍能发送研究对话消息', async () => {
   })
 })
 
+test('研究对话把主 Agent 回答渲染为 Markdown 结构', async () => {
+  setupDom()
+  Reflect.deleteProperty(globalThis, 'EventSource')
+  const thread = {
+    id: 'thread-markdown', capability: 'research', parentThreadId: null, title: 'Markdown 研究',
+    status: 'completed', createdAt: '2026-09-04T00:00:00Z', updatedAt: '2026-09-04T00:00:00Z',
+    sessionId: 'session-markdown', executionId: 'execution-markdown',
+  }
+  globalThis.fetch = async (input) => {
+    const url = String(input)
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok', engine: 'postgresql', schemaVersion: 28 }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/settings') return Response.json(settingsResponse())
+    if (url === '/api/portfolio/stored' || url === '/api/portfolio') return Response.json(portfolioResponse([]))
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+    if (url === '/api/portfolio/events?limit=50') return Response.json({ events: [] })
+    if (url === '/api/research') return Response.json({ records: [] })
+    if (url === '/api/conversations') return Response.json({ threads: [thread] })
+    if (url === '/api/conversations/thread-markdown') return Response.json({
+      thread,
+      lifecycle: { events: [{
+        sequence: 1, type: 'chat_completed',
+        text: '## 给你的实操含义\n\n- **别去猜底**：用关键位判断。',
+      }] },
+    })
+    throw new Error(`unexpected_fetch:${url}`)
+  }
+
+  const view = render(React.createElement(App))
+  const user = userEvent.setup({ document: window.document })
+  await user.click(await view.findByRole('button', { name: '研究对话' }))
+  const log = await view.findByRole('log', { name: '研究对话内容' })
+  assert.equal(log.querySelector('h2')?.textContent, '给你的实操含义')
+  assert.equal(log.querySelector('ul li strong')?.textContent, '别去猜底')
+  assert.equal(log.textContent?.includes('##'), false)
+  assert.equal(log.textContent?.includes('**'), false)
+})
+
 test('研究消息提交等待响应时立即回显并禁止重复点击', async () => {
   setupDom()
   Reflect.deleteProperty(globalThis, 'EventSource')

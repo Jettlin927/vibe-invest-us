@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
+import ReactMarkdown from 'react-markdown'
 
 import {
   aggregateModelTokenUsage, isRuntimeSettingsResponse, isSystemHealth,
@@ -882,7 +883,7 @@ function ConversationPage({ threads, thread, events, busy, onOpen, onNew, onCrea
       </header>
       <div ref={messageListRef} className="conversation-messages" role="log" aria-live="polite" aria-label="研究对话内容">
         {messages.length === 0 && <div className="conversation-empty"><strong>你想弄清楚什么？</strong><span>可以直接问标的、财报、估值、K线结构或组合风险。</span></div>}
-        {messages.map((message) => <article key={message.key} className={message.role}><strong>{message.role === 'user' ? '你' : 'AI'}</strong><p>{message.text}</p></article>)}
+        {messages.map((message) => <article key={message.key} className={message.role}><strong>{message.role === 'user' ? '你' : 'AI'}</strong>{message.role === 'assistant' ? <AssistantMarkdown text={message.text} /> : <p>{message.text}</p>}</article>)}
         {events.filter((event) => event.type === 'tool_call').map((event) => <details key={`tool-${event.sequence}`} className="conversation-tool"><summary>调用工具：{String(event.name ?? 'tool')}</summary><small>工具结果和参数按当前权限投影。</small></details>)}
       </div>
       <div className="conversation-input-dock">
@@ -891,6 +892,10 @@ function ConversationPage({ threads, thread, events, busy, onOpen, onNew, onCrea
       </div>
     </section>
   </div>
+}
+
+function AssistantMarkdown({ text }: { text: string }) {
+  return <div className="markdown-body"><ReactMarkdown skipHtml>{text}</ReactMarkdown></div>
 }
 
 function ConversationComposer({ mode, busy, onSubmit }: {
@@ -1603,9 +1608,9 @@ function ResearchReport({ record, onUpdate, onDelete, deleting, onResume, onFoll
     {!!report?.limitations?.length && <section className="limitations"><p className="micro">数据与分析限制</p><BulletList values={report.limitations} /></section>}
     {!!conversation.length && <section className="research-conversation" aria-label="与主 Agent 的对话">
       <p className="micro">继续对话</p>
-      {conversation.map((message) => <p key={message.key} className={message.role}>
-        <strong>{message.role === 'user' ? '你' : '主 Agent'}</strong>{message.text}
-      </p>)}
+      {conversation.map((message) => <article key={message.key} className={message.role}>
+        <strong>{message.role === 'user' ? '你' : '主 Agent'}</strong>{message.role === 'assistant' ? <AssistantMarkdown text={message.text} /> : <p>{message.text}</p>}
+      </article>)}
     </section>}
     <form className="research-follow-up" onSubmit={(event) => void onFollowUp(event)}>
       <label>继续与主 Agent 对话<textarea name="message" aria-label="追问主 Agent" required /></label>
