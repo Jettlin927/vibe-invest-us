@@ -20,7 +20,9 @@ export const searchEvidenceDefinition: RegisteredToolDefinition = {
   externalNetwork: 'financial_data', hostAccess: 'none', resultRetention: 'research_record',
   modelProjection: 'bounded_summary', executionMode: 'parallel', countsAsToolRound: true,
   surfaces: ['conversation'],
-  handlerOwner: 'research_capability',
+  handlerFactory: ({ researchCapability }) => (params, signal, onStart) => (
+    researchCapability('search_evidence', params, signal, onStart)
+  ),
 }
 
 export const readEvidenceDefinition: RegisteredToolDefinition = {
@@ -45,5 +47,7 @@ export const readEvidenceDefinition: RegisteredToolDefinition = {
   externalNetwork: 'financial_data', hostAccess: 'none', resultRetention: 'research_record',
   modelProjection: 'bounded_summary', executionMode: 'parallel', countsAsToolRound: true,
   surfaces: ['conversation'],
-  handlerOwner: 'research_capability',
+  handlerFactory: ({ researchCapability }) => (params, signal, onStart) => (
+    researchCapability('read_evidence', params, signal, onStart)
+  ),
 }

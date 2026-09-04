@@ -8,7 +8,6 @@ const readOnlyMetadata: Omit<RegisteredToolDefinition, 'model' | 'resultSchema'>
   modelProjection: 'bounded_summary', executionMode: 'parallel',
   countsAsToolRound: true,
   surfaces: ['conversation'],
-  handlerOwner: 'research_capability',
 }
 
 export const getResearchContextDefinition: RegisteredToolDefinition = {
@@ -19,6 +18,9 @@ export const getResearchContextDefinition: RegisteredToolDefinition = {
   },
   resultSchema: Type.Object({ facts: Type.Array(Type.Unknown()) }),
   ...readOnlyMetadata,
+  handlerFactory: ({ researchCapability }) => (params, signal, onStart) => (
+    researchCapability('get_research_context', params, signal, onStart)
+  ),
 }
 
 export const compareSecuritiesDefinition: RegisteredToolDefinition = {
@@ -34,6 +36,9 @@ export const compareSecuritiesDefinition: RegisteredToolDefinition = {
     gaps: Type.Array(Type.Unknown()),
   }),
   ...readOnlyMetadata,
+  handlerFactory: ({ researchCapability }) => (params, signal, onStart) => (
+    researchCapability('compare_securities', params, signal, onStart)
+  ),
 }
 
 export const getPortfolioExposureDefinition: RegisteredToolDefinition = {
@@ -47,4 +52,7 @@ export const getPortfolioExposureDefinition: RegisteredToolDefinition = {
     position: Type.Optional(Type.Unknown()), portfolio: Type.Unknown(), gaps: Type.Array(Type.Unknown()),
   }),
   ...readOnlyMetadata,
+  handlerFactory: ({ researchCapability }) => (params, signal, onStart) => (
+    researchCapability('get_portfolio_exposure', params, signal, onStart)
+  ),
 }

@@ -17,7 +17,6 @@ import type { PiAgentAdapterContent, PiAgentAdapterMessage } from './agent-runti
 import { toolRegistry } from './tool-registry.js'
 import { conversationToolsForMessage } from './tools.js'
 import { extractFreeResearchSymbols } from './free-research-tool-pack.js'
-import { hasRegisteredToolHandler } from './tool-handler-catalog.js'
 import { createActiveBudget } from './runtime-policy.js'
 
 type ConversationModel = {
@@ -340,10 +339,11 @@ export function createConversationService(options: ConversationOptions) {
     )).reverse().map((event) => String(event.message))
     const symbols = extractFreeResearchSymbols([String(currentUser.message), ...scopeMessages])
     const capabilityExecutor = options.createToolExecutor({ threadId, knownFacts, symbols })
-    const executeTool: ConversationToolExecutor = async (name, params, signal, onStart) => {
+    const executeConversationRuntime: ConversationToolExecutor = async (
+      name, params, signal, onStart,
+    ) => {
       const record = params && typeof params === 'object' && !Array.isArray(params)
         ? params as Record<string, unknown> : {}
-      const handlerOwner = toolRegistry.definition(name)?.handlerOwner
       if (name === 'spawn_agent' || name === 'delegate_research') {
         await onStart()
         try {
@@ -393,10 +393,21 @@ export function createConversationService(options: ConversationOptions) {
           return { result: { error: error instanceof Error ? error.message : String(error), facts: [] }, isError: true }
         }
       }
-      if (handlerOwner === 'research_capability'
-        && hasRegisteredToolHandler(handlerOwner, name)) {
-        return capabilityExecutor(name, params, signal, onStart)
-      }
+      await onStart()
+      return { result: { error: 'tool_not_available', facts: [] }, isError: true }
+    }
+    const handlerRuntime = {
+      researchCapability: capabilityExecutor,
+      conversationRuntime: executeConversationRuntime,
+    }
+    const handlers = new Map([...options.tools, ...(options.conditionalTools ?? [])].map((tool) => {
+      const handler = toolRegistry.definition(tool.name)?.handlerFactory?.(handlerRuntime)
+      if (!handler) throw new Error(`conversation_tool_handler_missing:${tool.name}`)
+      return [tool.name, handler] as const
+    }))
+    const executeTool: ConversationToolExecutor = async (name, params, signal, onStart) => {
+      const handler = handlers.get(name)
+      if (handler) return handler(params, signal, onStart)
       await onStart()
       return { result: { error: 'tool_not_available', facts: [] }, isError: true }
     }

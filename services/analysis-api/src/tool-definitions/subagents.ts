@@ -67,7 +67,9 @@ export const delegateResearchDefinition: RegisteredToolDefinition = {
   externalNetwork: 'none', hostAccess: 'none', resultRetention: 'research_record',
   modelProjection: 'bounded_summary', executionMode: 'sequential', countsAsToolRound: true,
   surfaces: ['conversation'],
-  handlerOwner: 'conversation_runtime',
+  handlerFactory: ({ conversationRuntime }) => (params, signal, onStart) => (
+    conversationRuntime('delegate_research', params, signal, onStart)
+  ),
 }
 
 export const collectResearchDefinition: RegisteredToolDefinition = {
@@ -91,5 +93,7 @@ export const collectResearchDefinition: RegisteredToolDefinition = {
   externalNetwork: 'none', hostAccess: 'none', resultRetention: 'research_record',
   modelProjection: 'bounded_summary', executionMode: 'sequential', countsAsToolRound: true,
   surfaces: ['conversation'],
-  handlerOwner: 'conversation_runtime',
+  handlerFactory: ({ conversationRuntime }) => (params, signal, onStart) => (
+    conversationRuntime('collect_research', params, signal, onStart)
+  ),
 }

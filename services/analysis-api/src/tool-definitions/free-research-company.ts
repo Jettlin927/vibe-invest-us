@@ -16,7 +16,9 @@ export const getCompanyDossierDefinition: RegisteredToolDefinition = {
   externalNetwork: 'financial_data', hostAccess: 'none', resultRetention: 'research_record',
   modelProjection: 'bounded_summary', executionMode: 'parallel', countsAsToolRound: true,
   surfaces: ['conversation'],
-  handlerOwner: 'research_capability',
+  handlerFactory: ({ researchCapability }) => (params, signal, onStart) => (
+    researchCapability('get_company_dossier', params, signal, onStart)
+  ),
 }
 
 export const getMarketStructureDefinition: RegisteredToolDefinition = {
@@ -30,5 +32,7 @@ export const getMarketStructureDefinition: RegisteredToolDefinition = {
   externalNetwork: 'financial_data', hostAccess: 'none', resultRetention: 'research_record',
   modelProjection: 'bounded_summary', executionMode: 'parallel', countsAsToolRound: true,
   surfaces: ['conversation'],
-  handlerOwner: 'research_capability',
+  handlerFactory: ({ researchCapability }) => (params, signal, onStart) => (
+    researchCapability('get_market_structure', params, signal, onStart)
+  ),
 }

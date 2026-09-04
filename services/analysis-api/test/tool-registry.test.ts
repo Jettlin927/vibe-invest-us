@@ -112,10 +112,10 @@ test('Registry 启动校验 fail closed 拒绝重复名称、缺失 schema 和�
   })]), /tool_registry_invalid:side_effect/)
   assert.throws(() => createToolRegistry([definition('conversation-without-handler', {
     surfaces: ['conversation'],
-  })]), /tool_registry_invalid:handler_owner:conversation-without-handler/)
+  })]), /tool_registry_invalid:handler_factory:conversation-without-handler/)
   assert.throws(() => createToolRegistry([definition('conversation-missing-handler', {
-    surfaces: ['conversation'], handlerOwner: 'research_capability',
-  })]), /tool_registry_invalid:handler_missing:conversation-missing-handler/)
+    surfaces: ['conversation'], handlerFactory: (() => undefined) as never,
+  })]), /tool_registry_invalid:handler_factory:conversation-missing-handler/)
 })
 
 test('Registry 启动时拒绝 Shell、命令执行和任意文件能力', () => {
@@ -175,6 +175,18 @@ test('自由对话普通闲聊不投影研究工具', () => {
     registry.projectConversation({ userMessage: '测试测试' }).map(({ name }) => name),
     [],
   )
+})
+
+test('条件 Web Search 由 Registry 声明 main/conversation 权限但不进入常规投影', () => {
+  const registry = createToolRegistry(registeredToolDefinitions)
+  const definition = registry.definition('search_web_evidence')
+  assert.deepEqual(definition?.allowedRoles, ['main', 'news'])
+  assert.deepEqual(definition?.surfaces, ['analysis', 'conversation'])
+  assert.equal(definition?.conversationAvailability, 'conditional')
+  assert.equal(registry.projectConversation().some(({ name }) => name === 'search_web_evidence'), false)
+  assert.deepEqual(registry.projectConversationConditional().map(({ name }) => name), [
+    'search_web_evidence',
+  ])
 })
 
 test('自由对话含 symbol 的宽泛研究只投影金融上下文工具', () => {
@@ -380,6 +392,31 @@ test('自由研究起始资料的模型投影不透传未知嵌套对象', () =>
     privateContext: { holdings: ['SECRET'] },
   })
   assert.deepEqual(projection, { facts: [], gaps: [] })
+})
+
+test('组合暴露的模型与用户投影只保留目标持仓和组合聚合白名单', () => {
+  const registry = createToolRegistry(registeredToolDefinitions)
+  const result = {
+    facts: [], gaps: [],
+    position: {
+      symbol: 'NVDA', quantity: 2, averageCost: 100, marketPrice: 120,
+      marketValue: 240, unrealizedProfitLoss: 40, portfolioWeight: 0.4,
+      cash: 999, otherPositions: ['SECRET'],
+    },
+    portfolio: {
+      totalMarketValue: 600, largestPositionWeight: 0.4, topThreeWeight: 0.9,
+      positionCount: 3, pricedPositionCount: 3, unpricedPositionCount: 0,
+      cash: 999, positions: ['SECRET'],
+    },
+  }
+  for (const projection of [
+    registry.projectResult('get_portfolio_exposure', result),
+    registry.projectPublicResult('get_portfolio_exposure', result),
+  ]) {
+    const serialized = JSON.stringify(projection)
+    assert.match(serialized, /NVDA|portfolioWeight|totalMarketValue/)
+    assert.doesNotMatch(serialized, /cash|otherPositions|positions|SECRET/)
+  }
 })
 
 test('消息面 Agent 只获得新闻候选、文档、公司事件和专项报告工具', () => {

@@ -1,7 +1,6 @@
 import AjvModule from 'ajv'
 import addFormatsModule from 'ajv-formats'
 import { selectFreeResearchToolNames } from './free-research-tool-pack.js'
-import { hasRegisteredToolHandler } from './tool-handler-catalog.js'
 
 import { fetchFinancialContextDefinition } from './tool-definitions/fetch-financial-context.js'
 import { getFinancialMetricSeriesDefinition } from './tool-definitions/get-financial-metric-series.js'
@@ -103,12 +102,20 @@ export function createToolRegistry(definitions: RegisteredToolDefinition[]) {
       invalid(name, 'surfaces')
     }
     if (definition.surfaces?.includes('conversation')
-      && !oneOf(definition.handlerOwner, ['research_capability', 'conversation_runtime'])) {
-      invalid(name, 'handler_owner')
+      && typeof definition.handlerFactory !== 'function') {
+      invalid(name, 'handler_factory')
     }
-    if (definition.handlerOwner
-      && !hasRegisteredToolHandler(definition.handlerOwner, name)) {
-      invalid(name, 'handler_missing')
+    if (definition.handlerFactory) {
+      const probe = async () => ({ result: {}, isError: false })
+      try {
+        if (typeof definition.handlerFactory({
+          researchCapability: probe, conversationRuntime: probe,
+        }) !== 'function') invalid(name, 'handler_factory')
+      } catch { invalid(name, 'handler_factory') }
+    }
+    if (definition.conversationAvailability
+      && !oneOf(definition.conversationAvailability, ['direct', 'conditional'])) {
+      invalid(name, 'conversation_availability')
     }
     if (!validReportPolicy(definition)) invalid(name, 'report_policy')
     return Object.freeze({ ...definition })
@@ -119,6 +126,7 @@ export function createToolRegistry(definitions: RegisteredToolDefinition[]) {
       .filter((definition) => definition.allowedRoles.includes(role)
         && definition.allowedStages.includes(stage)
         && (definition.surfaces ?? ['analysis']).includes('analysis')
+        && !(definition.conversationAvailability === 'conditional' && role === 'main')
         && !subagentTool(definition.model.name)
         && definition.model.name !== 'create_research_report')
       .map((definition) => definition.model),
@@ -128,10 +136,17 @@ export function createToolRegistry(definitions: RegisteredToolDefinition[]) {
       return validated
         .filter((definition) => definition.allowedStages.includes('research')
           && definition.surfaces?.includes('conversation') === true
+          && definition.conversationAvailability !== 'conditional'
           && ['read_only', 'creates_agent', 'creates_report', 'controls_agent'].includes(definition.sideEffect)
           && (requested === null || requested.has(definition.model.name)))
         .map((definition) => definition.model)
     },
+    projectConversationConditional: () => validated
+      .filter((definition) => definition.allowedRoles.includes('main')
+        && definition.allowedStages.includes('research')
+        && definition.surfaces?.includes('conversation') === true
+        && definition.conversationAvailability === 'conditional')
+      .map((definition) => definition.model),
     definition: (name: string) => validated.find((definition) => definition.model.name === name),
     projectResult(name: string, result: Record<string, unknown>) {
       const projection = validated.find((definition) => definition.model.name === name)?.modelProjection
@@ -201,8 +216,9 @@ function projectPublicToolResult(name: string, result: Record<string, unknown>) 
   }
   if (name === 'get_portfolio_exposure') return {
     ...common,
-    ...(result.position === null ? { position: null } : optionalObject('position', record(result.position))),
-    ...optionalObject('portfolio', record(result.portfolio)),
+    ...(result.position === null
+      ? { position: null } : optionalObject('position', projectPortfolioPosition(result.position))),
+    ...optionalObject('portfolio', projectPortfolioSummary(result.portfolio)),
   }
   if (name === 'get_financial_overview') return {
     ...common, ...optionalObject('overview', projectFinancialOverview(result.overview)),
@@ -298,6 +314,24 @@ function projectFinancialOverview(value: unknown) {
       record(entry), ['flag_type', 'severity', 'period'], 'string',
     )),
   }
+}
+
+function projectPortfolioPosition(value: unknown) {
+  const position = record(value)
+  return {
+    ...selectTyped(position, ['symbol'], 'string'),
+    ...selectTyped(position, [
+      'quantity', 'averageCost', 'marketPrice', 'marketValue',
+      'unrealizedProfitLoss', 'portfolioWeight',
+    ], 'number'),
+  }
+}
+
+function projectPortfolioSummary(value: unknown) {
+  return selectTyped(record(value), [
+    'totalMarketValue', 'largestPositionWeight', 'topThreeWeight',
+    'positionCount', 'pricedPositionCount', 'unpricedPositionCount',
+  ], 'number')
 }
 
 function projectPagination(result: Record<string, unknown>) {

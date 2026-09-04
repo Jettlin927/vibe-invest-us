@@ -12,5 +12,7 @@ export const createResearchReportDefinition: RegisteredToolDefinition = {
   externalNetwork: 'none', hostAccess: 'none', resultRetention: 'report_version',
   modelProjection: 'acknowledgement', executionMode: 'sequential', countsAsToolRound: true,
   surfaces: ['conversation'],
-  handlerOwner: 'research_capability',
+  handlerFactory: ({ researchCapability }) => (params, signal, onStart) => (
+    researchCapability('create_research_report', params, signal, onStart)
+  ),
 }
