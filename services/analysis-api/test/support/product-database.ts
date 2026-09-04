@@ -1,6 +1,7 @@
 import type {
   AgentEvent, AgentEventRepository, AgentSession, AnalysisRecord, AnalysisRepository, ConversationRepository, PortfolioRepository,
-  ProductEquitySnapshot, RuntimeSettingsRepository,
+  ProductEquitySnapshot, ProfitProtectionRepository, ProfitProtectionStateRecord,
+  ProfitProtectionTriggerRecord, RuntimeSettingsRepository,
   ToolProjectionRepository,
   ProductPosition,
 } from '@vibe-invest/product-dao'
@@ -12,6 +13,9 @@ import {
 export function createTestProductDatabase() {
   const positions = new Map<string, ProductPosition>()
   const snapshots = new Map<string, ProductEquitySnapshot>()
+  const protectionPlans = new Map<string, Awaited<ReturnType<ProfitProtectionRepository['save']>>[]>()
+  const protectionStates = new Map<string, ProfitProtectionStateRecord>()
+  const protectionTriggers = new Map<string, ProfitProtectionTriggerRecord>()
   let cash = 0
   const analyses = new Map<string, AnalysisRecord>()
   const analysisTombstones = new Set<string>()
@@ -171,6 +175,47 @@ export function createTestProductDatabase() {
           totalMarketValue: String(snapshot.totalMarketValue), cash: String(snapshot.cash),
         })),
       }
+    },
+  }
+
+  const profitProtectionRepository: ProfitProtectionRepository = {
+    async listLatest() {
+      return [...protectionPlans.values()].flatMap((versions) => versions.at(-1) ?? [])
+        .sort((left, right) => left.symbol.localeCompare(right.symbol))
+    },
+    async save(input) {
+      const versions = protectionPlans.get(input.symbol) ?? []
+      const plan = {
+        id: `test-profit-plan-${input.symbol}-${versions.length + 1}`,
+        ...input,
+        earningsDate: input.earningsDate ?? null,
+        earningsRiskStartsAt: input.earningsRiskStartsAt ?? null,
+        revision: versions.length + 1,
+      }
+      versions.push(plan)
+      protectionPlans.set(input.symbol, versions)
+      return plan
+    },
+    async listStates() { return [...protectionStates.values()] },
+    async recordEvaluation(input) {
+      protectionStates.set(input.symbol, { symbol: input.symbol, ...input.state })
+      if (input.trigger && !protectionTriggers.has(input.trigger.eventKey)) {
+        protectionTriggers.set(input.trigger.eventKey, {
+          id: `test-profit-trigger-${protectionTriggers.size + 1}`,
+          ...input.trigger, status: 'open', acknowledgedAt: null,
+        })
+      }
+    },
+    async listTriggers() {
+      return [...protectionTriggers.values()]
+        .sort((left, right) => right.triggeredAt.localeCompare(left.triggeredAt))
+    },
+    async acknowledgeTrigger(id, acknowledgedAt) {
+      const trigger = [...protectionTriggers.values()].find((candidate) => candidate.id === id)
+      if (!trigger) return null
+      const acknowledged = { ...trigger, status: 'acknowledged' as const, acknowledgedAt }
+      protectionTriggers.set(trigger.eventKey, acknowledged)
+      return acknowledged
     },
   }
 
@@ -1050,6 +1095,7 @@ export function createTestProductDatabase() {
       close: async () => {},
     },
     portfolioRepository,
+    profitProtectionRepository,
     analysisRepository,
     agentEventRepository,
     runtimeSettingsRepository,

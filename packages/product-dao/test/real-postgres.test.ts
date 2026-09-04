@@ -6,7 +6,7 @@ import { defaultRuntimeSettings } from '@vibe-invest/contracts'
 
 import {
   checkSchema, createAgentEventRepository, createAnalysisRepository, createConversationRepository, createPool,
-  createPortfolioRepository, createRuntimeSettingsRepository, createToolProjectionRepository,
+  createPortfolioRepository, createProfitProtectionRepository, createRuntimeSettingsRepository, createToolProjectionRepository,
   createTrackingRepository, migrate,
 } from '../src/index.js'
 
@@ -49,7 +49,59 @@ async function removeTrackingFixtures(pool: Pool, runIds: string[]) {
   }
 }
 
-test('真实 PostgreSQL v28 通过 Tracking Repository 管理自选 CRUD', {
+test('真实 PostgreSQL v31 通过 Profit Protection Repository 保留计划版本', {
+  skip: !migrationUrl || !applicationUrl,
+  concurrency: false,
+}, async () => {
+  await migrate(migrationUrl!)
+  const pool = createPool(applicationUrl!)
+  const migrationPool = createPool(migrationUrl!)
+  const repository = createProfitProtectionRepository(pool)
+  const symbol = `R${crypto.randomUUID().replaceAll('-', '').slice(0, 8)}`.toUpperCase()
+  try {
+    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 31 })
+    const first = await repository.save({
+      symbol, anchorPrice: 180, invalidationPrice: 162, coreRatio: 0.6,
+      maxPortfolioWeight: 0.1, plannedQuantity: 5, plannedAverageCost: 180,
+      createdAt: '2026-09-04T00:00:00.000Z',
+    })
+    const second = await repository.save({
+      symbol, anchorPrice: 183, invalidationPrice: 165, coreRatio: 0.6,
+      maxPortfolioWeight: 0.1, plannedQuantity: 6, plannedAverageCost: 183,
+      createdAt: '2026-09-04T01:00:00.000Z',
+    })
+    assert.equal(first.revision, 1)
+    assert.equal(second.revision, 2)
+    assert.deepEqual((await repository.listLatest()).find((plan) => plan.symbol === symbol), second)
+    const evaluation = {
+      symbol,
+      state: {
+        planId: second.id, peakPrice: 260, lastPrice: 230, ema20: 235,
+        observedAt: '2026-09-04', updatedAt: '2026-09-04T12:00:00.000Z',
+      },
+      trigger: {
+        eventKey: `${second.id}:trailing_stop`, symbol, planId: second.id,
+        rule: 'trailing_stop', payload: { marketPrice: 230, ema20: 235 },
+        triggeredAt: '2026-09-04T12:00:00.000Z',
+      },
+    }
+    await repository.recordEvaluation(evaluation)
+    await repository.recordEvaluation(evaluation)
+    assert.equal((await repository.listStates()).find((state) => state.symbol === symbol)?.peakPrice, 260)
+    const trigger = (await repository.listTriggers()).find((item) => item.symbol === symbol)
+    assert.equal(trigger?.status, 'open')
+    assert.equal((await repository.listTriggers()).filter((item) => item.symbol === symbol).length, 1)
+    assert.equal((await repository.acknowledgeTrigger(trigger!.id, '2026-09-04T13:00:00.000Z'))?.status, 'acknowledged')
+  } finally {
+    await migrationPool.query('DELETE FROM profit_protection_triggers WHERE symbol = $1', [symbol])
+    await migrationPool.query('DELETE FROM profit_protection_states WHERE symbol = $1', [symbol])
+    await migrationPool.query('DELETE FROM profit_protection_plan_versions WHERE symbol = $1', [symbol])
+    await pool.end()
+    await migrationPool.end()
+  }
+})
+
+test('真实 PostgreSQL v31 通过 Tracking Repository 管理自选 CRUD', {
   skip: !migrationUrl || !applicationUrl,
   concurrency: false,
 }, async () => {
@@ -58,7 +110,7 @@ test('真实 PostgreSQL v28 通过 Tracking Repository 管理自选 CRUD', {
   const tracking = createTrackingRepository(pool)
   const symbol = `W${crypto.randomUUID().replaceAll('-', '').slice(0, 8)}`.toUpperCase()
   try {
-    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 28 })
+    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 31 })
     const added = await tracking.addWatchlist({
       symbol: symbol.toLowerCase(), note: '观察财报', createdAt: '2026-08-30T01:00:00.000Z',
     })
@@ -863,7 +915,7 @@ test('真实 PostgreSQL v21 经当前迁移将未终态模型请求封存为 out
     assert.deepEqual(lifecycle?.modelAttempts[0]?.usage, {
       input: null, cacheRead: null, cacheWrite: null, output: null, total: null,
     })
-    assert.deepEqual(await checkSchema(appPool), { status: 'ok', version: 28 })
+    assert.deepEqual(await checkSchema(appPool), { status: 'ok', version: 31 })
   } finally {
     await removeResearchFixture(appPool, analysisId)
     await migrationPool.query(
@@ -901,7 +953,7 @@ test('真实 PostgreSQL v22 接受技术面 Tool Projection 角色', {
       createdAt: '2026-08-14T00:00:01.000Z',
     })
     assert.equal(projection.role, 'technical')
-    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 28 })
+    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 31 })
   } finally {
     const cleanup = createPool(migrationUrl!)
     await cleanup.query('DELETE FROM analyses WHERE id = $1', [analysisId])
@@ -2007,7 +2059,7 @@ test('真实 PostgreSQL migration 幂等且 application role 没有 DDL 权限',
   await migrate(migrationUrl!)
 
   const pool = createPool(applicationUrl!)
-  assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 28 })
+  assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 31 })
   const privileges = await pool.query<{ can_create: boolean; can_temp: boolean }>(
     `SELECT has_schema_privilege(current_user, 'public', 'CREATE') AS can_create,
             has_database_privilege(current_user, current_database(), 'TEMP') AS can_temp`,
@@ -2064,7 +2116,7 @@ test('真实 PostgreSQL migration receipt 为空时按 max=0 升级', {
     )
     await pool.query('DELETE FROM product_schema_migrations')
     await migrate(migrationUrl!)
-    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 28 })
+    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 31 })
     assert.deepEqual((await pool.query<{ sequence: number; provenance: string }>(
       `SELECT sequence, provenance FROM tool_event_migration_provenance WHERE session_id = $1`,
       [sessionId],
@@ -2131,23 +2183,23 @@ test('真实 PostgreSQL 拒绝未来 schema 且不修改数据库', {
   })
   try {
     await pool.query('DROP TABLE tool_event_migration_provenance')
-    await pool.query('INSERT INTO product_schema_migrations (version) VALUES (29)')
+    await pool.query('INSERT INTO product_schema_migrations (version) VALUES (32)')
     const before = await fingerprint()
 
     await assert.rejects(
       migrate(migrationUrl!),
-      /product_schema_future_version_unsupported:29/,
+      /product_schema_future_version_unsupported:32/,
     )
 
     assert.deepEqual(await fingerprint(), before)
   } finally {
-    await pool.query('DELETE FROM product_schema_migrations WHERE version = 29')
+    await pool.query('DELETE FROM product_schema_migrations WHERE version = 32')
     await migrate(migrationUrl!)
     await pool.end()
   }
 })
 
-test('真实 PostgreSQL v12 无 Tool Batch 的历史工具事件原样升级到 v28', {
+test('真实 PostgreSQL v12 无 Tool Batch 的历史工具事件原样升级到 v31', {
   skip: !migrationUrl,
   concurrency: false,
 }, async () => {
@@ -2191,7 +2243,7 @@ test('真实 PostgreSQL v12 无 Tool Batch 的历史工具事件原样升级到 
 
     await migrate(migrationUrl!)
 
-    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 28 })
+    assert.deepEqual(await checkSchema(pool), { status: 'ok', version: 31 })
     assert.deepEqual((await pool.query<{ sequence: number; provenance: string }>(
       `SELECT sequence, provenance FROM tool_event_migration_provenance
        WHERE session_id = $1 ORDER BY sequence`, [sessionId],

@@ -220,6 +220,135 @@ export type TrackingObservation = {
   payload: Record<string, unknown>
 }
 
+export const profitProtectionRules = [
+  'thesis_invalidation', 'position_changed', 'max_weight', 'earnings_window',
+  'first_take_profit', 'second_take_profit', 'activate_trailing', 'trailing_stop',
+] as const
+export type ProfitProtectionRule = typeof profitProtectionRules[number]
+export const profitProtectionLadderRules = [
+  'first_take_profit', 'second_take_profit', 'activate_trailing',
+] as const satisfies readonly ProfitProtectionRule[]
+export type ProfitProtectionLadderRule = typeof profitProtectionLadderRules[number]
+
+export const profitProtectionStatuses = [
+  'normal', 'triggered', 'review_required', 'data_gap',
+] as const
+export type ProfitProtectionStatusName = typeof profitProtectionStatuses[number]
+
+export type ProfitProtectionStatus = {
+  symbol: string
+  status: ProfitProtectionStatusName
+  planRevision: number
+  currentR: number | null
+  bindingRule: ProfitProtectionRule | null
+  nextRule: { kind: ProfitProtectionLadderRule; atR: number } | null
+  coreRatio: number
+  tradingRatio: number
+  anchorPrice: number
+  invalidationPrice: number
+  maxPortfolioWeight: number
+  marketPrice: number | null
+  portfolioWeight: number | null
+  levels: { firstTakeProfit: number; secondTakeProfit: number; trailingStart: number }
+  earnings?: { date: string; riskStartsAt: string; inRiskWindow: boolean }
+  trailing?: { active: boolean; ema20: number | null; observedAt: string; peakPrice: number | null }
+  profitJourney?: {
+    peakUnrealizedProfit: number; currentUnrealizedProfit: number
+    givebackAmount: number; givebackRatio: number | null
+  }
+}
+
+export type ProfitProtectionTrigger = {
+  id: string
+  symbol: string
+  rule: ProfitProtectionRule
+  status: 'open' | 'acknowledged'
+  triggeredAt: string
+  acknowledgedAt: string | null
+}
+
+export type ProfitProtectionOverview = {
+  summary: { planned: number; triggered: number; reviewRequired: number; dataGap: number }
+  positions: ProfitProtectionStatus[]
+  triggers: ProfitProtectionTrigger[]
+}
+
+export function isProfitProtectionOverview(value: unknown): value is ProfitProtectionOverview {
+  if (!isRecord(value) || !isRecord(value.summary)
+    || !Array.isArray(value.positions) || !Array.isArray(value.triggers)) return false
+  const summary = value.summary
+  if (!['planned', 'triggered', 'reviewRequired', 'dataGap']
+    .every((key) => nonNegativeInteger(summary[key]))) return false
+  return value.positions.every(isProfitProtectionStatus)
+    && value.triggers.every((trigger) => isRecord(trigger)
+      && typeof trigger.id === 'string' && typeof trigger.symbol === 'string'
+      && profitProtectionRules.includes(trigger.rule as ProfitProtectionRule)
+      && (trigger.status === 'open' || trigger.status === 'acknowledged')
+      && typeof trigger.triggeredAt === 'string'
+      && (trigger.acknowledgedAt === null || typeof trigger.acknowledgedAt === 'string'))
+}
+
+function isProfitProtectionStatus(value: unknown): value is ProfitProtectionStatus {
+  if (!isRecord(value) || typeof value.symbol !== 'string'
+    || !profitProtectionStatuses.includes(value.status as ProfitProtectionStatusName)
+    || !Number.isInteger(value.planRevision)
+    || !nullableFiniteNumber(value.currentR)
+    || !(value.bindingRule === null
+      || profitProtectionRules.includes(value.bindingRule as ProfitProtectionRule))
+    || !isRecord(value.levels)) return false
+  const numbers = [
+    value.coreRatio, value.tradingRatio, value.anchorPrice,
+    value.invalidationPrice, value.maxPortfolioWeight,
+  ]
+  const nullableNumbers = [value.marketPrice, value.portfolioWeight]
+  const levels = value.levels
+  return numbers.every(finiteNumber) && nullableNumbers.every(nullableFiniteNumber)
+    && ['firstTakeProfit', 'secondTakeProfit', 'trailingStart']
+      .every((key) => finiteNumber(levels[key]))
+    && (value.nextRule === null || (isRecord(value.nextRule)
+      && profitProtectionLadderRules.includes(value.nextRule.kind as ProfitProtectionLadderRule)
+      && finiteNumber(value.nextRule.atR)))
+    && validEarnings(value.earnings)
+    && validTrailing(value.trailing)
+    && validProfitJourney(value.profitJourney)
+}
+
+function validEarnings(value: unknown) {
+  return value === undefined || (isRecord(value)
+    && typeof value.date === 'string' && typeof value.riskStartsAt === 'string'
+    && typeof value.inRiskWindow === 'boolean')
+}
+
+function validTrailing(value: unknown) {
+  return value === undefined || (isRecord(value)
+    && typeof value.active === 'boolean' && nullableFiniteNumber(value.ema20)
+    && typeof value.observedAt === 'string' && nullableFiniteNumber(value.peakPrice))
+}
+
+function validProfitJourney(value: unknown) {
+  return value === undefined || (isRecord(value)
+    && finiteNumber(value.peakUnrealizedProfit)
+    && finiteNumber(value.currentUnrealizedProfit)
+    && finiteNumber(value.givebackAmount)
+    && nullableFiniteNumber(value.givebackRatio))
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+function finiteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value)
+}
+
+function nullableFiniteNumber(value: unknown): value is number | null {
+  return value === null || finiteNumber(value)
+}
+
+function nonNegativeInteger(value: unknown): value is number {
+  return Number.isInteger(value) && (value as number) >= 0
+}
+
 export const trackingEventSeverities = ['info', 'warning', 'critical'] as const
 export type TrackingEventSeverity = typeof trackingEventSeverities[number]
 

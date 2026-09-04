@@ -48,24 +48,63 @@ export function createTrackingService(dependencies: {
   listCompanyEvents?: (symbol: string, signal: AbortSignal) => Promise<FactQueryResult>
   now?: () => Date
   concurrency?: number
+  scanIntervalMs?: number
+  afterObservations?: (observations: ObservationInput[], completedAt: string) => Promise<void>
+  onBackgroundError?: (error: unknown) => void
 }) {
+  const scanIntervalMs = dependencies.scanIntervalMs ?? 0
+  if (!Number.isFinite(scanIntervalMs) || scanIntervalMs < 0 || scanIntervalMs > 2_147_483_647) {
+    throw new Error('invalid_tracking_scan_interval')
+  }
   const repository = dependencies.repository
   const running = new Map<string, { controller: AbortController; promise: Promise<void> }>()
+  let schedule: ReturnType<typeof setInterval> | null = null
+  const reportBackgroundError = (error: unknown) => {
+    if (dependencies.onBackgroundError) dependencies.onBackgroundError(error)
+    else console.error('tracking_background_error', error)
+  }
+
+  async function startScan() {
+    const [watchlist, positionSymbols] = await Promise.all([
+      repository.listWatchlist(), dependencies.listPositionSymbols(),
+    ])
+    const startedAt = currentTime(dependencies.now)
+    const run = await repository.beginRun({
+      id: crypto.randomUUID(), targets: mergeTargets(watchlist, positionSymbols), startedAt,
+    })
+    const controller = new AbortController()
+    const promise = executeScan(run, controller.signal)
+      .catch(reportBackgroundError)
+      .finally(() => { running.delete(run.id) })
+    running.set(run.id, { controller, promise })
+    return run
+  }
 
   return {
     async initialize() {
       const interrupted = await repository.getActiveRun()
-      if (!interrupted) return
-      try {
-        await repository.completeRun({
-          runId: interrupted.id,
-          status: 'failed',
-          observations: [],
-          completedAt: currentTime(dependencies.now),
-          error: 'tracking_run_interrupted',
-        })
-      } catch (error) {
-        if (!(error instanceof Error) || error.message !== 'tracking_run_not_active') throw error
+      if (interrupted) {
+        try {
+          await repository.completeRun({
+            runId: interrupted.id,
+            status: 'failed',
+            observations: [],
+            completedAt: currentTime(dependencies.now),
+            error: 'tracking_run_interrupted',
+          })
+        } catch (error) {
+          if (!(error instanceof Error) || error.message !== 'tracking_run_not_active') throw error
+        }
+      }
+      if (scanIntervalMs > 0 && !schedule) {
+        schedule = setInterval(() => {
+          void Promise.all([repository.listWatchlist(), dependencies.listPositionSymbols()])
+            .then(([watchlist, positions]) => {
+              if (watchlist.some(({ enabled }) => enabled) || positions.length > 0) return startScan()
+              return undefined
+            })
+            .catch(reportBackgroundError)
+        }, scanIntervalMs)
       }
     },
     async state(options: { symbol?: string; limit?: number } = {}) {
@@ -99,25 +138,13 @@ export function createTrackingService(dependencies: {
     removeWatchlist(symbol: string) {
       return repository.removeWatchlist(symbol)
     },
-    async startScan() {
-      const [watchlist, positionSymbols] = await Promise.all([
-        repository.listWatchlist(), dependencies.listPositionSymbols(),
-      ])
-      const startedAt = currentTime(dependencies.now)
-      const run = await repository.beginRun({
-        id: crypto.randomUUID(), targets: mergeTargets(watchlist, positionSymbols), startedAt,
-      })
-      const controller = new AbortController()
-      const promise = executeScan(run, controller.signal)
-        .catch(() => {})
-        .finally(() => { running.delete(run.id) })
-      running.set(run.id, { controller, promise })
-      return run
-    },
+    startScan,
     getScan(id: string) {
       return repository.getRun(id)
     },
     async close() {
+      if (schedule) clearInterval(schedule)
+      schedule = null
       for (const active of running.values()) active.controller.abort('tracking_service_closing')
       await Promise.allSettled([...running.values()].map(({ promise }) => promise))
     },
@@ -148,13 +175,23 @@ export function createTrackingService(dependencies: {
       ))
       const successful = observations.filter(({ status }) => status === 'success').length
       const gaps = observations.length - successful
-      const status = gaps === 0 ? 'completed' : successful === 0 ? 'failed' : 'partial'
+      let status: 'completed' | 'partial' | 'failed' = gaps === 0
+        ? 'completed' : successful === 0 ? 'failed' : 'partial'
+      const completedAt = currentTime(dependencies.now)
+      let protectionError: string | undefined
+      try {
+        await dependencies.afterObservations?.(observations, completedAt)
+      } catch {
+        protectionError = 'profit_protection_evaluation_failed'
+        if (status === 'completed') status = 'partial'
+      }
       await repository.completeRun({
         runId: run.id,
         status,
         observations,
-        completedAt: currentTime(dependencies.now),
-        ...(status === 'failed' ? { error: 'tracking_data_unavailable' } : {}),
+        completedAt,
+        ...(status === 'failed' ? { error: 'tracking_data_unavailable' }
+          : protectionError ? { error: protectionError } : {}),
       })
     } catch (error) {
       await repository.completeRun({

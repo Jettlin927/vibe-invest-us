@@ -117,6 +117,54 @@ test('用户可以维护现金并查看组合总值、仓位和未实现盈亏',
   await app.close()
 })
 
+test('用户可以为当前持仓建立版本化盈利保护计划并读取确定性状态', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'vibe-invest-profit-protection-'))
+  const app = await createPricedTestApp(join(dataDir, 'storage'), { CRDO: 216 })
+  await app.inject({
+    method: 'PUT', url: '/api/positions/CRDO',
+    payload: { quantity: 5, averageCost: 180 },
+  })
+
+  const created = await app.inject({
+    method: 'PUT', url: '/api/positions/CRDO/profit-protection',
+    payload: {
+      anchorPrice: 180, invalidationPrice: 162,
+      coreRatio: 0.6, maxPortfolioWeight: 1,
+    },
+  })
+  assert.equal(created.statusCode, 200)
+  assert.equal(created.json().revision, 1)
+
+  const response = await app.inject({ method: 'GET', url: '/api/profit-protection' })
+  assert.equal(response.statusCode, 200)
+  assert.equal(response.json().positions[0].symbol, 'CRDO')
+  assert.equal(response.json().positions[0].currentR, 2)
+  assert.equal(response.json().positions[0].bindingRule, 'first_take_profit')
+  assert.equal(response.json().summary.triggered, 1)
+})
+
+test('盈利保护 API 拒绝不存在的财报日历日期', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'vibe-invest-profit-protection-date-'))
+  const app = await createTestApp(join(dataDir, 'storage'))
+  await app.inject({
+    method: 'PUT', url: '/api/positions/CRDO',
+    payload: { quantity: 5, averageCost: 180 },
+  })
+
+  const response = await app.inject({
+    method: 'PUT', url: '/api/positions/CRDO/profit-protection',
+    payload: {
+      anchorPrice: 180, invalidationPrice: 162,
+      coreRatio: 0.6, maxPortfolioWeight: 1,
+      earningsDate: '2026-02-31', earningsRiskStartsAt: '2026-02-20',
+    },
+  })
+
+  assert.equal(response.statusCode, 400)
+  assert.deepEqual(response.json(), { error: 'invalid_profit_protection_plan' })
+  await app.close()
+})
+
 test('用户不等待外部行情也能读取已保存的持仓和现金', async () => {
   const dataDir = await mkdtemp(join(tmpdir(), 'vibe-invest-stored-portfolio-'))
   const app = await createTestApp(join(dataDir, 'storage'))

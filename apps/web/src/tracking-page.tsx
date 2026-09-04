@@ -33,6 +33,7 @@ export function TrackingPage({
   const supported = available ?? (overview !== null)
   const resolvedScan = newerScan(lastScan, overview?.latestScan)
   const scanFailed = resolvedScan?.status === 'failed'
+  const protectionFailed = resolvedScan?.error === 'profit_protection_evaluation_failed'
   const scanRunning = active || resolvedScan?.status === 'running'
   const gapCount = resolvedScan?.observations.filter(({ status }) => status === 'data_gap').length ?? 0
   const gapValue = !supported || !resolvedScan || scanFailed || scanRunning ? '—' : String(gapCount)
@@ -41,6 +42,7 @@ export function TrackingPage({
     : !resolvedScan ? '尚未扫描，完整性未知'
       : scanRunning ? '扫描中，完整性未知'
       : scanFailed ? `扫描失败：${resolvedScan.error ?? '未取得可比较数据'}`
+        : protectionFailed ? '盈利保护更新失败，行情扫描结果已保留'
         : gapCount ? '缺数不等于没有变化' : '最近扫描能力完整'
   const gapObservations = resolvedScan?.observations.filter(({ status }) => status === 'data_gap') ?? []
 
@@ -67,17 +69,19 @@ export function TrackingPage({
     <section className="tracking-summary" aria-label="追踪概览">
       <div><span>追踪标的</span><strong>{targets.length}</strong><small>自选与持仓去重并集</small></div>
       <div><span>待看变化</span><strong>{events.length}</strong><small>只展示跨基线的新事件</small></div>
-      <div className={gapCount || scanFailed ? 'warning' : ''}><span>数据缺口</span><strong>{gapValue}</strong><small>{gapDescription}</small></div>
+      <div className={gapCount || scanFailed || protectionFailed ? 'warning' : ''}><span>数据缺口</span><strong>{gapValue}</strong><small>{gapDescription}</small></div>
       <div><span>最近扫描</span><strong>{scanStatus(resolvedScan, overview?.activeScan)}</strong><small>{resolvedScan?.completedAt ? formatTime(resolvedScan.completedAt) : active ? '正在取得最新事实' : '尚未扫描'}</small></div>
     </section>
-    {(scanFailed || gapObservations.length > 0) && <section className="tracking-gaps" role="region" aria-label="数据缺口详情">
-      <strong>{scanFailed ? '最近扫描失败' : '以下能力没有取得可比较数据'}</strong>
+    {(scanFailed || protectionFailed || gapObservations.length > 0) && <section className="tracking-gaps" role="region" aria-label="数据缺口详情">
+      <strong>{scanFailed ? '最近扫描失败' : protectionFailed
+        ? '盈利保护更新失败' : '以下能力没有取得可比较数据'}</strong>
+      {protectionFailed && <p>行情扫描结果已保留，但盈利保护状态和提醒未更新。</p>}
       {scanFailed && gapObservations.length === 0
-        ? <p>{resolvedScan?.error ?? '未取得任何有效观测'}</p>
-        : gapObservations.map((observation) => <article key={observation.id}>
-            <span>{observation.symbol} · {capabilityLabel(observation.capability)}</span>
-            <p>{gapReason(observation.payload)}</p>
-          </article>)}
+        && <p>{resolvedScan?.error ?? '未取得任何有效观测'}</p>}
+      {gapObservations.map((observation) => <article key={observation.id}>
+        <span>{observation.symbol} · {capabilityLabel(observation.capability)}</span>
+        <p>{gapReason(observation.payload)}</p>
+      </article>)}
     </section>}
 
     <div className="tracking-grid">

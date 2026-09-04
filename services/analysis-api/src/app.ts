@@ -6,7 +6,7 @@ import {
 } from '@vibe-invest/contracts'
 import type {
   AgentEventRepository, AnalysisRepository, ConversationRepository, PortfolioRepository,
-  RuntimeSettingsRepository, ToolProjectionRepository, TrackingRepository,
+  ProfitProtectionRepository, RuntimeSettingsRepository, ToolProjectionRepository, TrackingRepository,
 } from '@vibe-invest/product-dao'
 
 import { createAnalysisService } from './analysis.js'
@@ -17,6 +17,7 @@ import {
   type FactQueryResult, type FinancialContext, type PaginatedFactQueryResult, type QuoteSnapshot,
 } from './financial-data-client.js'
 import { createPortfolio, isValidSymbol, normalizeSymbol } from './portfolio.js'
+import { createProfitProtection } from './profit-protection.js'
 import { projectResearchExport, projectResearchView } from './research-export.js'
 import { createResearchToolExecutor } from './research-capability.js'
 import { conversationResearchTools } from './tools.js'
@@ -28,6 +29,7 @@ type AppDependencies = {
     close: () => Promise<void>
   }
   portfolioRepository: PortfolioRepository
+  profitProtectionRepository?: ProfitProtectionRepository
   analysisRepository: AnalysisRepository
   agentEventRepository: AgentEventRepository
   runtimeSettingsRepository: RuntimeSettingsRepository
@@ -70,6 +72,8 @@ type AppDependencies = {
   fetchMarketPrices?: (symbols: string[], signal: AbortSignal) => Promise<Record<string, number>>
   fetchTrackingQuotes?: (symbols: string[], signal: AbortSignal) => Promise<QuoteSnapshot[]>
   trackingConcurrency?: number
+  trackingScanIntervalMs?: number
+  trackingBackgroundError?: (error: unknown) => void
   marketPriceTimeoutMs?: number
   model?: {
     analyze(input: any): AsyncIterable<ModelEvent>
@@ -86,9 +90,21 @@ type AppDependencies = {
   migrationVerificationToken?: string
 }
 
+function nestedNumber(value: unknown, ...path: string[]) {
+  let current = value
+  for (const key of path) {
+    if (!current || typeof current !== 'object' || Array.isArray(current)) return null
+    current = (current as Record<string, unknown>)[key]
+  }
+  return typeof current === 'number' && Number.isFinite(current) ? current : null
+}
+
 export function buildApp(dependencies: AppDependencies) {
   const app = Fastify({ logger: false })
   const portfolio = createPortfolio(dependencies.portfolioRepository)
+  const profitProtection = dependencies.profitProtectionRepository
+    ? createProfitProtection(dependencies.profitProtectionRepository)
+    : undefined
   const lifecycleOnly = dependencies.modelConfigured === false
     || !dependencies.fetchFinancialContext || !dependencies.model
   const analysis = createAnalysisService({
@@ -157,6 +173,31 @@ export function buildApp(dependencies: AppDependencies) {
         listCompanyEvents: dependencies.listCompanyEvents,
         now: dependencies.now,
         concurrency: dependencies.trackingConcurrency,
+        scanIntervalMs: dependencies.trackingScanIntervalMs,
+        onBackgroundError: dependencies.trackingBackgroundError,
+        afterObservations: profitProtection ? async (observations, completedAt) => {
+          const quoted = observations.filter((observation) => (
+            observation.capability === 'technical'
+            && nestedNumber(observation.payload, 'quote', 'price') !== null
+          ))
+          const prices = Object.fromEntries(quoted.flatMap((observation) => {
+            const price = nestedNumber(observation.payload, 'quote', 'price')
+            return price === null ? [] : [[observation.symbol, price]]
+          }))
+          const overview = await portfolio.overview(prices)
+          const signals = Object.fromEntries(quoted.flatMap((observation) => {
+            const price = nestedNumber(observation.payload, 'quote', 'price')
+            if (price === null) return []
+            return [[observation.symbol, {
+              ema20: nestedNumber(observation.payload, 'technical', 'indicators', 'ma_20'),
+              peakPrice: price,
+              observedAt: observation.observedAt,
+            }]]
+          }))
+          await profitProtection.observePortfolio({
+            positions: overview.positions, signals, asOf: completedAt,
+          })
+        } : undefined,
       })
     : undefined
 
@@ -261,6 +302,88 @@ export function buildApp(dependencies: AppDependencies) {
   })
 
   app.get('/api/portfolio/stored', async () => portfolio.overview({}))
+
+  app.get('/api/profit-protection', async (_request, reply) => {
+    if (!profitProtection) return reply.status(404).send({ error: 'profit_protection_unavailable' })
+    const positions = await portfolio.list()
+    let prices: Record<string, number> = {}
+    if (positions.length && dependencies.fetchMarketPrices) {
+      try {
+        prices = await dependencies.fetchMarketPrices(
+          positions.map(({ symbol }) => symbol),
+          AbortSignal.timeout(dependencies.marketPriceTimeoutMs ?? MARKET_PRICE_REQUEST_TIMEOUT_MS),
+        )
+      } catch {
+        prices = {}
+      }
+    }
+    const overview = await portfolio.overview(prices)
+    const evaluated = await profitProtection.evaluatePortfolio({ positions: overview.positions })
+    return {
+      summary: {
+        planned: evaluated.length,
+        triggered: evaluated.filter(({ status }) => status === 'triggered').length,
+        reviewRequired: evaluated.filter(({ status }) => status === 'review_required').length,
+        dataGap: evaluated.filter(({ status }) => status === 'data_gap').length,
+      },
+      positions: evaluated,
+      triggers: await profitProtection.listTriggers(),
+    }
+  })
+
+  app.put<{
+    Params: { symbol: string }
+    Body: {
+      anchorPrice?: unknown; invalidationPrice?: unknown
+      coreRatio?: unknown; maxPortfolioWeight?: unknown
+      earningsDate?: unknown; earningsRiskStartsAt?: unknown
+    }
+  }>('/api/positions/:symbol/profit-protection', async (request, reply) => {
+    if (!profitProtection) return reply.status(404).send({ error: 'profit_protection_unavailable' })
+    const symbol = normalizeSymbol(request.params.symbol)
+    const position = (await portfolio.list()).find((candidate) => candidate.symbol === symbol)
+    if (!isValidSymbol(symbol) || !position) {
+      return reply.status(404).send({ error: 'profit_protection_position_not_found' })
+    }
+    const {
+      anchorPrice, invalidationPrice, coreRatio, maxPortfolioWeight,
+      earningsDate, earningsRiskStartsAt,
+    } = request.body ?? {}
+    if (![anchorPrice, invalidationPrice, coreRatio, maxPortfolioWeight]
+      .every((value) => typeof value === 'number' && Number.isFinite(value))) {
+      return reply.status(400).send({ error: 'invalid_profit_protection_plan' })
+    }
+    try {
+      return await profitProtection.savePlan({
+        symbol,
+        anchorPrice: anchorPrice as number,
+        invalidationPrice: invalidationPrice as number,
+        coreRatio: coreRatio as number,
+        maxPortfolioWeight: maxPortfolioWeight as number,
+        earningsDate: typeof earningsDate === 'string' && earningsDate ? earningsDate : null,
+        earningsRiskStartsAt: typeof earningsRiskStartsAt === 'string' && earningsRiskStartsAt
+          ? earningsRiskStartsAt : null,
+      }, position, (dependencies.now?.() ?? new Date()).toISOString())
+    } catch (error) {
+      if (error instanceof Error && (
+        error.message.startsWith('profit_protection_')
+        || error.message === 'invalid_profit_protection_plan'
+      )) {
+        return reply.status(400).send({ error: error.message })
+      }
+      throw error
+    }
+  })
+
+  app.post<{ Params: { id: string } }>(
+    '/api/profit-protection/triggers/:id/acknowledge', async (request, reply) => {
+      if (!profitProtection) return reply.status(404).send({ error: 'profit_protection_unavailable' })
+      const trigger = await profitProtection.acknowledgeTrigger(
+        request.params.id, (dependencies.now?.() ?? new Date()).toISOString(),
+      )
+      return trigger ?? reply.status(404).send({ error: 'profit_protection_trigger_not_found' })
+    },
+  )
 
   app.get('/api/migration-verification', async (request, reply) => {
     const token = dependencies.migrationVerificationToken
