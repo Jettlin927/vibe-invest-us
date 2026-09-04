@@ -2,7 +2,7 @@ import { resolve } from 'node:path'
 
 import {
   checkSchema, createAgentEventRepository, createAnalysisRepository, createConversationRepository, createPool,
-  createPortfolioRepository, createRuntimeSettingsRepository,
+  createPortfolioRepository, createProfitProtectionRepository, createRuntimeSettingsRepository,
   createToolProjectionRepository, createTrackingRepository,
 } from '@vibe-invest/product-dao'
 
@@ -39,6 +39,7 @@ const app = buildApp({
     close: () => productPool.end(),
   },
   portfolioRepository: createPortfolioRepository(productPool),
+  profitProtectionRepository: createProfitProtectionRepository(productPool),
   analysisRepository: createAnalysisRepository(productPool),
   agentEventRepository: createAgentEventRepository(productPool),
   runtimeSettingsRepository: createRuntimeSettingsRepository(productPool),
@@ -71,6 +72,7 @@ const app = buildApp({
   ),
   fetchMarketPrices: (symbols, signal) => financialData.quotes(symbols, signal),
   fetchTrackingQuotes: (symbols, signal) => financialData.quoteSnapshots(symbols, signal),
+  trackingScanIntervalMs: Number(process.env.TRACKING_SCAN_INTERVAL_MINUTES ?? 0) * 60_000,
   model,
   modelConfigured: Boolean(
     modelProvider && process.env.MODEL_NAME && process.env.MODEL_BASE_URL && modelApiKey

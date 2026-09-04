@@ -30,6 +30,39 @@ type PortfolioEvent = {
   symbol: string | null; quantity: number | null; price: number | null
   amount: number | null; realizedProfitLoss: number | null; note: string; createdAt: string
 }
+type ProfitProtectionStatus = {
+  symbol: string
+  status: 'normal' | 'triggered' | 'review_required' | 'data_gap'
+  planRevision: number
+  currentR: number | null
+  bindingRule: 'thesis_invalidation' | 'position_changed' | 'max_weight'
+    | 'earnings_window' | 'first_take_profit' | 'second_take_profit'
+    | 'activate_trailing' | 'trailing_stop' | null
+  nextRule: { kind: string; atR: number } | null
+  coreRatio: number
+  tradingRatio: number
+  anchorPrice: number
+  invalidationPrice: number
+  maxPortfolioWeight: number
+  marketPrice: number | null
+  portfolioWeight: number | null
+  levels: { firstTakeProfit: number; secondTakeProfit: number; trailingStart: number }
+  earnings?: { date: string; riskStartsAt: string; inRiskWindow: boolean }
+  trailing?: { active: boolean; ema20: number | null; observedAt: string; peakPrice: number | null }
+  profitJourney?: {
+    peakUnrealizedProfit: number; currentUnrealizedProfit: number
+    givebackAmount: number; givebackRatio: number | null
+  }
+}
+type ProfitProtectionTrigger = {
+  id: string; symbol: string; rule: string; status: 'open' | 'acknowledged'
+  triggeredAt: string; acknowledgedAt: string | null
+}
+type ProfitProtectionOverview = {
+  summary: { planned: number; triggered: number; reviewRequired: number; dataGap: number }
+  positions: ProfitProtectionStatus[]
+  triggers: ProfitProtectionTrigger[]
+}
 type ResearchSummary = { id: string; symbol: string; status: string; terminal?: boolean; createdAt?: string; reportCreatedAt?: string | null; error?: string | null; starred?: boolean; note?: string; report?: { title?: string; trend?: string } }
 type Fact = { id: string; type: string; value: unknown; observedAt: string; source: string; sourceReference: string }
 type Report = {
@@ -137,6 +170,7 @@ export function App() {
   const [portfolio, setPortfolio] = useState<PortfolioOverview>(emptyPortfolio())
   const [portfolioHistory, setPortfolioHistory] = useState<PortfolioEquitySnapshot[]>([])
   const [portfolioEvents, setPortfolioEvents] = useState<PortfolioEvent[]>([])
+  const [profitProtection, setProfitProtection] = useState<ProfitProtectionOverview>(emptyProfitProtection())
   const [portfolioLoaded, setPortfolioLoaded] = useState(false)
   const [portfolioLoadFailed, setPortfolioLoadFailed] = useState(false)
   const [portfolioRefreshing, setPortfolioRefreshing] = useState(true)
@@ -216,6 +250,19 @@ export function App() {
       }
     } catch {
       // Event ledger is supplementary to the portfolio projection.
+    }
+    if (generation !== portfolioLoadGeneration.current) return
+    await loadProfitProtection(generation)
+  }
+  async function loadProfitProtection(generation = portfolioLoadGeneration.current) {
+    try {
+      const response = await fetch('/api/profit-protection')
+      const value: unknown = response.ok ? await response.json() : null
+      if (isProfitProtectionOverview(value) && generation === portfolioLoadGeneration.current) {
+        setProfitProtection(value)
+      }
+    } catch {
+      // Profit protection is optional for older instances.
     }
   }
   async function loadResearch() {
@@ -337,6 +384,22 @@ export function App() {
     if (!response.ok) { setError('减仓失败：请检查卖出数量和成交价。'); return false }
     await loadPortfolio()
     return true
+  }
+  async function saveProfitProtectionPlan(symbol: string, input: {
+    anchorPrice: number; invalidationPrice: number; coreRatio: number; maxPortfolioWeight: number
+    earningsDate: string | null; earningsRiskStartsAt: string | null
+  }) {
+    const response = await fetch(`/api/positions/${symbol}/profit-protection`, {
+      method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(input),
+    })
+    if (!response.ok) { setError('盈利保护计划保存失败，请检查基准价、失效价和比例。'); return false }
+    await loadProfitProtection()
+    return true
+  }
+  async function acknowledgeProfitProtectionTrigger(id: string) {
+    const response = await fetch(`/api/profit-protection/triggers/${id}/acknowledge`, { method: 'POST' })
+    if (!response.ok) { setError('盈利保护提醒确认失败。'); return }
+    await loadProfitProtection()
   }
   async function startAnalysis(event: React.FormEvent) {
     event.preventDefault()
@@ -718,7 +781,7 @@ export function App() {
       {page === 'analysis' && <AnalysisPage symbol={analysisSymbol} setSymbol={setAnalysisSymbol} status={analysisStatus} stages={analysisStages} active={analysisSubmitting || Boolean(activeAnalysisId)} onStart={startAnalysis} onCancel={cancelAnalysis} health={health} modelConfigured={modelConfigured} records={records} onOpen={async (id) => { await openResearch(id); navigate('research') }} />}
       {page === 'research' && <ResearchPage records={records} record={selectedResearch} onOpen={openResearch} onOpenTrace={openResearchTrace} onUpdate={updateResearch} onDelete={removeResearch} deleting={deletingResearchId === selectedResearch?.id} onResume={resumeResearch} onFollowUp={sendFollowUp} onReanalyze={reanalyzeResearch} freshnessDays={runtimeSettings?.current.values.reportFreshnessDays ?? null} />}
       {page === 'conversation' && <ConversationPage threads={conversationThreads} thread={selectedConversation} events={conversationEvents} busy={conversationBusy} onOpen={openConversation} onNew={() => { setSelectedConversation(null); setConversationEvents([]); setConversationBusy(false) }} onCreate={startConversation} onSend={sendConversationMessage} onCancel={cancelConversation} />}
-      {page === 'portfolio' && <PortfolioPage portfolio={portfolio} history={portfolioHistory} events={portfolioEvents} loaded={portfolioLoaded} loadFailed={portfolioLoadFailed} refreshing={portfolioRefreshing} onSave={savePosition} onSaveCash={saveCash} onBuy={buyPosition} onReduce={reducePosition} onDelete={removePosition} />}
+      {page === 'portfolio' && <PortfolioPage portfolio={portfolio} history={portfolioHistory} events={portfolioEvents} protection={profitProtection} loaded={portfolioLoaded} loadFailed={portfolioLoadFailed} refreshing={portfolioRefreshing} onSave={savePosition} onSaveCash={saveCash} onBuy={buyPosition} onReduce={reducePosition} onSaveProtection={saveProfitProtectionPlan} onAcknowledgeProtection={acknowledgeProfitProtectionTrigger} onDelete={removePosition} />}
       {page === 'settings' && <SettingsPage health={health} modelConfigured={modelConfigured} settings={runtimeSettings} onReload={loadSettings} />}
     </main>
   </div>
@@ -1562,10 +1625,11 @@ function ResearchReport({ record, onUpdate, onDelete, deleting, onResume, onFoll
   </article>
 }
 
-function PortfolioPage({ portfolio, history, events, loaded, loadFailed, refreshing, onSave, onSaveCash, onBuy, onReduce, onDelete }: {
+function PortfolioPage({ portfolio, history, events, protection, loaded, loadFailed, refreshing, onSave, onSaveCash, onBuy, onReduce, onSaveProtection, onAcknowledgeProtection, onDelete }: {
   portfolio: PortfolioOverview
   history: PortfolioEquitySnapshot[]
   events: PortfolioEvent[]
+  protection: ProfitProtectionOverview
   loaded: boolean
   loadFailed: boolean
   refreshing: boolean
@@ -1573,10 +1637,16 @@ function PortfolioPage({ portfolio, history, events, loaded, loadFailed, refresh
   onSaveCash: (event: React.FormEvent<HTMLFormElement>) => Promise<void>
   onBuy: (symbol: string, quantity: number, price: number) => Promise<boolean>
   onReduce: (symbol: string, quantity: number, price: number) => Promise<boolean>
+  onSaveProtection: (symbol: string, input: {
+    anchorPrice: number; invalidationPrice: number; coreRatio: number; maxPortfolioWeight: number
+    earningsDate: string | null; earningsRiskStartsAt: string | null
+  }) => Promise<boolean>
+  onAcknowledgeProtection: (id: string) => Promise<void>
   onDelete: (symbol: string) => Promise<void>
 }) {
   const [reducing, setReducing] = useState<PortfolioPosition | null>(null)
   const [buying, setBuying] = useState<PortfolioPosition | null>(null)
+  const [planning, setPlanning] = useState<PortfolioPosition | null>(null)
   if (!loaded) return <><PageHeader eyebrow="PRIVATE PORTFOLIO" title="我的持仓" description="现金、持仓市值和盈亏共同构成你的组合语境；行情缺失时不猜测组合总值。" />{loadFailed ? <p className="error-banner" role="alert" aria-label="持仓读取失败，请稍后重试。">持仓读取失败，请稍后重试。</p> : <p className="chart-empty" role="status" aria-label="正在读取已保存的持仓…">正在读取已保存的持仓…</p>}</>
   return <><PageHeader eyebrow="PRIVATE PORTFOLIO" title="我的持仓" description="现金、持仓市值和盈亏共同构成你的组合语境；行情缺失时不猜测组合总值。" />
     <div className="portfolio-kpis">
@@ -1590,11 +1660,12 @@ function PortfolioPage({ portfolio, history, events, loaded, loadFailed, refresh
       <PositionBars positions={portfolio.positions} mode="weight" />
       <PositionBars positions={portfolio.positions} mode="profit" />
     </div>
+    <ProfitProtectionPanel portfolio={portfolio} protection={protection} onPlan={setPlanning} onAcknowledge={onAcknowledgeProtection} />
     <EquityHistory history={history} />
     <section className="portfolio-holdings">
       <header><div><p className="micro">当前持仓 · {portfolio.positions.length}</p><h2>组合明细</h2></div>{refreshing ? <p className="data-warning">正在刷新 {portfolio.positions.length} 项行情…</p> : portfolio.unpricedPositionCount > 0 && <p className="data-warning">{portfolio.unpricedPositionCount} 项行情缺失，组合汇总已关闭。</p>}</header>
       <div className="portfolio-table-scroll"><div className="portfolio-table-row head"><span>标的</span><span>数量</span><span>平均成本</span><span>当前价</span><span>市值</span><span>仓位</span><span>未实现盈亏</span><span /></div>
-        {portfolio.positions.map((item) => <div className="portfolio-table-row" key={item.symbol}><strong>{item.symbol}</strong><span>{formatNumber(item.quantity)}</span><span>{formatMoney(item.averageCost)}</span><span>{formatNullableMoney(item.marketPrice)}</span><span>{formatNullableMoney(item.marketValue)}</span><span>{item.portfolioWeight === null ? '—' : formatPercent(item.portfolioWeight)}</span><span className={valueTone(item.unrealizedProfitLoss)}>{formatSignedMoney(item.unrealizedProfitLoss)}<small>{item.unrealizedReturn === null ? '' : formatSignedPercent(item.unrealizedReturn)}</small></span><span className="position-actions"><button className="quiet" onClick={() => setBuying(item)}>加仓</button><button className="quiet" onClick={() => setReducing(item)}>减仓</button><button className="text-button" onClick={() => void onDelete(item.symbol)}>删除</button></span></div>)}
+        {portfolio.positions.map((item) => <div className="portfolio-table-row" key={item.symbol}><strong>{item.symbol}</strong><span>{formatNumber(item.quantity)}</span><span>{formatMoney(item.averageCost)}</span><span>{formatNullableMoney(item.marketPrice)}</span><span>{formatNullableMoney(item.marketValue)}</span><span>{item.portfolioWeight === null ? '—' : formatPercent(item.portfolioWeight)}</span><span className={valueTone(item.unrealizedProfitLoss)}>{formatSignedMoney(item.unrealizedProfitLoss)}<small>{item.unrealizedReturn === null ? '' : formatSignedPercent(item.unrealizedReturn)}</small></span><span className="position-actions"><button className="quiet" aria-label={`为 ${item.symbol} 制定保护计划`} onClick={() => setPlanning(item)}>保护</button><button className="quiet" onClick={() => setBuying(item)}>加仓</button><button className="quiet" onClick={() => setReducing(item)}>减仓</button><button className="text-button" onClick={() => void onDelete(item.symbol)}>删除</button></span></div>)}
         {!portfolio.positions.length && <p className="empty-row">尚未录入持仓。</p>}
       </div>
     </section>
@@ -1602,7 +1673,28 @@ function PortfolioPage({ portfolio, history, events, loaded, loadFailed, refresh
     <EventLedger events={events} />
     {buying && <BuyDialog position={buying} cash={portfolio.cash} onCancel={() => setBuying(null)} onSubmit={async (quantity, price) => { if (await onBuy(buying.symbol, quantity, price)) setBuying(null) }} />}
     {reducing && <ReduceDialog position={reducing} cash={portfolio.cash} onCancel={() => setReducing(null)} onSubmit={async (quantity, price) => { if (await onReduce(reducing.symbol, quantity, price)) setReducing(null) }} />}
+    {planning && <ProfitProtectionDialog position={planning} current={protection.positions.find(({ symbol }) => symbol === planning.symbol) ?? null} onCancel={() => setPlanning(null)} onSubmit={async (input) => { if (await onSaveProtection(planning.symbol, input)) setPlanning(null) }} />}
   </>
+}
+
+function ProfitProtectionPanel({ portfolio, protection, onPlan, onAcknowledge }: {
+  portfolio: PortfolioOverview
+  protection: ProfitProtectionOverview
+  onPlan: (position: PortfolioPosition) => void
+  onAcknowledge: (id: string) => Promise<void>
+}) {
+  const bySymbol = new Map(protection.positions.map((status) => [status.symbol, status]))
+  return <section className="profit-protection"><header><div><p className="micro">盈利保护 · {protection.summary.planned}/{portfolio.positions.length} 已制定</p><h2>让浮盈按计划退出，而不是坐回原点</h2></div><p>这里只显示计划状态；实际卖出后才形成已实现利润。</p></header>
+    <div className="protection-summary"><span>已触发<strong>{protection.summary.triggered}</strong></span><span>需复核<strong>{protection.summary.reviewRequired}</strong></span><span>数据缺口<strong>{protection.summary.dataGap}</strong></span></div>
+    <div className="protection-grid">
+      {portfolio.positions.map((position) => {
+        const status = bySymbol.get(position.symbol)
+        if (!status) return <article className="protection-empty" key={position.symbol}><strong>{position.symbol}</strong><p>尚未制定盈利保护计划</p><button className="quiet" onClick={() => onPlan(position)}>制定计划</button></article>
+        return <article className={`protection-card ${status.status}`} key={status.symbol} role="region" aria-label={`${status.symbol} 盈利阶梯`}><header><div><strong>{status.symbol}</strong><span>{status.currentR === null ? '行情缺失' : `当前 ${status.currentR.toFixed(1)}R`}</span></div><b>{profitProtectionStatusLabel(status)}</b></header><div className="sleeve-bar" aria-label={`核心仓 ${formatPercent(status.coreRatio)}，交易仓 ${formatPercent(status.tradingRatio)}`}><i style={{ width: `${status.coreRatio * 100}%` }} /><em style={{ width: `${status.tradingRatio * 100}%` }} /></div><div className="profit-ladder"><span><small>失效</small>{formatNumber(status.invalidationPrice)}</span><span><small>基准</small>{formatNumber(status.anchorPrice)}</span><span><small>2R</small>{formatNumber(status.levels.firstTakeProfit)}</span><span><small>3R</small>{formatNumber(status.levels.secondTakeProfit)}</span><span><small>4R</small>{formatNumber(status.levels.trailingStart)}</span></div>{status.profitJourney && <div className="profit-journey"><span>峰值浮盈<strong>{formatSignedMoney(status.profitJourney.peakUnrealizedProfit)}</strong></span><span>当前浮盈<strong>{formatSignedMoney(status.profitJourney.currentUnrealizedProfit)}</strong></span><span>已回吐<strong>{formatMoney(status.profitJourney.givebackAmount)}{status.profitJourney.givebackRatio === null ? '' : ` · ${formatPercent(status.profitJourney.givebackRatio)}`}</strong></span></div>}{status.trailing && <p className="protection-signal">EMA20 {status.trailing.ema20 === null ? '缺失' : formatMoney(status.trailing.ema20)} · 峰值 {status.trailing.peakPrice === null ? '缺失' : formatMoney(status.trailing.peakPrice)} · {status.trailing.observedAt}</p>}{status.earnings && <p className="protection-signal">财报 {status.earnings.date} · 风险窗口自 {status.earnings.riskStartsAt}</p>}<footer><span>计划 V{status.planRevision}</span><button className="quiet" onClick={() => onPlan(position)}>修订计划</button></footer></article>
+      })}
+    </div>
+    {!!protection.triggers.filter(({ status }) => status === 'open').length && <div className="protection-alerts"><h3>待处理提醒</h3>{protection.triggers.filter(({ status }) => status === 'open').map((trigger) => <div key={trigger.id}><span><strong>{trigger.symbol}</strong>{profitProtectionRuleName(trigger.rule)} · {formatTime(trigger.triggeredAt)}</span><button className="quiet" onClick={() => void onAcknowledge(trigger.id)}>确认已处理</button></div>)}</div>}
+  </section>
 }
 
 function EquityHistory({ history }: { history: PortfolioEquitySnapshot[] }) {
@@ -1629,6 +1721,32 @@ function PositionBars({ positions, mode }: { positions: PortfolioPosition[]; mod
   const values = positions.flatMap((item) => { const value = mode === 'weight' ? item.portfolioWeight : item.unrealizedProfitLoss; return value === null ? [] : [{ symbol: item.symbol, value }] })
   const max = Math.max(...values.map((item) => Math.abs(item.value)), 0)
   return <section className="portfolio-bars"><p className="micro">{mode === 'weight' ? '仓位分布' : '盈亏分解'}</p><h2>{mode === 'weight' ? '谁占用了组合' : '谁在贡献盈亏'}</h2>{values.length ? values.map((item) => <div className="portfolio-bar-row" key={item.symbol}><strong>{item.symbol}</strong><span className={item.value < 0 ? 'bar-track negative' : 'bar-track'}><i style={{ width: `${max ? Math.abs(item.value) / max * 100 : 0}%` }} /></span><small className={valueTone(item.value)}>{mode === 'weight' ? formatPercent(item.value) : formatSignedMoney(item.value)}</small></div>) : <p className="chart-empty">行情可用后显示</p>}</section>
+}
+
+function ProfitProtectionDialog({ position, current, onCancel, onSubmit }: {
+  position: PortfolioPosition
+  current: ProfitProtectionStatus | null
+  onCancel: () => void
+  onSubmit: (input: {
+    anchorPrice: number; invalidationPrice: number; coreRatio: number; maxPortfolioWeight: number
+    earningsDate: string | null; earningsRiskStartsAt: string | null
+  }) => Promise<void>
+}) {
+  const [anchorPrice, setAnchorPrice] = useState(String(current?.anchorPrice ?? position.averageCost))
+  const [invalidationPrice, setInvalidationPrice] = useState(String(current?.invalidationPrice ?? ''))
+  const [coreRatio, setCoreRatio] = useState(String((current?.coreRatio ?? 0.6) * 100))
+  const [maxWeight, setMaxWeight] = useState(String((current?.maxPortfolioWeight ?? 0.1) * 100))
+  const [earningsDate, setEarningsDate] = useState(current?.earnings?.date ?? '')
+  const [earningsRiskStartsAt, setEarningsRiskStartsAt] = useState(current?.earnings?.riskStartsAt ?? '')
+  const anchor = Number(anchorPrice), invalidation = Number(invalidationPrice)
+  const risk = anchor - invalidation
+  const valid = anchorPrice !== '' && invalidationPrice !== ''
+    && Number.isFinite(anchor) && anchor > 0 && Number.isFinite(invalidation)
+    && invalidation >= 0 && risk > 0 && Number(coreRatio) > 0 && Number(coreRatio) < 100
+    && Number(maxWeight) > 0 && Number(maxWeight) <= 100
+    && Boolean(earningsDate) === Boolean(earningsRiskStartsAt)
+    && (!earningsDate || earningsRiskStartsAt <= earningsDate)
+  return <div className="portfolio-modal"><form role="dialog" aria-modal="true" aria-label={`${position.symbol} 盈利保护计划`} onSubmit={(event) => { event.preventDefault(); if (valid) void onSubmit({ anchorPrice: anchor, invalidationPrice: invalidation, coreRatio: Number(coreRatio) / 100, maxPortfolioWeight: Number(maxWeight) / 100, earningsDate: earningsDate || null, earningsRiskStartsAt: earningsRiskStartsAt || null }) }}><p className="micro">PROFIT PROTECTION</p><h2>{current ? '修订' : '制定'} {position.symbol} 计划</h2><p>计划固定保存当前 {formatNumber(position.quantity)} 股、平均成本 {formatMoney(position.averageCost)}。后续持仓变化会要求重新复核，不会静默改写风险锚点。</p><label>计划基准价<input aria-label="计划基准价" type="number" min="0.000001" step="any" value={anchorPrice} onChange={(event) => setAnchorPrice(event.target.value)} required /></label><label>失效价<input autoFocus aria-label="失效价" type="number" min="0" step="any" value={invalidationPrice} onChange={(event) => setInvalidationPrice(event.target.value)} required /></label><label>核心仓比例<input aria-label="核心仓比例" type="number" min="1" max="99" step="any" value={coreRatio} onChange={(event) => setCoreRatio(event.target.value)} required /></label><label>最大仓位<input aria-label="最大仓位" type="number" min="0.1" max="100" step="any" value={maxWeight} onChange={(event) => setMaxWeight(event.target.value)} required /></label><label>财报日期（可选）<input aria-label="财报日期" type="date" value={earningsDate} onChange={(event) => setEarningsDate(event.target.value)} /></label><label>风险窗口起始日（可选）<input aria-label="风险窗口起始日" type="date" value={earningsRiskStartsAt} onChange={(event) => setEarningsRiskStartsAt(event.target.value)} /></label><div className="trade-preview"><span>1R 风险距离<strong>{valid ? formatMoney(risk) : '—'}</strong></span><span>第一次兑现 · 2R<strong>{valid ? formatMoney(anchor + risk * 2) : '—'}</strong></span><span>移动保护 · 4R<strong>{valid ? formatMoney(anchor + risk * 4) : '—'}</strong></span></div><p>固定模板：2R 第一次兑现、3R 第二次兑现、4R 后由 Tracking 使用 EMA20 保护核心仓。财报日期和风险窗口必须同时填写。</p><div className="modal-actions"><button type="button" className="quiet" onClick={onCancel}>取消</button><button type="submit" disabled={!valid}>保存保护计划</button></div></form></div>
 }
 
 function BuyDialog({ position, cash, onCancel, onSubmit }: { position: PortfolioPosition; cash: number; onCancel: () => void; onSubmit: (quantity: number, price: number) => Promise<void> }) {
@@ -1888,6 +2006,12 @@ function formatSignedPercent(value: number) { return `${value > 0 ? '+' : ''}${(
 function formatSignedPercentOrDash(value: number | null) { return value === null ? '—' : formatSignedPercent(value) }
 function valueTone(value?: number | null) { return value === undefined || value === null || value === 0 ? '' : value > 0 ? 'positive' : 'negative' }
 function emptyPortfolio(): PortfolioOverview { return { cash: 0, totalCost: 0, totalMarketValue: 0, totalEquity: 0, totalUnrealizedProfitLoss: 0, totalUnrealizedReturn: null, pricedPositionCount: 0, unpricedPositionCount: 0, positions: [] } }
+function emptyProfitProtection(): ProfitProtectionOverview { return { summary: { planned: 0, triggered: 0, reviewRequired: 0, dataGap: 0 }, positions: [], triggers: [] } }
+function profitProtectionStatusLabel(status: ProfitProtectionStatus) {
+  if (status.status === 'data_gap') return '数据不足'
+  return profitProtectionRuleName(status.bindingRule ?? '')
+}
+function profitProtectionRuleName(rule: string) { return ({ thesis_invalidation: '失效条件', position_changed: '持仓已变化', earnings_window: '财报风险窗口', max_weight: '超过最大仓位', first_take_profit: '第一次兑现', second_take_profit: '第二次兑现', activate_trailing: '启用移动保护', trailing_stop: '跌破 EMA20' } as Record<string, string>)[rule] ?? '计划内' }
 
 function isPortfolioOverview(value: unknown): value is PortfolioOverview {
   if (!value || typeof value !== 'object') return false
@@ -1907,6 +2031,17 @@ function isPortfolioOverview(value: unknown): value is PortfolioOverview {
         && ['marketPrice', 'marketValue', 'unrealizedProfitLoss', 'unrealizedReturn', 'portfolioWeight']
           .every((key) => item[key] === null || (typeof item[key] === 'number' && Number.isFinite(item[key])))
     })
+}
+
+function isProfitProtectionOverview(value: unknown): value is ProfitProtectionOverview {
+  if (!value || typeof value !== 'object') return false
+  const candidate = value as Record<string, unknown>
+  const summary = candidate.summary as Record<string, unknown> | undefined
+  return Boolean(summary)
+    && ['planned', 'triggered', 'reviewRequired', 'dataGap']
+      .every((key) => typeof summary?.[key] === 'number' && Number.isFinite(summary[key]))
+    && Array.isArray(candidate.positions)
+    && Array.isArray(candidate.triggers)
 }
 
 function isPortfolioHistoryResponse(value: unknown): value is { snapshots: PortfolioEquitySnapshot[] } {

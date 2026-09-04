@@ -12,7 +12,7 @@ import {
   type WatchlistItem,
 } from '@vibe-invest/contracts'
 
-export const schemaVersion = 28
+export const schemaVersion = 31
 
 const migrationSql = `
 CREATE TABLE IF NOT EXISTS product_schema_migrations (
@@ -58,6 +58,48 @@ CREATE TABLE IF NOT EXISTS portfolio_events (
   realized_pnl numeric,
   note text NOT NULL DEFAULT '',
   created_at timestamptz NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS profit_protection_plan_versions (
+  id text PRIMARY KEY,
+  symbol text NOT NULL,
+  revision integer NOT NULL CHECK (revision > 0),
+  anchor_price numeric NOT NULL CHECK (anchor_price > 0),
+  invalidation_price numeric NOT NULL CHECK (invalidation_price >= 0),
+  core_ratio numeric NOT NULL CHECK (core_ratio > 0 AND core_ratio < 1),
+  max_portfolio_weight numeric NOT NULL CHECK (max_portfolio_weight > 0 AND max_portfolio_weight <= 1),
+  planned_quantity numeric NOT NULL CHECK (planned_quantity > 0),
+  planned_average_cost numeric NOT NULL CHECK (planned_average_cost >= 0),
+  earnings_date date,
+  earnings_risk_starts_at date,
+  created_at timestamptz NOT NULL,
+  UNIQUE (symbol, revision),
+  CHECK (invalidation_price < anchor_price)
+);
+
+ALTER TABLE profit_protection_plan_versions ADD COLUMN IF NOT EXISTS earnings_date date;
+ALTER TABLE profit_protection_plan_versions ADD COLUMN IF NOT EXISTS earnings_risk_starts_at date;
+
+CREATE TABLE IF NOT EXISTS profit_protection_states (
+  symbol text PRIMARY KEY,
+  plan_id text NOT NULL REFERENCES profit_protection_plan_versions(id),
+  peak_price numeric NOT NULL CHECK (peak_price >= 0),
+  last_price numeric NOT NULL CHECK (last_price >= 0),
+  ema_20 numeric,
+  observed_at text NOT NULL CHECK (observed_at <> ''),
+  updated_at timestamptz NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS profit_protection_triggers (
+  id text PRIMARY KEY,
+  event_key text NOT NULL UNIQUE,
+  symbol text NOT NULL,
+  plan_id text NOT NULL REFERENCES profit_protection_plan_versions(id),
+  rule text NOT NULL CHECK (rule <> ''),
+  status text NOT NULL CHECK (status IN ('open', 'acknowledged')),
+  payload_json jsonb NOT NULL CHECK (jsonb_typeof(payload_json) = 'object'),
+  triggered_at timestamptz NOT NULL,
+  acknowledged_at timestamptz
 );
 
 CREATE TABLE IF NOT EXISTS legacy_portfolio_migrations (
@@ -700,11 +742,27 @@ INSERT INTO product_schema_migrations (version)
 VALUES (28)
 ON CONFLICT (version) DO NOTHING;
 
+INSERT INTO product_schema_migrations (version)
+VALUES (29)
+ON CONFLICT (version) DO NOTHING;
+
+INSERT INTO product_schema_migrations (version)
+VALUES (30)
+ON CONFLICT (version) DO NOTHING;
+
+INSERT INTO product_schema_migrations (version)
+VALUES (31)
+ON CONFLICT (version) DO NOTHING;
+
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM vibe_invest_app;
 REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM vibe_invest_app;
 GRANT SELECT ON product_schema_migrations TO vibe_invest_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON positions, portfolio_settings, portfolio_equity_snapshots TO vibe_invest_app;
 GRANT SELECT, INSERT ON portfolio_events TO vibe_invest_app;
+GRANT SELECT, INSERT ON profit_protection_plan_versions TO vibe_invest_app;
+GRANT SELECT, INSERT, UPDATE ON profit_protection_states TO vibe_invest_app;
+GRANT SELECT, INSERT ON profit_protection_triggers TO vibe_invest_app;
+GRANT UPDATE (status, acknowledged_at) ON profit_protection_triggers TO vibe_invest_app;
 GRANT SELECT, INSERT ON legacy_portfolio_migrations TO vibe_invest_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON analyses, atomic_facts, analysis_facts, analysis_trace TO vibe_invest_app;
 GRANT SELECT, INSERT ON analysis_deletion_tombstones TO vibe_invest_app;
@@ -1424,6 +1482,220 @@ export function createPortfolioRepository(pool: Pool) {
 }
 
 export type PortfolioRepository = ReturnType<typeof createPortfolioRepository>
+
+export type ProfitProtectionPlanRecord = {
+  id: string
+  symbol: string
+  revision: number
+  anchorPrice: number
+  invalidationPrice: number
+  coreRatio: number
+  maxPortfolioWeight: number
+  plannedQuantity: number
+  plannedAverageCost: number
+  earningsDate: string | null
+  earningsRiskStartsAt: string | null
+  createdAt: string
+}
+
+type ProfitProtectionPlanInput = Omit<
+  ProfitProtectionPlanRecord,
+  'id' | 'revision' | 'earningsDate' | 'earningsRiskStartsAt'
+> & {
+  earningsDate?: string | null
+  earningsRiskStartsAt?: string | null
+}
+
+type ProfitProtectionPlanRow = {
+  id: string
+  symbol: string
+  revision: number
+  anchor_price: string
+  invalidation_price: string
+  core_ratio: string
+  max_portfolio_weight: string
+  planned_quantity: string
+  planned_average_cost: string
+  earnings_date: string | null
+  earnings_risk_starts_at: string | null
+  created_at: string
+}
+
+function toProfitProtectionPlan(row: ProfitProtectionPlanRow): ProfitProtectionPlanRecord {
+  return {
+    id: row.id,
+    symbol: row.symbol,
+    revision: row.revision,
+    anchorPrice: Number(row.anchor_price),
+    invalidationPrice: Number(row.invalidation_price),
+    coreRatio: Number(row.core_ratio),
+    maxPortfolioWeight: Number(row.max_portfolio_weight),
+    plannedQuantity: Number(row.planned_quantity),
+    plannedAverageCost: Number(row.planned_average_cost),
+    earningsDate: row.earnings_date,
+    earningsRiskStartsAt: row.earnings_risk_starts_at,
+    createdAt: new Date(row.created_at).toISOString(),
+  }
+}
+
+export type ProfitProtectionStateRecord = {
+  symbol: string
+  planId: string
+  peakPrice: number
+  lastPrice: number
+  ema20: number | null
+  observedAt: string
+  updatedAt: string
+}
+
+export type ProfitProtectionTriggerRecord = {
+  id: string
+  eventKey: string
+  symbol: string
+  planId: string
+  rule: string
+  status: 'open' | 'acknowledged'
+  payload: Record<string, unknown>
+  triggeredAt: string
+  acknowledgedAt: string | null
+}
+
+export function createProfitProtectionRepository(pool: Pool) {
+  const selectPlan = `SELECT id, symbol, revision, anchor_price::text, invalidation_price::text,
+    core_ratio::text, max_portfolio_weight::text, planned_quantity::text,
+    planned_average_cost::text, earnings_date::text, earnings_risk_starts_at::text, created_at
+    FROM profit_protection_plan_versions`
+  return {
+    async listLatest(): Promise<ProfitProtectionPlanRecord[]> {
+      const result = await pool.query<ProfitProtectionPlanRow>(
+        `${selectPlan} WHERE (symbol, revision) IN (
+          SELECT symbol, max(revision) FROM profit_protection_plan_versions GROUP BY symbol
+        ) ORDER BY symbol`,
+      )
+      return result.rows.map(toProfitProtectionPlan)
+    },
+    async save(input: ProfitProtectionPlanInput) {
+      const client = await pool.connect()
+      try {
+        await client.query('BEGIN')
+        await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [input.symbol])
+        const current = await client.query<{ revision: number }>(
+          'SELECT revision FROM profit_protection_plan_versions WHERE symbol = $1 ORDER BY revision DESC LIMIT 1',
+          [input.symbol],
+        )
+        const revision = (current.rows[0]?.revision ?? 0) + 1
+        const id = randomUUID()
+        const result = await client.query<ProfitProtectionPlanRow>(
+          `INSERT INTO profit_protection_plan_versions (
+            id, symbol, revision, anchor_price, invalidation_price, core_ratio,
+            max_portfolio_weight, planned_quantity, planned_average_cost,
+            earnings_date, earnings_risk_starts_at, created_at
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+          RETURNING id, symbol, revision, anchor_price::text, invalidation_price::text,
+            core_ratio::text, max_portfolio_weight::text, planned_quantity::text,
+            planned_average_cost::text, earnings_date::text, earnings_risk_starts_at::text, created_at`,
+          [id, input.symbol, revision, String(input.anchorPrice), String(input.invalidationPrice),
+            String(input.coreRatio), String(input.maxPortfolioWeight), String(input.plannedQuantity),
+            String(input.plannedAverageCost), input.earningsDate ?? null,
+            input.earningsRiskStartsAt ?? null,
+            input.createdAt],
+        )
+        await client.query('COMMIT')
+        return toProfitProtectionPlan(result.rows[0]!)
+      } catch (error) {
+        await client.query('ROLLBACK')
+        throw error
+      } finally {
+        client.release()
+      }
+    },
+    async listStates(): Promise<ProfitProtectionStateRecord[]> {
+      const result = await pool.query<{
+        symbol: string; plan_id: string; peak_price: string; last_price: string
+        ema_20: string | null; observed_at: string; updated_at: string
+      }>(`SELECT symbol, plan_id, peak_price::text, last_price::text, ema_20::text,
+          observed_at, updated_at::text FROM profit_protection_states ORDER BY symbol`)
+      return result.rows.map((row) => ({
+        symbol: row.symbol, planId: row.plan_id, peakPrice: Number(row.peak_price),
+        lastPrice: Number(row.last_price), ema20: row.ema_20 === null ? null : Number(row.ema_20),
+        observedAt: row.observed_at, updatedAt: new Date(row.updated_at).toISOString(),
+      }))
+    },
+    async recordEvaluation(input: {
+      symbol: string
+      state: Omit<ProfitProtectionStateRecord, 'symbol'>
+      trigger?: Omit<ProfitProtectionTriggerRecord, 'id' | 'status' | 'acknowledgedAt'>
+    }) {
+      const client = await pool.connect()
+      try {
+        await client.query('BEGIN')
+        await client.query(
+          `INSERT INTO profit_protection_states (
+            symbol, plan_id, peak_price, last_price, ema_20, observed_at, updated_at
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+          ON CONFLICT (symbol) DO UPDATE SET
+            plan_id = excluded.plan_id, peak_price = excluded.peak_price,
+            last_price = excluded.last_price, ema_20 = excluded.ema_20,
+            observed_at = excluded.observed_at, updated_at = excluded.updated_at`,
+          [input.symbol, input.state.planId, String(input.state.peakPrice),
+            String(input.state.lastPrice), input.state.ema20 === null ? null : String(input.state.ema20),
+            input.state.observedAt, input.state.updatedAt],
+        )
+        if (input.trigger) {
+          await client.query(
+            `INSERT INTO profit_protection_triggers (
+              id, event_key, symbol, plan_id, rule, status, payload_json, triggered_at
+            ) VALUES ($1, $2, $3, $4, $5, 'open', $6, $7)
+            ON CONFLICT (event_key) DO NOTHING`,
+            [randomUUID(), input.trigger.eventKey, input.trigger.symbol, input.trigger.planId,
+              input.trigger.rule, JSON.stringify(input.trigger.payload), input.trigger.triggeredAt],
+          )
+        }
+        await client.query('COMMIT')
+      } catch (error) {
+        await client.query('ROLLBACK')
+        throw error
+      } finally {
+        client.release()
+      }
+    },
+    async listTriggers(): Promise<ProfitProtectionTriggerRecord[]> {
+      const result = await pool.query<{
+        id: string; event_key: string; symbol: string; plan_id: string; rule: string
+        status: 'open' | 'acknowledged'; payload_json: Record<string, unknown>
+        triggered_at: string; acknowledged_at: string | null
+      }>(`SELECT id, event_key, symbol, plan_id, rule, status, payload_json,
+          triggered_at::text, acknowledged_at::text
+        FROM profit_protection_triggers ORDER BY triggered_at DESC, id DESC`)
+      return result.rows.map((row) => ({
+        id: row.id, eventKey: row.event_key, symbol: row.symbol, planId: row.plan_id,
+        rule: row.rule, status: row.status, payload: row.payload_json,
+        triggeredAt: new Date(row.triggered_at).toISOString(),
+        acknowledgedAt: row.acknowledged_at ? new Date(row.acknowledged_at).toISOString() : null,
+      }))
+    },
+    async acknowledgeTrigger(id: string, acknowledgedAt: string) {
+      const result = await pool.query<{
+        id: string; event_key: string; symbol: string; plan_id: string; rule: string
+        status: 'open' | 'acknowledged'; payload_json: Record<string, unknown>
+        triggered_at: string; acknowledged_at: string | null
+      }>(`UPDATE profit_protection_triggers
+        SET status = 'acknowledged', acknowledged_at = $2
+        WHERE id = $1
+        RETURNING id, event_key, symbol, plan_id, rule, status, payload_json,
+          triggered_at::text, acknowledged_at::text`, [id, acknowledgedAt])
+      const row = result.rows[0]
+      return row ? {
+        id: row.id, eventKey: row.event_key, symbol: row.symbol, planId: row.plan_id,
+        rule: row.rule, status: row.status, payload: row.payload_json,
+        triggeredAt: new Date(row.triggered_at).toISOString(),
+        acknowledgedAt: row.acknowledged_at ? new Date(row.acknowledged_at).toISOString() : null,
+      } : null
+    },
+  }
+}
+
+export type ProfitProtectionRepository = ReturnType<typeof createProfitProtectionRepository>
 
 export type AnalysisRecord = {
   id: string

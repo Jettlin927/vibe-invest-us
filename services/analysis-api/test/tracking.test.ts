@@ -134,6 +134,92 @@ test('立即扫描先返回 202，扫描自选与持仓并集且同一时刻只�
   await app.close()
 })
 
+test('Tracking 扫描完成前评估盈利保护并持久化一次性触发事件', async () => {
+  const database = createTestProductDatabase()
+  const data = successfulTrackingData({
+    fetchTrackingQuotes: async () => [{
+      symbol: 'NVDA', price: 216, observedAt: '2026-09-04T20:00:00Z',
+      source: 'test-quotes', degraded: false, sources: [],
+    }],
+    getTechnicalEvidence: async () => ({
+      symbol: 'NVDA', actualStart: '2026-01-01', actualEnd: '2026-09-04', totalBarCount: 160,
+      structures: {}, indicators: { ma_5: 210, ma_20: 205, rsi_14: 60 },
+      volatility: {}, drawdown: {}, volumePrice: { volumeRatio5To20: 1 },
+      keyLevels: {}, conflicts: [], facts: [], sources: [{ source: 'test-history', status: 'ok' }],
+    }),
+  })
+  const app = buildApp({
+    ...database, trackingRepository: createTestTrackingRepository(),
+    financialDataHealth: healthyFinancialData, ...data,
+  })
+  await app.ready()
+  await app.inject({
+    method: 'PUT', url: '/api/positions/NVDA',
+    payload: { quantity: 5, averageCost: 180 },
+  })
+  await app.inject({
+    method: 'PUT', url: '/api/positions/NVDA/profit-protection',
+    payload: { anchorPrice: 180, invalidationPrice: 162, coreRatio: 0.6, maxPortfolioWeight: 1 },
+  })
+
+  const scan = await app.inject({ method: 'POST', url: '/api/tracking/scans' })
+  await waitForScan(app, scan.json().id)
+  const triggers = await app.inject({ method: 'GET', url: '/api/profit-protection' })
+
+  assert.equal(triggers.statusCode, 200)
+  assert.equal(triggers.json().triggers.length, 1)
+  assert.equal(triggers.json().triggers[0].rule, 'first_take_profit')
+  const acknowledged = await app.inject({
+    method: 'POST',
+    url: `/api/profit-protection/triggers/${triggers.json().triggers[0].id}/acknowledge`,
+  })
+  assert.equal(acknowledged.statusCode, 200)
+  assert.equal(acknowledged.json().status, 'acknowledged')
+  await app.close()
+})
+
+test('实例配置扫描间隔后自动运行 Tracking 且关闭服务会停止调度', async () => {
+  const database = createTestProductDatabase()
+  await database.portfolioRepository.recordReconcile('NVDA', 1, 90)
+  let quoteCalls = 0
+  const data = successfulTrackingData({
+    fetchTrackingQuotes: async (...args: Parameters<ReturnType<typeof successfulTrackingData>['fetchTrackingQuotes']>) => {
+      quoteCalls += 1
+      return successfulTrackingData().fetchTrackingQuotes(...args)
+    },
+  })
+  const app = buildApp({
+    ...database, trackingRepository: createTestTrackingRepository(),
+    financialDataHealth: healthyFinancialData, ...data, trackingScanIntervalMs: 20,
+  })
+  await app.ready()
+
+  for (let attempt = 0; attempt < 50 && quoteCalls === 0; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  assert.ok(quoteCalls > 0)
+  await app.close()
+  const callsAtClose = quoteCalls
+  await new Promise((resolve) => setTimeout(resolve, 35))
+  assert.equal(quoteCalls, callsAtClose)
+})
+
+test('定时扫描在没有自选或持仓目标时保持安静', async () => {
+  const app = buildApp({
+    ...createTestProductDatabase(), trackingRepository: createTestTrackingRepository(),
+    financialDataHealth: healthyFinancialData, ...successfulTrackingData(),
+    trackingScanIntervalMs: 10,
+  })
+  await app.ready()
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    const state = await app.inject({ method: 'GET', url: '/api/tracking' })
+    assert.equal(state.json().latestScan, null)
+  } finally {
+    await app.close()
+  }
+})
+
 test('基线之后只为确定性技术、基本面、官方事件和新标题变化生成事件', async () => {
   let version = 1
   const trackingRepository = createTestTrackingRepository()

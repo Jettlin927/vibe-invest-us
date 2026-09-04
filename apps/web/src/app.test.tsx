@@ -608,6 +608,84 @@ test('持仓页展示现金、盈亏和仓位，并能减仓后把卖出所得�
   await view.findAllByText('US$750.00')
 })
 
+test('持仓页可以建立盈利保护计划并展示 R 阶梯状态', async () => {
+  setupDom()
+  const portfolio = {
+    ...portfolioResponse([{ symbol: 'CRDO', quantity: 5, averageCost: 180 }]),
+    totalMarketValue: 1080, totalEquity: 1080, totalUnrealizedProfitLoss: 180,
+    totalUnrealizedReturn: 0.2,
+    positions: [{
+      symbol: 'CRDO', quantity: 5, averageCost: 180, costAmount: 900,
+      marketPrice: 216, marketValue: 1080, unrealizedProfitLoss: 180,
+      unrealizedReturn: 0.2, portfolioWeight: 1,
+    }],
+  }
+  let protection = {
+    summary: { planned: 0, triggered: 0, reviewRequired: 0, dataGap: 0 },
+    positions: [] as Array<Record<string, unknown>>,
+    triggers: [] as Array<Record<string, unknown>>,
+  }
+  globalThis.fetch = async (input, init) => {
+    const url = String(input)
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { database: { status: 'ok' }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/settings') return Response.json({ model: { configured: false } })
+    if (url === '/api/research') return Response.json({ records: [] })
+    if (url === '/api/portfolio/stored' || url === '/api/portfolio') return Response.json(portfolio)
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+    if (url === '/api/portfolio/events?limit=50') return Response.json({ events: [] })
+    if (url === '/api/profit-protection' && !init?.method) return Response.json(protection)
+    if (url === '/api/positions/CRDO/profit-protection' && init?.method === 'PUT') {
+      protection = {
+        summary: { planned: 1, triggered: 1, reviewRequired: 0, dataGap: 0 },
+        positions: [{
+          symbol: 'CRDO', status: 'triggered', planRevision: 1, currentR: 2,
+          bindingRule: 'first_take_profit', nextRule: { kind: 'second_take_profit', atR: 3 },
+          coreRatio: 0.6, tradingRatio: 0.4, anchorPrice: 180, invalidationPrice: 162,
+          maxPortfolioWeight: 1, marketPrice: 216, portfolioWeight: 1,
+          levels: { firstTakeProfit: 216, secondTakeProfit: 234, trailingStart: 252 },
+          trailing: { active: true, ema20: 205, observedAt: '2026-09-04', peakPrice: 260 },
+          profitJourney: {
+            peakUnrealizedProfit: 400, currentUnrealizedProfit: 180,
+            givebackAmount: 220, givebackRatio: 0.55,
+          },
+        }],
+        triggers: [{
+          id: 'trigger-1', symbol: 'CRDO', rule: 'first_take_profit', status: 'open',
+          triggeredAt: '2026-09-04T12:00:00.000Z', acknowledgedAt: null,
+        }],
+      }
+      return Response.json({ symbol: 'CRDO', revision: 1 })
+    }
+    if (url === '/api/profit-protection/triggers/trigger-1/acknowledge' && init?.method === 'POST') {
+      protection.triggers[0]!.status = 'acknowledged'
+      return Response.json(protection.triggers[0])
+    }
+    throw new Error(`unexpected_fetch:${url}`)
+  }
+
+  const view = render(React.createElement(App))
+  const user = userEvent.setup({ document: window.document })
+  await user.click(await view.findByRole('button', { name: '我的持仓' }))
+  await user.click(await view.findByRole('button', { name: '为 CRDO 制定保护计划' }))
+  assert.equal((view.getByRole('button', { name: '保存保护计划' }) as HTMLButtonElement).disabled, true)
+  await user.clear(view.getByLabelText('计划基准价'))
+  await user.type(view.getByLabelText('计划基准价'), '180')
+  await user.type(view.getByLabelText('失效价'), '162')
+  await user.clear(view.getByLabelText('核心仓比例'))
+  await user.type(view.getByLabelText('核心仓比例'), '60')
+  await user.clear(view.getByLabelText('最大仓位'))
+  await user.type(view.getByLabelText('最大仓位'), '100')
+  await user.click(view.getByRole('button', { name: '保存保护计划' }))
+
+  await view.findByText('当前 2.0R')
+  await view.findByText('第一次兑现')
+  await view.findByText('峰值浮盈')
+  await view.findByText('US$220.00 · 55.0%')
+  await user.click(view.getByRole('button', { name: '确认已处理' }))
+  await waitFor(() => assert.equal(view.queryByRole('button', { name: '确认已处理' }), null))
+  assert.match(view.getByRole('region', { name: 'CRDO 盈利阶梯' }).textContent ?? '', /162.*180.*216.*234.*252/)
+})
+
 test('持仓页可以加仓，买入花费从现金扣减并记入调仓账本', async () => {
   setupDom()
   let portfolio = {
