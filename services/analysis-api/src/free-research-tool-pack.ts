@@ -22,7 +22,7 @@ export function selectFreeResearchToolNames(
     .test(userMessage)
   const delegateRequested = /(?:派|让|请|创建|启动|调用|委派|安排).{0,12}(?:子\s*Agent|子代理|sub-?agent)/i
     .test(userMessage)
-  const collectRequested = /(?:等待|读取|查看|汇总|收集).{0,12}(?:子\s*Agent|子代理|sub-?agent)/i
+  const collectRequested = /(?:等待|读取|查看|汇总|收集|停止|终止|取消).{0,12}(?:子\s*Agent|子代理|sub-?agent)/i
     .test(userMessage)
   if (delegateRequested && !agentDenied) {
     requested.push('delegate_research', 'collect_research')

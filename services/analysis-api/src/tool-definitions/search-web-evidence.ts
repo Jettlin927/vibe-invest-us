@@ -11,4 +11,5 @@ export const searchWebEvidenceDefinition: RegisteredToolDefinition = {
   allowedRoles: ['news'], allowedStages: ['research'], sideEffect: 'read_only',
   externalNetwork: 'financial_data', hostAccess: 'none', resultRetention: 'research_record',
   modelProjection: 'bounded_summary', executionMode: 'parallel', countsAsToolRound: true,
+  handlerOwner: 'research_capability',
 }

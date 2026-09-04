@@ -1,4 +1,5 @@
 import type { Tool } from '@earendil-works/pi-ai'
+import type { ToolHandlerOwner } from '../tool-handler-catalog.js'
 
 export type ToolRole = 'main' | 'fundamental' | 'news' | 'technical'
 export type ToolStage = 'research' | 'finalization'
@@ -17,5 +18,5 @@ export type RegisteredToolDefinition = {
   executionMode: 'sequential' | 'parallel'
   countsAsToolRound: boolean
   surfaces?: ToolSurface[]
-  handlerOwner?: 'research_capability' | 'conversation_runtime'
+  handlerOwner?: ToolHandlerOwner
 }

@@ -1,6 +1,7 @@
 import AjvModule from 'ajv'
 import addFormatsModule from 'ajv-formats'
 import { selectFreeResearchToolNames } from './free-research-tool-pack.js'
+import { hasRegisteredToolHandler } from './tool-handler-catalog.js'
 
 import { fetchFinancialContextDefinition } from './tool-definitions/fetch-financial-context.js'
 import { getFinancialMetricSeriesDefinition } from './tool-definitions/get-financial-metric-series.js'
@@ -105,6 +106,10 @@ export function createToolRegistry(definitions: RegisteredToolDefinition[]) {
       && !oneOf(definition.handlerOwner, ['research_capability', 'conversation_runtime'])) {
       invalid(name, 'handler_owner')
     }
+    if (definition.handlerOwner
+      && !hasRegisteredToolHandler(definition.handlerOwner, name)) {
+      invalid(name, 'handler_missing')
+    }
     if (!validReportPolicy(definition)) invalid(name, 'report_policy')
     return Object.freeze({ ...definition })
   })
@@ -140,7 +145,7 @@ export function createToolRegistry(definitions: RegisteredToolDefinition[]) {
       if (result.modelProjection && typeof result.modelProjection === 'object') {
         return result.modelProjection as Record<string, unknown>
       }
-      if (['get_company_dossier', 'get_market_structure', 'compare_securities',
+      if (['get_research_context', 'get_company_dossier', 'get_market_structure', 'compare_securities',
         'get_portfolio_exposure'].includes(name)) {
         return projectPublicToolResult(name, result)
       }

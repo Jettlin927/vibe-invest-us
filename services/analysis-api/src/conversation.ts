@@ -17,6 +17,7 @@ import type { PiAgentAdapterContent, PiAgentAdapterMessage } from './agent-runti
 import { toolRegistry } from './tool-registry.js'
 import { conversationToolsForMessage } from './tools.js'
 import { extractFreeResearchSymbols } from './free-research-tool-pack.js'
+import { hasRegisteredToolHandler } from './tool-handler-catalog.js'
 import { createActiveBudget } from './runtime-policy.js'
 
 type ConversationModel = {
@@ -392,7 +393,8 @@ export function createConversationService(options: ConversationOptions) {
           return { result: { error: error instanceof Error ? error.message : String(error), facts: [] }, isError: true }
         }
       }
-      if (handlerOwner === 'research_capability' || name === 'search_web_evidence') {
+      if (handlerOwner === 'research_capability'
+        && hasRegisteredToolHandler(handlerOwner, name)) {
         return capabilityExecutor(name, params, signal, onStart)
       }
       await onStart()

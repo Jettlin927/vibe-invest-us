@@ -113,6 +113,9 @@ test('Registry 启动校验 fail closed 拒绝重复名称、缺失 schema 和�
   assert.throws(() => createToolRegistry([definition('conversation-without-handler', {
     surfaces: ['conversation'],
   })]), /tool_registry_invalid:handler_owner:conversation-without-handler/)
+  assert.throws(() => createToolRegistry([definition('conversation-missing-handler', {
+    surfaces: ['conversation'], handlerOwner: 'research_capability',
+  })]), /tool_registry_invalid:handler_missing:conversation-missing-handler/)
 })
 
 test('Registry 启动时拒绝 Shell、命令执行和任意文件能力', () => {
@@ -286,6 +289,16 @@ test('自由对话能力池不暴露底层 Subagent 生命周期工具', () => {
   for (const legacy of ['spawn_agent', 'wait_agent', 'read_agent_result', 'stop_agent']) {
     assert.equal(names.includes(legacy), false)
   }
+  assert.deepEqual(
+    createToolRegistry(registeredToolDefinitions)
+      .projectConversation({ userMessage: '停止刚才的子 Agent。' }).map(({ name }) => name),
+    ['collect_research'],
+  )
+  assert.equal(
+    createToolRegistry(registeredToolDefinitions)
+      .definition('collect_research')?.sideEffect,
+    'controls_agent',
+  )
 })
 
 test('自由对话识别小写 ticker 和常见技术表达但不把 API 当作标的', () => {
@@ -357,6 +370,16 @@ test('自由研究比较的模型与用户投影都递归移除未知嵌套字�
     assert.match(serialized, /NVDA|CY2026Q2|targetPrice|totalBarCount/)
     assert.doesNotMatch(serialized, /secret|providerEnvelope|hidden|internal|providerRaw|raw/)
   }
+})
+
+test('自由研究起始资料的模型投影不透传未知嵌套对象', () => {
+  const registry = createToolRegistry(registeredToolDefinitions)
+  const projection = registry.projectResult('get_research_context', {
+    facts: [], gaps: [], indicators: { rsi14: 55, providerRaw: 'secret' },
+    valuation: { target: 100, providerEnvelope: { hidden: true } },
+    privateContext: { holdings: ['SECRET'] },
+  })
+  assert.deepEqual(projection, { facts: [], gaps: [] })
 })
 
 test('消息面 Agent 只获得新闻候选、文档、公司事件和专项报告工具', () => {
