@@ -157,12 +157,13 @@ export function createToolRegistry(definitions: RegisteredToolDefinition[]) {
         }
         return { submitted: result.submitted === true, ...(result.error ? { error: result.error } : {}) }
       }
-      if (result.modelProjection && typeof result.modelProjection === 'object') {
-        return result.modelProjection as Record<string, unknown>
-      }
-      if (['get_research_context', 'get_company_dossier', 'get_market_structure', 'compare_securities',
+      if (['get_research_context', 'get_company_dossier', 'get_market_structure',
+        'search_evidence', 'read_evidence', 'compare_securities',
         'get_portfolio_exposure'].includes(name)) {
         return projectPublicToolResult(name, result)
+      }
+      if (result.modelProjection && typeof result.modelProjection === 'object') {
+        return result.modelProjection as Record<string, unknown>
       }
       return selectResult(result, boundedResultKeys)
     },

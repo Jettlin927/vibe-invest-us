@@ -390,6 +390,7 @@ test('自由研究起始资料的模型投影不透传未知嵌套对象', () =>
     facts: [], gaps: [], indicators: { rsi14: 55, providerRaw: 'secret' },
     valuation: { target: 100, providerEnvelope: { hidden: true } },
     privateContext: { holdings: ['SECRET'] },
+    modelProjection: { privateContext: { holdings: ['MODEL_PROJECTION_SECRET'] } },
   })
   assert.deepEqual(projection, { facts: [], gaps: [] })
 })
