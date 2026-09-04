@@ -393,6 +393,9 @@ test('自由研究起始资料的模型投影不透传未知嵌套对象', () =>
     modelProjection: { privateContext: { holdings: ['MODEL_PROJECTION_SECRET'] } },
   })
   assert.deepEqual(projection, { facts: [], gaps: [] })
+  assert.deepEqual(registry.projectResult('search_web_evidence', {
+    facts: [], modelProjection: { privateContext: 'WEB_SEARCH_SECRET' },
+  }), { facts: [] })
 })
 
 test('组合暴露的模型与用户投影只保留目标持仓和组合聚合白名单', () => {

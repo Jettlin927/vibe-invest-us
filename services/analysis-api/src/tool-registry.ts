@@ -158,7 +158,7 @@ export function createToolRegistry(definitions: RegisteredToolDefinition[]) {
         return { submitted: result.submitted === true, ...(result.error ? { error: result.error } : {}) }
       }
       if (['get_research_context', 'get_company_dossier', 'get_market_structure',
-        'search_evidence', 'read_evidence', 'compare_securities',
+        'search_evidence', 'search_web_evidence', 'read_evidence', 'compare_securities',
         'get_portfolio_exposure'].includes(name)) {
         return projectPublicToolResult(name, result)
       }
