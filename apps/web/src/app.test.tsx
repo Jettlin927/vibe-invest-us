@@ -129,7 +129,7 @@ test('研究对话把主 Agent 回答渲染为 Markdown 结构', async () => {
       thread,
       lifecycle: { events: [{
         sequence: 1, type: 'chat_completed',
-        text: '## 给你的实操含义\n\n- **别去猜底**：用关键位判断。',
+        text: '## 给你的实操含义\n\n- **别去猜底**：用关键位判断。\n\n<button>危险</button>\n\n![外部图](https://attacker.example/holding.png)',
       }] },
     })
     throw new Error(`unexpected_fetch:${url}`)
@@ -141,8 +141,47 @@ test('研究对话把主 Agent 回答渲染为 Markdown 结构', async () => {
   const log = await view.findByRole('log', { name: '研究对话内容' })
   assert.equal(log.querySelector('h2')?.textContent, '给你的实操含义')
   assert.equal(log.querySelector('ul li strong')?.textContent, '别去猜底')
-  assert.equal(log.textContent?.includes('##'), false)
-  assert.equal(log.textContent?.includes('**'), false)
+  const assistantMarkdown = log.querySelector('.markdown-body')!
+  assert.equal(assistantMarkdown.textContent?.includes('##'), false)
+  assert.equal(assistantMarkdown.textContent?.includes('**'), false)
+  assert.equal(log.querySelector('.markdown-body button'), null)
+  assert.equal(log.querySelector('.markdown-body img'), null)
+  assert.match(assistantMarkdown.textContent ?? '', /外部图/)
+})
+
+test('研究对话最终消息只替换同一轮的流式内容', async () => {
+  setupDom()
+  Reflect.deleteProperty(globalThis, 'EventSource')
+  const thread = {
+    id: 'thread-turns', capability: 'research', parentThreadId: null, title: '多轮研究',
+    status: 'completed', createdAt: '2026-09-04T00:00:00Z', updatedAt: '2026-09-04T00:00:00Z',
+    sessionId: 'session-turns', executionId: 'execution-turns',
+  }
+  globalThis.fetch = async (input) => {
+    const url = String(input)
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { productDatabase: { status: 'ok', engine: 'postgresql', schemaVersion: 31 }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/settings') return Response.json(settingsResponse())
+    if (url === '/api/portfolio/stored' || url === '/api/portfolio') return Response.json(portfolioResponse([]))
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+    if (url === '/api/portfolio/events?limit=50') return Response.json({ events: [] })
+    if (url === '/api/research') return Response.json({ records: [] })
+    if (url === '/api/conversations') return Response.json({ threads: [thread] })
+    if (url === '/api/conversations/thread-turns') return Response.json({
+      thread,
+      lifecycle: { events: [
+        { sequence: 1, type: 'text_delta', text: '旧轮部分回答' },
+        { sequence: 2, type: 'user_message', message: '新问题' },
+        { sequence: 3, type: 'chat_completed', text: '新轮最终回答' },
+      ] },
+    })
+    throw new Error(`unexpected_fetch:${url}`)
+  }
+
+  const view = render(React.createElement(App))
+  const user = userEvent.setup({ document: window.document })
+  await user.click(await view.findByRole('button', { name: '研究对话' }))
+  const log = await view.findByRole('log', { name: '研究对话内容' })
+  assert.match(log.textContent ?? '', /旧轮部分回答.*新问题.*新轮最终回答/)
 })
 
 test('研究消息提交等待响应时立即回显并禁止重复点击', async () => {
@@ -919,7 +958,8 @@ test('无有效报告的研究页仍可向原主 Agent 发送追问', async () =
         sequence: 1, type: 'runtime_follow_up', message: payload.message,
         createdAt: '2026-08-14T01:00:00.000Z',
       }, {
-        sequence: 2, type: 'chat_completed', text: '这是主 Agent 的可回放回答。',
+        sequence: 2, type: 'chat_completed',
+        text: '## 可回放回答\n\n- **重点**：保持纪律。\n\n<button>危险</button>\n\n![外部图](https://attacker.example/research.png)',
         createdAt: '2026-08-14T01:00:01.000Z',
       }]
       return Response.json({ sessionId: 'follow-up-session', executionId: 'follow-up-execution' }, { status: 202 })
@@ -931,12 +971,16 @@ test('无有效报告的研究页仍可向原主 Agent 发送追问', async () =
   const user = userEvent.setup({ document: window.document })
   await user.click(await view.findByRole('button', { name: '新建分析' }))
   await user.click(await view.findByRole('button', { name: /打开 NVDA/ }))
-  await user.type(await view.findByLabelText('追问主 Agent'), '继续补充研究')
+  await user.type(await view.findByLabelText('追问主 Agent'), '# 继续 **补充**')
   await user.click(view.getByRole('button', { name: '发送追问' }))
-  await waitFor(() => assert.equal(sent, '继续补充研究'))
+  await waitFor(() => assert.equal(sent, '# 继续 **补充**'))
   const conversation = await view.findByRole('region', { name: '与主 Agent 的对话' })
-  assert.match(conversation.textContent ?? '', /你继续补充研究/)
-  assert.match(conversation.textContent ?? '', /主 Agent这是主 Agent 的可回放回答/)
+  assert.match(conversation.querySelector('article.user p')?.textContent ?? '', /# 继续 \*\*补充\*\*/)
+  assert.equal(conversation.querySelector('article.user p h1, article.user p strong'), null)
+  assert.equal(conversation.querySelector('h2')?.textContent, '可回放回答')
+  assert.equal(conversation.querySelector('li strong')?.textContent, '重点')
+  assert.equal(conversation.querySelector('.markdown-body button, .markdown-body img'), null)
+  assert.match(conversation.querySelector('.markdown-body')?.textContent ?? '', /外部图/)
   await user.click(view.getByRole('tab', { name: '轨迹' }))
   await waitFor(() => assert.match(view.getByRole('region', { name: '研究轨迹' }).textContent ?? '', /Execution follow-up-execution · Generation 2/))
 })

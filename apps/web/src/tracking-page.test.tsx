@@ -82,6 +82,45 @@ test('Tracking API 不可用时页面显示未知且禁用扫描', () => {
   assert.equal((view.getByRole('button', { name: '立即扫描' }) as HTMLButtonElement).disabled, true)
 })
 
+test('行情扫描成功但盈利保护更新失败时页面显示降级原因', () => {
+  setupDom()
+  const view = render(<TrackingPage
+    overview={{
+      watchlist: [], targets: [{ symbol: 'NVDA', sources: ['position'] }], activeScan: null,
+      latestScan: {
+        id: 'run-protection-partial', status: 'partial',
+        targets: [{ symbol: 'NVDA', sources: ['position'] }],
+        startedAt: '2026-09-04T20:00:00Z', completedAt: '2026-09-04T20:00:01Z',
+        error: 'profit_protection_evaluation_failed',
+        observations: [{
+          id: 'observation-1', runId: 'run-protection-partial', symbol: 'NVDA',
+          capability: 'technical', status: 'success', baselineObservationId: null,
+          observedAt: '2026-09-04T20:00:00Z', payload: { gaps: [] },
+        }, {
+          id: 'observation-2', runId: 'run-protection-partial', symbol: 'NVDA',
+          capability: 'fundamental', status: 'data_gap', baselineObservationId: null,
+          observedAt: '2026-09-04T20:00:00Z',
+          payload: { gaps: [{ source: 'fundamental', reason: 'all_sources_failed' }] },
+        }],
+        events: [],
+      },
+      events: [],
+    }}
+    loading={false} scanning={false}
+    onWatch={async () => true}
+    onUnwatch={async () => {}}
+    onScan={async () => {}}
+    onAnalyze={async () => {}}
+  />)
+
+  const summary = view.getByRole('region', { name: '追踪概览' })
+  assert.match(summary.textContent ?? '', /盈利保护更新失败/)
+  assert.doesNotMatch(summary.textContent ?? '', /最近扫描能力完整/)
+  const detail = view.getByRole('region', { name: '数据缺口详情' })
+  assert.match(detail.textContent ?? '', /行情扫描结果已保留/)
+  assert.match(detail.textContent ?? '', /NVDA.*基本面.*all_sources_failed/s)
+})
+
 test('添加自选失败时保留用户输入', async () => {
   setupDom()
   const view = render(<TrackingPage

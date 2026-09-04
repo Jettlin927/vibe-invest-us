@@ -50,10 +50,19 @@ export function createTrackingService(dependencies: {
   concurrency?: number
   scanIntervalMs?: number
   afterObservations?: (observations: ObservationInput[], completedAt: string) => Promise<void>
+  onBackgroundError?: (error: unknown) => void
 }) {
+  const scanIntervalMs = dependencies.scanIntervalMs ?? 0
+  if (!Number.isFinite(scanIntervalMs) || scanIntervalMs < 0 || scanIntervalMs > 2_147_483_647) {
+    throw new Error('invalid_tracking_scan_interval')
+  }
   const repository = dependencies.repository
   const running = new Map<string, { controller: AbortController; promise: Promise<void> }>()
   let schedule: ReturnType<typeof setInterval> | null = null
+  const reportBackgroundError = (error: unknown) => {
+    if (dependencies.onBackgroundError) dependencies.onBackgroundError(error)
+    else console.error('tracking_background_error', error)
+  }
 
   async function startScan() {
     const [watchlist, positionSymbols] = await Promise.all([
@@ -65,7 +74,7 @@ export function createTrackingService(dependencies: {
     })
     const controller = new AbortController()
     const promise = executeScan(run, controller.signal)
-      .catch(() => {})
+      .catch(reportBackgroundError)
       .finally(() => { running.delete(run.id) })
     running.set(run.id, { controller, promise })
     return run
@@ -87,15 +96,15 @@ export function createTrackingService(dependencies: {
           if (!(error instanceof Error) || error.message !== 'tracking_run_not_active') throw error
         }
       }
-      if (dependencies.scanIntervalMs && dependencies.scanIntervalMs > 0 && !schedule) {
+      if (scanIntervalMs > 0 && !schedule) {
         schedule = setInterval(() => {
           void Promise.all([repository.listWatchlist(), dependencies.listPositionSymbols()])
             .then(([watchlist, positions]) => {
               if (watchlist.some(({ enabled }) => enabled) || positions.length > 0) return startScan()
               return undefined
             })
-            .catch(() => {})
-        }, dependencies.scanIntervalMs)
+            .catch(reportBackgroundError)
+        }, scanIntervalMs)
       }
     },
     async state(options: { symbol?: string; limit?: number } = {}) {
@@ -166,19 +175,23 @@ export function createTrackingService(dependencies: {
       ))
       const successful = observations.filter(({ status }) => status === 'success').length
       const gaps = observations.length - successful
-      const status = gaps === 0 ? 'completed' : successful === 0 ? 'failed' : 'partial'
+      let status: 'completed' | 'partial' | 'failed' = gaps === 0
+        ? 'completed' : successful === 0 ? 'failed' : 'partial'
       const completedAt = currentTime(dependencies.now)
+      let protectionError: string | undefined
       try {
         await dependencies.afterObservations?.(observations, completedAt)
       } catch {
-        // Profit-protection evaluation must not turn a valid market scan into a failure.
+        protectionError = 'profit_protection_evaluation_failed'
+        if (status === 'completed') status = 'partial'
       }
       await repository.completeRun({
         runId: run.id,
         status,
         observations,
         completedAt,
-        ...(status === 'failed' ? { error: 'tracking_data_unavailable' } : {}),
+        ...(status === 'failed' ? { error: 'tracking_data_unavailable' }
+          : protectionError ? { error: protectionError } : {}),
       })
     } catch (error) {
       await repository.completeRun({

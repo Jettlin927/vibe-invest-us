@@ -178,6 +178,75 @@ test('Tracking 扫描完成前评估盈利保护并持久化一次性触发事�
   await app.close()
 })
 
+test('技术指标缺失时仍按可用报价生成价格型盈利保护提醒', async () => {
+  const database = createTestProductDatabase()
+  const app = buildApp({
+    ...database,
+    trackingRepository: createTestTrackingRepository(),
+    financialDataHealth: healthyFinancialData,
+    ...successfulTrackingData({
+      fetchTrackingQuotes: async () => [{
+        symbol: 'NVDA', price: 126, observedAt: '2026-09-04T20:00:00Z',
+        source: 'test-quotes', degraded: false, sources: [],
+      }],
+      getTechnicalEvidence: async () => { throw new Error('technical_history_unavailable') },
+    }),
+  })
+  await app.ready()
+  await app.inject({
+    method: 'PUT', url: '/api/positions/NVDA',
+    payload: { quantity: 1, averageCost: 90 },
+  })
+  await app.inject({
+    method: 'PUT', url: '/api/positions/NVDA/profit-protection',
+    payload: { anchorPrice: 90, invalidationPrice: 72, coreRatio: 0.6, maxPortfolioWeight: 1 },
+  })
+
+  const scan = await app.inject({ method: 'POST', url: '/api/tracking/scans' })
+  const completed = await waitForScan(app, scan.json().id)
+  const protection = await app.inject({ method: 'GET', url: '/api/profit-protection' })
+
+  assert.equal(completed.json().status, 'partial')
+  assert.equal(protection.json().triggers.length, 1)
+  assert.equal(protection.json().triggers[0].rule, 'first_take_profit')
+  await app.close()
+})
+
+test('盈利保护写入失败时 Tracking Run 明确降级而不是报告成功', async () => {
+  const database = createTestProductDatabase()
+  const app = buildApp({
+    ...database,
+    profitProtectionRepository: {
+      ...database.profitProtectionRepository,
+      async recordEvaluation() { throw new Error('profit_protection_storage_failed') },
+    },
+    trackingRepository: createTestTrackingRepository(),
+    financialDataHealth: healthyFinancialData,
+    ...successfulTrackingData({
+      fetchTrackingQuotes: async () => [{
+        symbol: 'NVDA', price: 126, observedAt: '2026-09-04T20:00:00Z',
+        source: 'test-quotes', degraded: false, sources: [],
+      }],
+    }),
+  })
+  await app.ready()
+  await app.inject({
+    method: 'PUT', url: '/api/positions/NVDA',
+    payload: { quantity: 1, averageCost: 90 },
+  })
+  await app.inject({
+    method: 'PUT', url: '/api/positions/NVDA/profit-protection',
+    payload: { anchorPrice: 90, invalidationPrice: 72, coreRatio: 0.6, maxPortfolioWeight: 1 },
+  })
+
+  const scan = await app.inject({ method: 'POST', url: '/api/tracking/scans' })
+  const completed = await waitForScan(app, scan.json().id)
+
+  assert.equal(completed.json().status, 'partial')
+  assert.equal(completed.json().error, 'profit_protection_evaluation_failed')
+  await app.close()
+})
+
 test('实例配置扫描间隔后自动运行 Tracking 且关闭服务会停止调度', async () => {
   const database = createTestProductDatabase()
   await database.portfolioRepository.recordReconcile('NVDA', 1, 90)
@@ -204,6 +273,15 @@ test('实例配置扫描间隔后自动运行 Tracking 且关闭服务会停止�
   assert.equal(quoteCalls, callsAtClose)
 })
 
+test('Tracking 拒绝无效的定时扫描间隔', () => {
+  assert.throws(() => buildApp({
+    ...createTestProductDatabase(),
+    trackingRepository: createTestTrackingRepository(),
+    financialDataHealth: healthyFinancialData,
+    trackingScanIntervalMs: Number.NaN,
+  }), /invalid_tracking_scan_interval/)
+})
+
 test('定时扫描在没有自选或持仓目标时保持安静', async () => {
   const app = buildApp({
     ...createTestProductDatabase(), trackingRepository: createTestTrackingRepository(),
@@ -218,6 +296,57 @@ test('定时扫描在没有自选或持仓目标时保持安静', async () => {
   } finally {
     await app.close()
   }
+})
+
+test('定时扫描前置读取失败时通过后台错误边界报告', async () => {
+  const repository = createTestTrackingRepository()
+  let reported: unknown
+  const app = buildApp({
+    ...createTestProductDatabase(),
+    trackingRepository: {
+      ...repository,
+      async listWatchlist() { throw new Error('tracking_schedule_read_failed') },
+    },
+    financialDataHealth: healthyFinancialData,
+    trackingScanIntervalMs: 10,
+    trackingBackgroundError: (error) => { reported = error },
+  })
+  await app.ready()
+  try {
+    for (let attempt = 0; attempt < 20 && !reported; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    }
+    assert.match(String(reported), /tracking_schedule_read_failed/)
+  } finally {
+    await app.close()
+  }
+})
+
+test('Tracking Run 最终写库失败时通过后台错误边界报告', async () => {
+  const repository = createTestTrackingRepository()
+  let reported: unknown
+  const app = buildApp({
+    ...createTestProductDatabase(),
+    trackingRepository: {
+      ...repository,
+      async completeRun() { throw new Error('tracking_completion_failed') },
+    },
+    financialDataHealth: healthyFinancialData,
+    ...successfulTrackingData(),
+    trackingBackgroundError: (error) => { reported = error },
+  })
+  await app.ready()
+  await app.inject({
+    method: 'PUT', url: '/api/positions/NVDA', payload: { quantity: 1, averageCost: 90 },
+  })
+
+  const response = await app.inject({ method: 'POST', url: '/api/tracking/scans' })
+  assert.equal(response.statusCode, 202)
+  for (let attempt = 0; attempt < 20 && !reported; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  assert.match(String(reported), /tracking_completion_failed/)
+  await app.close()
 })
 
 test('基线之后只为确定性技术、基本面、官方事件和新标题变化生成事件', async () => {

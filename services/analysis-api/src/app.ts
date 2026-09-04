@@ -73,6 +73,7 @@ type AppDependencies = {
   fetchTrackingQuotes?: (symbols: string[], signal: AbortSignal) => Promise<QuoteSnapshot[]>
   trackingConcurrency?: number
   trackingScanIntervalMs?: number
+  trackingBackgroundError?: (error: unknown) => void
   marketPriceTimeoutMs?: number
   model?: {
     analyze(input: any): AsyncIterable<ModelEvent>
@@ -173,16 +174,18 @@ export function buildApp(dependencies: AppDependencies) {
         now: dependencies.now,
         concurrency: dependencies.trackingConcurrency,
         scanIntervalMs: dependencies.trackingScanIntervalMs,
+        onBackgroundError: dependencies.trackingBackgroundError,
         afterObservations: profitProtection ? async (observations, completedAt) => {
-          const technical = observations.filter((observation) => (
-            observation.capability === 'technical' && observation.status === 'success'
+          const quoted = observations.filter((observation) => (
+            observation.capability === 'technical'
+            && nestedNumber(observation.payload, 'quote', 'price') !== null
           ))
-          const prices = Object.fromEntries(technical.flatMap((observation) => {
+          const prices = Object.fromEntries(quoted.flatMap((observation) => {
             const price = nestedNumber(observation.payload, 'quote', 'price')
             return price === null ? [] : [[observation.symbol, price]]
           }))
           const overview = await portfolio.overview(prices)
-          const signals = Object.fromEntries(technical.flatMap((observation) => {
+          const signals = Object.fromEntries(quoted.flatMap((observation) => {
             const price = nestedNumber(observation.payload, 'quote', 'price')
             if (price === null) return []
             return [[observation.symbol, {

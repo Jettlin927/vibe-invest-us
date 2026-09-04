@@ -3,10 +3,11 @@ import { randomUUID } from 'node:crypto'
 import { Pool, type PoolClient } from 'pg'
 import {
   agentExecutionStatuses, aggregateModelTokenUsage, defaultRuntimeSettings, parseRuntimeSettingsUpdate,
-  terminalAgentExecutionStatuses,
+  profitProtectionRules, terminalAgentExecutionStatuses,
   type AgentExecutionStatus,
   type ConversationThread,
   type ExecutionSettingsSnapshot, type RuntimeSettings, type RuntimeSettingsRevision,
+  type ProfitProtectionRule,
   type TrackingEvent, type TrackingObservation, type TrackingObservationInput,
   type TrackingRun, type TrackingRunDetail, type TrackingTarget, type TrackingTargetSource,
   type WatchlistItem,
@@ -1553,11 +1554,29 @@ export type ProfitProtectionTriggerRecord = {
   eventKey: string
   symbol: string
   planId: string
-  rule: string
+  rule: ProfitProtectionRule
   status: 'open' | 'acknowledged'
   payload: Record<string, unknown>
   triggeredAt: string
   acknowledgedAt: string | null
+}
+
+type ProfitProtectionTriggerRow = {
+  id: string; event_key: string; symbol: string; plan_id: string; rule: string
+  status: 'open' | 'acknowledged'; payload_json: Record<string, unknown>
+  triggered_at: string; acknowledged_at: string | null
+}
+
+function toProfitProtectionTrigger(row: ProfitProtectionTriggerRow): ProfitProtectionTriggerRecord {
+  if (!profitProtectionRules.includes(row.rule as ProfitProtectionRule)) {
+    throw new Error('invalid_profit_protection_rule')
+  }
+  return {
+    id: row.id, eventKey: row.event_key, symbol: row.symbol, planId: row.plan_id,
+    rule: row.rule as ProfitProtectionRule, status: row.status, payload: row.payload_json,
+    triggeredAt: new Date(row.triggered_at).toISOString(),
+    acknowledgedAt: row.acknowledged_at ? new Date(row.acknowledged_at).toISOString() : null,
+  }
 }
 
 export function createProfitProtectionRepository(pool: Pool) {
@@ -1660,37 +1679,21 @@ export function createProfitProtectionRepository(pool: Pool) {
       }
     },
     async listTriggers(): Promise<ProfitProtectionTriggerRecord[]> {
-      const result = await pool.query<{
-        id: string; event_key: string; symbol: string; plan_id: string; rule: string
-        status: 'open' | 'acknowledged'; payload_json: Record<string, unknown>
-        triggered_at: string; acknowledged_at: string | null
-      }>(`SELECT id, event_key, symbol, plan_id, rule, status, payload_json,
+      const result = await pool.query<ProfitProtectionTriggerRow>(
+        `SELECT id, event_key, symbol, plan_id, rule, status, payload_json,
           triggered_at::text, acknowledged_at::text
-        FROM profit_protection_triggers ORDER BY triggered_at DESC, id DESC`)
-      return result.rows.map((row) => ({
-        id: row.id, eventKey: row.event_key, symbol: row.symbol, planId: row.plan_id,
-        rule: row.rule, status: row.status, payload: row.payload_json,
-        triggeredAt: new Date(row.triggered_at).toISOString(),
-        acknowledgedAt: row.acknowledged_at ? new Date(row.acknowledged_at).toISOString() : null,
-      }))
+        FROM profit_protection_triggers ORDER BY triggered_at DESC, id DESC`,
+      )
+      return result.rows.map(toProfitProtectionTrigger)
     },
     async acknowledgeTrigger(id: string, acknowledgedAt: string) {
-      const result = await pool.query<{
-        id: string; event_key: string; symbol: string; plan_id: string; rule: string
-        status: 'open' | 'acknowledged'; payload_json: Record<string, unknown>
-        triggered_at: string; acknowledged_at: string | null
-      }>(`UPDATE profit_protection_triggers
+      const result = await pool.query<ProfitProtectionTriggerRow>(`UPDATE profit_protection_triggers
         SET status = 'acknowledged', acknowledged_at = $2
         WHERE id = $1
         RETURNING id, event_key, symbol, plan_id, rule, status, payload_json,
           triggered_at::text, acknowledged_at::text`, [id, acknowledgedAt])
       const row = result.rows[0]
-      return row ? {
-        id: row.id, eventKey: row.event_key, symbol: row.symbol, planId: row.plan_id,
-        rule: row.rule, status: row.status, payload: row.payload_json,
-        triggeredAt: new Date(row.triggered_at).toISOString(),
-        acknowledgedAt: row.acknowledged_at ? new Date(row.acknowledged_at).toISOString() : null,
-      } : null
+      return row ? toProfitProtectionTrigger(row) : null
     },
   }
 }

@@ -2,8 +2,9 @@ import { useEffect, useRef, useState, type ReactNode } from 'react'
 import ReactMarkdown from 'react-markdown'
 
 import {
-  aggregateModelTokenUsage, isRuntimeSettingsResponse, isSystemHealth,
+  aggregateModelTokenUsage, isProfitProtectionOverview, isRuntimeSettingsResponse, isSystemHealth,
   isTerminalAgentExecutionStatus, runtimeSettingLimits,
+  type ProfitProtectionOverview, type ProfitProtectionStatus,
   type RuntimeSettings, type RuntimeSettingsResponse, type SystemHealth,
   type TokenUsageAggregate, type TrackingRunDetail,
 } from '@vibe-invest/contracts'
@@ -30,39 +31,6 @@ type PortfolioEvent = {
   id: string; kind: 'buy' | 'sell' | 'cash_adjust' | 'reconcile'
   symbol: string | null; quantity: number | null; price: number | null
   amount: number | null; realizedProfitLoss: number | null; note: string; createdAt: string
-}
-type ProfitProtectionStatus = {
-  symbol: string
-  status: 'normal' | 'triggered' | 'review_required' | 'data_gap'
-  planRevision: number
-  currentR: number | null
-  bindingRule: 'thesis_invalidation' | 'position_changed' | 'max_weight'
-    | 'earnings_window' | 'first_take_profit' | 'second_take_profit'
-    | 'activate_trailing' | 'trailing_stop' | null
-  nextRule: { kind: string; atR: number } | null
-  coreRatio: number
-  tradingRatio: number
-  anchorPrice: number
-  invalidationPrice: number
-  maxPortfolioWeight: number
-  marketPrice: number | null
-  portfolioWeight: number | null
-  levels: { firstTakeProfit: number; secondTakeProfit: number; trailingStart: number }
-  earnings?: { date: string; riskStartsAt: string; inRiskWindow: boolean }
-  trailing?: { active: boolean; ema20: number | null; observedAt: string; peakPrice: number | null }
-  profitJourney?: {
-    peakUnrealizedProfit: number; currentUnrealizedProfit: number
-    givebackAmount: number; givebackRatio: number | null
-  }
-}
-type ProfitProtectionTrigger = {
-  id: string; symbol: string; rule: string; status: 'open' | 'acknowledged'
-  triggeredAt: string; acknowledgedAt: string | null
-}
-type ProfitProtectionOverview = {
-  summary: { planned: number; triggered: number; reviewRequired: number; dataGap: number }
-  positions: ProfitProtectionStatus[]
-  triggers: ProfitProtectionTrigger[]
 }
 type ResearchSummary = { id: string; symbol: string; status: string; terminal?: boolean; createdAt?: string; reportCreatedAt?: string | null; error?: string | null; starred?: boolean; note?: string; report?: { title?: string; trend?: string } }
 type Fact = { id: string; type: string; value: unknown; observedAt: string; source: string; sourceReference: string }
@@ -142,6 +110,48 @@ type ConversationThread = {
   status: string; createdAt: string; updatedAt: string; sessionId: string; executionId: string
 }
 type ConversationEvent = { sequence: number; type?: string; createdAt?: string; [key: string]: unknown }
+type ChatMessage = {
+  key: string; role: 'user' | 'assistant'; text: string; streaming?: boolean
+}
+type ChatProjectionEvent = {
+  sequence: number; type?: string; message?: unknown; text?: unknown
+}
+
+function projectChatMessages(
+  events: ChatProjectionEvent[], options: { includeArtifacts?: boolean } = {},
+): ChatMessage[] {
+  const messages: ChatMessage[] = []
+  let streamingIndex = -1
+  for (const event of events) {
+    if ((event.type === 'user_message' || event.type === 'runtime_follow_up')
+      && typeof event.message === 'string') {
+      streamingIndex = -1
+      messages.push({ key: `user-${event.sequence}`, role: 'user', text: event.message })
+    } else if (event.type === 'text_delta' && typeof event.text === 'string') {
+      if (streamingIndex >= 0) messages[streamingIndex]!.text += event.text
+      else {
+        streamingIndex = messages.length
+        messages.push({
+          key: `assistant-stream-${event.sequence}`,
+          role: 'assistant', text: event.text, streaming: true,
+        })
+      }
+    } else if (event.type === 'chat_completed' && typeof event.text === 'string') {
+      const finalMessage = {
+        key: `assistant-${event.sequence}`, role: 'assistant' as const, text: event.text,
+      }
+      if (streamingIndex >= 0) messages[streamingIndex] = finalMessage
+      else messages.push(finalMessage)
+      streamingIndex = -1
+    } else if (options.includeArtifacts && event.type === 'artifact_completed') {
+      messages.push({
+        key: `artifact-${event.sequence}`, role: 'assistant',
+        text: '研究报告 Artifact 已保存，可在研究记录中继续查看。',
+      })
+    }
+  }
+  return messages
+}
 
 function createMessageId() {
   if (typeof crypto.randomUUID === 'function') return crypto.randomUUID()
@@ -843,33 +853,7 @@ function ConversationPage({ threads, thread, events, busy, onOpen, onNew, onCrea
     const list = messageListRef.current
     if (list) list.scrollTop = list.scrollHeight
   }, [events.length])
-  const messages = events.reduce<Array<{
-    key: string; role: 'user' | 'assistant'; text: string; streaming?: boolean
-  }>>((all, event) => {
-    if (event.type === 'user_message' && typeof event.message === 'string') {
-      all.push({ key: `user-${event.sequence}`, role: 'user', text: event.message })
-    } else if (event.type === 'text_delta' && typeof event.text === 'string') {
-      const previous = all.at(-1)
-      if (previous?.role === 'assistant' && previous.streaming) previous.text += event.text
-      else all.push({ key: `assistant-stream-${event.sequence}`, role: 'assistant', text: event.text, streaming: true })
-    } else if (event.type === 'chat_completed' && typeof event.text === 'string') {
-      let streamingIndex = -1
-      for (let index = all.length - 1; index >= 0; index -= 1) {
-        if (all[index]?.role === 'assistant' && all[index]?.streaming) {
-          streamingIndex = index
-          break
-        }
-      }
-      if (streamingIndex >= 0) {
-        all[streamingIndex] = {
-          key: `assistant-${event.sequence}`, role: 'assistant', text: event.text,
-        }
-      } else all.push({ key: `assistant-${event.sequence}`, role: 'assistant', text: event.text })
-    } else if (event.type === 'artifact_completed') {
-      all.push({ key: `artifact-${event.sequence}`, role: 'assistant', text: '研究报告 Artifact 已保存，可在研究记录中继续查看。' })
-    }
-    return all
-  }, [])
+  const messages = projectChatMessages(events, { includeArtifacts: true })
   const active = busy || Boolean(thread && ['queued', 'running'].includes(thread.status))
   return <div className="conversation-layout">
     <aside className="conversation-threads">
@@ -895,7 +879,10 @@ function ConversationPage({ threads, thread, events, busy, onOpen, onNew, onCrea
 }
 
 function AssistantMarkdown({ text }: { text: string }) {
-  return <div className="markdown-body"><ReactMarkdown skipHtml>{text}</ReactMarkdown></div>
+  return <div className="markdown-body"><ReactMarkdown
+    skipHtml
+    components={{ img: ({ alt }) => <span>{alt ?? ''}</span> }}
+  >{text}</ReactMarkdown></div>
 }
 
 function ConversationComposer({ mode, busy, onSubmit }: {
@@ -1574,25 +1561,7 @@ function ResearchReport({ record, onUpdate, onDelete, deleting, onResume, onFoll
   const stale = freshnessDays !== null && isReportOlderThan(
     selectedVersion?.createdAt ?? record.reportCreatedAt, freshnessDays,
   )
-  const conversation = (record.messages ?? record.mainAgent?.events ?? []).reduce<Array<{
-    key: string; role: 'user' | 'assistant'; text: string; streaming?: boolean
-  }>>((messages, event) => {
-    if (event.type === 'runtime_follow_up' && event.message) {
-      messages.push({ key: `user:${event.sequence}`, role: 'user', text: event.message })
-    }
-    if (event.type === 'chat_completed' && event.text) {
-      if (messages.at(-1)?.streaming) messages.pop()
-      messages.push({ key: `assistant:${event.sequence}`, role: 'assistant', text: event.text })
-    }
-    if (event.type === 'text_delta' && event.text) {
-      const previous = messages.at(-1)
-      if (previous?.role === 'assistant' && previous.streaming) previous.text += event.text
-      else messages.push({
-        key: `assistant-stream:${event.sequence}`, role: 'assistant', text: event.text, streaming: true,
-      })
-    }
-    return messages
-  }, [])
+  const conversation = projectChatMessages(record.messages ?? record.mainAgent?.events ?? [])
   return <article className="research-report">
     <header className="report-title"><div><p className="micro">{record.symbol} · {statusLabel(record.status)}</p><h2>{report?.title ?? '受限分析'}</h2>{stale && <p role="status" className="data-warning">此报告可能过期：已超过当前 {freshnessDays} 天时效阈值。</p>}</div><span className={`verdict ${record.status}`}>{trendVerdict(report?.trend)}<small>未来 1—4 周</small></span></header>
     {record.error && <p role="alert" className="error-banner">{friendlyError(record.error)}</p>}
@@ -2036,17 +2005,6 @@ function isPortfolioOverview(value: unknown): value is PortfolioOverview {
         && ['marketPrice', 'marketValue', 'unrealizedProfitLoss', 'unrealizedReturn', 'portfolioWeight']
           .every((key) => item[key] === null || (typeof item[key] === 'number' && Number.isFinite(item[key])))
     })
-}
-
-function isProfitProtectionOverview(value: unknown): value is ProfitProtectionOverview {
-  if (!value || typeof value !== 'object') return false
-  const candidate = value as Record<string, unknown>
-  const summary = candidate.summary as Record<string, unknown> | undefined
-  return Boolean(summary)
-    && ['planned', 'triggered', 'reviewRequired', 'dataGap']
-      .every((key) => typeof summary?.[key] === 'number' && Number.isFinite(summary[key]))
-    && Array.isArray(candidate.positions)
-    && Array.isArray(candidate.triggers)
 }
 
 function isPortfolioHistoryResponse(value: unknown): value is { snapshots: PortfolioEquitySnapshot[] } {

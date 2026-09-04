@@ -2,6 +2,7 @@ import type {
   ProfitProtectionPlanRecord as ProfitProtectionPlan,
   ProfitProtectionRepository,
 } from '@vibe-invest/product-dao'
+import type { ProfitProtectionRule } from '@vibe-invest/contracts'
 
 export type ProfitProtectionPosition = {
   symbol: string
@@ -11,9 +12,7 @@ export type ProfitProtectionPosition = {
   portfolioWeight: number | null
 }
 
-type BindingRule = 'thesis_invalidation' | 'position_changed' | 'max_weight'
-  | 'earnings_window' | 'first_take_profit' | 'second_take_profit'
-  | 'activate_trailing' | 'trailing_stop' | null
+type BindingRule = ProfitProtectionRule | null
 
 type ProfitProtectionSignal = {
   ema20: number | null
@@ -33,8 +32,11 @@ export function createProfitProtection(repository: ProfitProtectionRepository) {
       if (input.symbol !== position.symbol) throw new Error('profit_protection_position_mismatch')
       const earningsDate = input.earningsDate ?? null
       const earningsRiskStartsAt = input.earningsRiskStartsAt ?? null
-      const validDate = (value: string) => /^\d{4}-\d{2}-\d{2}$/.test(value)
-        && !Number.isNaN(Date.parse(`${value}T00:00:00Z`))
+      const validDate = (value: string) => {
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false
+        const parsed = new Date(`${value}T00:00:00Z`)
+        return !Number.isNaN(parsed.valueOf()) && parsed.toISOString().slice(0, 10) === value
+      }
       if (
         !Number.isFinite(input.anchorPrice) || input.anchorPrice <= 0
         || !Number.isFinite(input.invalidationPrice) || input.invalidationPrice < 0
@@ -157,8 +159,10 @@ export function createProfitProtection(repository: ProfitProtectionRepository) {
               peakPrice,
             },
           } : {}),
-          ...(signal && peakPrice !== null && position.marketPrice !== null ? {
-            profitJourney: profitJourney(plan.anchorPrice, position.quantity, peakPrice, position.marketPrice),
+          ...(signal && !positionChanged && peakPrice !== null && position.marketPrice !== null ? {
+            profitJourney: profitJourney(
+              plan.plannedAverageCost, position.quantity, peakPrice, position.marketPrice,
+            ),
           } : {}),
         }]
       })
@@ -207,9 +211,9 @@ export function createProfitProtection(repository: ProfitProtectionRepository) {
   }
 }
 
-function profitJourney(anchorPrice: number, quantity: number, peakPrice: number, currentPrice: number) {
-  const peakUnrealizedProfit = (peakPrice - anchorPrice) * quantity
-  const currentUnrealizedProfit = (currentPrice - anchorPrice) * quantity
+function profitJourney(averageCost: number, quantity: number, peakPrice: number, currentPrice: number) {
+  const peakUnrealizedProfit = (peakPrice - averageCost) * quantity
+  const currentUnrealizedProfit = (currentPrice - averageCost) * quantity
   const givebackAmount = Math.max(0, peakUnrealizedProfit - currentUnrealizedProfit)
   return {
     peakUnrealizedProfit,

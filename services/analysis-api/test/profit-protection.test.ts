@@ -159,11 +159,13 @@ test('持仓数量或平均成本变化后要求复核而不静默重算风险�
       symbol: 'CRDO', quantity: 6, averageCost: 183,
       marketPrice: 216, portfolioWeight: 0.08,
     }],
+    signals: { CRDO: { ema20: 205, peakPrice: 260, observedAt: '2026-09-04' } },
   })
 
   assert.equal(status?.status, 'review_required')
   assert.equal(status?.bindingRule, 'position_changed')
   assert.equal(status?.currentR, 2)
+  assert.equal(status?.profitJourney, undefined)
 })
 
 test('保护计划拒绝无风险距离或不匹配当前持仓的输入', async () => {
@@ -246,6 +248,27 @@ test('历史峰值达到 4R 后跌破 EMA20 会触发移动保护并计算利润
     currentUnrealizedProfit: 250,
     givebackAmount: 150,
     givebackRatio: 0.375,
+  })
+})
+
+test('利润回吐按计划冻结的持仓成本而不是风险锚点计算', async () => {
+  const protection = createProfitProtection(createRepository())
+  const position = { symbol: 'CRDO', quantity: 10, averageCost: 100 }
+  await protection.savePlan({
+    symbol: 'CRDO', anchorPrice: 120, invalidationPrice: 110,
+    coreRatio: 0.6, maxPortfolioWeight: 1,
+  }, position, '2026-09-01T00:00:00.000Z')
+
+  const [status] = await protection.evaluatePortfolio({
+    positions: [{ ...position, marketPrice: 130, portfolioWeight: 1 }],
+    signals: { CRDO: { ema20: 125, peakPrice: 150, observedAt: '2026-09-04' } },
+  })
+
+  assert.deepEqual(status?.profitJourney, {
+    peakUnrealizedProfit: 500,
+    currentUnrealizedProfit: 300,
+    givebackAmount: 200,
+    givebackRatio: 0.4,
   })
 })
 
