@@ -63,3 +63,13 @@
   .tracking-event-body { grid-template-columns: 1fr; }
   .tracking-event footer { align-items: start; flex-direction: column; }
 }
+
+.tracking-event .tracking-relevance { font-size: 12px; margin-bottom: 12px; }
+.tracking-detail { padding: 18px 0 0; }
+.tracking-detail dl { display: grid; grid-template-columns: 80px 1fr; gap: 8px; font: 12px/1.7 Inter, sans-serif; }
+.tracking-detail dd { margin: 0; }
+.tracking-detail label { display: grid; gap: 8px; margin: 16px 0; font-size: 12px; }
+.tracking-detail select { min-width: 0; width: 100%; padding: 10px; color: #29231d; background: #f6f0e6; border: 1px solid #cfc7ba; }
+.tracking-detail footer { justify-content: start; flex-wrap: wrap; margin: 14px 0; }
+.tracking-detail > small { font: 12px/1.6 Inter, sans-serif; color: #6f665c; }
+.tracking-event button:disabled { opacity: .6; cursor: wait; }

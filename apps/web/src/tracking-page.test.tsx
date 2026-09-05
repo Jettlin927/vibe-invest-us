@@ -48,7 +48,9 @@ test('追踪页维护自选、解释变化并从事件进入深入分析', async
     onWatch={async (symbol, note) => { calls.push(`watch:${symbol}:${note}`); return true }}
     onUnwatch={async (symbol) => { calls.push(`unwatch:${symbol}`) }}
     onScan={async () => { calls.push('scan') }}
-    onAnalyze={async (symbol) => { calls.push(`analyze:${symbol}`) }}
+    onAnalyze={async (event, researchId) => { calls.push(`analyze:${event.id}:${researchId}`) }}
+    researchRecords={[{ id: 'research-old', symbol: 'NVDA', report: { title: '原有研究' }, createdAt: '2026-08-29T00:00:00Z' }]}
+    onOpenResearch={async (id) => { calls.push(`open:${id}`) }}
   />)
   const user = userEvent.setup({ document: window.document })
 
@@ -61,11 +63,15 @@ test('追踪页维护自选、解释变化并从事件进入深入分析', async
   await user.type(view.getByLabelText('自选备注'), '观察新品周期')
   await user.click(view.getByRole('button', { name: '加入自选' }))
   await user.click(view.getByRole('button', { name: '立即扫描' }))
-  await user.click(view.getByRole('button', { name: '深入分析 NVDA' }))
+  assert.equal(view.queryByRole('button', { name: '围绕此变化研究 NVDA' }), null)
+  await user.click(view.getByText('查看变化详情'))
+  assert.deepEqual(calls, ['watch:AAPL:观察新品周期', 'scan'])
+  await user.click(view.getByRole('button', { name: '查看已有研究 NVDA' }))
+  await user.click(view.getByRole('button', { name: '围绕此变化研究 NVDA' }))
   await user.click(view.getByRole('button', { name: '移除自选 NVDA' }))
 
   await waitFor(() => assert.deepEqual(calls, [
-    'watch:AAPL:观察新品周期', 'scan', 'analyze:NVDA', 'unwatch:NVDA',
+    'watch:AAPL:观察新品周期', 'scan', 'open:research-old', 'analyze:event-1:research-old', 'unwatch:NVDA',
   ]))
 })
 

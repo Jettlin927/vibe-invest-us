@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { DisclosureSection, useDisclosure } from './disclosure.js'
+import { useEffect, useId, useRef, useState, type ReactNode } from 'react'
 import ReactMarkdown from 'react-markdown'
 
 import {
@@ -6,10 +7,10 @@ import {
   isTerminalAgentExecutionStatus, runtimeSettingLimits,
   type ProfitProtectionOverview, type ProfitProtectionStatus,
   type RuntimeSettings, type RuntimeSettingsResponse, type SystemHealth,
-  type TokenUsageAggregate, type TrackingRunDetail,
+  type TokenUsageAggregate, type TrackingRunDetail, type TrackingEvent,
 } from '@vibe-invest/contracts'
 
-import { TrackingPage, type TrackingOverview } from './tracking-page.js'
+import { TrackingPage, trackingResearchQuestion, type TrackingOverview } from './tracking-page.js'
 
 type Page = 'overview' | 'tracking' | 'analysis' | 'research' | 'conversation' | 'portfolio' | 'settings'
 type Position = { symbol: string; quantity: number; averageCost: number }
@@ -33,7 +34,7 @@ type PortfolioEvent = {
   amount: number | null; realizedProfitLoss: number | null; note: string; createdAt: string
 }
 type ResearchSummary = { id: string; symbol: string; status: string; terminal?: boolean; createdAt?: string; reportCreatedAt?: string | null; error?: string | null; starred?: boolean; note?: string; report?: { title?: string; trend?: string } }
-type Fact = { id: string; type: string; value: unknown; observedAt: string; source: string; sourceReference: string }
+type Fact = { id: string; type: string; value: unknown; observedAt: string; fetchedAt?: string; source: string; sourceReference: string }
 type Report = {
   title?: string; marketState?: string; trend?: string; drivers?: string[]
   supportingEvidence?: string[]; contraryEvidence?: string[]
@@ -192,6 +193,7 @@ export function App() {
   const [selectedConversation, setSelectedConversation] = useState<ConversationThread | null>(null)
   const [conversationEvents, setConversationEvents] = useState<ConversationEvent[]>([])
   const [conversationBusy, setConversationBusy] = useState(false)
+  const [conversationDraft, setConversationDraft] = useState('')
   const [trackingOverview, setTrackingOverview] = useState<TrackingOverview | null>(null)
   const [trackingAvailable, setTrackingAvailable] = useState<boolean | null>(null)
   const [trackingLastScan, setTrackingLastScan] = useState<TrackingRunDetail | null>(null)
@@ -503,9 +505,16 @@ export function App() {
     }
     setError('分析等待超时')
   }
+  async function readResearch(id: string): Promise<ResearchRecord> {
+    const response = await fetch(`/api/research/${encodeURIComponent(id)}`)
+    if (!response.ok) throw new Error('research_unavailable')
+    const record = await response.json() as ResearchRecord
+    if (record.id !== id) throw new Error('research_mismatch')
+    return record
+  }
   async function openResearch(id: string) {
-    const response = await fetch(`/api/research/${id}`)
-    if (response.ok) setSelectedResearch(await response.json())
+    try { setSelectedResearch(await readResearch(id)) }
+    catch { setError('研究记录读取失败，请重试。') }
   }
   async function openResearchTrace(id: string) {
     if (selectedResearch?.id === id && (
@@ -770,8 +779,26 @@ export function App() {
       setTrackingScanning(false)
     }
   }
-  async function analyzeTrackingSymbol(symbol: string) {
-    await startAnalysisForSymbol(symbol)
+  async function analyzeTrackingEvent(event: TrackingEvent, researchId?: string) {
+    let question = trackingResearchQuestion(event)
+    if (researchId) {
+      const previous = await readResearch(researchId)
+      if (previous.symbol !== event.symbol || !previous.report) throw new Error('tracking_research_mismatch')
+      const report = previous.report
+      const cited = new Set([...(report.supportingEvidence ?? []), ...(report.contraryEvidence ?? []), ...(report.keyJudgments ?? []).flatMap((item) => item.evidence)])
+      question += '\n\n' + [
+        `对照旧报告：${report.title ?? previous.symbol}（${previous.reportCreatedAt ?? previous.createdAt ?? '时间未知'}）。旧报告可能过期，请核对事实时效。`,
+        `此前市场状态：${report.marketState ?? '未提供'}；趋势：${report.trend ?? '未提供'}`,
+        ...(report.keyJudgments ?? []).map((item) => `此前判断：${item.judgment}`),
+        ...(report.scenarios ?? []).map((item) => `此前情景：${item.name}；条件：${item.condition}；可能结果：${item.outcome}`),
+        `此前失效条件：${(report.invalidationConditions ?? []).join('；') || '未提供'}`,
+        `此前限制：${(report.limitations ?? []).join('；') || '未列出'}`,
+        ...(previous.facts ?? []).filter((fact) => cited.has(fact.id)).map((fact) => `旧报告依据：${factHeadline(fact)}；事实时间：${fact.observedAt}；取得时间：${fact.fetchedAt ?? '未提供'}；来源：${fact.source} ${fact.sourceReference}`),
+      ].join('\n')
+    }
+    setSelectedConversation(null); setConversationEvents([]); setConversationBusy(false)
+    setConversationDraft(question); setPage('conversation')
+    window.scrollTo({ top: 0 })
   }
   function navigate(next: Page) {
     setPage(next)
@@ -788,10 +815,10 @@ export function App() {
     <main className={`page-main${page === 'conversation' ? ' conversation-main' : ''}`}>
       {error && <p role="alert" className="error-banner">{error}</p>}
       {page === 'overview' && <Overview records={records} selected={selectedResearch} positions={positions} health={health} modelConfigured={modelConfigured} onNavigate={navigate} onOpen={async (id) => { await openResearch(id); navigate('research') }} />}
-      {page === 'tracking' && <TrackingPage overview={trackingOverview} available={trackingAvailable} lastScan={trackingLastScan} loading={trackingLoading} scanning={trackingScanning} onWatch={watchSymbol} onUnwatch={unwatchSymbol} onScan={scanTracking} onAnalyze={analyzeTrackingSymbol} />}
+      {page === 'tracking' && <TrackingPage overview={trackingOverview} available={trackingAvailable} lastScan={trackingLastScan} loading={trackingLoading} scanning={trackingScanning} onWatch={watchSymbol} onUnwatch={unwatchSymbol} onScan={scanTracking} onAnalyze={analyzeTrackingEvent} researchBusy={conversationBusy || Boolean(selectedConversation && ['queued', 'running'].includes(selectedConversation.status))} researchRecords={records} onOpenResearch={async (id) => { setSelectedResearch(await readResearch(id)); setPage('research'); window.scrollTo({ top: 0 }) }} />}
       {page === 'analysis' && <AnalysisPage symbol={analysisSymbol} setSymbol={setAnalysisSymbol} status={analysisStatus} stages={analysisStages} active={analysisSubmitting || Boolean(activeAnalysisId)} onStart={startAnalysis} onCancel={cancelAnalysis} health={health} modelConfigured={modelConfigured} records={records} onOpen={async (id) => { await openResearch(id); navigate('research') }} />}
       {page === 'research' && <ResearchPage records={records} record={selectedResearch} onOpen={openResearch} onOpenTrace={openResearchTrace} onUpdate={updateResearch} onDelete={removeResearch} deleting={deletingResearchId === selectedResearch?.id} onResume={resumeResearch} onFollowUp={sendFollowUp} onReanalyze={reanalyzeResearch} freshnessDays={runtimeSettings?.current.values.reportFreshnessDays ?? null} />}
-      {page === 'conversation' && <ConversationPage threads={conversationThreads} thread={selectedConversation} events={conversationEvents} busy={conversationBusy} onOpen={openConversation} onNew={() => { setSelectedConversation(null); setConversationEvents([]); setConversationBusy(false) }} onCreate={startConversation} onSend={sendConversationMessage} onCancel={cancelConversation} />}
+      {page === 'conversation' && <ConversationPage initialMessage={conversationDraft} threads={conversationThreads} thread={selectedConversation} events={conversationEvents} busy={conversationBusy} onOpen={openConversation} onNew={() => { setConversationDraft(''); setSelectedConversation(null); setConversationEvents([]); setConversationBusy(false) }} onCreate={startConversation} onSend={sendConversationMessage} onCancel={cancelConversation} />}
       {page === 'portfolio' && <PortfolioPage portfolio={portfolio} history={portfolioHistory} events={portfolioEvents} protection={profitProtection} loaded={portfolioLoaded} loadFailed={portfolioLoadFailed} refreshing={portfolioRefreshing} onSave={savePosition} onSaveCash={saveCash} onBuy={buyPosition} onReduce={reducePosition} onSaveProtection={saveProfitProtectionPlan} onAcknowledgeProtection={acknowledgeProfitProtectionTrigger} onDelete={removePosition} />}
       {page === 'settings' && <SettingsPage health={health} modelConfigured={modelConfigured} settings={runtimeSettings} onReload={loadSettings} />}
     </main>
@@ -839,7 +866,8 @@ function AnalysisPage({ symbol, setSymbol, status, stages, active, onStart, onCa
   </>
 }
 
-function ConversationPage({ threads, thread, events, busy, onOpen, onNew, onCreate, onSend, onCancel }: {
+function ConversationPage({ initialMessage, threads, thread, events, busy, onOpen, onNew, onCreate, onSend, onCancel }: {
+  initialMessage: string
   threads: ConversationThread[]; thread: ConversationThread | null; events: ConversationEvent[]
   busy: boolean
   onOpen: (id: string) => Promise<void>
@@ -871,7 +899,7 @@ function ConversationPage({ threads, thread, events, busy, onOpen, onNew, onCrea
         {events.filter((event) => event.type === 'tool_call').map((event) => <details key={`tool-${event.sequence}`} className="conversation-tool"><summary>调用工具：{String(event.name ?? 'tool')}</summary><small>工具结果和参数按当前权限投影。</small></details>)}
       </div>
       <div className="conversation-input-dock">
-        <ConversationComposer mode={thread ? 'send' : 'create'} busy={active} onSubmit={thread ? onSend : onCreate} />
+        <ConversationComposer key={thread?.id ?? initialMessage} initialMessage={thread ? '' : initialMessage} mode={thread ? 'send' : 'create'} busy={active} onSubmit={thread ? onSend : onCreate} />
         <small>Enter 发送 · Shift + Enter 换行</small>
       </div>
     </section>
@@ -885,11 +913,13 @@ function AssistantMarkdown({ text }: { text: string }) {
   >{text}</ReactMarkdown></div>
 }
 
-function ConversationComposer({ mode, busy, onSubmit }: {
+function ConversationComposer({ mode, busy, onSubmit, initialMessage = '' }: {
+  initialMessage?: string
   mode: 'create' | 'send'; busy: boolean
   onSubmit: (event: React.FormEvent<HTMLFormElement>) => Promise<void>
 }) {
   const inputRef = useRef<HTMLTextAreaElement>(null)
+  useEffect(() => { if (inputRef.current && initialMessage) { resize(inputRef.current); inputRef.current.focus() } }, [initialMessage])
   const label = busy
     ? mode === 'create' ? '正在开始…' : '正在发送…'
     : mode === 'create' ? '开始对话' : '发送'
@@ -914,7 +944,7 @@ function ConversationComposer({ mode, busy, onSubmit }: {
   }
   return <form className="conversation-composer" onSubmit={submit}>
     <textarea
-      ref={inputRef} rows={1} name="message"
+      ref={inputRef} rows={1} name="message" defaultValue={initialMessage}
       aria-label={mode === 'create' ? '开始研究对话' : '继续研究对话'}
       placeholder={mode === 'create' ? '问一只股票、一份财报，或一个需要验证的判断…' : '继续追问…'}
       required disabled={busy} onInput={(event) => resize(event.currentTarget)} onKeyDown={handleKeyDown}
@@ -933,12 +963,14 @@ function ResearchPage({ records, record, onOpen, onOpenTrace, onUpdate, onDelete
   onReanalyze: () => Promise<void>
   freshnessDays: number | null
 }) {
+  const library = useDisclosure('research-library')
   const [researchTab, setResearchTab] = useState<'report' | 'trace'>('report')
   useEffect(() => { setResearchTab('report') }, [record?.id])
   return <>
     <PageHeader eyebrow="RESEARCH ARCHIVE" title="研究记录" description="每份报告都绑定当时的数据快照、来源和分析轨迹，结论变化也有迹可循。" />
-    <div className="research-layout">
-      <aside className="research-index"><p className="micro">全部记录 · {records.length}</p>{records.map((item) => <button className={record?.id === item.id ? 'active' : ''} key={item.id} onClick={() => void onOpen(item.id)}><strong>{item.symbol}</strong><span>{item.report?.title ?? statusLabel(item.status)}</span><small>{item.starred ? `已标记 · ${statusLabel(item.status)}` : statusLabel(item.status)}</small></button>)}</aside>
+    <button className="quiet research-library-toggle" aria-expanded={library.open} aria-controls="research-library" onClick={library.toggle}>{library.open ? '收起研究列表' : `展开研究列表 · ${records.length} 份`}</button>
+    <div className={`research-layout${library.open ? '' : ' library-collapsed'}`}>
+      <aside id="research-library" hidden={!library.open} className="research-index"><p className="micro">全部记录 · {records.length}</p>{records.map((item) => <button className={record?.id === item.id ? 'active' : ''} key={item.id} onClick={() => void onOpen(item.id)}><strong>{item.symbol}</strong><span>{item.report?.title ?? statusLabel(item.status)}</span><small>{item.starred ? `已标记 · ${statusLabel(item.status)}` : statusLabel(item.status)}</small></button>)}</aside>
       <div className="research-tabcol">
         <div className="research-tabs" role="tablist" aria-label="研究记录视图切换">
           <button role="tab" aria-selected={researchTab === 'report'} className={researchTab === 'report' ? 'active' : ''} onClick={() => setResearchTab('report')}>研究</button>
@@ -951,7 +983,7 @@ function ResearchPage({ records, record, onOpen, onOpenTrace, onUpdate, onDelete
           ? <ResearchReport record={record} onUpdate={onUpdate} onDelete={onDelete} deleting={deleting} onResume={onResume} onFollowUp={onFollowUp} onReanalyze={onReanalyze} freshnessDays={freshnessDays} />
           : <article className="research-report"><ResearchTraceView record={record} /></article>}
       </div>
-      <div className="research-rail"><IncidentPanel record={record} /><SpecialistDecisions agents={record?.specialistAgents} /><SpecialistFindings agents={record?.specialistAgents} /></div>
+      <DisclosureSection name="research-context" title="研究辅助信息" className="research-rail" defaultOpen={false} summary={<IncidentPanel record={record} />}><SpecialistDecisions agents={record?.specialistAgents} /><SpecialistFindings agents={record?.specialistAgents} /></DisclosureSection>
     </div>
   </>
 }
@@ -1544,6 +1576,23 @@ function ResearchReport({ record, onUpdate, onDelete, deleting, onResume, onFoll
   onReanalyze: () => Promise<void>
   freshnessDays: number | null
 }) {
+  const evidencePrefix = useId()
+  const [evidenceOpen, setEvidenceOpen] = useState(false)
+  const [evidenceTarget, setEvidenceTarget] = useState<string | null>(null)
+  function focusReportElement(id: string) {
+    document.getElementById(id)?.focus()
+    document.getElementById(id)?.scrollIntoView?.({ block: 'center' })
+  }
+  function focusEvidence(id: string) {
+    if (evidenceOpen) focusReportElement(id)
+    else { setEvidenceOpen(true); setEvidenceTarget(id) }
+  }
+  useEffect(() => {
+    if (evidenceOpen && evidenceTarget) {
+      focusReportElement(evidenceTarget)
+    }
+  }, [evidenceOpen, evidenceTarget])
+  useEffect(() => { setEvidenceOpen(false); setEvidenceTarget(null) }, [record?.id])
   const latestBaseVersion = record?.reportVersions?.at(-1)?.version ?? null
   const [selectedBaseVersion, setSelectedBaseVersion] = useState<number | null>(latestBaseVersion)
   useEffect(() => {
@@ -1552,6 +1601,10 @@ function ResearchReport({ record, onUpdate, onDelete, deleting, onResume, onFoll
   if (!record) return <article className="research-report empty">选择一条研究记录开始阅读。</article>
   const facts = new Map(record.facts.map((fact) => [fact.id, fact]))
   const report = record.report
+  const evidenceIds = [...new Set([
+    ...(report?.keyJudgments ?? []).flatMap((item) => item.evidence),
+    ...(report?.supportingEvidence ?? []), ...(report?.contraryEvidence ?? []),
+  ])]
   const indicatorFact = record.facts.find((fact) => fact.type === 'indicators')
   const indicator = asRecord(indicatorFact?.value)
   const valuationFact = record.facts.find((fact) => fact.type === 'valuation')
@@ -1568,13 +1621,23 @@ function ResearchReport({ record, onUpdate, onDelete, deleting, onResume, onFoll
     <section className="report-hero"><div><p className="micro">当前市场状态</p><p>{report?.marketState ?? '没有足够数据形成市场状态判断。'}</p><strong>{report?.trend}</strong></div><PriceChart facts={record.facts} /></section>
     <section className="indicator-strip"><Metric label="MA 5" value={formatMaybeMoney(indicator.ma_5)} /><Metric label="MA 20" value={formatMaybeMoney(indicator.ma_20)} /><Metric label="RSI 14" value={formatMaybeNumber(indicator.rsi_14)} /><Metric label="年化波动" value={formatPercent(indicator.annualized_volatility)} /><Metric label="最大回撤" value={formatPercent(indicator.max_drawdown)} /></section>
     {!!report?.drivers?.length && <ReportBlock number="01" title="主要驱动"><BulletList values={report.drivers} /></ReportBlock>}
-    {!!report?.keyJudgments?.length && <ReportBlock number="02" title="关键判断与依据"><div className="judgments">{report.keyJudgments.map((item, index) => <section key={index}><strong>{item.judgment}</strong><Evidence facts={facts} ids={item.evidence} /></section>)}</div></ReportBlock>}
+    {!!report?.keyJudgments?.length && <ReportBlock number="02" title="关键判断与依据"><div className="judgments">{report.keyJudgments.map((item, index) => <section key={index}><p>{item.judgment}</p><div className="evidence-references">{[...new Set(item.evidence)].map((id) => {
+      const number = evidenceIds.indexOf(id) + 1
+      const fact = facts.get(id)
+      return <button key={id} id={`${evidencePrefix}-ref-${index}-${number}`} className="text-button" aria-label={`查看依据 ${number}：${fact ? factLabel(fact.type) : '依据缺失'}`} onClick={() => focusEvidence(`${evidencePrefix}-fact-${number}`)}>依据 {number}{!fact && ' · 缺失'}</button>
+    })}</div></section>)}</div></ReportBlock>}
     {valuationFact && <ReportBlock number="03" title="估值温度"><ValuationView fact={valuationFact} explanation={report?.valuation} /></ReportBlock>}
     {!!report?.scenarios?.length && <ReportBlock number="04" title="未来情景"><div className="scenarios">{report.scenarios.map((scenario) => <section key={scenario.name}><strong>{scenario.name}</strong><p><b>条件</b>{scenario.condition}</p><p><b>可能结果</b>{scenario.outcome}</p></section>)}</div></ReportBlock>}
     {!!report?.invalidationConditions?.length && <ReportBlock number="05" title="判断失效条件"><BulletList values={report.invalidationConditions} /></ReportBlock>}
     {(report?.personalImpact || report?.conditionalSuggestion) && <ReportBlock number="06" title="与你的持仓"><p>{report.personalImpact}</p>{report.conditionalSuggestion && <p className="suggestion">条件式方向：{report.conditionalSuggestion}</p>}</ReportBlock>}
-    <details className="evidence-drawer"><summary>查看全部支持与相反证据</summary><div className="evidence-columns"><section><h3>支持证据</h3><Evidence facts={facts} ids={report?.supportingEvidence ?? []} /></section><section><h3>相反证据</h3><Evidence facts={facts} ids={report?.contraryEvidence ?? []} /></section></div></details>
     {!!report?.limitations?.length && <section className="limitations"><p className="micro">数据与分析限制</p><BulletList values={report.limitations} /></section>}
+    <details className="evidence-drawer" open={evidenceOpen} onToggle={(event) => setEvidenceOpen(event.currentTarget.open)}><summary>证据附录 · {evidenceIds.length} 条依据（含支持与相反证据）</summary>
+      <section aria-label="证据附录" hidden={!evidenceOpen}><ol className="evidence-list">{evidenceIds.map((id, index) => <li key={id} id={`${evidencePrefix}-fact-${index + 1}`} tabIndex={-1}>
+        <p className="evidence-meta">依据 {index + 1}{report?.supportingEvidence?.includes(id) && ' · 支持证据'}{report?.contraryEvidence?.includes(id) && ' · 相反证据'}</p>
+        {facts.has(id) ? <FactCard fact={facts.get(id)!} /> : <p className="missing">这条依据已经不可用，相关判断需要复核。</p>}
+        {(report?.keyJudgments ?? []).flatMap((judgment, judgmentIndex) => judgment.evidence.includes(id) ? [<button key={judgmentIndex} className="text-button" onClick={() => document.getElementById(`${evidencePrefix}-ref-${judgmentIndex}-${index + 1}`)?.focus()}>返回判断 {judgmentIndex + 1}</button>] : [])}
+      </li>)}</ol></section>
+    </details>
     {!!conversation.length && <section className="research-conversation" aria-label="与主 Agent 的对话">
       <p className="micro">继续对话</p>
       {conversation.map((message) => <article key={message.key} className={message.role}>
@@ -1619,16 +1682,22 @@ function PortfolioPage({ portfolio, history, events, protection, loaded, loadFai
   onDelete: (symbol: string) => Promise<void>
 }) {
   const [reducing, setReducing] = useState<PortfolioPosition | null>(null)
-  const [buying, setBuying] = useState<PortfolioPosition | null>(null)
+  const [buying, setBuying] = useState<string | null>(null)
   const [planning, setPlanning] = useState<PortfolioPosition | null>(null)
   if (!loaded) return <><PageHeader eyebrow="PRIVATE PORTFOLIO" title="我的持仓" description="现金、持仓市值和盈亏共同构成你的组合语境；行情缺失时不猜测组合总值。" />{loadFailed ? <p className="error-banner" role="alert" aria-label="持仓读取失败，请稍后重试。">持仓读取失败，请稍后重试。</p> : <p className="chart-empty" role="status" aria-label="正在读取已保存的持仓…">正在读取已保存的持仓…</p>}</>
   return <><PageHeader eyebrow="PRIVATE PORTFOLIO" title="我的持仓" description="现金、持仓市值和盈亏共同构成你的组合语境；行情缺失时不猜测组合总值。" />
-    <div className="portfolio-kpis">
+    <DisclosureSection name="portfolio-summary" title="组合概况" className="portfolio-summary"><div className="portfolio-kpis">
       <PortfolioKpi label="组合总值" value={formatNullableMoney(portfolio.totalEquity)} note="持仓市值 + USD 现金" />
       <PortfolioKpi label="持仓市值" value={formatNullableMoney(portfolio.totalMarketValue)} note={refreshing ? '行情刷新中' : `${portfolio.pricedPositionCount}/${portfolio.positions.length} 项有行情`} />
       <PortfolioKpi label="USD 现金" value={formatMoney(portfolio.cash)} note={portfolio.totalEquity ? `占组合 ${formatPercent(portfolio.cash / portfolio.totalEquity)}` : '独立手工维护'} />
       <PortfolioKpi label="未实现盈亏" value={formatSignedMoney(portfolio.totalUnrealizedProfitLoss)} note={refreshing ? '行情刷新中' : portfolio.totalUnrealizedReturn === null ? '行情不可用' : formatSignedPercent(portfolio.totalUnrealizedReturn)} tone={portfolio.totalUnrealizedProfitLoss} />
-    </div>
+    </div></DisclosureSection>
+    <DisclosureSection name="holdings" title="组合明细" eyebrow={`当前持仓 · ${portfolio.positions.length}`} className="portfolio-holdings" actions={<button onClick={() => setBuying('')}>记录买入</button>} summary={refreshing ? <p className="data-warning">正在刷新 {portfolio.positions.length} 项行情…</p> : portfolio.unpricedPositionCount > 0 && <p className="data-warning">{portfolio.unpricedPositionCount} 项行情缺失，组合汇总已关闭。</p>}>
+      <div className="portfolio-table-scroll"><div className="portfolio-table-row head"><span>标的</span><span>数量</span><span>平均成本</span><span>当前价</span><span>市值</span><span>仓位</span><span>未实现盈亏</span><span /></div>
+        {portfolio.positions.map((item) => <div className="portfolio-table-row" key={item.symbol}><strong>{item.symbol}</strong><span>{formatNumber(item.quantity)}</span><span>{formatMoney(item.averageCost)}</span><span>{formatNullableMoney(item.marketPrice)}</span><span>{formatNullableMoney(item.marketValue)}</span><span>{item.portfolioWeight === null ? '—' : formatPercent(item.portfolioWeight)}</span><span className={valueTone(item.unrealizedProfitLoss)}>{formatSignedMoney(item.unrealizedProfitLoss)}<small>{item.unrealizedReturn === null ? '' : formatSignedPercent(item.unrealizedReturn)}</small></span><span className="position-actions"><button className="quiet" aria-label={`为 ${item.symbol} 制定保护计划`} onClick={() => setPlanning(item)}>保护</button><button className="quiet" onClick={() => setBuying(item.symbol)}>加仓</button><button className="quiet" onClick={() => setReducing(item)}>减仓</button><button className="text-button" onClick={() => void onDelete(item.symbol)}>删除</button></span></div>)}
+        {!portfolio.positions.length && <p className="empty-row">尚未录入持仓。</p>}
+      </div>
+    </DisclosureSection>
     <div className="portfolio-visuals">
       <PortfolioDonut portfolio={portfolio} />
       <PositionBars positions={portfolio.positions} mode="weight" />
@@ -1636,16 +1705,9 @@ function PortfolioPage({ portfolio, history, events, protection, loaded, loadFai
     </div>
     <ProfitProtectionPanel portfolio={portfolio} protection={protection} onPlan={setPlanning} onAcknowledge={onAcknowledgeProtection} />
     <EquityHistory history={history} />
-    <section className="portfolio-holdings">
-      <header><div><p className="micro">当前持仓 · {portfolio.positions.length}</p><h2>组合明细</h2></div>{refreshing ? <p className="data-warning">正在刷新 {portfolio.positions.length} 项行情…</p> : portfolio.unpricedPositionCount > 0 && <p className="data-warning">{portfolio.unpricedPositionCount} 项行情缺失，组合汇总已关闭。</p>}</header>
-      <div className="portfolio-table-scroll"><div className="portfolio-table-row head"><span>标的</span><span>数量</span><span>平均成本</span><span>当前价</span><span>市值</span><span>仓位</span><span>未实现盈亏</span><span /></div>
-        {portfolio.positions.map((item) => <div className="portfolio-table-row" key={item.symbol}><strong>{item.symbol}</strong><span>{formatNumber(item.quantity)}</span><span>{formatMoney(item.averageCost)}</span><span>{formatNullableMoney(item.marketPrice)}</span><span>{formatNullableMoney(item.marketValue)}</span><span>{item.portfolioWeight === null ? '—' : formatPercent(item.portfolioWeight)}</span><span className={valueTone(item.unrealizedProfitLoss)}>{formatSignedMoney(item.unrealizedProfitLoss)}<small>{item.unrealizedReturn === null ? '' : formatSignedPercent(item.unrealizedReturn)}</small></span><span className="position-actions"><button className="quiet" aria-label={`为 ${item.symbol} 制定保护计划`} onClick={() => setPlanning(item)}>保护</button><button className="quiet" onClick={() => setBuying(item)}>加仓</button><button className="quiet" onClick={() => setReducing(item)}>减仓</button><button className="text-button" onClick={() => void onDelete(item.symbol)}>删除</button></span></div>)}
-        {!portfolio.positions.length && <p className="empty-row">尚未录入持仓。</p>}
-      </div>
-    </section>
-    <div className="portfolio-editors"><section className="cash-form"><p className="micro">资金调整</p><h2>入金或出金</h2><form onSubmit={(event) => void onSaveCash(event)}><label>目标现金<input key={portfolio.cash} name="cash" aria-label="目标现金" type="number" min="0" step="any" defaultValue={portfolio.cash} required /></label><button type="submit">记录资金调整</button></form><p>调高记为入金、调低记为出金，差额作为资金调整事件记入调仓账本；买入扣现金、卖出加现金也会自动记录。</p></section><section className="position-form"><p className="micro">校准持仓</p><form onSubmit={(event) => void onSave(event)}><label>股票代码<input name="symbol" aria-label="股票代码" required /></label><label>数量<input name="quantity" aria-label="数量" type="number" min="0.000001" step="any" required /></label><label>平均成本<input name="averageCost" aria-label="平均成本" type="number" min="0" step="any" required /></label><button type="submit">校准持仓</button></form><p>把持仓对齐到券商实际数量与成本；不影响现金，差额以校准事件记入调仓账本。日常买入请用「加仓」。</p></section></div>
+    <div className="portfolio-editors"><DisclosureSection name="cash" title="资金调整" eyebrow="入金或出金" className="cash-form" defaultOpen={false}><form onSubmit={(event) => void onSaveCash(event)}><label>目标现金<input key={portfolio.cash} name="cash" aria-label="目标现金" type="number" min="0" step="any" defaultValue={portfolio.cash} required /></label><button type="submit">记录资金调整</button></form><p>调高记为入金、调低记为出金，差额作为资金调整事件记入调仓账本；买入扣现金、卖出加现金也会自动记录。</p></DisclosureSection><DisclosureSection name="reconcile" title="持仓校准" className="position-form" defaultOpen={false}><form onSubmit={(event) => void onSave(event)}><label>股票代码<input name="symbol" aria-label="股票代码" required /></label><label>数量<input name="quantity" aria-label="数量" type="number" min="0.000001" step="any" required /></label><label>平均成本<input name="averageCost" aria-label="平均成本" type="number" min="0" step="any" required /></label><button type="submit">校准持仓</button></form><p>把持仓对齐到券商实际数量与成本；不影响现金，差额以校准事件记入调仓账本。日常买入请用「记录买入」。</p></DisclosureSection></div>
     <EventLedger events={events} />
-    {buying && <BuyDialog position={buying} cash={portfolio.cash} onCancel={() => setBuying(null)} onSubmit={async (quantity, price) => { if (await onBuy(buying.symbol, quantity, price)) setBuying(null) }} />}
+    {buying !== null && <BuyDialog initialSymbol={buying} portfolio={portfolio} onCancel={() => setBuying(null)} onSubmit={async (symbol, quantity, price) => { const saved = await onBuy(symbol, quantity, price); if (saved) setBuying(null); return saved }} />}
     {reducing && <ReduceDialog position={reducing} cash={portfolio.cash} onCancel={() => setReducing(null)} onSubmit={async (quantity, price) => { if (await onReduce(reducing.symbol, quantity, price)) setReducing(null) }} />}
     {planning && <ProfitProtectionDialog position={planning} current={protection.positions.find(({ symbol }) => symbol === planning.symbol) ?? null} onCancel={() => setPlanning(null)} onSubmit={async (input) => { if (await onSaveProtection(planning.symbol, input)) setPlanning(null) }} />}
   </>
@@ -1658,8 +1720,10 @@ function ProfitProtectionPanel({ portfolio, protection, onPlan, onAcknowledge }:
   onAcknowledge: (id: string) => Promise<void>
 }) {
   const bySymbol = new Map(protection.positions.map((status) => [status.symbol, status]))
-  return <section className="profit-protection"><header><div><p className="micro">盈利保护 · {protection.summary.planned}/{portfolio.positions.length} 已制定</p><h2>让浮盈按计划退出，而不是坐回原点</h2></div><p>这里只显示计划状态；实际卖出后才形成已实现利润。</p></header>
+  return <DisclosureSection name="protection" title="盈利保护" eyebrow={`${protection.summary.planned}/${portfolio.positions.length} 已制定`} className="profit-protection" defaultOpen={false} summary={
     <div className="protection-summary"><span>已触发<strong>{protection.summary.triggered}</strong></span><span>需复核<strong>{protection.summary.reviewRequired}</strong></span><span>数据缺口<strong>{protection.summary.dataGap}</strong></span></div>
+  }>
+    <p>这里只显示计划状态；实际卖出后才形成已实现利润。</p>
     <div className="protection-grid">
       {portfolio.positions.map((position) => {
         const status = bySymbol.get(position.symbol)
@@ -1668,16 +1732,19 @@ function ProfitProtectionPanel({ portfolio, protection, onPlan, onAcknowledge }:
       })}
     </div>
     {!!protection.triggers.filter(({ status }) => status === 'open').length && <div className="protection-alerts"><h3>待处理提醒</h3>{protection.triggers.filter(({ status }) => status === 'open').map((trigger) => <div key={trigger.id}><span><strong>{trigger.symbol}</strong>{profitProtectionRuleName(trigger.rule)} · {formatTime(trigger.triggeredAt)}</span><button className="quiet" onClick={() => void onAcknowledge(trigger.id)}>确认已处理</button></div>)}</div>}
-  </section>
+  </DisclosureSection>
 }
 
 function EquityHistory({ history }: { history: PortfolioEquitySnapshot[] }) {
+  const { open, toggle } = useDisclosure('equity-details', false)
   const canvas = useRef<HTMLCanvasElement>(null)
   const chronological = [...history].reverse()
-  useEffect(() => { if (canvas.current) drawEquityHistory(canvas.current, chronological) }, [history.map((item) => `${item.marketDay}:${item.totalEquity}`).join('|')])
+  useEffect(() => { if (canvas.current) return observeChart(canvas.current, (element) => drawEquityHistory(element, chronological)) }, [history.map((item) => `${item.marketDay}:${item.totalEquity}`).join('|')])
   return <section className="equity-history"><header><div><p className="micro">组合权益历史 · 最近 {history.length} 个估值日</p><h2>组合总值怎样变化</h2></div><p>总权益 = 持仓市值 + USD 现金</p></header>
     {history.length > 1 ? <figure><canvas ref={canvas} role="img" aria-label={`组合权益历史，共 ${history.length} 个观测点`} /><figcaption><span>{chronological[0].marketDay}</span><span>USD</span><span>{chronological.at(-1)?.marketDay}</span></figcaption></figure> : <p className="chart-empty">产生至少两个完整估值日后显示权益曲线</p>}
-    {!!history.length && <div className="equity-table-scroll"><table aria-label="组合权益历史明细"><thead><tr><th>日期</th><th>总权益</th><th>持仓市值</th><th>现金</th><th>单日变动</th><th>涨跌幅</th><th>行情覆盖</th><th>状态</th></tr></thead><tbody>{history.map((item) => <tr key={item.marketDay}><td>{item.marketDay}</td><td><strong>{formatMoney(item.totalEquity)}</strong></td><td>{formatMoney(item.totalMarketValue)}</td><td>{formatMoney(item.cash)}</td><td className={valueTone(item.dailyChange)}>{formatSignedMoneyOrDash(item.dailyChange)}</td><td className={valueTone(item.dailyReturn)}>{formatSignedPercentOrDash(item.dailyReturn)}</td><td>{item.pricedCount}/{item.holdingsCount}</td><td><b className={item.afterClose ? 'history-status close' : 'history-status'}>{item.afterClose ? '收盘' : '盘中'}</b></td></tr>)}</tbody></table></div>}
+    <p className="history-note">权益变动包含入金、出金和持仓校准的影响，不代表投资收益率；与上一个已有估值日比较。</p>
+    {history.length > 3 && <button className="quiet history-toggle" aria-expanded={open} aria-controls="equity-details" aria-label={open ? '收起权益明细' : '展开全部权益明细'} onClick={toggle}>{open ? '收起 · 仅看最近三天' : `展开全部 ${history.length} 天明细`}</button>}
+    {!!history.length && <div className="equity-table-scroll" id="equity-details"><table aria-label="组合权益历史明细"><thead><tr><th>日期</th><th>总权益</th><th>持仓市值</th><th>现金</th><th>权益变动</th><th>权益变动比例</th><th>行情覆盖</th><th>状态</th></tr></thead><tbody>{(open ? history : history.slice(0, 3)).map((item) => <tr key={item.marketDay}><td>{item.marketDay}</td><td><strong>{formatMoney(item.totalEquity)}</strong></td><td>{formatMoney(item.totalMarketValue)}</td><td>{formatMoney(item.cash)}</td><td className={valueTone(item.dailyChange)}>{formatSignedMoneyOrDash(item.dailyChange)}</td><td className={valueTone(item.dailyReturn)}>{formatSignedPercentOrDash(item.dailyReturn)}</td><td>{item.pricedCount}/{item.holdingsCount}</td><td><b className={item.afterClose ? 'history-status close' : 'history-status'}>{item.afterClose ? '收盘' : '盘中'}</b></td></tr>)}</tbody></table></div>}
   </section>
 }
 
@@ -1688,13 +1755,13 @@ function PortfolioDonut({ portfolio }: { portfolio: PortfolioOverview }) {
   const segments = portfolio.positions.flatMap((item) => item.marketValue === null || item.marketValue <= 0 ? [] : [{ label: item.symbol, value: item.marketValue }])
   if (portfolio.cash > 0) segments.push({ label: '现金', value: portfolio.cash })
   useEffect(() => { if (canvas.current) drawAllocationDonut(canvas.current, segments) }, [segments.map((item) => `${item.label}:${item.value}`).join('|')])
-  return <section className="portfolio-donut"><p className="micro">资产构成</p><h2>持仓与现金</h2>{segments.length ? <><canvas ref={canvas} role="img" aria-label={segments.map((item) => `${item.label} ${formatMoney(item.value)}`).join('，')} /><div className="donut-legend">{segments.map((item, index) => <span key={item.label}><i style={{ background: chartColors[index % chartColors.length] }} />{item.label}<strong>{formatPercent(item.value / segments.reduce((sum, entry) => sum + entry.value, 0))}</strong></span>)}</div></> : <p className="chart-empty">录入现金或持仓后显示资产构成</p>}</section>
+  return <DisclosureSection name="allocation" title="资产构成" eyebrow="持仓与现金" className="portfolio-donut">{segments.length ? <><canvas ref={canvas} role="img" aria-label={segments.map((item) => `${item.label} ${formatMoney(item.value)}`).join('，')} /><div className="donut-legend">{segments.map((item, index) => <span key={item.label}><i style={{ background: chartColors[index % chartColors.length] }} />{item.label}<strong>{formatPercent(item.value / segments.reduce((sum, entry) => sum + entry.value, 0))}</strong></span>)}</div></> : <p className="chart-empty">录入现金或持仓后显示资产构成</p>}</DisclosureSection>
 }
 
 function PositionBars({ positions, mode }: { positions: PortfolioPosition[]; mode: 'weight' | 'profit' }) {
   const values = positions.flatMap((item) => { const value = mode === 'weight' ? item.portfolioWeight : item.unrealizedProfitLoss; return value === null ? [] : [{ symbol: item.symbol, value }] })
   const max = Math.max(...values.map((item) => Math.abs(item.value)), 0)
-  return <section className="portfolio-bars"><p className="micro">{mode === 'weight' ? '仓位分布' : '盈亏分解'}</p><h2>{mode === 'weight' ? '谁占用了组合' : '谁在贡献盈亏'}</h2>{values.length ? values.map((item) => <div className="portfolio-bar-row" key={item.symbol}><strong>{item.symbol}</strong><span className={item.value < 0 ? 'bar-track negative' : 'bar-track'}><i style={{ width: `${max ? Math.abs(item.value) / max * 100 : 0}%` }} /></span><small className={valueTone(item.value)}>{mode === 'weight' ? formatPercent(item.value) : formatSignedMoney(item.value)}</small></div>) : <p className="chart-empty">行情可用后显示</p>}</section>
+  return <DisclosureSection name={`position-${mode}`} title={mode === 'weight' ? '仓位分布' : '盈亏分解'} className="portfolio-bars">{values.length ? values.map((item) => <div className="portfolio-bar-row" key={item.symbol}><strong>{item.symbol}</strong><span className={item.value < 0 ? 'bar-track negative' : 'bar-track'}><i style={{ width: `${max ? Math.abs(item.value) / max * 100 : 0}%` }} /></span><small className={valueTone(item.value)}>{mode === 'weight' ? formatPercent(item.value) : formatSignedMoney(item.value)}</small></div>) : <p className="chart-empty">行情可用后显示</p>}</DisclosureSection>
 }
 
 function ProfitProtectionDialog({ position, current, onCancel, onSubmit }: {
@@ -1723,21 +1790,65 @@ function ProfitProtectionDialog({ position, current, onCancel, onSubmit }: {
   return <div className="portfolio-modal"><form role="dialog" aria-modal="true" aria-label={`${position.symbol} 盈利保护计划`} onSubmit={(event) => { event.preventDefault(); if (valid) void onSubmit({ anchorPrice: anchor, invalidationPrice: invalidation, coreRatio: Number(coreRatio) / 100, maxPortfolioWeight: Number(maxWeight) / 100, earningsDate: earningsDate || null, earningsRiskStartsAt: earningsRiskStartsAt || null }) }}><p className="micro">PROFIT PROTECTION</p><h2>{current ? '修订' : '制定'} {position.symbol} 计划</h2><p>计划固定保存当前 {formatNumber(position.quantity)} 股、平均成本 {formatMoney(position.averageCost)}。后续持仓变化会要求重新复核，不会静默改写风险锚点。</p><label>计划基准价<input aria-label="计划基准价" type="number" min="0.000001" step="any" value={anchorPrice} onChange={(event) => setAnchorPrice(event.target.value)} required /></label><label>失效价<input autoFocus aria-label="失效价" type="number" min="0" step="any" value={invalidationPrice} onChange={(event) => setInvalidationPrice(event.target.value)} required /></label><label>核心仓比例<input aria-label="核心仓比例" type="number" min="1" max="99" step="any" value={coreRatio} onChange={(event) => setCoreRatio(event.target.value)} required /></label><label>最大仓位<input aria-label="最大仓位" type="number" min="0.1" max="100" step="any" value={maxWeight} onChange={(event) => setMaxWeight(event.target.value)} required /></label><label>财报日期（可选）<input aria-label="财报日期" type="date" value={earningsDate} onChange={(event) => setEarningsDate(event.target.value)} /></label><label>风险窗口起始日（可选）<input aria-label="风险窗口起始日" type="date" value={earningsRiskStartsAt} onChange={(event) => setEarningsRiskStartsAt(event.target.value)} /></label><div className="trade-preview"><span>1R 风险距离<strong>{valid ? formatMoney(risk) : '—'}</strong></span><span>第一次兑现 · 2R<strong>{valid ? formatMoney(anchor + risk * 2) : '—'}</strong></span><span>移动保护 · 4R<strong>{valid ? formatMoney(anchor + risk * 4) : '—'}</strong></span></div><p>固定模板：2R 第一次兑现、3R 第二次兑现、4R 后由 Tracking 使用 EMA20 保护核心仓。财报日期和风险窗口必须同时填写。</p><div className="modal-actions"><button type="button" className="quiet" onClick={onCancel}>取消</button><button type="submit" disabled={!valid}>保存保护计划</button></div></form></div>
 }
 
-function BuyDialog({ position, cash, onCancel, onSubmit }: { position: PortfolioPosition; cash: number; onCancel: () => void; onSubmit: (quantity: number, price: number) => Promise<void> }) {
+function BuyDialog({ initialSymbol, portfolio, onCancel, onSubmit }: {
+  initialSymbol: string; portfolio: PortfolioOverview; onCancel: () => void
+  onSubmit: (symbol: string, quantity: number, price: number) => Promise<boolean>
+}) {
+  const dialog = useRef<HTMLDialogElement>(null)
+  const returnFocus = useRef(document.activeElement)
+  useEffect(() => {
+    if (dialog.current?.showModal) dialog.current.showModal()
+    else dialog.current?.setAttribute('open', '')
+    dialog.current?.querySelector<HTMLInputElement>(initialSymbol ? '[aria-label="买入数量"]' : '[aria-label="买入股票代码"]')?.focus()
+    return () => { if (returnFocus.current instanceof HTMLElement && returnFocus.current.isConnected) returnFocus.current.focus() }
+  }, [])
+  const [symbol, setSymbol] = useState(initialSymbol)
   const [quantity, setQuantity] = useState('')
-  const [price, setPrice] = useState(position.marketPrice === null ? '' : String(position.marketPrice))
-  const shares = Number(quantity), buyPrice = Number(price), valid = Number.isFinite(shares) && shares > 0 && Number.isFinite(buyPrice) && buyPrice >= 0
-  const spent = valid ? shares * buyPrice : 0, affordable = spent <= cash
-  const nextAverageCost = valid ? (position.quantity * position.averageCost + spent) / (position.quantity + shares) : 0
-  return <div className="portfolio-modal"><form role="dialog" aria-modal="true" aria-label={`加仓 ${position.symbol}`} onSubmit={(event) => { event.preventDefault(); if (valid && affordable) void onSubmit(shares, buyPrice) }}><p className="micro">BUY POSITION</p><h2>加仓 {position.symbol}</h2><p>当前持有 {formatNumber(position.quantity)} 股，平均成本 {formatMoney(position.averageCost)}，可用现金 {formatMoney(cash)}。</p><label>买入数量<input autoFocus aria-label="买入数量" type="number" min="0.000001" step="any" value={quantity} onChange={(event) => setQuantity(event.target.value)} required /></label><label>成交价<input aria-label="成交价" type="number" min="0" step="any" value={price} onChange={(event) => setPrice(event.target.value)} required /></label><div className="trade-preview"><span>买入花费<strong>{valid ? formatMoney(spent) : '—'}</strong></span><span>加仓后现金<strong>{valid ? formatMoney(cash - spent) : '—'}</strong></span><span>加仓后平均成本<strong>{valid ? formatMoney(nextAverageCost) : '—'}</strong></span></div>{valid && !affordable && <p role="alert" className="missing">买入金额超过当前现金，请先入金或降低买入金额。</p>}<div className="modal-actions"><button type="button" className="quiet" onClick={onCancel}>取消</button><button type="submit" disabled={!valid || !affordable}>确认加仓</button></div></form></div>
+  const [price, setPrice] = useState('')
+  const [saving, setSaving] = useState(false)
+  const submitting = useRef(false)
+  const [error, setError] = useState('')
+  const normalizedSymbol = symbol.trim().toUpperCase()
+  const position = portfolio.positions.find((item) => item.symbol === normalizedSymbol)
+  const shares = Number(quantity), buyPrice = Number(price)
+  const valid = /^[A-Z][A-Z0-9.-]{0,9}$/.test(normalizedSymbol)
+    && quantity.trim() !== '' && price.trim() !== ''
+    && Number.isFinite(shares) && shares > 0 && Number.isFinite(buyPrice) && buyPrice >= 0
+    && Number.isFinite(shares * buyPrice)
+  const spent = valid ? shares * buyPrice : 0, affordable = spent <= portfolio.cash
+  const nextQuantity = (position?.quantity ?? 0) + shares
+  const nextAverageCost = valid ? ((position?.quantity ?? 0) * (position?.averageCost ?? 0) + spent) / nextQuantity : 0
+  async function submit(event: React.FormEvent) {
+    event.preventDefault()
+    if (!valid || !affordable || submitting.current) return
+    submitting.current = true; setSaving(true); setError('')
+    try {
+      if (!await onSubmit(normalizedSymbol, shares, buyPrice)) setError('买入未记录，请核对现金、股票代码和成交信息后重试。')
+    } catch {
+      setError('未能确认记录结果，请先核对调仓账本，避免重复记录。')
+    } finally { submitting.current = false; setSaving(false) }
+  }
+  return <dialog ref={dialog} className="portfolio-modal buy-dialog" aria-label="记录买入" onCancel={(event) => { event.preventDefault(); if (!submitting.current) onCancel() }}><form onSubmit={(event) => void submit(event)}>
+    <p className="micro">记录实际成交</p><h2>{initialSymbol ? `加仓 ${initialSymbol}` : '记录买入'}</h2>
+    <p>{position ? `当前持有 ${formatNumber(position.quantity)} 股，平均成本 ${formatMoney(position.averageCost)}。` : '新标的将在记录后加入持仓。'}可用现金 {formatMoney(portfolio.cash)}。</p>
+    <fieldset disabled={saving} className="buy-fields">
+      <label>股票代码<input autoFocus={!initialSymbol} aria-label="买入股票代码" value={symbol} onChange={(event) => setSymbol(event.target.value)} readOnly={Boolean(initialSymbol)} required /></label>
+      <label>买入数量<input autoFocus={Boolean(initialSymbol)} aria-label="买入数量" type="number" min="0.000001" step="any" value={quantity} onChange={(event) => setQuantity(event.target.value)} required /></label>
+      <label>成交价<input aria-label="成交价" type="number" min="0" step="any" value={price} onChange={(event) => setPrice(event.target.value)} required /></label>
+    </fieldset>
+    <div className="trade-preview"><span>买入花费<strong>{valid ? formatMoney(spent) : '—'}</strong></span><span>买入后现金<strong>{valid ? formatMoney(portfolio.cash - spent) : '—'}</strong></span><span>买入后持仓<strong>{valid ? `${formatNumber(nextQuantity)} 股` : '—'}</strong></span><span>买入后平均成本<strong>{valid ? formatMoney(nextAverageCost) : '—'}</strong></span></div>
+    {valid && !affordable && <p role="alert" className="missing">买入金额超过当前现金，请先入金或降低买入金额。</p>}
+    {error && <p role="alert" className="missing">{error}</p>}
+    <div className="modal-actions"><button type="button" className="quiet" disabled={saving} onClick={onCancel}>取消</button><button type="submit" disabled={!valid || !affordable || saving}>{saving ? '记录中…' : '确认买入'}</button></div>
+  </form></dialog>
 }
 
 const eventKindLabels: Record<PortfolioEvent['kind'], string> = { buy: '买入', sell: '卖出', cash_adjust: '资金调整', reconcile: '校准' }
 
 function EventLedger({ events }: { events: PortfolioEvent[] }) {
-  return <section className="equity-history"><header><div><p className="micro">调仓账本 · 最近 {events.length} 条</p><h2>每一次仓位与现金变化</h2></div><p>持仓与现金都由这些事件推导而来</p></header>
+  return <DisclosureSection name="ledger" title="调仓账本" eyebrow={`最近 ${events.length} 条 · 持仓与现金变化`} className="equity-history" defaultOpen={false}>
     {events.length ? <div className="equity-table-scroll"><table aria-label="调仓事件账本"><thead><tr><th>时间</th><th>事件</th><th>标的</th><th>数量</th><th>价格</th><th>现金变化</th><th>已实现盈亏</th><th>备注</th></tr></thead><tbody>{events.map((event) => <tr key={event.id}><td>{event.createdAt.slice(0, 16).replace('T', ' ')}</td><td>{eventKindLabels[event.kind]}</td><td>{event.symbol ?? '—'}</td><td>{event.quantity === null ? '—' : formatNumber(event.quantity)}</td><td>{event.price === null ? '—' : formatMoney(event.price)}</td><td className={valueTone(event.amount)}>{event.amount === null ? '—' : formatSignedMoney(event.amount)}</td><td className={valueTone(event.realizedProfitLoss)}>{event.realizedProfitLoss === null ? '—' : formatSignedMoney(event.realizedProfitLoss)}</td><td>{event.note || '—'}</td></tr>)}</tbody></table></div> : <p className="chart-empty">买入、卖出、资金调整或校准后在这里留下记录</p>}
-  </section>
+  </DisclosureSection>
 }
 
 function ReduceDialog({ position, cash, onCancel, onSubmit }: { position: PortfolioPosition; cash: number; onCancel: () => void; onSubmit: (quantity: number, price: number) => Promise<void> }) {
@@ -1819,7 +1930,7 @@ function formatFrozenSettings(settings: RuntimeSettings) {
 function PriceChart({ facts, compact = false }: { facts: Fact[]; compact?: boolean }) {
   const canvas = useRef<HTMLCanvasElement>(null)
   const bars = normalizedBars(facts).slice(compact ? -30 : -60)
-  useEffect(() => { if (canvas.current) drawPriceChart(canvas.current, bars, compact) }, [facts, compact])
+  useEffect(() => { if (canvas.current) return observeChart(canvas.current, (element) => drawPriceChart(element, bars, compact)) }, [facts, compact])
   if (bars.length < 2) return <div className="chart-empty">暂无足够历史行情</div>
   return <figure className={compact ? 'price-chart compact' : 'price-chart'}><canvas ref={canvas} role="img" aria-label={`${bars[0].date} 至 ${bars.at(-1)?.date} 的收盘价与成交量趋势`} /><figcaption><span>{bars[0].date}</span><span>收盘价与成交量</span><span>{bars.at(-1)?.date}</span></figcaption></figure>
 }
@@ -1831,17 +1942,18 @@ function ValuationView({ fact, explanation }: { fact: Fact; explanation?: string
   const ranges = asRecord(value.historical_ranges)
   const historical = Array.isArray(ranges.pe) ? ranges.pe.map(Number) : []
   const multiple = Number(currentMultiples.pe)
-  useEffect(() => { if (canvas.current) drawValuation(canvas.current, multiple, historical) }, [multiple, historical.join(',')])
+  useEffect(() => { if (canvas.current) return observeChart(canvas.current, (element) => drawValuation(element, multiple, historical)) }, [multiple, historical.join(',')])
   return <div className="valuation-view"><div><strong>{Number.isFinite(multiple) ? `${multiple.toFixed(1)}×` : '不可用'}</strong><span>当前 PE</span><p>{explanation ?? '估值仅作为区间参考，不单独构成买卖依据。'}</p></div>{Number.isFinite(multiple) && historical.length === 2 ? <figure><canvas ref={canvas} role="img" aria-label={`当前 PE ${multiple.toFixed(1)} 倍，历史区间 ${historical[0].toFixed(1)} 至 ${historical[1].toFixed(1)} 倍`} /><figcaption>当前 PE 与自身历史区间</figcaption></figure> : <p className="chart-empty">历史估值区间不可用</p>}</div>
 }
 
-function Evidence({ facts, ids }: { facts: Map<string, Fact>; ids: string[] }) {
-  return <ul className="evidence-list">{ids.map((id) => { const fact = facts.get(id); return fact ? <li key={id}><FactCard fact={fact} /></li> : <li key={id} className="missing">这条依据已经不可用</li> })}</ul>
-}
 function FactCard({ fact }: { fact: Fact }) {
   const href = safeReference(fact.sourceReference)
-  const content = <><span className="fact-kind">{factLabel(fact.type)}</span><strong>{factHeadline(fact)}</strong><small>{fact.source} · {formatTime(fact.observedAt)}</small></>
-  return href ? <a className="fact-card" href={href} target="_blank" rel="noreferrer">{content}</a> : <div className="fact-card">{content}</div>
+  return <div className="fact-card">
+    <span className="fact-kind">{factLabel(fact.type)}</span><strong>{factHeadline(fact)}</strong>
+    <small>{fact.source} · 事实时间 {formatTime(fact.observedAt)}{fact.fetchedAt && <> · 取得时间 {formatTime(fact.fetchedAt)}</>}</small>
+    {href && <a href={href} target="_blank" rel="noreferrer">查看来源</a>}
+    <details className="fact-details"><summary>完整数据</summary><pre>{JSON.stringify(fact.value, null, 2)}</pre></details>
+  </div>
 }
 
 function ToolResultSummary({ result }: { result: Record<string, unknown> }) {
@@ -1898,8 +2010,20 @@ function normalizedBars(facts: Fact[]) {
   }
   return [...map.values()].sort((a, b) => a.date.localeCompare(b.date))
 }
+function observeChart(canvas: HTMLCanvasElement, draw: (canvas: HTMLCanvasElement) => void) {
+  draw(canvas)
+  if (typeof ResizeObserver === 'undefined') return
+  let width = canvas.getBoundingClientRect().width
+  const observer = new ResizeObserver(() => {
+    const nextWidth = canvas.getBoundingClientRect().width
+    if (nextWidth > 0 && nextWidth !== width) { width = nextWidth; draw(canvas) }
+  })
+  observer.observe(canvas)
+  return () => observer.disconnect()
+}
+
 function drawPriceChart(canvas: HTMLCanvasElement, bars: ReturnType<typeof normalizedBars>, compact: boolean) {
-  const rect = canvas.getBoundingClientRect(), ratio = window.devicePixelRatio || 1, width = Math.max(rect.width, 320), height = compact ? 150 : 260
+  const rect = canvas.getBoundingClientRect(), ratio = window.devicePixelRatio || 1, width = Math.max(rect.width, 280), height = compact ? 150 : 260
   canvas.width = width * ratio; canvas.height = height * ratio; canvas.style.height = `${height}px`
   const ctx = canvas.getContext('2d'); if (!ctx) return; ctx.scale(ratio, ratio); ctx.clearRect(0, 0, width, height)
   const pad = { x: 12, top: 18, bottom: 38 }, plotHeight = height - pad.top - pad.bottom
@@ -1931,7 +2055,7 @@ function drawAllocationDonut(canvas: HTMLCanvasElement, segments: Array<{ label:
 }
 function drawEquityHistory(canvas: HTMLCanvasElement, points: PortfolioEquitySnapshot[]) {
   const rect = canvas.getBoundingClientRect(), ratio = window.devicePixelRatio || 1
-  const width = Math.max(rect.width, 640), height = 250
+  const width = Math.max(rect.width, 280), height = 250
   canvas.width = width * ratio; canvas.height = height * ratio; canvas.style.height = `${height}px`
   const ctx = canvas.getContext('2d'); if (!ctx) return; ctx.scale(ratio, ratio); ctx.clearRect(0, 0, width, height)
   const values = points.map((item) => item.totalEquity), min = Math.min(...values), max = Math.max(...values), range = max - min || Math.max(max * .02, 1)
@@ -1946,21 +2070,37 @@ function drawEquityHistory(canvas: HTMLCanvasElement, points: PortfolioEquitySna
   ctx.fillStyle = '#736b62'; ctx.font = '10px Inter, system-ui'; ctx.fillText(formatMoney(max), width - pad.right + 9, pad.top + 4); ctx.fillText(formatMoney(min), width - pad.right + 9, height - pad.bottom)
 }
 
+const financialMetricLabels: Record<string, string> = {
+  revenue: '营业收入', gross_profit: '毛利润', gross_margin: '毛利率', operating_income: '营业利润',
+  operating_margin: '营业利润率', net_income: '净利润', operating_cash_flow: '经营现金流',
+  operating_cash_flow_margin: '经营现金流利润率', free_cash_flow: '自由现金流', fcf_margin: '自由现金流率',
+  capex: '资本开支', diluted_eps: '稀释每股收益', inventory: '存货', inventories: '存货',
+  revenue_yoy: '收入同比', inventory_yoy: '存货同比', accounts_receivable: '应收账款',
+}
+
 function factHeadline(fact: Fact) {
   const value = asRecord(fact.value)
+  if (['derived_financial_metric', 'reported_financial'].includes(fact.type)) {
+    const metric = String(value.metric ?? fact.type)
+    const amount = typeof value.value === 'number'
+      ? /margin|_yoy|_growth/.test(metric) ? formatPercent(value.value) : `${formatCompact(value.value)}${value.unit ? ` ${value.unit}` : ''}`
+      : String(value.value ?? '数据缺失')
+    return `${financialMetricLabels[metric] ?? metric} · ${amount}${value.period ? ` · ${value.period}` : ''}`
+  }
+  if (fact.type === 'financial_quality_flag') return `${String(value.flagType ?? '财务质量警示')}${value.period ? ` · ${value.period}` : ''}`
   if (fact.type === 'quote') return formatMoney(Number(fact.value))
   if (fact.type === 'daily_bar') return `${String(value.date ?? fact.observedAt).slice(0, 10)} · 收 ${formatMoney(Number(value.close))} · 成交量 ${formatCompact(Number(value.volume))}`
   if (fact.type === 'news') return String(value.title ?? value.summary ?? '新闻条目')
   if (fact.type === 'indicators') return `MA5 ${formatMaybeMoney(value.ma_5)} · MA20 ${formatMaybeMoney(value.ma_20)} · RSI ${formatMaybeNumber(value.rsi_14)}`
   if (fact.type === 'valuation') { const multiples = asRecord(value.current_multiples); return `当前 PE ${formatMaybeNumber(multiples.pe)}× · 可比公司 ${Array.isArray(value.comparable_symbols) && value.comparable_symbols.length ? value.comparable_symbols.join('、') : '不适用'}` }
   if (typeof fact.value === 'number') return formatCompact(fact.value)
-  return String(value.title ?? value.name ?? value.status ?? '结构化事实')
+  return String(value.title ?? value.name ?? value.summary ?? value.status ?? `${fact.type} · 展开完整数据查看`)
 }
 function asRecord(value: unknown): Record<string, any> { return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, any> : {} }
 function pipelineIndex(status: string, stages: string[]) { if (['completed', 'partial'].includes(status)) return 6; if (['failed', 'stopped', 'interrupted', 'budget_exhausted'].includes(status)) return Math.max(0, stages.includes('model_event') ? 4 : stages.includes('financial_context') ? 3 : 1); return stages.includes('model_completed') ? 5 : stages.includes('model_event') ? 4 : stages.includes('financial_context') ? 3 : ['running', 'running_model', 'running_tools', 'waiting_for_specialists', 'finalizing'].includes(status) ? 2 : ['queued', 'planning'].includes(status) ? 1 : 0 }
 function pipelineLabel(stage: string) { return ({ queued: '创建分析任务', running: '准备市场与持仓材料', financial_context: '冻结金融上下文', model_event: 'AI 综合判断', model_completed: '校验结构化报告', completed: '保存研究记录' } as Record<string, string>)[stage] }
 function safeReference(value: string) { return value.startsWith('http://') || value.startsWith('https://') ? value : undefined }
-function factLabel(type: string) { return ({ quote: '当前价格', daily_bar: '历史行情', news: '相关新闻', indicators: '技术指标', valuation: '估值结果', dilutedEps: '每股收益', revenue: '营业收入', netIncome: '净利润', operatingCashFlow: '经营现金流' } as Record<string, string>)[type] ?? '结构化事实' }
+function factLabel(type: string) { return ({ quote: '当前价格', daily_bar: '历史行情', news: '相关新闻', indicators: '技术指标', valuation: '估值结果', dilutedEps: '每股收益', revenue: '营业收入', netIncome: '净利润', operatingCashFlow: '经营现金流', derived_financial_metric: '财务指标', reported_financial: '财报数据', financial_quality_flag: '财务质量警示', company_event: '公司事件' } as Record<string, string>)[type] ?? type }
 function statusLabel(status: string) { return ({ queued: '排队中', planning: '规划中', not_started: '未启动', running: '分析中', running_model: '模型分析中', running_tools: '工具执行中', waiting_for_specialists: '等待专项分析', finalizing: '报告收口中', completed: '已完成', partial: '部分完成', failed: '失败', stopping: '正在停止', stopped: '已停止', interrupted: '服务中断', budget_exhausted: '预算已耗尽' } as Record<string, string>)[status] ?? status }
 function directionLabel(direction?: string) { return ({ bullish: '偏多', bearish: '偏空', neutral: '中性' } as Record<string, string>)[direction ?? ''] ?? direction ?? '方向未知' }
 function confidenceLabel(confidence?: string) { return ({ low: '低置信度', medium: '中等置信度', high: '高置信度' } as Record<string, string>)[confidence ?? ''] ?? confidence ?? '置信度未知' }
