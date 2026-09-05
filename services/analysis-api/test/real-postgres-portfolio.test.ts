@@ -39,6 +39,40 @@ function createPostgresApp(now?: () => Date) {
   })
 }
 
+test('真实 PostgreSQL 新标的买入原子记录持仓现金账本，失败不写入且重启可读回', {
+  skip: !databaseUrl, concurrency: false,
+}, async () => {
+  const app = createPostgresApp()
+  try {
+    await app.ready()
+    await app.inject({ method: 'DELETE', url: '/api/positions/UXNEW' })
+    await app.inject({ method: 'PUT', url: '/api/portfolio/cash', payload: { cash: 500 } })
+    const before = (await app.inject({ method: 'GET', url: '/api/portfolio/events' })).json().events.length
+    const bought = await app.inject({ method: 'POST', url: '/api/positions/UXNEW/buy', payload: { quantity: 2, price: 100 } })
+    assert.equal(bought.statusCode, 200)
+    assert.deepEqual(bought.json(), { position: { symbol: 'UXNEW', quantity: 2, averageCost: 100 }, cash: 300, spent: 200 })
+    const events = (await app.inject({ method: 'GET', url: '/api/portfolio/events' })).json().events
+    assert.equal(events.length, before + 1)
+    assert.equal(events[0].kind, 'buy')
+    assert.equal(events[0].symbol, 'UXNEW')
+    assert.equal(events[0].amount, -200)
+    const rejected = await app.inject({ method: 'POST', url: '/api/positions/UXNEW/buy', payload: { quantity: 4, price: 100 } })
+    assert.equal(rejected.statusCode, 400)
+    assert.deepEqual((await app.inject({ method: 'GET', url: '/api/portfolio/events' })).json().events, events)
+    assert.equal((await app.inject({ method: 'GET', url: '/api/portfolio/stored' })).json().cash, 300)
+    const increased = await app.inject({ method: 'POST', url: '/api/positions/UXNEW/buy', payload: { quantity: 2, price: 120 } })
+    assert.deepEqual(increased.json(), { position: { symbol: 'UXNEW', quantity: 4, averageCost: 110 }, cash: 60, spent: 240 })
+  } finally { await app.close() }
+  const restarted = createPostgresApp()
+  try {
+    const stored = (await restarted.inject({ method: 'GET', url: '/api/portfolio/stored' })).json()
+    assert.equal(stored.cash, 60)
+    const position = stored.positions.find((item: { symbol: string }) => item.symbol === 'UXNEW')
+    assert.equal(position.quantity, 4)
+    assert.equal(position.averageCost, 110)
+  } finally { await restarted.close() }
+})
+
 test('真实 PostgreSQL HTTP 持仓与研究闭环在重启后持久化', {
   skip: !databaseUrl,
   concurrency: false,
@@ -178,7 +212,10 @@ test('真实 PostgreSQL HTTP 持仓与研究闭环在重启后持久化', {
   const research = await readback.inject({ method: 'GET', url: `/api/research/${created.analysisId}` })
   assert.equal(research.statusCode, 200)
   assert.equal(research.json().report.title, '测试报告')
-  assert.ok(research.json().trace.length > 0)
+  assert.equal(research.json().trace, undefined)
+  const trace = await readback.inject({ method: 'GET', url: `/api/research/${created.analysisId}/trace` })
+  assert.equal(trace.statusCode, 200)
+  assert.ok(trace.json().mainAgent.events.length > 0)
   await readback.close()
 })
 

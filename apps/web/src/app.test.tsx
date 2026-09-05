@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { JSDOM } from 'jsdom'
 import React from 'react'
-import { cleanup, fireEvent, render, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { defaultRuntimeSettings } from '@vibe-invest/contracts'
 
@@ -24,6 +24,135 @@ function setupDom() {
 }
 
 test.afterEach(() => cleanup())
+
+test('追踪研究先准备可编辑问题，发送时保留变化与选定旧报告而不创建单股分析', async () => {
+  setupDom()
+  Reflect.deleteProperty(globalThis, 'EventSource')
+  const old = { id: 'old-report', symbol: 'NVDA', status: 'completed', createdAt: '2026-08-29T00:00:00Z', facts: [], report: {
+    title: '此前的趋势判断', marketState: '原先处于震荡', keyJudgments: [{ judgment: '等待均线突破', evidence: [] }], limitations: ['新闻缺失'],
+  } }
+  let failOldReport = true
+  const writes: Array<{ url: string; message: string }> = []
+  globalThis.fetch = async (input, init) => {
+    const url = String(input)
+    if (init?.method === 'POST') {
+      writes.push({ url, message: JSON.parse(String(init.body)).message })
+      return Response.json({ id: 'new-thread', title: '变化研究', status: 'running', sessionId: 's-1' })
+    }
+    if (url === '/api/settings') return Response.json(settingsResponse())
+    if (url === '/api/portfolio' || url === '/api/portfolio/stored') return Response.json(portfolioResponse([]))
+    if (url === '/api/research') return Response.json({ records: [old] })
+    if (url === '/api/research/old-report') return failOldReport ? Response.json({ error: 'unavailable' }, { status: 503 }) : Response.json(old)
+    if (url === '/api/tracking?limit=100') return Response.json({ watchlist: [], targets: [{ symbol: 'NVDA', sources: ['position'] }], events: [{
+      id: 'change-1', symbol: 'NVDA', kind: 'price_move', capability: 'technical', severity: 'warning',
+      occurredAt: '2026-09-04T20:00:00Z', createdAt: '2026-09-04T20:01:00Z',
+      payload: { previous: 100, current: 110, change: 0.1, evidence: { source: 'test-source', sourceReference: 'https://example.com/fact', fetchedAt: '2026-09-04T20:01:00Z' } },
+    }] })
+    return Response.json({ snapshots: [], events: [], threads: [] })
+  }
+  const view = render(<App />)
+  const user = userEvent.setup({ document: window.document })
+  await user.click(view.getByRole('button', { name: '追踪' }))
+  await user.click(await view.findByText('查看变化详情'))
+  await user.click(view.getByRole('button', { name: '查看已有研究 NVDA' }))
+  await view.findByText('研究资料读取失败，请重试；尚未发起研究。')
+  assert.ok(view.getByRole('button', { name: '围绕此变化研究 NVDA' }))
+  failOldReport = false
+  await user.click(view.getByRole('button', { name: '围绕此变化研究 NVDA' }))
+  const input = await view.findByLabelText('开始研究对话') as HTMLTextAreaElement
+  assert.equal(writes.length, 0)
+  assert.match(input.value, /US\$100.00.*US\$110.00/s)
+  assert.match(input.value, /此前的趋势判断.*等待均线突破.*新闻缺失/s)
+  await user.type(input, '\n也核对成交量。')
+  await user.click(view.getByRole('button', { name: '开始对话' }))
+  await waitFor(() => assert.equal(writes.length, 1))
+  assert.equal(writes[0].url, '/api/conversations')
+  assert.match(writes[0].message, /https:\/\/example.com\/fact/)
+  assert.match(writes[0].message, /也核对成交量/)
+  await user.click(view.getByRole('button', { name: '追踪' }))
+  await user.click(view.getByText('查看变化详情'))
+  assert.equal((view.getByRole('button', { name: '围绕此变化研究 NVDA' }) as HTMLButtonElement).disabled, true)
+  assert.equal(writes.length, 1)
+})
+
+test('持仓模块独立折叠并记住选择，权益曲线保留全部点而明细只显示最近三天', async () => {
+  setupDom()
+  const snapshots = ['2026-09-04', '2026-09-03', '2026-09-02', '2026-09-01'].map((marketDay) => ({
+    marketDay, observedAt: `${marketDay}T20:00:00Z`, totalEquity: 500, totalMarketValue: 0, cash: 500,
+    dailyChange: 0, dailyReturn: 0, pricedCount: 0, holdingsCount: 0, afterClose: true,
+  }))
+  globalThis.fetch = async (input) => {
+    const url = String(input)
+    if (url === '/api/settings') return Response.json(settingsResponse())
+    if (url === '/api/portfolio/stored' || url === '/api/portfolio') return Response.json(portfolioResponse([], 500))
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots })
+    if (url === '/api/research') return Response.json({ records: [] })
+    return Response.json({ events: [], threads: [] })
+  }
+  let view = render(<App />)
+  const user = userEvent.setup({ document: window.document })
+  await user.click(view.getByRole('button', { name: '我的持仓' }))
+  const table = await view.findByRole('table', { name: '组合权益历史明细' })
+  assert.equal(within(table).getAllByRole('row').length, 4)
+  assert.ok(view.getByRole('img', { name: '组合权益历史，共 4 个观测点' }))
+  await user.click(view.getByRole('button', { name: '展开全部权益明细' }))
+  assert.equal(within(table).getAllByRole('row').length, 5)
+  await user.click(view.getByRole('button', { name: '收起权益明细' }))
+  assert.equal(within(table).getAllByRole('row').length, 4)
+  assert.ok(view.getByRole('button', { name: '展开盈利保护' }))
+  await user.click(view.getByRole('button', { name: '展开持仓校准' }))
+  await user.type(view.getByLabelText('股票代码'), 'AMD')
+  await user.click(view.getByRole('button', { name: '收起持仓校准' }))
+  await user.click(view.getByRole('button', { name: '展开持仓校准' }))
+  assert.equal((view.getByLabelText('股票代码') as HTMLInputElement).value, 'AMD')
+  await user.click(view.getByRole('button', { name: '收起组合明细' }))
+  view.unmount()
+  view = render(<App />)
+  await user.click(view.getByRole('button', { name: '我的持仓' }))
+  assert.ok(await view.findByRole('button', { name: '展开组合明细' }))
+  assert.ok(view.getByRole('button', { name: '记录买入' }))
+})
+
+test('记录新标的买入直接扣现金，失败保留输入且取消不记账', async () => {
+  setupDom()
+  let portfolio = portfolioResponse([], 500)
+  const writes: Array<{ url: string; body: unknown }> = []
+  let fail = true
+  globalThis.fetch = async (input, init) => {
+    const url = String(input)
+    if (init?.method === 'POST') {
+      writes.push({ url, body: JSON.parse(String(init.body)) })
+      if (fail) return Response.json({ error: 'insufficient_cash' }, { status: 400 })
+      portfolio = portfolioResponse([{ symbol: 'AMD', quantity: 2, averageCost: 100 }], 300)
+      return Response.json({ cash: 300, spent: 200 })
+    }
+    if (url === '/api/settings') return Response.json(settingsResponse())
+    if (url === '/api/portfolio/stored' || url === '/api/portfolio') return Response.json(portfolio)
+    if (url === '/api/research') return Response.json({ records: [] })
+    return Response.json({ snapshots: [], events: [], threads: [] })
+  }
+  const view = render(<App />)
+  const user = userEvent.setup({ document: window.document })
+  await user.click(view.getByRole('button', { name: '我的持仓' }))
+  await user.click(await view.findByRole('button', { name: '记录买入' }))
+  const dialog = within(view.getByRole('dialog', { name: '记录买入' }))
+  await user.type(dialog.getByLabelText('买入股票代码'), 'amd')
+  await user.type(dialog.getByLabelText('买入数量'), '2')
+  assert.equal((dialog.getByRole('button', { name: '确认买入' }) as HTMLButtonElement).disabled, true)
+  await user.type(dialog.getByLabelText('成交价'), '100')
+  assert.ok(dialog.getByText('US$300.00'))
+  await user.click(dialog.getByRole('button', { name: '确认买入' }))
+  await dialog.findByRole('alert')
+  assert.equal((dialog.getByLabelText('买入股票代码') as HTMLInputElement).value, 'amd')
+  fail = false
+  await user.click(dialog.getByRole('button', { name: '确认买入' }))
+  await waitFor(() => assert.equal(view.queryByRole('dialog'), null))
+  assert.deepEqual(writes, Array(2).fill({ url: '/api/positions/AMD/buy', body: { quantity: 2, price: 100 } }))
+  assert.ok(view.getAllByText('US$300.00').length)
+  await user.click(view.getByRole('button', { name: '记录买入' }))
+  await user.click(view.getByRole('button', { name: '取消' }))
+  assert.equal(writes.length, 2)
+})
 
 function portfolioResponse(positions: Array<{ symbol: string; quantity: number; averageCost: number }>, cash = 0) {
   const detailed = positions.map((position) => {
@@ -457,6 +586,7 @@ test('用户保存持仓后能在持仓列表看到它', async () => {
   const view = render(React.createElement(App))
   const user = userEvent.setup({ document: window.document })
   await user.click(await view.findByRole('button', { name: '我的持仓' }))
+  await user.click(await view.findByRole('button', { name: '展开持仓校准' }))
   await user.type(await view.findByLabelText('股票代码'), 'NVDA')
   await user.type(view.getByLabelText('数量'), '12')
   await user.type(view.getByLabelText('平均成本'), '105')
@@ -556,6 +686,7 @@ test('较早的慢行情不能覆盖写入后的新持仓', async () => {
   const user = userEvent.setup({ document: window.document })
   await user.click(await view.findByRole('button', { name: '我的持仓' }))
   await view.findAllByText('NVDA')
+  await user.click(await view.findByRole('button', { name: '展开持仓校准' }))
   await user.type(view.getByLabelText('股票代码'), 'AMD')
   await user.type(view.getByLabelText('数量'), '5')
   await user.type(view.getByLabelText('平均成本'), '80')
@@ -753,6 +884,7 @@ test('持仓页可以建立盈利保护计划并展示 R 阶梯状态', async ()
   await user.type(view.getByLabelText('最大仓位'), '100')
   await user.click(view.getByRole('button', { name: '保存保护计划' }))
 
+  await user.click(view.getByRole('button', { name: '展开盈利保护' }))
   await view.findByText('当前 2.0R')
   await view.findByText('第一次兑现')
   await view.findByText('峰值浮盈')
@@ -806,11 +938,13 @@ test('持仓页可以加仓，买入花费从现金扣减并记入调仓账本',
   await view.findByText('US$2,000.00')
   await user.click(view.getByRole('button', { name: '加仓' }))
   await user.type(view.getByLabelText('买入数量'), '10')
+  await user.type(view.getByLabelText('成交价'), '120')
   await view.findAllByText('US$1,200.00')
   await view.findByText('US$800.00')
   await view.findByText('US$110.00')
-  await user.click(view.getByRole('button', { name: '确认加仓' }))
+  await user.click(view.getByRole('button', { name: '确认买入' }))
   await waitFor(() => assert.equal(view.getByLabelText('目标现金').getAttribute('value'), '800'))
+  await user.click(view.getByRole('button', { name: '展开调仓账本' }))
   const ledger = await view.findByRole('table', { name: '调仓事件账本' })
   assert.match(ledger.textContent ?? '', /买入/)
   assert.match(ledger.textContent ?? '', /入金/)
@@ -912,6 +1046,7 @@ test('用户创建分析并打开研究记录后能看到报告依据', async ()
   await view.findByText(/NVDA 财报/)
   await view.findAllByText('返回结果（用户视图）')
   await view.findByText(/找到 3 条候选新闻 · 产生 1 条原子事实/)
+  await user.click(view.getByRole('button', { name: '展开研究辅助信息' }))
   const decisions = await view.findByRole('region', { name: '专项规划决策' })
   assert.match(decisions.textContent ?? '', /消息面专项已启动/)
   assert.match(decisions.textContent ?? '', /近期新闻是否改变 NVDA 叙事？/)
@@ -1582,6 +1717,7 @@ test('研究页固定展示未启动的消息面专项及理由', async () => {
   const user = userEvent.setup({ document: window.document })
   await user.click(await view.findByRole('button', { name: '新建分析' }))
   await user.click(await view.findByRole('button', { name: /打开 NVDA/ }))
+  await user.click(await view.findByRole('button', { name: '展开研究辅助信息' }))
 
   const specialist = await view.findByRole('region', { name: '消息面专项 Agent' })
   assert.match(specialist.textContent ?? '', /未启动/)
@@ -1621,6 +1757,7 @@ test('研究页独立展示消息面专项的工具轨迹、证据缺口和版�
   const user = userEvent.setup({ document: window.document })
   await user.click(await view.findByRole('button', { name: '新建分析' }))
   await user.click(await view.findByRole('button', { name: /打开 NVDA/ }))
+  await user.click(await view.findByRole('button', { name: '展开研究辅助信息' }))
 
   const specialist = await view.findByRole('region', { name: '消息面专项 Agent' })
   assert.match(specialist.textContent ?? '', /报告版本 1/)
@@ -1668,6 +1805,7 @@ test('研究页固定展示基本面专项，并独立展示工具轨迹和不�
   const user = userEvent.setup({ document: window.document })
   await user.click(await view.findByRole('button', { name: '新建分析' }))
   await user.click(await view.findByRole('button', { name: /打开 NVDA/ }))
+  await user.click(await view.findByRole('button', { name: '展开研究辅助信息' }))
 
   const specialist = await view.findByRole('region', { name: '基本面专项 Agent' })
   assert.match(specialist.textContent ?? '', /报告版本 1/)
@@ -1713,6 +1851,7 @@ test('研究页独立展示技术面专项的多周期报告与工具轨迹', as
   const user = userEvent.setup({ document: window.document })
   await user.click(await view.findByRole('button', { name: '新建分析' }))
   await user.click(await view.findByRole('button', { name: /打开 NVDA/ }))
+  await user.click(await view.findByRole('button', { name: '展开研究辅助信息' }))
 
   const specialist = await view.findByRole('region', { name: '技术面专项 Agent' })
   assert.match(specialist.textContent ?? '', /短周期偏强但中周期冲突.*中性.*中等/)
@@ -1764,6 +1903,7 @@ test('研究页同时展示主 Agent 等待目标和完整三专项树', async (
   const user = userEvent.setup({ document: window.document })
   await user.click(await view.findByRole('button', { name: '新建分析' }))
   await user.click(await view.findByRole('button', { name: /打开 NVDA/ }))
+  await user.click(await view.findByRole('button', { name: '展开研究辅助信息' }))
 
   for (const name of ['消息面专项 Agent', '基本面专项 Agent', '技术面专项 Agent']) {
     assert.ok(await view.findByRole('region', { name }))
@@ -2049,9 +2189,9 @@ test('研究报告把结构化事实翻译成人话且不渲染原始事件流',
     report: {
       title: 'NVDA 研究简报', trend: '中性偏强', marketState: '价格保持在中期均线上方。',
       drivers: [], supportingEvidence: ['indicator-1'], contraryEvidence: [],
-      keyJudgments: [{ judgment: '动能仍在', evidence: ['indicator-1'] }], scenarios: [], invalidationConditions: [], limitations: [],
+      keyJudgments: [{ judgment: '动能仍在', evidence: ['indicator-1', 'metric-1'] }], scenarios: [], invalidationConditions: [], limitations: [],
     },
-    facts: [{ id: 'indicator-1', type: 'indicators', value: { ma_5: 219.44, ma_20: 207.8, rsi_14: 54.26 }, observedAt: '2026-08-12T13:48:38Z', source: 'deterministic-calculation', sourceReference: '' }],
+    facts: [{ id: 'metric-1', type: 'derived_financial_metric', value: { metric: 'gross_margin', value: 0.333, period: 'FY2026' }, observedAt: 'FY2026', fetchedAt: '2026-09-04T00:00:00Z', source: 'deterministic-calculation', sourceReference: '' }, { id: 'indicator-1', type: 'indicators', value: { ma_5: 219.44, ma_20: 207.8, rsi_14: 54.26 }, observedAt: '2026-08-12T13:48:38Z', source: 'deterministic-calculation', sourceReference: '' }],
     trace: [...Array.from({ length: 120 }, () => ({ type: 'text_delta', delta: '{"raw":"token"}' })), { type: 'status', status: 'completed' }],
   }
   globalThis.fetch = async (input) => {
@@ -2067,6 +2207,17 @@ test('研究报告把结构化事实翻译成人话且不渲染原始事件流',
   const view = render(React.createElement(App))
   const user = userEvent.setup({ document: window.document })
   await user.click(await view.findByRole('button', { name: '研究记录' }))
+  await view.findByText('动能仍在')
+  assert.equal(view.queryByRole('region', { name: '证据附录' }), null)
+  await user.click(view.getByRole('button', { name: '查看依据 1：技术指标' }))
+  const appendix = view.getByRole('region', { name: '证据附录' })
+  assert.equal(within(appendix).getAllByText('MA5 US$219.44 · MA20 US$207.80 · RSI 54.26').length, 1)
+  assert.ok(within(appendix).getByText('毛利率 · 33.3% · FY2026'))
+  assert.doesNotMatch(appendix.textContent ?? '', /结构化事实/)
+  await user.click(within(appendix).getAllByRole('button', { name: '返回判断 1' })[0])
+  assert.equal(document.activeElement?.textContent, '依据 1')
+  await user.click(view.getByRole('button', { name: '查看依据 1：技术指标' }))
+  assert.equal(document.activeElement?.id, appendix.querySelector('li')?.id)
   await view.findAllByText('MA5 US$219.44 · MA20 US$207.80 · RSI 54.26')
   assert.equal(view.container.textContent?.includes('{"raw":"token"}'), false)
   await user.click(view.getByRole('tab', { name: '轨迹' }))
