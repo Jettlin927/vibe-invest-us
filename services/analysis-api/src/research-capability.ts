@@ -47,8 +47,8 @@ export function createResearchToolExecutor(
   threadId: string
   knownFacts: Map<string, { id: string; [key: string]: unknown }>
 }) => ConversationToolExecutor {
-  const allowedSymbols = new Set((scope.symbols ?? []).map((symbol) => symbol.toUpperCase()))
   return ({ knownFacts }) => async (name, params, signal, onStart) => {
+    const allowedSymbols = new Set((scope.symbols ?? []).map((symbol) => symbol.toUpperCase()))
     const record = params && typeof params === 'object' && !Array.isArray(params)
       ? params as Record<string, unknown> : {}
     const symbol = typeof record.symbol === 'string' && record.symbol.trim()

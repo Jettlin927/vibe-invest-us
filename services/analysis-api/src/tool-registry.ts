@@ -1,3 +1,4 @@
+import { workbenchToolDefinitions, workbenchToolNames } from './tool-definitions/workbench.js'
 import AjvModule from 'ajv'
 import addFormatsModule from 'ajv-formats'
 import { selectFreeResearchToolNames } from './free-research-tool-pack.js'
@@ -39,6 +40,7 @@ import type {
 export type { RegisteredToolDefinition } from './tool-definitions/types.js'
 
 export const registeredToolDefinitions = [
+  ...workbenchToolDefinitions,
   fetchFinancialContextDefinition,
   runFundamentalAnalysisDefinition,
   runNewsAnalysisDefinition,
@@ -88,7 +90,7 @@ export function createToolRegistry(definitions: RegisteredToolDefinition[]) {
       || !definition.allowedStages.every((stage) => oneOf(stage, ['research', 'finalization']))) {
       invalid(name, 'allowed_stages')
     }
-    if (!oneOf(definition.sideEffect, ['read_only', 'creates_report', 'creates_agent', 'controls_agent'])) invalid(name, 'side_effect')
+    if (!oneOf(definition.sideEffect, ['read_only', 'creates_report', 'creates_agent', 'controls_agent', 'writes_workspace'])) invalid(name, 'side_effect')
     if (!oneOf(definition.externalNetwork, ['none', 'financial_data'])) invalid(name, 'external_network')
     if (definition.hostAccess !== 'none') invalid(name, 'host_access')
     if (!oneOf(definition.resultRetention, ['research_record', 'report_version'])) invalid(name, 'result_retention')
@@ -137,7 +139,7 @@ export function createToolRegistry(definitions: RegisteredToolDefinition[]) {
         .filter((definition) => definition.allowedStages.includes('research')
           && definition.surfaces?.includes('conversation') === true
           && definition.conversationAvailability !== 'conditional'
-          && ['read_only', 'creates_agent', 'creates_report', 'controls_agent'].includes(definition.sideEffect)
+          && ['read_only', 'creates_agent', 'creates_report', 'controls_agent', 'writes_workspace'].includes(definition.sideEffect)
           && (requested === null || requested.has(definition.model.name)))
         .map((definition) => definition.model)
     },
@@ -198,6 +200,7 @@ function subagentTool(name: string) {
 }
 
 function projectPublicToolResult(name: string, result: Record<string, unknown>) {
+  if (workbenchToolNames.has(name)) return result
   const common = projectCommonResult(result)
   if (['spawn_agent', 'wait_agent', 'read_agent_result', 'stop_agent',
     'delegate_research', 'collect_research'].includes(name)) return {

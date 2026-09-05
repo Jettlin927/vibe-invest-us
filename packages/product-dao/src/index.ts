@@ -1,3 +1,8 @@
+import { assertActiveExecution } from './execution-guard.js'
+import { researchSourceMigrationSql } from './research-library.js'
+export * from './research-library.js'
+import { workbenchMigrationSql } from './workbench.js'
+export * from './workbench.js'
 import { randomUUID } from 'node:crypto'
 
 import { Pool, type PoolClient } from 'pg'
@@ -13,9 +18,16 @@ import {
   type WatchlistItem,
 } from '@vibe-invest/contracts'
 
-export const schemaVersion = 31
+export const schemaVersion = 32
 
 const migrationSql = `
+${workbenchMigrationSql}
+CREATE TABLE IF NOT EXISTS portfolio_trade_operations (
+  operation_id text PRIMARY KEY,
+  payload_json jsonb NOT NULL,
+  result_json jsonb NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS product_schema_migrations (
   version integer PRIMARY KEY,
   applied_at timestamptz NOT NULL DEFAULT now()
@@ -755,8 +767,14 @@ INSERT INTO product_schema_migrations (version)
 VALUES (31)
 ON CONFLICT (version) DO NOTHING;
 
+INSERT INTO product_schema_migrations (version) VALUES (32) ON CONFLICT (version) DO NOTHING;
+
+${researchSourceMigrationSql}
+
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM vibe_invest_app;
 REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM vibe_invest_app;
+GRANT SELECT, INSERT, UPDATE ON research_source_links TO vibe_invest_app;
+GRANT SELECT, INSERT ON workbench_versions, workbench_operations, portfolio_trade_operations TO vibe_invest_app;
 GRANT SELECT ON product_schema_migrations TO vibe_invest_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON positions, portfolio_settings, portfolio_equity_snapshots TO vibe_invest_app;
 GRANT SELECT, INSERT ON portfolio_events TO vibe_invest_app;
@@ -1203,6 +1221,9 @@ type SnapshotRow = {
   after_close: boolean
 }
 
+type PortfolioBuyResult = { event: PortfolioEvent; position: ProductPosition; cash: number; spent: number }
+type PortfolioSellResult = { event: PortfolioEvent; position: ProductPosition | null; cash: number; proceeds: number; realizedProfitLoss: number }
+
 export function createPortfolioRepository(pool: Pool) {
   return {
     async list(): Promise<ProductPosition[]> {
@@ -1220,10 +1241,23 @@ export function createPortfolioRepository(pool: Pool) {
       return Number(result.rows[0]?.cash ?? 0)
     },
     // 买入（加仓）：同一事务内追加事件、扣减现金、按加权平均更新持仓投影；现金不足时整体回滚。
-    async recordBuy(symbol: string, quantity: number, price: number, note = '') {
+    async recordBuy(symbol: string, quantity: number, price: number, note = '', operationId?: string, executionId?: string) {
       const client = await pool.connect()
       try {
         await client.query('BEGIN')
+        const operationPayload = JSON.stringify({ side: 'buy', symbol, quantity, price, note })
+        if (operationId) {
+          await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [operationId])
+          const previous = await client.query<{ matches: boolean; result_json: PortfolioBuyResult }>(
+            'SELECT payload_json = $2::jsonb AS matches, result_json FROM portfolio_trade_operations WHERE operation_id = $1',
+            [operationId, operationPayload],
+          )
+          if (previous.rows[0]) {
+            if (!previous.rows[0].matches) throw new Error('portfolio_operation_conflict')
+            await client.query('COMMIT')
+            return previous.rows[0].result_json
+          }
+        }
         const cashResult = await client.query<{ cash: string }>(
           'SELECT cash::text FROM portfolio_settings WHERE id = $1 FOR UPDATE',
           [1],
@@ -1262,13 +1296,19 @@ export function createPortfolioRepository(pool: Pool) {
         const event = await insertEvent(client, {
           kind: 'buy', symbol, quantity, price, amount: -spent, note, createdAt: now,
         })
-        await client.query('COMMIT')
-        return {
+        const result = {
           event,
           position: { symbol, quantity: nextQuantity, averageCost: nextAverageCost },
           cash: nextCash,
           spent,
         }
+        await assertActiveExecution(client, executionId)
+        if (operationId) await client.query(
+          'INSERT INTO portfolio_trade_operations (operation_id, payload_json, result_json) VALUES ($1, $2, $3)',
+          [operationId, operationPayload, JSON.stringify(result)],
+        )
+        await client.query('COMMIT')
+        return result
       } catch (error) {
         await client.query('ROLLBACK')
         throw error
@@ -1277,10 +1317,23 @@ export function createPortfolioRepository(pool: Pool) {
       }
     },
     // 卖出（减仓）：同一事务内追加事件、增加现金、减少持仓数量并记录本次已实现盈亏。
-    async recordSell(symbol: string, quantity: number, price: number, note = '') {
+    async recordSell(symbol: string, quantity: number, price: number, note = '', operationId?: string, executionId?: string) {
       const client = await pool.connect()
       try {
         await client.query('BEGIN')
+        const operationPayload = JSON.stringify({ side: 'sell', symbol, quantity, price, note })
+        if (operationId) {
+          await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [operationId])
+          const previous = await client.query<{ matches: boolean; result_json: PortfolioSellResult }>(
+            'SELECT payload_json = $2::jsonb AS matches, result_json FROM portfolio_trade_operations WHERE operation_id = $1',
+            [operationId, operationPayload],
+          )
+          if (previous.rows[0]) {
+            if (!previous.rows[0].matches) throw new Error('portfolio_operation_conflict')
+            await client.query('COMMIT')
+            return previous.rows[0].result_json
+          }
+        }
         const positionResult = await client.query<PositionRow>(
           `SELECT symbol, quantity::text, average_cost::text
            FROM positions WHERE symbol = $1 FOR UPDATE`,
@@ -1316,14 +1369,20 @@ export function createPortfolioRepository(pool: Pool) {
           kind: 'sell', symbol, quantity, price, amount: proceeds,
           realizedProfitLoss, note, createdAt: now,
         })
-        await client.query('COMMIT')
-        return {
+        const result = {
           event,
           position: remaining === 0 ? null : toPosition({ ...row, quantity: String(remaining) }),
           cash,
           proceeds,
           realizedProfitLoss,
         }
+        await assertActiveExecution(client, executionId)
+        if (operationId) await client.query(
+          'INSERT INTO portfolio_trade_operations (operation_id, payload_json, result_json) VALUES ($1, $2, $3)',
+          [operationId, operationPayload, JSON.stringify(result)],
+        )
+        await client.query('COMMIT')
+        return result
       } catch (error) {
         await client.query('ROLLBACK')
         throw error
@@ -4394,6 +4453,27 @@ async function readTrackingRunDetail(
 
 export function createTrackingRepository(pool: Pool) {
   return {
+    async setWatchlistItem(symbol: string, input: { enabled: boolean; note?: string }, executionId?: string) {
+      const client = await pool.connect()
+      try {
+        await client.query('BEGIN')
+        if (input.enabled) await client.query(
+          `INSERT INTO watchlist_items (symbol, note, enabled, created_at, updated_at)
+           VALUES ($1, $2, true, now(), now())
+           ON CONFLICT (symbol) DO UPDATE SET enabled = true,
+             note = CASE WHEN $3::boolean THEN excluded.note ELSE watchlist_items.note END, updated_at = now()`,
+          [symbol, input.note ?? '', input.note !== undefined],
+        )
+        else await client.query('DELETE FROM watchlist_items WHERE symbol = $1', [symbol])
+        await assertActiveExecution(client, executionId)
+        const result = await client.query<WatchlistItemRow>(
+          'SELECT symbol, note, enabled, created_at::text, updated_at::text FROM watchlist_items WHERE symbol = $1', [symbol],
+        )
+        await client.query('COMMIT')
+        return result.rows[0] ? mapWatchlistItem(result.rows[0]) : null
+      } catch (error) { await client.query('ROLLBACK'); throw error }
+      finally { client.release() }
+    },
     async listWatchlist(): Promise<WatchlistItem[]> {
       const result = await pool.query<WatchlistItemRow>(
         `SELECT symbol, note, enabled, created_at::text, updated_at::text

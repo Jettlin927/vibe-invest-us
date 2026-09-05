@@ -52,6 +52,12 @@ test('生产入口由 Analysis API 托管编译后的 Web', async () => {
 
   assert.equal(response.statusCode, 200)
   assert.match(response.body, /vibe-invest health/)
+  for (const url of ['/workbench', '/workbench/saved-page', '/research/saved-record', '/conversations/saved-thread']) {
+    const linked = await app.inject({ method: 'GET', url })
+    assert.equal(linked.statusCode, 200)
+    assert.match(linked.body, /vibe-invest health/)
+  }
+  assert.equal((await app.inject({ method: 'GET', url: '/api/not-a-route' })).statusCode, 404)
   assert.match(response.headers['content-type'] ?? '', /text\/html/)
 
   await app.close()

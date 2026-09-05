@@ -1,3 +1,7 @@
+import { createWorkbenchToolExecutor } from './workbench-tools.js'
+import { createWorkbench } from './workbench.js'
+import { createResearchLibrary } from './research-library.js'
+import type { WorkbenchRepository, ResearchLibraryRepository } from '@vibe-invest/product-dao'
 import fastifyStatic from '@fastify/static'
 import Fastify from 'fastify'
 
@@ -28,6 +32,8 @@ type AppDependencies = {
     checkSchema: () => Promise<{ status: 'ok'; version: number }>
     close: () => Promise<void>
   }
+  workbenchRepository?: WorkbenchRepository
+  researchLibraryRepository?: ResearchLibraryRepository
   portfolioRepository: PortfolioRepository
   profitProtectionRepository?: ProfitProtectionRepository
   analysisRepository: AnalysisRepository
@@ -101,6 +107,8 @@ function nestedNumber(value: unknown, ...path: string[]) {
 
 export function buildApp(dependencies: AppDependencies) {
   const app = Fastify({ logger: false })
+  const workbench = dependencies.workbenchRepository ? createWorkbench(dependencies.workbenchRepository) : undefined
+  const library = dependencies.researchLibraryRepository ? createResearchLibrary({ repository: dependencies.researchLibraryRepository }) : undefined
   const portfolio = createPortfolio(dependencies.portfolioRepository)
   const profitProtection = dependencies.profitProtectionRepository
     ? createProfitProtection(dependencies.profitProtectionRepository)
@@ -145,7 +153,10 @@ export function buildApp(dependencies: AppDependencies) {
         tools: conversationResearchTools,
         conditionalTools: dependencies.searchWebEvidence ? conversationConditionalTools : [],
         model: { analyzeConversation: dependencies.model.analyzeConversation },
-        createToolExecutor: ({ threadId, knownFacts, symbols }) => createResearchToolExecutor({
+        createToolExecutor: ({ threadId, executionId, scopeMessages, userMessage, knownFacts, symbols }) => createWorkbenchToolExecutor({
+          library, workbench, portfolio: dependencies.portfolioRepository, tracking: dependencies.trackingRepository,
+          conversations: dependencies.conversationRepository!,
+        }, { threadId, executionId, scopeMessages, userMessage, knownFacts, symbols }, createResearchToolExecutor({
           fetchFinancialContext: dependencies.fetchFinancialContext,
           searchNewsCandidates: dependencies.searchNewsCandidates,
           searchWebEvidence: dependencies.searchWebEvidence,
@@ -161,7 +172,7 @@ export function buildApp(dependencies: AppDependencies) {
           listPortfolioSymbols: async () => (await portfolio.list()).map(({ symbol }) => symbol),
           fetchMarketPrices: dependencies.fetchMarketPrices,
           getPortfolioContext: (symbol, marketPrices) => portfolio.context(symbol, marketPrices),
-        }, { symbols })({ threadId, knownFacts }),
+        }, { symbols })({ threadId, knownFacts })),
         runtimeMinuteMs: dependencies.runtimeMinuteMs,
         activeNow: dependencies.activeNow,
         activeTimeoutSignal: dependencies.activeTimeoutSignal,
@@ -221,6 +232,9 @@ export function buildApp(dependencies: AppDependencies) {
     void app.register(fastifyStatic, {
       root: dependencies.staticDir,
     })
+    for (const route of ['/workbench', '/workbench/:id', '/research', '/research/:id', '/conversations/:id', '/conversation', '/portfolio', '/tracking', '/analysis', '/settings', '/trace']) {
+      app.get(route, async (_request, reply) => reply.sendFile('index.html'))
+    }
   }
 
   app.get('/api/health', async (_request, reply) => {
@@ -247,6 +261,38 @@ export function buildApp(dependencies: AppDependencies) {
       })
     }
   })
+
+  if (library) {
+    app.get<{ Querystring: { q?: string; symbol?: string; offset?: string; limit?: string } }>('/api/research-library', async (request) => library.search({
+      q: request.query.q, symbol: request.query.symbol, offset: Number(request.query.offset ?? 0), limit: Number(request.query.limit ?? 20),
+    }))
+    app.get<{ Params: { id: string }; Querystring: { offset?: string; limit?: string } }>('/api/research-library/:id', async (request, reply) => {
+      const result = await library.read(request.params.id, Number(request.query.offset ?? 0), Number(request.query.limit ?? 30))
+      return result ?? reply.status(404).send({ error: 'research_record_not_found' })
+    })
+  }
+  if (workbench) {
+    const write = async (action: () => Promise<unknown>, reply: import('fastify').FastifyReply) => {
+      try { return await action() }
+      catch (error) {
+        const message = error instanceof Error ? error.message : ''
+        if (message.startsWith('invalid_workbench_')) return reply.status(400).send({ error: message })
+        if (message.endsWith('_not_found')) return reply.status(404).send({ error: message })
+        if (message.endsWith('_conflict')) return reply.status(409).send({ error: message })
+        throw error
+      }
+    }
+    app.get('/api/workbench/pages', async () => ({ pages: await workbench.listPages() }))
+    app.post('/api/workbench/pages', async (request, reply) => write(async () => ({ page: await workbench.savePage(request.body) }), reply))
+    app.get<{ Params: { id: string } }>('/api/workbench/pages/:id', async (request, reply) => (
+      await workbench.getPage(request.params.id) ?? reply.status(404).send({ error: 'workbench_page_not_found' })
+    ))
+    app.post<{ Params: { id: string }; Body: { operationId: string; revision: number } }>('/api/workbench/pages/:id/restore', async (request, reply) => write(async () => ({
+      page: await workbench.restorePage({ ...request.body, id: request.params.id }),
+    }), reply))
+    app.get('/api/workbench/stances', async () => ({ stances: await workbench.listStances() }))
+    app.post('/api/workbench/stances', async (request, reply) => write(async () => ({ stance: await workbench.saveStance(request.body) }), reply))
+  }
 
   app.get('/api/positions', async () => ({ positions: await portfolio.list() }))
 
@@ -580,7 +626,7 @@ export function buildApp(dependencies: AppDependencies) {
     const thread = await conversation.get(request.params.id)
     if (!thread) return reply.status(404).send({ error: 'conversation_not_found' })
     const lifecycle = await dependencies.agentEventRepository.sessionLifecycle(thread.sessionId)
-    return { thread, lifecycle: lifecycle ? projectResearchView(lifecycle) : null }
+    return { thread, lifecycle: lifecycle ? projectResearchView(lifecycle) : null, sources: await library?.listSources(thread.id) ?? [] }
   })
   app.get<{ Params: { id: string } }>('/api/conversations/:id/children', async (request, reply) => {
     if (!conversation) return reply.status(404).send({ error: 'conversation_unavailable' })
@@ -764,8 +810,8 @@ export function buildApp(dependencies: AppDependencies) {
       throw error
     }
   })
-  app.get<{ Params: { id: string } }>('/api/research/:id', async (request, reply) => {
-    const result = await analysis?.researchView(request.params.id)
+  app.get<{ Params: { id: string }; Querystring: { reportVersionId?: string } }>('/api/research/:id', async (request, reply) => {
+    const result = await analysis?.researchView(request.params.id, request.query.reportVersionId)
     return result ? projectResearchView(result) : reply.status(404).send({ error: 'research_not_found' })
   })
   app.get<{ Params: { id: string } }>('/api/research/:id/trace', async (request, reply) => {

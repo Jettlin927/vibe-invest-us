@@ -2381,3 +2381,110 @@ test('设置写入失败可见且提交期间禁用并防止重复请求', async
 function runtimeSettings(overrides: Record<string, number> = {}) {
   return { ...defaultRuntimeSettings, ...overrides }
 }
+
+test('研究深链接读取指定报告，带入自由对话只填草稿且保留来源', async () => {
+  setupDom()
+  window.history.replaceState(null, '', '/research/source-research')
+  const writes: string[] = []
+  globalThis.fetch = async (input, init) => {
+    const url = String(input)
+    if (init?.method === 'POST') writes.push(url)
+    if (url === '/api/settings') return Response.json(settingsResponse())
+    if (url === '/api/portfolio' || url === '/api/portfolio/stored') return Response.json(portfolioResponse([]))
+    if (url === '/api/research') return Response.json({ records: [{ id: 'other', symbol: 'AAPL', status: 'completed' }] })
+    if (url === '/api/research/source-research') return Response.json({ id: 'source-research', symbol: 'NVDA', status: 'completed', facts: [], report: { title: '待继续的研究' } })
+    return Response.json({ snapshots: [], events: [], threads: [] })
+  }
+  const view = render(<App />)
+  const user = userEvent.setup({ document: window.document })
+  await view.findByText('待继续的研究')
+  await user.click(view.getByRole('button', { name: '带入自由对话' }))
+  const input = view.getByRole('textbox') as HTMLTextAreaElement
+  assert.match(input.value, /来源研究 ID：source-research/)
+  assert.match(input.value, /\/research\/source-research/)
+  assert.deepEqual(writes, [])
+})
+
+test('页面工具结果独立显示安全的打开入口，即使模型正文只有纯文本', async () => {
+  setupDom()
+  window.history.replaceState(null, '', '/conversations/page-thread')
+  const thread = { id: 'page-thread', title: '页面制作', status: 'completed', sessionId: 's', executionId: 'e' }
+  globalThis.fetch = async (input) => {
+    const url = String(input)
+    if (url === '/api/settings') return Response.json(settingsResponse())
+    if (url === '/api/portfolio' || url === '/api/portfolio/stored') return Response.json(portfolioResponse([]))
+    if (url === '/api/research') return Response.json({ records: [] })
+    if (url === '/api/conversations/page-thread') return Response.json({ thread, lifecycle: { events: [
+      { sequence: 1, type: 'tool_result', name: 'save_workbench_page', result: { page: { id: 'page/one', title: '我的决策页' }, href: 'javascript:alert(1)' } },
+      { sequence: 2, type: 'tool_result', name: 'restore_workbench_page', result: { page: { id: 'page-two', title: '恢复的页面' } } },
+      { sequence: 3, type: 'chat_completed', text: '页面已经保存。' },
+      { sequence: 4, type: 'tool_result', name: 'save_workbench_page', isError: true, result: { page: { id: 'failed', title: '失败的页面' } } },
+    ] } })
+    return Response.json({ snapshots: [], events: [], threads: [] })
+  }
+  const view = render(<App />)
+  assert.equal((await view.findByRole('link', { name: '打开页面：我的决策页' })).getAttribute('href'), '/workbench/page%2Fone')
+  assert.equal(view.getByRole('link', { name: '打开页面：恢复的页面' }).getAttribute('href'), '/workbench/page-two')
+  assert.equal(view.queryByRole('link', { name: '打开页面：失败的页面' }), null)
+  assert.equal(document.title, 'vibe invest · 研究对话')
+})
+
+test('历史版本深链接请求指定版本并显示版本标记与旧版追问基准', async () => {
+  setupDom()
+  window.history.replaceState(null, '', '/research/versioned?reportVersionId=old-version')
+  const requests: string[] = []
+  globalThis.fetch = async (input) => {
+    const url = String(input)
+    requests.push(url)
+    if (url === '/api/settings') return Response.json(settingsResponse())
+    if (url === '/api/portfolio' || url === '/api/portfolio/stored') return Response.json(portfolioResponse([]))
+    if (url === '/api/research') return Response.json({ records: [] })
+    if (url.startsWith('/api/research/versioned')) return Response.json({
+      id:'versioned',symbol:'NVDA',status:'completed',facts:[],
+      report:{title:url.includes('reportVersionId=old-version') ? '旧版独立正文':'新版独立正文'},
+      selectedReportVersion:{id:'old-version',version:1,createdAt:'2026-08-01T00:00:00Z'},
+      reportVersions:[{version:1,createdAt:'2026-08-01T00:00:00Z',report:{title:'旧版'}},{version:2,createdAt:'2026-09-05T00:00:00Z',report:{title:'新版'}}],
+    })
+    return Response.json({snapshots:[],events:[],threads:[]})
+  }
+  const view = render(<App />)
+  await view.findByText('旧版独立正文')
+  assert.ok(requests.includes('/api/research/versioned?reportVersionId=old-version'))
+  assert.equal(view.queryByText('新版独立正文'),null)
+  assert.match(view.getByText(/正在查看历史报告版本/).textContent ?? '',/1/)
+  assert.equal((view.getByRole('combobox',{name:'报告基准版本'}) as HTMLSelectElement).value,'1')
+  await userEvent.setup({ document: window.document }).click(view.getByRole('button', { name: '带入自由对话' }))
+  const draft = (view.getByRole('textbox') as HTMLTextAreaElement).value
+  assert.match(draft, /来源报告版本 ID：old-version/)
+  assert.match(draft, /\/research\/versioned\?reportVersionId=old-version/)
+})
+
+test('旧会话深链接不被稍后返回的会话列表自动选择覆盖', async () => {
+  setupDom()
+  window.history.replaceState(null, '', '/conversations/old-thread')
+  const oldThread = { id: 'old-thread', title: '旧来源对话', status: 'completed', sessionId: 'old-s', executionId: 'old-e' }
+  const newThread = { id: 'new-thread', title: '最近对话', status: 'completed', sessionId: 'new-s', executionId: 'new-e' }
+  let releaseList!: (response: Response) => void
+  const listResponse = new Promise<Response>((resolve) => { releaseList = resolve })
+  const opened: string[] = []
+  globalThis.fetch = async (input) => {
+    const url = String(input)
+    if (url === '/api/settings') return Response.json(settingsResponse())
+    if (url === '/api/portfolio' || url === '/api/portfolio/stored') return Response.json(portfolioResponse([]))
+    if (url === '/api/research') return Response.json({ records: [] })
+    if (url === '/api/conversations') return listResponse
+    if (url.startsWith('/api/conversations/')) {
+      opened.push(url)
+      const thread = url.endsWith('old-thread') ? oldThread : newThread
+      return Response.json({ thread, lifecycle: { events: [{ sequence: 1, type: 'chat_completed', text: `${thread.title}正文` }] } })
+    }
+    return Response.json({ snapshots: [], events: [], threads: [] })
+  }
+  const view = render(<App />)
+  await view.findByText('旧来源对话正文')
+  releaseList(Response.json({ threads: [newThread, oldThread] }))
+  await view.findByRole('button', { name: /最近对话/ })
+  assert.deepEqual(opened, ['/api/conversations/old-thread'])
+  assert.ok(view.getByText('旧来源对话正文'))
+  assert.equal(view.queryByText('最近对话正文'), null)
+})
