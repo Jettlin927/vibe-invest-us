@@ -36,6 +36,9 @@ function definition(
 test('唯一 Registry 中每个工具独立声明完整权限、保留、网络、投影与轮次 metadata', () => {
   const registry = createToolRegistry(registeredToolDefinitions)
   assert.deepEqual(registry.list().map((tool) => tool.model.name), [
+    'search_research_library', 'read_research_record', 'get_workspace_context',
+    'save_research_stance', 'set_watchlist_item', 'record_portfolio_trade',
+    'save_workbench_page', 'read_workbench_page', 'restore_workbench_page',
     'fetch_financial_context',
     'run_fundamental_analysis',
     'run_news_analysis',
@@ -208,7 +211,7 @@ test('自由对话按比较和组合意图投影专用深工具', () => {
   assert.deepEqual(
     registry.projectConversation({ userMessage: 'NVDA 对我的持仓和组合集中度有什么影响？' })
       .map(({ name }) => name),
-    ['get_portfolio_exposure'],
+    ['get_workspace_context', 'get_portfolio_exposure'],
   )
 })
 

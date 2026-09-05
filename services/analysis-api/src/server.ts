@@ -1,7 +1,7 @@
 import { resolve } from 'node:path'
 
 import {
-  checkSchema, createAgentEventRepository, createAnalysisRepository, createConversationRepository, createPool,
+  createWorkbenchRepository, createResearchLibraryRepository, checkSchema, createAgentEventRepository, createAnalysisRepository, createConversationRepository, createPool,
   createPortfolioRepository, createProfitProtectionRepository, createRuntimeSettingsRepository,
   createToolProjectionRepository, createTrackingRepository,
 } from '@vibe-invest/product-dao'
@@ -38,6 +38,8 @@ const app = buildApp({
     checkSchema: () => checkSchema(productPool),
     close: () => productPool.end(),
   },
+  workbenchRepository: createWorkbenchRepository(productPool),
+  researchLibraryRepository: createResearchLibraryRepository(productPool),
   portfolioRepository: createPortfolioRepository(productPool),
   profitProtectionRepository: createProfitProtectionRepository(productPool),
   analysisRepository: createAnalysisRepository(productPool),

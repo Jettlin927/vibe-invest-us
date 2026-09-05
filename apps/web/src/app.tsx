@@ -10,9 +10,11 @@ import {
   type TokenUsageAggregate, type TrackingRunDetail, type TrackingEvent,
 } from '@vibe-invest/contracts'
 
+import { WorkbenchPage } from './workbench-page.js'
+
 import { TrackingPage, trackingResearchQuestion, type TrackingOverview } from './tracking-page.js'
 
-type Page = 'overview' | 'tracking' | 'analysis' | 'research' | 'conversation' | 'portfolio' | 'settings'
+type Page = 'workbench' | 'overview' | 'tracking' | 'analysis' | 'research' | 'conversation' | 'portfolio' | 'settings'
 type Position = { symbol: string; quantity: number; averageCost: number }
 type PortfolioPosition = Position & {
   costAmount: number; marketPrice: number | null; marketValue: number | null
@@ -73,7 +75,8 @@ type ResearchRecord = ResearchSummary & {
     sequence: number; type?: string; createdAt: string
     message?: string; messageId?: string; text?: string
   }>
-  reportVersions?: Array<{ version: number; createdAt: string; report: { title?: string } }>
+  selectedReportVersion?: { id: string; version: number; createdAt: string }
+  reportVersions?: Array<{ id?: string; version: number; createdAt: string; report: { title?: string } }>
   snapshot?: { gaps?: Array<{ capability?: string; reason?: string }> }
   mainAgent?: {
     id: string; status: string
@@ -106,9 +109,14 @@ type ResearchRecord = ResearchSummary & {
     } }
   }>
 }
+type ConversationSource = {
+  sourceRecordId: string; title: string; href: string | null; available: boolean
+  reportVersions: Array<{id: string; version: number}>; messageSequences: number[]; readAt: string
+}
 type ConversationThread = {
   id: string; capability: string; parentThreadId?: string | null; title: string | null
   status: string; createdAt: string; updatedAt: string; sessionId: string; executionId: string
+  sources?: ConversationSource[]
 }
 type ConversationEvent = { sequence: number; type?: string; createdAt?: string; [key: string]: unknown }
 type ChatMessage = {
@@ -170,11 +178,14 @@ const pages: Array<{ id: Page; label: string }> = [
   { id: 'research', label: '研究记录' },
   { id: 'conversation', label: '研究对话' },
   { id: 'portfolio', label: '我的持仓' },
+  { id: 'workbench', label: '我的页面' },
   { id: 'settings', label: '系统设置' },
 ]
 
 export function App() {
-  const [page, setPage] = useState<Page>('overview')
+  const [page, setPage] = useState<Page>(() => window.location.pathname.startsWith('/workbench') ? 'workbench' : 'overview')
+  const [workbenchPageId, setWorkbenchPageId] = useState<string | undefined>(() => window.location.pathname.split('/')[1] === 'workbench' ? window.location.pathname.split('/')[2] : undefined)
+  useEffect(() => { document.title = `vibe invest · ${pages.find((item) => item.id === page)?.label ?? '总览'}` }, [page])
   const [health, setHealth] = useState<SystemHealth | null>(null)
   const [modelConfigured, setModelConfigured] = useState(false)
   const [runtimeSettings, setRuntimeSettings] = useState<RuntimeSettingsResponse | null>(null)
@@ -282,7 +293,7 @@ export function App() {
     const response = await fetch('/api/research')
     const next = (await response.json()).records as ResearchSummary[]
     setRecords(next)
-    if (!selectedResearch && next[0]) void openResearch(next[0].id)
+    if (!selectedResearch && next[0] && !window.location.pathname.startsWith('/research/')) void openResearch(next[0].id)
   }
   async function loadConversations() {
     try {
@@ -290,7 +301,7 @@ export function App() {
       if (!response.ok) return
       const next = await response.json() as { threads?: ConversationThread[] }
       setConversationThreads(next.threads ?? [])
-      if (!selectedConversation && next.threads?.[0]) void openConversation(next.threads[0].id)
+      if (!selectedConversation && next.threads?.[0] && !window.location.pathname.startsWith('/conversations/')) void openConversation(next.threads[0].id)
     } catch {
       // Older instances may not expose the conversation route yet.
     }
@@ -335,6 +346,20 @@ export function App() {
       loadSettings(),
       loadPortfolio(), loadResearch(), loadConversations(), loadTracking(),
     ]).catch((cause) => setError(cause instanceof Error ? cause.message : String(cause)))
+  }, [])
+  useEffect(() => {
+    function openLocation() {
+      const [section, rawId] = window.location.pathname.slice(1).split('/')
+      const id = rawId ? decodeURIComponent(rawId) : undefined
+      if (section === 'workbench') { setWorkbenchPageId(id); setPage('workbench') }
+      else if (section === 'research' && id) { setPage('research'); void openResearch(id, new URLSearchParams(window.location.search).get('reportVersionId') ?? undefined).catch((cause) => setError(String(cause))) }
+      else if (section === 'conversations' && id) { setPage('conversation'); void openConversation(id).catch((cause) => setError(String(cause))) }
+      else if (pages.some((item) => item.id === section)) setPage(section as Page)
+      else setPage('overview')
+    }
+    openLocation()
+    window.addEventListener('popstate', openLocation)
+    return () => window.removeEventListener('popstate', openLocation)
   }, [])
   useEffect(() => {
     const agent = selectedResearch?.mainAgent
@@ -505,16 +530,17 @@ export function App() {
     }
     setError('分析等待超时')
   }
-  async function readResearch(id: string): Promise<ResearchRecord> {
-    const response = await fetch(`/api/research/${encodeURIComponent(id)}`)
+  async function readResearch(id: string, reportVersionId?: string): Promise<ResearchRecord> {
+    const suffix = reportVersionId === undefined ? '' : `?reportVersionId=${encodeURIComponent(reportVersionId)}`
+    const response = await fetch(`/api/research/${encodeURIComponent(id)}${suffix}`)
     if (!response.ok) throw new Error('research_unavailable')
     const record = await response.json() as ResearchRecord
     if (record.id !== id) throw new Error('research_mismatch')
     return record
   }
-  async function openResearch(id: string) {
-    try { setSelectedResearch(await readResearch(id)) }
-    catch { setError('研究记录读取失败，请重试。') }
+  async function openResearch(id: string, reportVersionId?: string) {
+    try { setSelectedResearch(await readResearch(id, reportVersionId)) }
+    catch { setSelectedResearch(null); setError(reportVersionId === undefined ? '研究记录读取失败，请重试。' : '指定报告版本不存在或读取失败，未切换到最新版本。') }
   }
   async function openResearchTrace(id: string) {
     if (selectedResearch?.id === id && (
@@ -533,10 +559,10 @@ export function App() {
     const response = await fetch(`/api/conversations/${id}`)
     if (!response.ok) return
     const value = await response.json() as {
-      thread?: ConversationThread; lifecycle?: { events?: ConversationEvent[] }
+      thread?: ConversationThread; lifecycle?: { events?: ConversationEvent[] }; sources?: ConversationSource[]
     }
     if (!value.thread) return
-    setSelectedConversation(value.thread)
+    setSelectedConversation({ ...value.thread, sources: value.sources ?? [] })
     setConversationEvents(value.lifecycle?.events ?? [])
     setConversationBusy(['queued', 'running'].includes(value.thread.status))
   }
@@ -802,6 +828,8 @@ export function App() {
   }
   function navigate(next: Page) {
     setPage(next)
+    window.history.pushState(null, '', next === 'overview' ? '/' : `/${next}`)
+    if (next === 'workbench') setWorkbenchPageId(undefined)
     if (next === 'tracking') void loadTracking()
     window.scrollTo({ top: 0, behavior: 'smooth' })
   }
@@ -815,9 +843,10 @@ export function App() {
     <main className={`page-main${page === 'conversation' ? ' conversation-main' : ''}`}>
       {error && <p role="alert" className="error-banner">{error}</p>}
       {page === 'overview' && <Overview records={records} selected={selectedResearch} positions={positions} health={health} modelConfigured={modelConfigured} onNavigate={navigate} onOpen={async (id) => { await openResearch(id); navigate('research') }} />}
+      {page === 'workbench' && <WorkbenchPage pageId={workbenchPageId} onOpen={(id) => { setWorkbenchPageId(id); window.history.pushState(null, '', id ? `/workbench/${encodeURIComponent(id)}` : '/workbench') }} />}
       {page === 'tracking' && <TrackingPage overview={trackingOverview} available={trackingAvailable} lastScan={trackingLastScan} loading={trackingLoading} scanning={trackingScanning} onWatch={watchSymbol} onUnwatch={unwatchSymbol} onScan={scanTracking} onAnalyze={analyzeTrackingEvent} researchBusy={conversationBusy || Boolean(selectedConversation && ['queued', 'running'].includes(selectedConversation.status))} researchRecords={records} onOpenResearch={async (id) => { setSelectedResearch(await readResearch(id)); setPage('research'); window.scrollTo({ top: 0 }) }} />}
       {page === 'analysis' && <AnalysisPage symbol={analysisSymbol} setSymbol={setAnalysisSymbol} status={analysisStatus} stages={analysisStages} active={analysisSubmitting || Boolean(activeAnalysisId)} onStart={startAnalysis} onCancel={cancelAnalysis} health={health} modelConfigured={modelConfigured} records={records} onOpen={async (id) => { await openResearch(id); navigate('research') }} />}
-      {page === 'research' && <ResearchPage records={records} record={selectedResearch} onOpen={openResearch} onOpenTrace={openResearchTrace} onUpdate={updateResearch} onDelete={removeResearch} deleting={deletingResearchId === selectedResearch?.id} onResume={resumeResearch} onFollowUp={sendFollowUp} onReanalyze={reanalyzeResearch} freshnessDays={runtimeSettings?.current.values.reportFreshnessDays ?? null} />}
+      {page === 'research' && <ResearchPage records={records} record={selectedResearch} onOpen={openResearch} onOpenTrace={openResearchTrace} onUpdate={updateResearch} onDelete={removeResearch} deleting={deletingResearchId === selectedResearch?.id} onResume={resumeResearch} onFollowUp={sendFollowUp} onReanalyze={reanalyzeResearch} freshnessDays={runtimeSettings?.current.values.reportFreshnessDays ?? null} onContinue={() => { if (!selectedResearch) return; setSelectedConversation(null); setConversationEvents([]); setConversationBusy(false); setConversationDraft(`继续研究 ${selectedResearch.symbol}：${selectedResearch.report?.title ?? '已有研究'}\n来源研究 ID：${selectedResearch.id}\n${selectedResearch.selectedReportVersion ? `来源报告版本 ID：${selectedResearch.selectedReportVersion.id}\n` : ''}来源：[查看原研究](/research/${encodeURIComponent(selectedResearch.id)}${selectedResearch.selectedReportVersion ? `?reportVersionId=${encodeURIComponent(selectedResearch.selectedReportVersion.id)}` : ''})\n请先读取这份已有研究，再回答我的补充问题：`); navigate('conversation') }} continueDisabled={conversationBusy || Boolean(selectedConversation && ['queued', 'running'].includes(selectedConversation.status))} />}
       {page === 'conversation' && <ConversationPage initialMessage={conversationDraft} threads={conversationThreads} thread={selectedConversation} events={conversationEvents} busy={conversationBusy} onOpen={openConversation} onNew={() => { setConversationDraft(''); setSelectedConversation(null); setConversationEvents([]); setConversationBusy(false) }} onCreate={startConversation} onSend={sendConversationMessage} onCancel={cancelConversation} />}
       {page === 'portfolio' && <PortfolioPage portfolio={portfolio} history={portfolioHistory} events={portfolioEvents} protection={profitProtection} loaded={portfolioLoaded} loadFailed={portfolioLoadFailed} refreshing={portfolioRefreshing} onSave={savePosition} onSaveCash={saveCash} onBuy={buyPosition} onReduce={reducePosition} onSaveProtection={saveProfitProtectionPlan} onAcknowledgeProtection={acknowledgeProfitProtectionTrigger} onDelete={removePosition} />}
       {page === 'settings' && <SettingsPage health={health} modelConfigured={modelConfigured} settings={runtimeSettings} onReload={loadSettings} />}
@@ -893,9 +922,19 @@ function ConversationPage({ initialMessage, threads, thread, events, busy, onOpe
         <div><p className="micro">RESEARCH THREAD</p><strong>{thread?.title || '新研究对话'}</strong><small>{active ? 'AI 正在研究并组织回答' : thread ? statusLabel(thread.status) : '先提出问题，AI 再决定是否调用研究工具'}</small></div>
         {active && thread && <button className="quiet danger" onClick={() => void onCancel()}>停止</button>}
       </header>
+      {Boolean(thread?.sources?.length) && <details className="conversation-tool" open><summary>本次对话引用的历史来源</summary>{thread!.sources!.map((source) => <p key={source.sourceRecordId}>
+        {source.available && source.href ? <a href={source.href}>{source.title}</a> : <span>{source.title}（原记录已删除，来源失效）</span>}
+        <small> · {source.reportVersions.length ? `报告版本 ${source.reportVersions.map((version) => version.version).join('、')}` : '无报告版本'} · 已读取 {source.messageSequences.length} 条消息 · {formatAnalysisDate(source.readAt)}</small>
+      </p>)}</details>}
       <div ref={messageListRef} className="conversation-messages" role="log" aria-live="polite" aria-label="研究对话内容">
         {messages.length === 0 && <div className="conversation-empty"><strong>你想弄清楚什么？</strong><span>可以直接问标的、财报、估值、K线结构或组合风险。</span></div>}
         {messages.map((message) => <article key={message.key} className={message.role}><strong>{message.role === 'user' ? '你' : 'AI'}</strong>{message.role === 'assistant' ? <AssistantMarkdown text={message.text} /> : <p>{message.text}</p>}</article>)}
+        {events.filter((event) => event.type === 'tool_result' && event.isError !== true && ['save_workbench_page', 'restore_workbench_page'].includes(String(event.name))).map((event) => {
+          const savedPage = asRecord(asRecord(event.result).page)
+          return typeof savedPage.id === 'string' && savedPage.id && typeof savedPage.title === 'string'
+            ? <p key={`page-${event.sequence}`}><a href={`/workbench/${encodeURIComponent(savedPage.id)}`}>打开页面：{savedPage.title}</a></p>
+            : null
+        })}
         {events.filter((event) => event.type === 'tool_call').map((event) => <details key={`tool-${event.sequence}`} className="conversation-tool"><summary>调用工具：{String(event.name ?? 'tool')}</summary><small>工具结果和参数按当前权限投影。</small></details>)}
       </div>
       <div className="conversation-input-dock">
@@ -953,7 +992,8 @@ function ConversationComposer({ mode, busy, onSubmit, initialMessage = '' }: {
   </form>
 }
 
-function ResearchPage({ records, record, onOpen, onOpenTrace, onUpdate, onDelete, deleting, onResume, onFollowUp, onReanalyze, freshnessDays }: {
+function ResearchPage({ records, record, onOpen, onOpenTrace, onUpdate, onDelete, deleting, onResume, onFollowUp, onReanalyze, freshnessDays, onContinue, continueDisabled }: {
+  onContinue: () => void; continueDisabled: boolean
   records: ResearchSummary[]; record: ResearchRecord | null; onOpen: (id: string) => Promise<void>
   onOpenTrace: (id: string) => Promise<void>
   onUpdate: (event: React.FormEvent<HTMLFormElement>) => Promise<void>; onDelete: () => Promise<void>
@@ -968,6 +1008,7 @@ function ResearchPage({ records, record, onOpen, onOpenTrace, onUpdate, onDelete
   useEffect(() => { setResearchTab('report') }, [record?.id])
   return <>
     <PageHeader eyebrow="RESEARCH ARCHIVE" title="研究记录" description="每份报告都绑定当时的数据快照、来源和分析轨迹，结论变化也有迹可循。" />
+    {record && <button className="quiet" disabled={continueDisabled} onClick={onContinue}>带入自由对话</button>}
     <button className="quiet research-library-toggle" aria-expanded={library.open} aria-controls="research-library" onClick={library.toggle}>{library.open ? '收起研究列表' : `展开研究列表 · ${records.length} 份`}</button>
     <div className={`research-layout${library.open ? '' : ' library-collapsed'}`}>
       <aside id="research-library" hidden={!library.open} className="research-index"><p className="micro">全部记录 · {records.length}</p>{records.map((item) => <button className={record?.id === item.id ? 'active' : ''} key={item.id} onClick={() => void onOpen(item.id)}><strong>{item.symbol}</strong><span>{item.report?.title ?? statusLabel(item.status)}</span><small>{item.starred ? `已标记 · ${statusLabel(item.status)}` : statusLabel(item.status)}</small></button>)}</aside>
@@ -1593,7 +1634,7 @@ function ResearchReport({ record, onUpdate, onDelete, deleting, onResume, onFoll
     }
   }, [evidenceOpen, evidenceTarget])
   useEffect(() => { setEvidenceOpen(false); setEvidenceTarget(null) }, [record?.id])
-  const latestBaseVersion = record?.reportVersions?.at(-1)?.version ?? null
+  const latestBaseVersion = record?.selectedReportVersion?.version ?? record?.reportVersions?.at(-1)?.version ?? null
   const [selectedBaseVersion, setSelectedBaseVersion] = useState<number | null>(latestBaseVersion)
   useEffect(() => {
     setSelectedBaseVersion(latestBaseVersion)
@@ -1616,6 +1657,7 @@ function ResearchReport({ record, onUpdate, onDelete, deleting, onResume, onFoll
   )
   const conversation = projectChatMessages(record.messages ?? record.mainAgent?.events ?? [])
   return <article className="research-report">
+    {record.selectedReportVersion && <p role="status">正在查看历史报告版本 {record.selectedReportVersion.version} · {formatAnalysisDate(record.selectedReportVersion.createdAt)}</p>}
     <header className="report-title"><div><p className="micro">{record.symbol} · {statusLabel(record.status)}</p><h2>{report?.title ?? '受限分析'}</h2>{stale && <p role="status" className="data-warning">此报告可能过期：已超过当前 {freshnessDays} 天时效阈值。</p>}</div><span className={`verdict ${record.status}`}>{trendVerdict(report?.trend)}<small>未来 1—4 周</small></span></header>
     {record.error && <p role="alert" className="error-banner">{friendlyError(record.error)}</p>}
     <section className="report-hero"><div><p className="micro">当前市场状态</p><p>{report?.marketState ?? '没有足够数据形成市场状态判断。'}</p><strong>{report?.trend}</strong></div><PriceChart facts={record.facts} /></section>

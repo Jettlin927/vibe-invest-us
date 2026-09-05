@@ -1,3 +1,4 @@
+import { legacyReport } from './report-view.js'
 import { createHash, randomUUID } from 'node:crypto'
 import type {
   AgentEvent, AgentEventRepository, AgentSession, AnalysisRepository, RuntimeSettingsRepository,
@@ -1380,7 +1381,7 @@ export function createAnalysisService(options: {
       )).map(({ snapshot: _snapshot, ...version }) => version),
     }
   }
-  async function researchView(analysisId: string) {
+  async function researchView(analysisId: string, reportVersionId?: string) {
     await initialized
     const record = await repository.research(analysisId, 'view')
     if (!record) return null
@@ -1388,6 +1389,16 @@ export function createAnalysisService(options: {
     const sessions = await options.eventRepository.listSessions(analysisId)
     const primary = sessions.find(({ isPrimary }) => isPrimary)
     const reportVersions = await options.eventRepository.listReportVersions(analysisId)
+    const selectedReportVersion = reportVersionId === undefined ? undefined
+      : reportVersions.find((version) => version.id === reportVersionId)
+    if (reportVersionId !== undefined && !selectedReportVersion) return null
+    const frozenSnapshot = selectedReportVersion?.snapshot as { facts?: Fact[] } | undefined
+    const selectedReport = selectedReportVersion
+      ? legacyReport(selectedReportVersion.report as Record<string, unknown>) : undefined
+    if (selectedReport && !Array.isArray(frozenSnapshot?.facts)) {
+      selectedReport.limitations.push('此报告版本缺少冻结事实，无法还原当时依据。')
+    }
+
     const primaryEvents = primary
       ? await options.eventRepository.listByTypes(
           primary.id, ['runtime_follow_up', 'chat_completed', 'tool_result'],
@@ -1427,12 +1438,17 @@ export function createAnalysisService(options: {
     )
     return {
       ...visibleRecord, messages,
+      ...(selectedReportVersion ? {
+        report: selectedReport, reportCreatedAt: selectedReportVersion.createdAt,
+        facts: Array.isArray(frozenSnapshot?.facts) ? frozenSnapshot.facts : [],
+        selectedReportVersion: { id: selectedReportVersion.id, version: selectedReportVersion.version, createdAt: selectedReportVersion.createdAt },
+      } : {}),
       ...(primary ? { mainAgent: { id: primary.id, status: primary.status } } : {}),
       specialistAgents: projectedSpecialists,
       reportVersions: reportVersions.filter(({ sessionId, kind }) => (
         sessionId === primary?.id && kind === 'integrated'
-      )).map(({ version, createdAt, report }) => ({
-        version, createdAt,
+      )).map(({ id, version, createdAt, report }) => ({
+        id, version, createdAt,
         report: { title: (report as Record<string, unknown>).title },
       })),
     }

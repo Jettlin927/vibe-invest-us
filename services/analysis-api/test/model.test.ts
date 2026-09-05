@@ -429,10 +429,11 @@ test('自由对话在安全 Turn 边界可以 compaction 并继续使用同一�
   for await (const event of model.analyzeConversation({
     executionId: 'free-conversation-compaction', runtimeSettings: runtimeSettings({ compactionReserveTokens: 256 }),
     systemPrompt: 'system', userPrompt: '请先取数再总结。', knownFacts: [],
-    toolRuntime: createTestToolRuntime(), tools: conversationResearchTools,
+    toolRuntime: createTestToolRuntime(),
+    tools: conversationResearchTools.filter(({ name }) => name === 'get_research_context'),
     executeTool: async (_name, _params, _signal, onStart) => {
       await onStart()
-      return { result: { facts: [], summary: 'large '.repeat(400) }, isError: false }
+      return { result: { facts: [], summary: 'large '.repeat(600) }, isError: false }
     },
   })) events.push(event)
 

@@ -17,7 +17,7 @@ export type RegisteredToolDefinition = {
   resultSchema: object
   allowedRoles: ToolRole[]
   allowedStages: ToolStage[]
-  sideEffect: 'read_only' | 'creates_report' | 'creates_agent' | 'controls_agent'
+  sideEffect: 'read_only' | 'creates_report' | 'creates_agent' | 'controls_agent' | 'writes_workspace'
   externalNetwork: 'none' | 'financial_data'
   hostAccess: 'none'
   resultRetention: 'research_record' | 'report_version'
