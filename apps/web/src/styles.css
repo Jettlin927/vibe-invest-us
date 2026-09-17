@@ -166,3 +166,7 @@ button:focus-visible, a:focus-visible, summary:focus-visible { outline: 2px soli
 .research-rail.disclosure-section { padding-top: 16px; border-top: 1px solid #d8d1c4; }
 
 .disclosure-header .quiet { padding: 10px 12px; color: inherit; background: transparent; border: 1px solid #cfc7ba; font: 700 12px Inter, sans-serif; }
+
+.portfolio-modal output { display: block; padding: 12px; color: #211d18; background: #ece6da; border: 1px dashed #cfc7ba; font-size: 16px; }
+.portfolio-modal .anchor-origin { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 6px 0 0; color: #756d64; font: 10px Inter, sans-serif; }
+.portfolio-modal .anchor-origin button { padding: 4px 8px; color: #28231e; background: transparent; border: 1px solid #cfc7ba; font: 650 10px Inter, sans-serif; }

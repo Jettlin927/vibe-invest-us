@@ -875,6 +875,9 @@ test('持仓页可以建立盈利保护计划并展示 R 阶梯状态', async ()
   await user.click(await view.findByRole('button', { name: '我的持仓' }))
   await user.click(await view.findByRole('button', { name: '为 CRDO 制定保护计划' }))
   assert.equal((view.getByRole('button', { name: '保存保护计划' }) as HTMLButtonElement).disabled, true)
+  assert.equal(view.getByLabelText('计划基准价').textContent, '216')
+  assert.match(view.getByRole('dialog').textContent ?? '', /自动读取制定时的现价 216/)
+  await user.click(view.getByRole('button', { name: '手动修改' }))
   await user.clear(view.getByLabelText('计划基准价'))
   await user.type(view.getByLabelText('计划基准价'), '180')
   await user.type(view.getByLabelText('失效价'), '162')
@@ -892,6 +895,77 @@ test('持仓页可以建立盈利保护计划并展示 R 阶梯状态', async ()
   await user.click(view.getByRole('button', { name: '确认已处理' }))
   await waitFor(() => assert.equal(view.queryByRole('button', { name: '确认已处理' }), null))
   assert.match(view.getByRole('region', { name: 'CRDO 盈利阶梯' }).textContent ?? '', /162.*180.*216.*234.*252/)
+})
+
+test('保护计划基准价自动读取现价、修订沿用冻结值、无行情时回退平均成本', async () => {
+  setupDom()
+  const portfolio = {
+    ...portfolioResponse([{ symbol: 'NVDA', quantity: 2, averageCost: 100 }]),
+    totalMarketValue: 240, totalEquity: 240, totalUnrealizedProfitLoss: 0,
+    totalUnrealizedReturn: 0,
+    positions: [
+      {
+        symbol: 'NVDA', quantity: 2, averageCost: 100, costAmount: 200,
+        marketPrice: 120, marketValue: 240, unrealizedProfitLoss: 40,
+        unrealizedReturn: 0.2, portfolioWeight: 1,
+      },
+      {
+        symbol: 'MSFT', quantity: 4, averageCost: 50, costAmount: 200,
+        marketPrice: 55, marketValue: 220, unrealizedProfitLoss: 20,
+        unrealizedReturn: 0.1, portfolioWeight: 0.5,
+      },
+      {
+        symbol: 'AMD', quantity: 4, averageCost: 25, costAmount: 100,
+        marketPrice: null, marketValue: null, unrealizedProfitLoss: null,
+        unrealizedReturn: null, portfolioWeight: null,
+      },
+    ],
+  }
+  globalThis.fetch = async (input, init) => {
+    const url = String(input)
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { database: { status: 'ok' }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/settings') return Response.json({ model: { configured: false } })
+    if (url === '/api/research') return Response.json({ records: [] })
+    if (url === '/api/portfolio/stored' || url === '/api/portfolio') return Response.json(portfolio)
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+    if (url === '/api/portfolio/events?limit=50') return Response.json({ events: [] })
+    if (url === '/api/profit-protection' && !init?.method) {
+      return Response.json({
+        summary: { planned: 1, triggered: 0, reviewRequired: 0, dataGap: 0 },
+        positions: [{
+          symbol: 'NVDA', status: 'normal', planRevision: 3, currentR: 0.5,
+          bindingRule: null, nextRule: { kind: 'first_take_profit', atR: 2 },
+          coreRatio: 0.3, tradingRatio: 0.7, anchorPrice: 110, invalidationPrice: 90,
+          maxPortfolioWeight: 0.5, marketPrice: 120, portfolioWeight: 1,
+          levels: { firstTakeProfit: 130, secondTakeProfit: 150, trailingStart: 170 },
+        }],
+        triggers: [],
+      })
+    }
+    throw new Error(`unexpected_fetch:${url}`)
+  }
+  const view = render(React.createElement(App))
+  const user = userEvent.setup({ document: window.document })
+  await user.click(await view.findByRole('button', { name: '我的持仓' }))
+
+  await user.click(await view.findByRole('button', { name: '为 NVDA 制定保护计划' }))
+  assert.match(view.getByRole('dialog').textContent ?? '', /修订 NVDA 计划/)
+  assert.equal(view.getByLabelText('计划基准价').textContent, '110')
+  assert.match(view.getByRole('dialog').textContent ?? '', /沿用本版计划冻结值 110；当前现价 120/)
+  await user.click(view.getByRole('button', { name: '取消' }))
+
+  await user.click(await view.findByRole('button', { name: '为 MSFT 制定保护计划' }))
+  assert.equal(view.getByLabelText('计划基准价').textContent, '55')
+  assert.match(view.getByRole('dialog').textContent ?? '', /自动读取制定时的现价 55/)
+  await user.click(view.getByRole('button', { name: '手动修改' }))
+  assert.equal((view.getByLabelText('计划基准价') as HTMLInputElement).value, '55')
+  await user.click(view.getByRole('button', { name: '恢复自动读取' }))
+  assert.equal(view.getByLabelText('计划基准价').textContent, '55')
+  await user.click(view.getByRole('button', { name: '取消' }))
+
+  await user.click(await view.findByRole('button', { name: '为 AMD 制定保护计划' }))
+  assert.equal(view.getByLabelText('计划基准价').textContent, '25')
+  assert.match(view.getByRole('dialog').textContent ?? '', /行情暂不可用，基准价已回退为平均成本 25/)
 })
 
 test('持仓页可以加仓，买入花费从现金扣减并记入调仓账本', async () => {
