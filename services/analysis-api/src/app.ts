@@ -1,3 +1,4 @@
+import { registerPortfolioMcp } from './portfolio-mcp.js'
 import { createWorkbenchToolExecutor } from './workbench-tools.js'
 import { createWorkbench } from './workbench.js'
 import { createResearchLibrary } from './research-library.js'
@@ -93,6 +94,7 @@ type AppDependencies = {
   runtimeMinuteMs?: number
   activeNow?: () => number
   activeTimeoutSignal?: (timeoutMs: number) => AbortSignal
+  portfolioMcpToken?: string
   migrationVerificationToken?: string
 }
 
@@ -107,6 +109,7 @@ function nestedNumber(value: unknown, ...path: string[]) {
 
 export function buildApp(dependencies: AppDependencies) {
   const app = Fastify({ logger: false })
+  registerPortfolioMcp(app, dependencies.portfolioRepository, dependencies.portfolioMcpToken)
   const workbench = dependencies.workbenchRepository ? createWorkbench(dependencies.workbenchRepository) : undefined
   const library = dependencies.researchLibraryRepository ? createResearchLibrary({ repository: dependencies.researchLibraryRepository }) : undefined
   const portfolio = createPortfolio(dependencies.portfolioRepository)

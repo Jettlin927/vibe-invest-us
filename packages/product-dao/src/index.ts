@@ -1224,6 +1224,26 @@ type SnapshotRow = {
 type PortfolioBuyResult = { event: PortfolioEvent; position: ProductPosition; cash: number; spent: number }
 type PortfolioSellResult = { event: PortfolioEvent; position: ProductPosition | null; cash: number; proceeds: number; realizedProfitLoss: number }
 
+// 与账本修改共用事务，保证重试不会覆盖其后发生的买卖或资金变化。
+async function readPortfolioOperation<T>(client: PoolClient, operationId: string | undefined, payload: string): Promise<T | undefined> {
+  if (!operationId) return undefined
+  await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [operationId])
+  const previous = await client.query<{ matches: boolean; result_json: T }>(
+    'SELECT payload_json = $2::jsonb AS matches, result_json FROM portfolio_trade_operations WHERE operation_id = $1',
+    [operationId, payload],
+  )
+  if (!previous.rows[0]) return undefined
+  if (!previous.rows[0].matches) throw new Error('portfolio_operation_conflict')
+  return previous.rows[0].result_json
+}
+
+async function savePortfolioOperation(client: PoolClient, operationId: string | undefined, payload: string, result: unknown) {
+  if (operationId) await client.query(
+    'INSERT INTO portfolio_trade_operations (operation_id, payload_json, result_json) VALUES ($1, $2, $3)',
+    [operationId, payload, JSON.stringify(result)],
+  )
+}
+
 export function createPortfolioRepository(pool: Pool) {
   return {
     async list(): Promise<ProductPosition[]> {
@@ -1334,6 +1354,10 @@ export function createPortfolioRepository(pool: Pool) {
             return previous.rows[0].result_json
           }
         }
+        const cashResult = await client.query<{ cash: string }>(
+          'SELECT cash::text FROM portfolio_settings WHERE id = $1 FOR UPDATE',
+          [1],
+        )
         const positionResult = await client.query<PositionRow>(
           `SELECT symbol, quantity::text, average_cost::text
            FROM positions WHERE symbol = $1 FOR UPDATE`,
@@ -1344,10 +1368,6 @@ export function createPortfolioRepository(pool: Pool) {
           await client.query('ROLLBACK')
           return null
         }
-        const cashResult = await client.query<{ cash: string }>(
-          'SELECT cash::text FROM portfolio_settings WHERE id = $1 FOR UPDATE',
-          [1],
-        )
         const remaining = Number(row.quantity) - quantity
         const proceeds = quantity * price
         const cash = Number(cashResult.rows[0]?.cash ?? 0) + proceeds
@@ -1391,19 +1411,31 @@ export function createPortfolioRepository(pool: Pool) {
       }
     },
     // 资金调整：以目标现金值为输入，差额记一条入金或出金事件；现金只通过事件变化。
-    async recordCashAdjustment(targetCash: number, note = '') {
+    async recordCashAdjustment(targetCash: number, note = '', operationId?: string) {
       const client = await pool.connect()
       try {
         await client.query('BEGIN')
+        const payload = JSON.stringify({ kind: 'cash_adjust', targetCash, note })
+        const previous = await readPortfolioOperation<{ event: PortfolioEvent | null; cash: number }>(client, operationId, payload)
+        if (previous) {
+          await client.query('COMMIT')
+          return previous
+        }
         const cashResult = await client.query<{ cash: string }>(
           'SELECT cash::text FROM portfolio_settings WHERE id = $1 FOR UPDATE',
           [1],
         )
         const cash = Number(cashResult.rows[0]?.cash ?? 0)
         const delta = targetCash - cash
-        if (delta === 0 || targetCash < 0) {
+        if (targetCash < 0) {
           await client.query('ROLLBACK')
-          return targetCash < 0 ? null : { event: null, cash }
+          return null
+        }
+        if (delta === 0) {
+          const result = { event: null, cash }
+          await savePortfolioOperation(client, operationId, payload, result)
+          await client.query('COMMIT')
+          return result
         }
         const now = new Date().toISOString()
         await client.query(
@@ -1414,8 +1446,10 @@ export function createPortfolioRepository(pool: Pool) {
           kind: 'cash_adjust', amount: delta,
           note: note || (delta > 0 ? '入金' : '出金'), createdAt: now,
         })
+        const result = { event, cash: targetCash }
+        await savePortfolioOperation(client, operationId, payload, result)
         await client.query('COMMIT')
-        return { event, cash: targetCash }
+        return result
       } catch (error) {
         await client.query('ROLLBACK')
         throw error
@@ -1424,10 +1458,18 @@ export function createPortfolioRepository(pool: Pool) {
       }
     },
     // 校准：把某标的持仓对齐到实际数量与成本；现金不变，差额由事件留痕，保持账本可审计。
-    async recordReconcile(symbol: string, quantity: number, averageCost: number, note = '') {
+    async recordReconcile(symbol: string, quantity: number, averageCost: number, note = '', operationId?: string) {
       const client = await pool.connect()
       try {
         await client.query('BEGIN')
+        const payload = JSON.stringify({ kind: 'reconcile', symbol, quantity, averageCost, note })
+        const previous = await readPortfolioOperation<{ event: PortfolioEvent; position: ProductPosition | null }>(client, operationId, payload)
+        if (previous) {
+          await client.query('COMMIT')
+          return previous
+        }
+        // 和买入采用相同的锁顺序，也串行化尚不存在的持仓校准。
+        await client.query('SELECT id FROM portfolio_settings WHERE id = 1 FOR UPDATE')
         await client.query(
           'SELECT symbol FROM positions WHERE symbol = $1 FOR UPDATE',
           [symbol],
@@ -1450,11 +1492,13 @@ export function createPortfolioRepository(pool: Pool) {
           kind: 'reconcile', symbol, quantity, price: averageCost,
           note: note || '校准持仓', createdAt: now,
         })
-        await client.query('COMMIT')
-        return {
+        const result = {
           event,
           position: quantity === 0 ? null : { symbol, quantity, averageCost },
         }
+        await savePortfolioOperation(client, operationId, payload, result)
+        await client.query('COMMIT')
+        return result
       } catch (error) {
         await client.query('ROLLBACK')
         throw error

@@ -81,6 +81,7 @@ const app = buildApp({
     && (modelApiProtocol === 'responses' || modelApiProtocol === 'chat-completions'),
   ),
   migrationVerificationToken: process.env.MIGRATION_VERIFICATION_TOKEN,
+  portfolioMcpToken: process.env.PORTFOLIO_MCP_TOKEN,
 })
 
 await app.listen({ host, port })
