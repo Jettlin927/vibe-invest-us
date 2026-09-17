@@ -324,15 +324,15 @@ def test_quote_batch_refreshes_symbols_concurrently(monkeypatch):
     assert [quote["price"] for quote in response.json()["quotes"]] == [123.5] * 4
 
 
-def test_quote_batch_refreshes_sources_concurrently_without_dropping_diagnostics(monkeypatch):
-    source_barrier = threading.Barrier(2, timeout=0.5)
+def test_quote_batch_stops_at_first_healthy_source_and_skips_backups(monkeypatch):
+    calls = []
 
     class PrimarySource:
         name = "primary"
         def __init__(self, timeout=15):
             self.timeout = timeout
         def fetch(self, symbol):
-            source_barrier.wait()
+            calls.append("primary")
             return Quote(
                 price=123.5,
                 observed_at=datetime(2026, 8, 12, tzinfo=timezone.utc),
@@ -344,7 +344,7 @@ def test_quote_batch_refreshes_sources_concurrently_without_dropping_diagnostics
         def __init__(self, timeout=15):
             self.timeout = timeout
         def fetch(self, symbol):
-            source_barrier.wait()
+            calls.append("backup")
             return Quote(
                 price=999,
                 observed_at=datetime(2026, 8, 12, tzinfo=timezone.utc),
@@ -363,15 +363,94 @@ def test_quote_batch_refreshes_sources_concurrently_without_dropping_diagnostics
     response = TestClient(app).post("/v1/quotes", json=["nvda"])
 
     assert response.status_code == 200
+    assert calls == ["primary"]
     assert response.json()["quotes"][0] == {
         "symbol": "NVDA", "price": 123.5,
         "observed_at": "2026-08-12T00:00:00Z", "source": "primary",
         "degraded": False,
         "sources": [
             {"source": "primary", "status": "ok", "error": None, "item_count": 1},
-            {"source": "backup", "status": "ok", "error": None, "item_count": 1},
         ],
     }
+
+
+def test_quote_batch_does_not_wait_for_a_slow_backup_source(monkeypatch):
+    class PrimarySource:
+        name = "primary"
+        def __init__(self, timeout=15):
+            self.timeout = timeout
+        def fetch(self, symbol):
+            return Quote(
+                price=123.5,
+                observed_at=datetime(2026, 8, 12, tzinfo=timezone.utc),
+                source_reference=f"https://primary.example.com/{symbol}",
+            )
+
+    class BackupSource:
+        name = "backup"
+        def __init__(self, timeout=15):
+            self.timeout = timeout
+        def fetch(self, symbol):
+            time.sleep(0.6)
+            return Quote(
+                price=999,
+                observed_at=datetime(2026, 8, 12, tzinfo=timezone.utc),
+                source_reference=f"https://backup.example.com/{symbol}",
+            )
+
+    monkeypatch.setitem(__import__("app.main", fromlist=["source_config"]).source_config, "quote", [
+        {"name": "primary", "enabled": True, "priority": 10},
+        {"name": "backup", "enabled": True, "priority": 20},
+    ])
+    monkeypatch.setitem(__import__("app.source_config", fromlist=["SOURCE_CLASSES"]).SOURCE_CLASSES, "quote", {
+        "primary": PrimarySource,
+        "backup": BackupSource,
+    })
+
+    started = time.monotonic()
+    response = TestClient(app).post("/v1/quotes", json=["nvda"])
+    elapsed = time.monotonic() - started
+
+    assert response.status_code == 200
+    assert response.json()["quotes"][0]["source"] == "primary"
+    assert response.json()["quotes"][0]["price"] == 123.5
+    assert elapsed < 0.3, elapsed
+
+
+def test_quote_attempt_timeout_is_capped_for_the_page_critical_path(monkeypatch):
+    class AnySource:
+        name = "any"
+        def __init__(self, timeout=15):
+            self.timeout = timeout
+        def fetch(self, _symbol):
+            return None
+
+    monkeypatch.setitem(__import__("app.main", fromlist=["source_config"]).source_config, "quote", [
+        {"name": "any", "enabled": True, "priority": 10, "timeout_seconds": 8},
+    ])
+    monkeypatch.setitem(__import__("app.source_config", fromlist=["SOURCE_CLASSES"]).SOURCE_CLASSES, "quote", {
+        "any": AnySource,
+    })
+
+    assert [source.timeout for source in __import__("app.main", fromlist=["_quote_sources"])._quote_sources()] == [2.0]
+
+
+def test_quote_attempt_timeout_keeps_a_tighter_configured_budget(monkeypatch):
+    class AnySource:
+        name = "any"
+        def __init__(self, timeout=15):
+            self.timeout = timeout
+        def fetch(self, _symbol):
+            return None
+
+    monkeypatch.setitem(__import__("app.main", fromlist=["source_config"]).source_config, "quote", [
+        {"name": "any", "enabled": True, "priority": 10, "timeout_seconds": 1},
+    ])
+    monkeypatch.setitem(__import__("app.source_config", fromlist=["SOURCE_CLASSES"]).SOURCE_CLASSES, "quote", {
+        "any": AnySource,
+    })
+
+    assert [source.timeout for source in __import__("app.main", fromlist=["_quote_sources"])._quote_sources()] == [1.0]
 
 
 def test_quote_batch_does_not_starve_small_requests_behind_large_batch(monkeypatch):

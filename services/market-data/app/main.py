@@ -12,7 +12,7 @@ from app.context import (
     filing_document_page, financial_metric_series_result, financial_overview_facts, search_news_facts,
     official_company_event_facts, price_window_result, technical_evidence_result,
     technical_indicator_facts, web_search_lead_facts, valuation_evidence_result,
-    _first_available_batch,
+    _first_available_chain,
 )
 from app.models import AtomicFact, FactQueryResult, FilingDocumentResult, FinancialContext, FinancialOverviewResult, NewsDocumentResult, PaginatedFactResult, PriceWindowResult, QuoteBatch, QuoteSnapshot, SourceStatus, TechnicalEvidenceResult, ValuationEvidenceResult
 from app.source_config import build_sources, load_source_config
@@ -78,7 +78,22 @@ class _FairBatchScheduler:
 app = FastAPI(title="vibe-invest Financial Data")
 source_config = load_source_config()
 _QUOTE_BATCH_CONCURRENCY = 16
+_QUOTE_ATTEMPT_TIMEOUT_SECONDS = 2.0
 _quote_batch_scheduler = _FairBatchScheduler(_QUOTE_BATCH_CONCURRENCY)
+
+
+def _quote_sources():
+    """构造本次请求的行情源，并把单次尝试上限压到 2 秒。
+
+    源配置里允许 8 秒超时（读大文档时合适），但行情在页面首屏路径上：一次尝试超过 2 秒
+    就应该降级到下一个源，而不是把整页拖住。
+    """
+    sources = build_sources(source_config, "quote")
+    for source in sources:
+        timeout = getattr(source, "timeout", None)
+        if isinstance(timeout, (int, float)) and timeout > _QUOTE_ATTEMPT_TIMEOUT_SECONDS:
+            source.timeout = _QUOTE_ATTEMPT_TIMEOUT_SECONDS
+    return sources
 
 
 @app.get("/health", operation_id="getHealth", response_model=HealthResponse)
@@ -241,8 +256,8 @@ def quotes(symbols: List[str]) -> QuoteBatch:
     normalized_symbols = [symbol.strip().upper() for symbol in symbols[:100]]
     if not normalized_symbols:
         return QuoteBatch(quotes=[])
-    outcomes = _first_available_batch([
-        (symbol, build_sources(source_config, "quote")) for symbol in normalized_symbols
+    outcomes = _first_available_chain([
+        (symbol, _quote_sources()) for symbol in normalized_symbols
     ], _quote_batch_scheduler)
     result = []
     for symbol, outcome in zip(normalized_symbols, outcomes):

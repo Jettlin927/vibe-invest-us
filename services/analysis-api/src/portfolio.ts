@@ -1,5 +1,14 @@
 import type { PortfolioRepository, ProductPosition } from '@vibe-invest/product-dao'
 
+export type QuoteFreshness = {
+  /** 本批行情里最早的观测时间；为 null 表示上游没有给出观测时间。 */
+  observedAt: string | null
+  sources: string[]
+  /** 这批结果实际取得的时间；cached 为真时即缓存写入时间。 */
+  fetchedAt: string
+  cached: boolean
+}
+
 export type PortfolioOverview = {
   cash: number
   totalCost: number
@@ -17,6 +26,8 @@ export type PortfolioOverview = {
     unrealizedReturn: number | null
     portfolioWeight: number | null
   }>
+  /** 只在确实取到行情元数据时出现；/api/portfolio/stored 不带此字段。 */
+  quotes?: QuoteFreshness
 }
 
 export type PortfolioEquitySnapshot = {

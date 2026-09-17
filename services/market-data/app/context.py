@@ -708,21 +708,29 @@ def _fetch_valuation(source, symbol: str, quote: Optional[Quote]):
         )], DataGap(capability="valuation", reason="source_unavailable")
 
 
-def _first_available_batch(source_groups, scheduler) -> List[CapabilityResult]:
+def _first_available_chain(source_groups, scheduler) -> List[CapabilityResult]:
+    """按优先级依次尝试每个标的的源，第一个有结果的源即被采用。
+
+    只有上一源失败、超时或返回空结果时才请求下一源，因此响应时间由第一个健康源决定，
+    不会像"并发请求全部源再等全部返回"那样被最慢的备用源拖住。
+    """
     groups = [(symbol, list(sources)) for symbol, sources in source_groups]
-    results = [[None] * len(sources) for _, sources in groups]
-    jobs = [
-        (group_index, source_index, source, symbol)
-        for group_index, (symbol, sources) in enumerate(groups)
-        for source_index, source in enumerate(sources)
-    ]
     attempts = scheduler.run([
-        lambda source=source, symbol=symbol: _fetch_source(source, symbol)
-        for _, _, source, symbol in jobs
+        lambda sources=sources, symbol=symbol: _fetch_first_available(sources, symbol)
+        for symbol, sources in groups
     ])
-    for (group_index, source_index, _, _), attempt in zip(jobs, attempts):
-        results[group_index][source_index] = attempt
-    return [_capability_result(group) for group in results]
+    return [_capability_result(results) for results in attempts]
+
+
+def _fetch_first_available(sources, symbol: str):
+    results = []
+    for source in sources:
+        result = _fetch_source(source, symbol)
+        results.append(result)
+        _, candidate, error = result
+        if error is None and candidate:
+            break
+    return results
 
 
 def _fetch_source(source, symbol: str):

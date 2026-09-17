@@ -968,6 +968,60 @@ test('保护计划基准价自动读取现价、修订沿用冻结值、无行�
   assert.match(view.getByRole('dialog').textContent ?? '', /行情暂不可用，基准价已回退为平均成本 25/)
 })
 
+test('持仓页展示行情时间与来源，刷新按钮只重取行情而不回到 stored 投影', async () => {
+  setupDom()
+  const requests: string[] = []
+  let cached = true
+  const portfolio = {
+    ...portfolioResponse([{ symbol: 'NVDA', quantity: 10, averageCost: 100 }]),
+    totalMarketValue: 1200, totalEquity: 1200, totalUnrealizedProfitLoss: 200,
+    totalUnrealizedReturn: 0.2,
+    positions: [{
+      symbol: 'NVDA', quantity: 10, averageCost: 100, costAmount: 1000,
+      marketPrice: 120, marketValue: 1200, unrealizedProfitLoss: 200,
+      unrealizedReturn: 0.2, portfolioWeight: 1,
+    }],
+    get quotes() {
+      return {
+        observedAt: '2026-03-05T20:00:00.000Z', sources: ['tencent'],
+        fetchedAt: '2026-03-05T20:00:05.000Z', cached,
+      }
+    },
+  }
+  globalThis.fetch = async (input, init) => {
+    const url = String(input)
+    requests.push(url)
+    if (url === '/api/health') return Response.json({ service: 'analysis-api', status: 'ok', dependencies: { database: { status: 'ok' }, financialData: { service: 'financial-data', status: 'ok' } } })
+    if (url === '/api/settings') return Response.json({ model: { configured: false } })
+    if (url === '/api/research') return Response.json({ records: [] })
+    if (url === '/api/portfolio/stored' || url === '/api/portfolio') return Response.json(portfolio)
+    if (url === '/api/portfolio?refresh=1') { cached = false; return Response.json(portfolio) }
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+    if (url === '/api/portfolio/events?limit=50') return Response.json({ events: [] })
+    if (url === '/api/profit-protection' && !init?.method) {
+      return Response.json({ summary: { planned: 0, triggered: 0, reviewRequired: 0, dataGap: 0 }, positions: [], triggers: [] })
+    }
+    throw new Error(`unexpected_fetch:${url}`)
+  }
+
+  const view = render(React.createElement(App))
+  const user = userEvent.setup({ document: window.document })
+  await user.click(await view.findByRole('button', { name: '我的持仓' }))
+
+  const section = (await view.findByRole('heading', { name: '组合概况' })).closest('section')
+  const refreshButton = view.getByRole('button', { name: '刷新行情' }) as HTMLButtonElement
+  await waitFor(() => assert.equal(refreshButton.disabled, false))
+  assert.match(section?.textContent ?? '', /tencent/)
+  assert.match(section?.textContent ?? '', /缓存/)
+
+  await user.click(refreshButton)
+  await waitFor(() => assert.equal(requests.filter((url) => url === '/api/portfolio?refresh=1').length, 1))
+  await waitFor(() => assert.equal(refreshButton.disabled, false))
+  assert.doesNotMatch(section?.textContent ?? '', /缓存/)
+  assert.match(section?.textContent ?? '', /tencent/)
+  assert.equal(requests.filter((url) => url === '/api/portfolio/stored').length, 1)
+})
+
 test('持仓页可以加仓，买入花费从现金扣减并记入调仓账本', async () => {
   setupDom()
   let portfolio = {

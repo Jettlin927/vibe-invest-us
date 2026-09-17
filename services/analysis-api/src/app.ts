@@ -22,6 +22,7 @@ import {
   type FactQueryResult, type FinancialContext, type PaginatedFactQueryResult, type QuoteSnapshot,
 } from './financial-data-client.js'
 import { createPortfolio, isValidSymbol, normalizeSymbol } from './portfolio.js'
+import { pricesFromSnapshots, type QuoteBatch } from './quote-cache.js'
 import { createProfitProtection } from './profit-protection.js'
 import { projectResearchExport, projectResearchView } from './research-export.js'
 import { createResearchToolExecutor } from './research-capability.js'
@@ -77,6 +78,9 @@ type AppDependencies = {
     symbol: string, startDate: string, endDate: string, signal: AbortSignal,
   ) => Promise<FactQueryResult>
   fetchMarketPrices?: (symbols: string[], signal: AbortSignal) => Promise<Record<string, number>>
+  fetchMarketQuotes?: (
+    symbols: string[], signal: AbortSignal, options?: { force?: boolean },
+  ) => Promise<QuoteBatch>
   fetchTrackingQuotes?: (symbols: string[], signal: AbortSignal) => Promise<QuoteSnapshot[]>
   trackingConcurrency?: number
   trackingScanIntervalMs?: number
@@ -105,6 +109,19 @@ function nestedNumber(value: unknown, ...path: string[]) {
     current = (current as Record<string, unknown>)[key]
   }
   return typeof current === 'number' && Number.isFinite(current) ? current : null
+}
+
+function quoteFreshness(batch: QuoteBatch) {
+  const observed = batch.snapshots
+    .flatMap((quote) => (typeof quote.observedAt === 'string' ? [quote.observedAt] : []))
+    .sort()
+  return {
+    // 取最早的一个：整批行情至少新到这个时间，避免用最新的一支掩盖滞后的持仓。
+    observedAt: observed[0] ?? null,
+    sources: [...new Set(batch.snapshots.flatMap((quote) => (quote.source ? [quote.source] : [])))].sort(),
+    fetchedAt: new Date(batch.fetchedAt).toISOString(),
+    cached: batch.cached,
+  }
 }
 
 export function buildApp(dependencies: AppDependencies) {
@@ -447,18 +464,23 @@ export function buildApp(dependencies: AppDependencies) {
     return dependencies.portfolioRepository.migrationVerificationState()
   })
 
-  app.get('/api/portfolio', async (_request, reply) => {
+  app.get<{ Querystring: { refresh?: string } }>('/api/portfolio', async (request, reply) => {
     const positions = await portfolio.list()
     if (!positions.length) return portfolio.overview({})
-    if (!dependencies.fetchMarketPrices) return portfolio.overview({})
+    if (!dependencies.fetchMarketPrices && !dependencies.fetchMarketQuotes) return portfolio.overview({})
     try {
-      const prices = await dependencies.fetchMarketPrices(
-        positions.map((position) => position.symbol),
-        AbortSignal.timeout(dependencies.marketPriceTimeoutMs ?? MARKET_PRICE_REQUEST_TIMEOUT_MS),
-      )
+      const symbols = positions.map((position) => position.symbol)
+      const signal = AbortSignal.timeout(dependencies.marketPriceTimeoutMs ?? MARKET_PRICE_REQUEST_TIMEOUT_MS)
+      // refresh=1 由持仓页的「刷新行情」按钮触发：绕过短 TTL 缓存，但仍与已在途的取价合并。
+      const batch = dependencies.fetchMarketQuotes
+        ? await dependencies.fetchMarketQuotes(symbols, signal, { force: request.query.refresh === '1' })
+        : null
+      const prices = batch
+        ? pricesFromSnapshots(batch.snapshots)
+        : await dependencies.fetchMarketPrices!(symbols, signal)
       const overview = await portfolio.overview(prices)
       await portfolio.recordSnapshot(overview, dependencies.now?.() ?? new Date())
-      return overview
+      return batch ? { ...overview, quotes: quoteFreshness(batch) } : overview
     } catch {
       return reply.status(200).send(await portfolio.overview({}))
     }

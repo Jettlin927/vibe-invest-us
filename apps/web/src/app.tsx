@@ -20,10 +20,14 @@ type PortfolioPosition = Position & {
   costAmount: number; marketPrice: number | null; marketValue: number | null
   unrealizedProfitLoss: number | null; unrealizedReturn: number | null; portfolioWeight: number | null
 }
+type QuoteFreshness = {
+  observedAt: string | null; sources: string[]; fetchedAt: string; cached: boolean
+}
 type PortfolioOverview = {
   cash: number; totalCost: number; totalMarketValue: number | null; totalEquity: number | null
   totalUnrealizedProfitLoss: number | null; totalUnrealizedReturn: number | null
   pricedPositionCount: number; unpricedPositionCount: number; positions: PortfolioPosition[]
+  quotes?: QuoteFreshness
 }
 type PortfolioEquitySnapshot = {
   marketDay: string; totalEquity: number; totalMarketValue: number; cash: number
@@ -219,16 +223,17 @@ export function App() {
   const [deletingResearchId, setDeletingResearchId] = useState<string | null>(null)
   const [error, setError] = useState('')
 
-  async function loadPortfolio() {
+  async function loadPortfolio(options: { quotesOnly?: boolean } = {}) {
     const generation = ++portfolioLoadGeneration.current
     let hasPortfolio = portfolioLoaded
     setPortfolioLoadFailed(false)
     setPortfolioRefreshing(true)
-    const storedRequest = fetch('/api/portfolio/stored')
-    const refreshedRequest = fetch('/api/portfolio').catch(() => null)
+    // 只刷行情时跳过 stored 投影：它不带价格，先落地会让页面闪一下「不可用」。
+    const storedRequest = options.quotesOnly ? null : fetch('/api/portfolio/stored')
+    const refreshedRequest = fetch(options.quotesOnly ? '/api/portfolio?refresh=1' : '/api/portfolio').catch(() => null)
     try {
       const storedResponse = await storedRequest
-      const value: unknown = storedResponse.ok ? await storedResponse.json() : null
+      const value: unknown = storedResponse && storedResponse.ok ? await storedResponse.json() : null
       if (isPortfolioOverview(value) && generation === portfolioLoadGeneration.current) {
         setPortfolio(value)
         setPositions(value.positions.map(({ symbol, quantity, averageCost }) => ({ symbol, quantity, averageCost })))
@@ -848,7 +853,7 @@ export function App() {
       {page === 'analysis' && <AnalysisPage symbol={analysisSymbol} setSymbol={setAnalysisSymbol} status={analysisStatus} stages={analysisStages} active={analysisSubmitting || Boolean(activeAnalysisId)} onStart={startAnalysis} onCancel={cancelAnalysis} health={health} modelConfigured={modelConfigured} records={records} onOpen={async (id) => { await openResearch(id); navigate('research') }} />}
       {page === 'research' && <ResearchPage records={records} record={selectedResearch} onOpen={openResearch} onOpenTrace={openResearchTrace} onUpdate={updateResearch} onDelete={removeResearch} deleting={deletingResearchId === selectedResearch?.id} onResume={resumeResearch} onFollowUp={sendFollowUp} onReanalyze={reanalyzeResearch} freshnessDays={runtimeSettings?.current.values.reportFreshnessDays ?? null} onContinue={() => { if (!selectedResearch) return; setSelectedConversation(null); setConversationEvents([]); setConversationBusy(false); setConversationDraft(`继续研究 ${selectedResearch.symbol}：${selectedResearch.report?.title ?? '已有研究'}\n来源研究 ID：${selectedResearch.id}\n${selectedResearch.selectedReportVersion ? `来源报告版本 ID：${selectedResearch.selectedReportVersion.id}\n` : ''}来源：[查看原研究](/research/${encodeURIComponent(selectedResearch.id)}${selectedResearch.selectedReportVersion ? `?reportVersionId=${encodeURIComponent(selectedResearch.selectedReportVersion.id)}` : ''})\n请先读取这份已有研究，再回答我的补充问题：`); navigate('conversation') }} continueDisabled={conversationBusy || Boolean(selectedConversation && ['queued', 'running'].includes(selectedConversation.status))} />}
       {page === 'conversation' && <ConversationPage initialMessage={conversationDraft} threads={conversationThreads} thread={selectedConversation} events={conversationEvents} busy={conversationBusy} onOpen={openConversation} onNew={() => { setConversationDraft(''); setSelectedConversation(null); setConversationEvents([]); setConversationBusy(false) }} onCreate={startConversation} onSend={sendConversationMessage} onCancel={cancelConversation} />}
-      {page === 'portfolio' && <PortfolioPage portfolio={portfolio} history={portfolioHistory} events={portfolioEvents} protection={profitProtection} loaded={portfolioLoaded} loadFailed={portfolioLoadFailed} refreshing={portfolioRefreshing} onSave={savePosition} onSaveCash={saveCash} onBuy={buyPosition} onReduce={reducePosition} onSaveProtection={saveProfitProtectionPlan} onAcknowledgeProtection={acknowledgeProfitProtectionTrigger} onDelete={removePosition} />}
+      {page === 'portfolio' && <PortfolioPage portfolio={portfolio} history={portfolioHistory} events={portfolioEvents} protection={profitProtection} loaded={portfolioLoaded} loadFailed={portfolioLoadFailed} refreshing={portfolioRefreshing} onRefreshQuotes={() => loadPortfolio({ quotesOnly: true })} onSave={savePosition} onSaveCash={saveCash} onBuy={buyPosition} onReduce={reducePosition} onSaveProtection={saveProfitProtectionPlan} onAcknowledgeProtection={acknowledgeProfitProtectionTrigger} onDelete={removePosition} />}
       {page === 'settings' && <SettingsPage health={health} modelConfigured={modelConfigured} settings={runtimeSettings} onReload={loadSettings} />}
     </main>
   </div>
@@ -1704,7 +1709,7 @@ function ResearchReport({ record, onUpdate, onDelete, deleting, onResume, onFoll
   </article>
 }
 
-function PortfolioPage({ portfolio, history, events, protection, loaded, loadFailed, refreshing, onSave, onSaveCash, onBuy, onReduce, onSaveProtection, onAcknowledgeProtection, onDelete }: {
+function PortfolioPage({ portfolio, history, events, protection, loaded, loadFailed, refreshing, onRefreshQuotes, onSave, onSaveCash, onBuy, onReduce, onSaveProtection, onAcknowledgeProtection, onDelete }: {
   portfolio: PortfolioOverview
   history: PortfolioEquitySnapshot[]
   events: PortfolioEvent[]
@@ -1712,6 +1717,7 @@ function PortfolioPage({ portfolio, history, events, protection, loaded, loadFai
   loaded: boolean
   loadFailed: boolean
   refreshing: boolean
+  onRefreshQuotes: () => Promise<void>
   onSave: (event: React.FormEvent<HTMLFormElement>) => Promise<void>
   onSaveCash: (event: React.FormEvent<HTMLFormElement>) => Promise<void>
   onBuy: (symbol: string, quantity: number, price: number) => Promise<boolean>
@@ -1728,7 +1734,7 @@ function PortfolioPage({ portfolio, history, events, protection, loaded, loadFai
   const [planning, setPlanning] = useState<PortfolioPosition | null>(null)
   if (!loaded) return <><PageHeader eyebrow="PRIVATE PORTFOLIO" title="我的持仓" description="现金、持仓市值和盈亏共同构成你的组合语境；行情缺失时不猜测组合总值。" />{loadFailed ? <p className="error-banner" role="alert" aria-label="持仓读取失败，请稍后重试。">持仓读取失败，请稍后重试。</p> : <p className="chart-empty" role="status" aria-label="正在读取已保存的持仓…">正在读取已保存的持仓…</p>}</>
   return <><PageHeader eyebrow="PRIVATE PORTFOLIO" title="我的持仓" description="现金、持仓市值和盈亏共同构成你的组合语境；行情缺失时不猜测组合总值。" />
-    <DisclosureSection name="portfolio-summary" title="组合概况" className="portfolio-summary"><div className="portfolio-kpis">
+    <DisclosureSection name="portfolio-summary" title="组合概况" className="portfolio-summary" eyebrow={quoteFreshnessLabel(portfolio.quotes, refreshing)} actions={<button className="quiet" aria-label="刷新行情" title={quoteFreshnessTitle(portfolio.quotes)} disabled={refreshing} onClick={() => void onRefreshQuotes()}>{refreshing ? '刷新中…' : '刷新行情'}</button>}><div className="portfolio-kpis">
       <PortfolioKpi label="组合总值" value={formatNullableMoney(portfolio.totalEquity)} note="持仓市值 + USD 现金" />
       <PortfolioKpi label="持仓市值" value={formatNullableMoney(portfolio.totalMarketValue)} note={refreshing ? '行情刷新中' : `${portfolio.pricedPositionCount}/${portfolio.positions.length} 项有行情`} />
       <PortfolioKpi label="USD 现金" value={formatMoney(portfolio.cash)} note={portfolio.totalEquity ? `占组合 ${formatPercent(portfolio.cash / portfolio.totalEquity)}` : '独立手工维护'} />
@@ -2160,6 +2166,28 @@ function directionLabel(direction?: string) { return ({ bullish: '偏多', beari
 function confidenceLabel(confidence?: string) { return ({ low: '低置信度', medium: '中等置信度', high: '高置信度' } as Record<string, string>)[confidence ?? ''] ?? confidence ?? '置信度未知' }
 function trendVerdict(trend?: string) { if (!trend) return '受限'; if (/偏强|看涨|上升/.test(trend)) return '谨慎偏多'; if (/偏弱|看跌|下降/.test(trend)) return '谨慎偏空'; return '中性观察' }
 function formatTime(value: string) { const date = new Date(value); return Number.isNaN(date.valueOf()) ? value : date.toLocaleString('zh-CN', { dateStyle: 'medium', timeStyle: 'short' }) }
+function formatQuoteClock(value: string) {
+  const date = new Date(value)
+  if (Number.isNaN(date.valueOf())) return value
+  const pad = (input: number) => String(input).padStart(2, '0')
+  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
+function quoteFreshnessLabel(quotes: QuoteFreshness | undefined, refreshing: boolean) {
+  if (refreshing) return '正在刷新行情…'
+  if (!quotes) return '行情时间未知'
+  const observed = quotes.observedAt ? formatQuoteClock(quotes.observedAt) : '时间未知'
+  const sources = quotes.sources.length ? quotes.sources.join('/') : '来源未知'
+  return `行情 ${observed} · ${sources}${quotes.cached ? ' · 缓存' : ''}`
+}
+function quoteFreshnessTitle(quotes?: QuoteFreshness) {
+  if (!quotes) return '尚未取到行情元数据'
+  return [
+    quotes.observedAt ? `观测 ${formatTime(quotes.observedAt)}` : '无观测时间',
+    `来源 ${quotes.sources.join('/') || '未知'}`,
+    `取得 ${formatTime(quotes.fetchedAt)}`,
+    quotes.cached ? '来自缓存' : '刚刚取回',
+  ].join(' · ')
+}
 function formatMoney(value: number) { return Number.isFinite(value) ? new Intl.NumberFormat('zh-CN', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 }).format(value) : '—' }
 function formatNullableMoney(value: number | null) { return value === null ? '不可用' : formatMoney(value) }
 function formatSignedMoney(value: number | null) { if (value === null || !Number.isFinite(value)) return '不可用'; return `${value > 0 ? '+' : ''}${formatMoney(value)}` }

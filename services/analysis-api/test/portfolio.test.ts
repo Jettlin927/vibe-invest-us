@@ -5,6 +5,8 @@ import { join } from 'node:path'
 import test from 'node:test'
 
 import { buildApp } from '../src/app.js'
+import type { QuoteSnapshot } from '../src/financial-data-client.js'
+import { createQuoteCache, pricesFromSnapshots } from '../src/quote-cache.js'
 import { createTestProductDatabase } from './support/product-database.js'
 
 const healthyFinancialData = async () => ({
@@ -114,6 +116,43 @@ test('用户可以维护现金并查看组合总值、仓位和未实现盈亏',
       { symbol: 'NVDA', quantity: 10, averageCost: 100, costAmount: 1000, marketPrice: 120, marketValue: 1200, unrealizedProfitLoss: 200, unrealizedReturn: 0.2, portfolioWeight: 1200 / 2600 },
     ],
   })
+  await app.close()
+})
+
+test('组合读取返回行情观测时间与来源，手动刷新绕过缓存', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'vibe-invest-quote-freshness-'))
+  let loads = 0
+  const cache = createQuoteCache(async (symbols): Promise<QuoteSnapshot[]> => {
+    loads += 1
+    return symbols.map((symbol) => ({
+      symbol, price: 120, observedAt: '2026-03-05T14:00:00.000Z', source: 'tencent',
+      degraded: false, sources: [],
+    }))
+  }, { ttlMs: 10_000 })
+  const app = buildApp({
+    ...productDatabaseFor(join(dataDir, 'storage')),
+    financialDataHealth: healthyFinancialData,
+    fetchMarketPrices: async (symbols, signal) => pricesFromSnapshots((await cache.read(symbols, signal)).snapshots),
+    fetchMarketQuotes: (symbols, signal, options) => cache.read(symbols, signal, options),
+  })
+  await app.ready()
+  await app.inject({ method: 'PUT', url: '/api/positions/NVDA', payload: { quantity: 10, averageCost: 100 } })
+
+  const first = await app.inject({ method: 'GET', url: '/api/portfolio' })
+  assert.equal(loads, 1)
+  assert.deepEqual(first.json().quotes, {
+    observedAt: '2026-03-05T14:00:00.000Z', sources: ['tencent'],
+    fetchedAt: first.json().quotes.fetchedAt, cached: false,
+  })
+
+  const cached = await app.inject({ method: 'GET', url: '/api/portfolio' })
+  assert.equal(loads, 1)
+  assert.equal(cached.json().quotes.cached, true)
+
+  const refreshed = await app.inject({ method: 'GET', url: '/api/portfolio?refresh=1' })
+  assert.equal(loads, 2)
+  assert.equal(refreshed.json().quotes.cached, false)
+  assert.equal(refreshed.json().positions[0].marketPrice, 120)
   await app.close()
 })
 

@@ -9,6 +9,7 @@ import {
 import { buildApp } from './app.js'
 import { createFinancialDataClient } from './financial-data-client.js'
 import { createPiModel } from './model.js'
+import { createQuoteCache, pricesFromSnapshots } from './quote-cache.js'
 
 const port = Number(process.env.PORT ?? 3000)
 const host = process.env.HOST ?? '0.0.0.0'
@@ -18,6 +19,12 @@ const productPool = createPool(productDatabaseUrl)
 const staticDir = process.env.WEB_STATIC_DIR ?? resolve('public')
 const financialDataUrl = process.env.FINANCIAL_DATA_URL ?? 'http://127.0.0.1:8000'
 const financialData = createFinancialDataClient(financialDataUrl)
+// 组合页一次加载会先取组合、再取盈利保护，两处都需要同一批行情；
+// 短 TTL 缓存让它们共用一次上游取价，「刷新行情」按钮用 force 绕过。
+const quotes = createQuoteCache(
+  (symbols, signal) => financialData.quoteSnapshots(symbols, signal),
+  { ttlMs: Number(process.env.MARKET_PRICE_CACHE_TTL_MS ?? 10_000) },
+)
 const modelProvider = process.env.MODEL_PROVIDER
 const modelApiKey = process.env.MODEL_API_KEY
 const modelApiProtocol = process.env.MODEL_API_PROTOCOL
@@ -72,7 +79,8 @@ const app = buildApp({
   fetchTechnicalIndicators: (symbol, startDate, endDate, signal) => (
     financialData.technicalIndicators(symbol, startDate, endDate, signal)
   ),
-  fetchMarketPrices: (symbols, signal) => financialData.quotes(symbols, signal),
+  fetchMarketPrices: async (symbols, signal) => pricesFromSnapshots((await quotes.read(symbols, signal)).snapshots),
+  fetchMarketQuotes: (symbols, signal, options) => quotes.read(symbols, signal, options),
   fetchTrackingQuotes: (symbols, signal) => financialData.quoteSnapshots(symbols, signal),
   trackingScanIntervalMs: Number(process.env.TRACKING_SCAN_INTERVAL_MINUTES ?? 0) * 60_000,
   model,
