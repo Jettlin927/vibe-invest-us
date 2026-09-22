@@ -4,12 +4,12 @@ import {
   createWorkbenchRepository, createResearchLibraryRepository, checkSchema, createAgentEventRepository, createAnalysisRepository, createConversationRepository, createPool,
   createPortfolioRepository, createProfitProtectionRepository, createRuntimeSettingsRepository,
   createToolProjectionRepository, createTrackingRepository,
-} from '@vibe-invest/product-dao'
+} from '@vibe-invest/db'
 
 import { buildApp } from './app.js'
-import { createFinancialDataClient } from './financial-data-client.js'
-import { createPiModel } from './model.js'
-import { createQuoteCache, pricesFromSnapshots } from './quote-cache.js'
+import { createFinancialDataClient } from './adapters/financial-data-client.js'
+import { createPiModel } from './service/agent-runtime/model.js'
+import { createQuoteCache, pricesFromSnapshots } from './service/quote-cache.js'
 
 const port = Number(process.env.PORT ?? 3000)
 const host = process.env.HOST ?? '0.0.0.0'

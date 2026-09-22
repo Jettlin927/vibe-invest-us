@@ -1,4 +1,4 @@
-from app.financials import build_financials
+from app.domain.financials import build_financials
 
 
 def sec_item(value, end, filed, form, fp, frame, start=None):

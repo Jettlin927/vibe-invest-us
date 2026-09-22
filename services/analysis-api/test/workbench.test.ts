@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { createWorkbench } from '../src/workbench.js'
-import type { WorkbenchRepository } from '@vibe-invest/product-dao'
+import { createWorkbench } from '../src/service/workbench.js'
+import type { WorkbenchRepository } from '@vibe-invest/db'
 
 test('页面拒绝脚本、未知组件和多余字段，立场拒绝非法状态', async () => {
   const repository = new Proxy({}, { get() { return () => { throw new Error('unexpected_write') } } }) as WorkbenchRepository

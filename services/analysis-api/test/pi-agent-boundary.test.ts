@@ -99,7 +99,7 @@ test('只有 Pi Adapter 可直接导入 pi-agent-core', async () => {
     const source = await readFile(file, 'utf8')
     for (const { specifier } of piAgentCoreReferences(source)) {
       assert.equal(specifier, piAgentCorePackage, 'pi-agent-core 只允许精确包根')
-      assert.equal(relative(root, file), 'services/analysis-api/src/agent-runtime/pi-agent-adapter.ts')
+      assert.equal(relative(root, file), 'services/analysis-api/src/adapters/pi-agent-adapter.ts')
     }
   }
 })
@@ -128,7 +128,7 @@ test('Adapter 公开声明不泄露 Pi 类型，调用方无需导入 Pi 包', a
       join(root, 'node_modules/typescript/bin/tsc'),
       '--declaration', '--emitDeclarationOnly', '--module', 'NodeNext', '--moduleResolution', 'NodeNext',
       '--target', 'ES2024', '--strict', '--skipLibCheck', '--outDir', directory,
-      join(root, 'services/analysis-api/src/agent-runtime/pi-agent-adapter.ts'),
+      join(root, 'services/analysis-api/src/adapters/pi-agent-adapter.ts'),
     ])
     const declaration = await readFile(join(directory, 'pi-agent-adapter.d.ts'), 'utf8')
     assert.doesNotMatch(declaration, /@earendil-works\/pi-(?:agent-core|ai)|typebox/)
@@ -145,7 +145,7 @@ test('Adapter 公开声明不泄露 Pi 类型，调用方无需导入 Pi 包', a
 
 test('Adapter 从 pi-agent-core 包根导入仅限显式 allowlist', async () => {
   const source = await readFile(
-    join(root, 'services/analysis-api/src/agent-runtime/pi-agent-adapter.ts'), 'utf8',
+    join(root, 'services/analysis-api/src/adapters/pi-agent-adapter.ts'), 'utf8',
   )
   assertPiAgentCoreBoundary(source, [
     'Agent', 'AgentTool', 'estimateTokens',

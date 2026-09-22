@@ -6,7 +6,7 @@ import type {
   TrackingTarget,
   WatchlistItem,
 } from '@vibe-invest/contracts'
-import type { TrackingRepository } from '@vibe-invest/product-dao'
+import type { TrackingRepository } from '@vibe-invest/db'
 
 export function createTestTrackingRepository() {
   const watchlist = new Map<string, WatchlistItem>()

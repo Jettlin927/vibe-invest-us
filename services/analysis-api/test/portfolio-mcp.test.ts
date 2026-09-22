@@ -3,8 +3,9 @@ import test from 'node:test'
 import Fastify from 'fastify'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
-import { createPool, createPortfolioRepository, migrate } from '@vibe-invest/product-dao'
-import { registerPortfolioMcp } from '../src/portfolio-mcp.js'
+import { createPool, createPortfolioRepository, migrate } from '@vibe-invest/db'
+import { registerPortfolioMcp } from '../src/api/portfolio-mcp.js'
+import { createPortfolio } from '../src/service/portfolio.js'
 
 const token = 'portfolio-test-token-at-least-32-characters'
 const databaseUrl = process.env.TEST_DATABASE_URL
@@ -13,11 +14,11 @@ test('MCP 默认关闭，认证和浏览器来源检查先于账本访问', asyn
   const pool = createPool('postgresql://unused:unused@127.0.0.1:1/unused')
   const repository = createPortfolioRepository(pool)
   const off = Fastify()
-  registerPortfolioMcp(off, repository)
+  registerPortfolioMcp(off, createPortfolio(repository))
   assert.equal((await off.inject({ method: 'POST', url: '/mcp', payload: {} })).statusCode, 404)
   await off.close()
   const app = Fastify()
-  registerPortfolioMcp(app, repository, token)
+  registerPortfolioMcp(app, createPortfolio(repository), token)
   for (const method of ['GET', 'POST', 'DELETE'] as const) {
     assert.equal((await app.inject({ method, url: '/mcp' })).statusCode, 401)
   }
@@ -34,7 +35,7 @@ test('真实 MCP HTTP + PostgreSQL：买卖、校准、现金、并发重试、�
   const repository = createPortfolioRepository(pool)
   const prefix = `mcp-test-${Date.now()}`
   let app = Fastify()
-  registerPortfolioMcp(app, repository, token)
+  registerPortfolioMcp(app, createPortfolio(repository), token)
   await app.listen({ host: '127.0.0.1', port: 0 })
   const address = app.server.address()
   assert.ok(address && typeof address !== 'string')
@@ -85,7 +86,7 @@ test('真实 MCP HTTP + PostgreSQL：买卖、校准、现金、并发重试、�
     await client.close()
     await app.close()
     app = Fastify()
-    registerPortfolioMcp(app, createPortfolioRepository(pool), token)
+    registerPortfolioMcp(app, createPortfolio(createPortfolioRepository(pool)), token)
     await app.listen({ host: '127.0.0.1', port: address.port })
     client = await connect()
     const current = (await call('get_portfolio')).value

@@ -1,10 +1,10 @@
 from datetime import datetime, timezone
 
-from app.context import (
+from app.service.context import (
     build_financial_context, company_event_facts, read_news_document_fact, search_news_facts,
     official_company_event_facts, technical_indicator_facts, web_search_lead_facts,
 )
-from app.models import DailyBar, NewsItem, Quote
+from app.domain.models import DailyBar, NewsItem, Quote
 
 
 NOW = datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc)
@@ -21,7 +21,7 @@ class Source:
 
 
 def bars():
-    return [DailyBar(date=f"2026-07-{day:02d}", open=day, high=day + 2, low=day - 1,
+    return [DailyBar(date=f"2026-07-{day:02d}", open=day, high=day + 2, low=max(day - 1, 0.5),
                      close=day + 1, volume=day * 1000) for day in range(1, 31)]
 
 
@@ -253,7 +253,7 @@ def test_company_events_are_distinct_title_only_candidates_with_source_status():
 
 
 def test_financial_metric_series_pages_normalized_periods_without_xbrl_fields():
-    from app.context import financial_metric_series
+    from app.service.context import financial_metric_series
     normalized = {
         "derived_metrics": [
             {"fact_id": f"fact:revenue:{index}", "metric": "revenue_yoy", "scope": "quarter",
@@ -274,7 +274,7 @@ def test_financial_metric_series_pages_normalized_periods_without_xbrl_fields():
 
 
 def test_filing_document_page_binds_fact_to_read_byte_range_without_retaining_full_text():
-    from app.context import filing_document_page
+    from app.service.context import filing_document_page
     filing = {
         "filingId": "0001045810-26-000123", "form": "10-Q", "filedAt": "2026-07-31",
         "sourceReference": "https://www.sec.gov/Archives/edgar/data/example.htm",

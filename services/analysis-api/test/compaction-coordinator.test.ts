@@ -5,8 +5,8 @@ import {
   CompactionCapacityExhaustedError, CompactionGenerationError, createCompactionCoordinator,
   DEFAULT_KEEP_RECENT_TOKENS,
   type CompactionCut, type CompactionMetrics, type CompactionSink,
-} from '../src/agent-runtime/compaction.js'
-import type { PiAgentAdapterMessage, PiAgentAdapterTool } from '../src/agent-runtime/pi-agent-adapter.js'
+} from '../src/service/agent-runtime/compaction.js'
+import type { PiAgentAdapterMessage, PiAgentAdapterTool } from '../src/adapters/pi-agent-adapter.js'
 
 const user = (text: string): PiAgentAdapterMessage => ({ role: 'user', content: text, timestamp: 0 })
 

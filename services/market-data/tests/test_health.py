@@ -8,11 +8,11 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.adapters import (
+from app.adapters.sources import (
     _PinnedHTTPConnection, YahooValuationSource, _diagnose, configure_diagnostics, read_document_page,
     validate_document_url,
 )
-from app.models import Quote
+from app.domain.models import Quote
 from datetime import datetime, timezone
 
 
@@ -39,7 +39,7 @@ def test_financial_data_runtime_disables_access_logs_that_can_include_tool_param
 
 
 def test_financial_context_fetches_capabilities_concurrently(monkeypatch):
-    from app.models import DailyBar, NewsItem
+    from app.domain.models import DailyBar, NewsItem
 
     barrier = threading.Barrier(4, timeout=0.5)
     state = {"barrier_broken": False}
@@ -69,7 +69,7 @@ def test_financial_context_fetches_capabilities_concurrently(monkeypatch):
         "fundamentals": [Source("fundamentals", {})],
         "valuation": [],
     }
-    monkeypatch.setattr("app.main.build_sources", lambda _config, capability: sources[capability])
+    monkeypatch.setattr("app.service.financial_data.build_sources", lambda _config, capability: sources[capability])
 
     response = TestClient(app).post("/v1/financial-context", params={"symbol": "nvda"})
 
@@ -110,7 +110,7 @@ def test_yahoo_valuation_preserves_each_metric_fact_date(monkeypatch):
             {"asOfDate": "2026-08-12", "reportedValue": {"raw": 28}},
         ],
     }]}}
-    monkeypatch.setattr("app.adapters._read", lambda *args, **kwargs: json.dumps(payload))
+    monkeypatch.setattr("app.adapters.sources._read", lambda *args, **kwargs: json.dumps(payload))
 
     metrics = YahooValuationSource()._metrics("NVDA")
 
@@ -140,14 +140,14 @@ def test_yahoo_valuation_without_quote_uses_latest_input_fact_date(monkeypatch):
 
 
 def test_financial_overview_hides_xbrl_mapping_and_returns_official_facts(monkeypatch):
-    from app.models import AtomicFact, FactQueryResult
+    from app.domain.models import AtomicFact, FactQueryResult
     expected = FactQueryResult(facts=[AtomicFact(
         id="fact:NVDA:financial:revenue:2026-Q2", type="reported_financial",
         value={"metric": "revenue", "period": "2026-Q2", "value": 30_000_000_000, "currency": "USD"},
         observedAt="2026-07-31T00:00:00Z", fetchedAt="2026-08-13T00:00:00Z",
         source="sec", sourceReference="https://www.sec.gov/Archives/example", evidenceLevel="reported_financial",
     )])
-    monkeypatch.setattr("app.main.financial_overview_facts", lambda symbol, now, source: (
+    monkeypatch.setattr("app.service.financial_data.financial_overview_facts", lambda symbol, now, source: (
         {"symbol": symbol, "latestPeriod": "2026-Q2", "qualityFlags": []}, expected.facts, expected.sources,
     ))
 
@@ -161,8 +161,8 @@ def test_financial_overview_hides_xbrl_mapping_and_returns_official_facts(monkey
 
 
 def test_financial_metric_series_http_returns_complete_pagination_metadata(monkeypatch):
-    from app.models import PaginatedFactResult
-    monkeypatch.setattr("app.main.financial_metric_series_result", lambda symbol, metric, cursor, source, now: (
+    from app.domain.models import PaginatedFactResult
+    monkeypatch.setattr("app.service.financial_data.financial_metric_series_result", lambda symbol, metric, cursor, source, now: (
         PaginatedFactResult(
             facts=[], returnedCount=0, totalCount=4, nextCursor=None, truncated=False,
         )
@@ -180,7 +180,7 @@ def test_financial_metric_series_http_returns_complete_pagination_metadata(monke
 
 
 def test_valuation_evidence_http_returns_host_calculated_facts_and_method_states(monkeypatch):
-    from app.models import AtomicFact, ValuationEvidenceResult
+    from app.domain.models import AtomicFact, ValuationEvidenceResult
     expected = ValuationEvidenceResult(
         symbol="NVDA", authorizedComparables=["AMD", "AVGO", "QCOM"],
         comparables=[{"symbol": "AMD", "pe": 28}],
@@ -197,7 +197,7 @@ def test_valuation_evidence_http_returns_host_calculated_facts_and_method_states
             evidenceLevel="deterministic_valuation",
         )],
     )
-    monkeypatch.setattr("app.main.valuation_evidence_result", lambda symbol, now, quote, source: expected)
+    monkeypatch.setattr("app.service.financial_data.valuation_evidence_result", lambda symbol, now, quote, source, fundamentals: expected)
 
     response = TestClient(app).post("/v1/valuation-evidence", params={"symbol": "nvda"})
 
@@ -210,10 +210,12 @@ def test_valuation_evidence_http_returns_host_calculated_facts_and_method_states
 
 
 def test_valuation_evidence_result_combines_input_and_method_facts_once():
-    from app.context import valuation_evidence_result
-    from app.valuation import ValuationInput, calculate_valuation
+    from app.service.context import valuation_evidence_result
+    from app.domain.valuation import ValuationInput, calculate_valuation
 
     class ValuationSource:
+        name = "test-valuation"
+
         def fetch_with_market_price(self, symbol, price, observed_at):
             return calculate_valuation(ValuationInput(
                 symbol=symbol, industry="semiconductor", current_price=120,
@@ -232,11 +234,11 @@ def test_valuation_evidence_result_combines_input_and_method_facts_once():
 
 
 def test_filing_document_http_uses_sec_adapter_and_returns_bounded_page(monkeypatch):
-    monkeypatch.setattr("app.main.SecFilingSource.fetch", lambda self, symbol, filing_id: {
+    monkeypatch.setattr("app.service.financial_data.SecFilingSource.fetch", lambda self, symbol, filing_id: {
         "filingId": filing_id, "form": "10-Q", "filedAt": "2026-07-31",
         "sourceReference": "https://www.sec.gov/Archives/edgar/data/example.htm",
     })
-    monkeypatch.setattr("app.main.SecFilingSource.fetch_page", lambda self, filing, cursor: {
+    monkeypatch.setattr("app.service.financial_data.SecFilingSource.fetch_page", lambda self, filing, cursor: {
         **filing, "summary": "Revenue increased.", "contentHash": "a" * 64,
         "startByte": 0, "endByte": 127, "totalBytes": 400,
         "nextCursor": "128", "truncated": True,
@@ -275,11 +277,11 @@ def test_quote_batch_uses_fallback_without_exposing_provider_payload(monkeypatch
                 source_reference=f"https://example.com/{symbol}",
             )
 
-    monkeypatch.setitem(__import__("app.main", fromlist=["source_config"]).source_config, "quote", [
+    monkeypatch.setitem(__import__("app.service.financial_data", fromlist=["source_config"]).source_config, "quote", [
         {"name": "primary", "enabled": True, "priority": 10},
         {"name": "backup", "enabled": True, "priority": 20},
     ])
-    monkeypatch.setitem(__import__("app.source_config", fromlist=["SOURCE_CLASSES"]).SOURCE_CLASSES, "quote", {
+    monkeypatch.setitem(__import__("app.adapters.config", fromlist=["SOURCE_CLASSES"]).SOURCE_CLASSES, "quote", {
         "primary": FailedSource, "backup": BackupSource,
     })
     response = TestClient(app).post("/v1/quotes", json=["nvda", "amd"])
@@ -311,10 +313,10 @@ def test_quote_batch_refreshes_symbols_concurrently(monkeypatch):
                 source_reference=f"https://example.com/{symbol}",
             )
 
-    monkeypatch.setitem(__import__("app.main", fromlist=["source_config"]).source_config, "quote", [
+    monkeypatch.setitem(__import__("app.service.financial_data", fromlist=["source_config"]).source_config, "quote", [
         {"name": "quote", "enabled": True, "priority": 10},
     ])
-    monkeypatch.setitem(__import__("app.source_config", fromlist=["SOURCE_CLASSES"]).SOURCE_CLASSES, "quote", {
+    monkeypatch.setitem(__import__("app.adapters.config", fromlist=["SOURCE_CLASSES"]).SOURCE_CLASSES, "quote", {
         "quote": QuoteSource,
     })
 
@@ -351,11 +353,11 @@ def test_quote_batch_stops_at_first_healthy_source_and_skips_backups(monkeypatch
                 source_reference=f"https://backup.example.com/{symbol}",
             )
 
-    monkeypatch.setitem(__import__("app.main", fromlist=["source_config"]).source_config, "quote", [
+    monkeypatch.setitem(__import__("app.service.financial_data", fromlist=["source_config"]).source_config, "quote", [
         {"name": "primary", "enabled": True, "priority": 10},
         {"name": "backup", "enabled": True, "priority": 20},
     ])
-    monkeypatch.setitem(__import__("app.source_config", fromlist=["SOURCE_CLASSES"]).SOURCE_CLASSES, "quote", {
+    monkeypatch.setitem(__import__("app.adapters.config", fromlist=["SOURCE_CLASSES"]).SOURCE_CLASSES, "quote", {
         "primary": PrimarySource,
         "backup": BackupSource,
     })
@@ -398,11 +400,11 @@ def test_quote_batch_does_not_wait_for_a_slow_backup_source(monkeypatch):
                 source_reference=f"https://backup.example.com/{symbol}",
             )
 
-    monkeypatch.setitem(__import__("app.main", fromlist=["source_config"]).source_config, "quote", [
+    monkeypatch.setitem(__import__("app.service.financial_data", fromlist=["source_config"]).source_config, "quote", [
         {"name": "primary", "enabled": True, "priority": 10},
         {"name": "backup", "enabled": True, "priority": 20},
     ])
-    monkeypatch.setitem(__import__("app.source_config", fromlist=["SOURCE_CLASSES"]).SOURCE_CLASSES, "quote", {
+    monkeypatch.setitem(__import__("app.adapters.config", fromlist=["SOURCE_CLASSES"]).SOURCE_CLASSES, "quote", {
         "primary": PrimarySource,
         "backup": BackupSource,
     })
@@ -425,14 +427,14 @@ def test_quote_attempt_timeout_is_capped_for_the_page_critical_path(monkeypatch)
         def fetch(self, _symbol):
             return None
 
-    monkeypatch.setitem(__import__("app.main", fromlist=["source_config"]).source_config, "quote", [
+    monkeypatch.setitem(__import__("app.service.financial_data", fromlist=["source_config"]).source_config, "quote", [
         {"name": "any", "enabled": True, "priority": 10, "timeout_seconds": 8},
     ])
-    monkeypatch.setitem(__import__("app.source_config", fromlist=["SOURCE_CLASSES"]).SOURCE_CLASSES, "quote", {
+    monkeypatch.setitem(__import__("app.adapters.config", fromlist=["SOURCE_CLASSES"]).SOURCE_CLASSES, "quote", {
         "any": AnySource,
     })
 
-    assert [source.timeout for source in __import__("app.main", fromlist=["_quote_sources"])._quote_sources()] == [2.0]
+    assert [source.timeout for source in __import__("app.service.financial_data", fromlist=["_quote_sources"])._quote_sources()] == [2.0]
 
 
 def test_quote_attempt_timeout_keeps_a_tighter_configured_budget(monkeypatch):
@@ -443,14 +445,14 @@ def test_quote_attempt_timeout_keeps_a_tighter_configured_budget(monkeypatch):
         def fetch(self, _symbol):
             return None
 
-    monkeypatch.setitem(__import__("app.main", fromlist=["source_config"]).source_config, "quote", [
+    monkeypatch.setitem(__import__("app.service.financial_data", fromlist=["source_config"]).source_config, "quote", [
         {"name": "any", "enabled": True, "priority": 10, "timeout_seconds": 1},
     ])
-    monkeypatch.setitem(__import__("app.source_config", fromlist=["SOURCE_CLASSES"]).SOURCE_CLASSES, "quote", {
+    monkeypatch.setitem(__import__("app.adapters.config", fromlist=["SOURCE_CLASSES"]).SOURCE_CLASSES, "quote", {
         "any": AnySource,
     })
 
-    assert [source.timeout for source in __import__("app.main", fromlist=["_quote_sources"])._quote_sources()] == [1.0]
+    assert [source.timeout for source in __import__("app.service.financial_data", fromlist=["_quote_sources"])._quote_sources()] == [1.0]
 
 
 def test_quote_batch_does_not_starve_small_requests_behind_large_batch(monkeypatch):
@@ -482,10 +484,10 @@ def test_quote_batch_does_not_starve_small_requests_behind_large_batch(monkeypat
                 source_reference=f"https://example.com/{symbol}",
             )
 
-    monkeypatch.setitem(__import__("app.main", fromlist=["source_config"]).source_config, "quote", [
+    monkeypatch.setitem(__import__("app.service.financial_data", fromlist=["source_config"]).source_config, "quote", [
         {"name": "quote", "enabled": True, "priority": 10},
     ])
-    monkeypatch.setitem(__import__("app.source_config", fromlist=["SOURCE_CLASSES"]).SOURCE_CLASSES, "quote", {
+    monkeypatch.setitem(__import__("app.adapters.config", fromlist=["SOURCE_CLASSES"]).SOURCE_CLASSES, "quote", {
         "quote": QuoteSource,
     })
 
@@ -526,11 +528,11 @@ def test_quote_batch_treats_empty_response_as_gap_and_falls_back(monkeypatch):
                 source_reference=f"https://example.com/{symbol}",
             )
 
-    monkeypatch.setitem(__import__("app.main", fromlist=["source_config"]).source_config, "quote", [
+    monkeypatch.setitem(__import__("app.service.financial_data", fromlist=["source_config"]).source_config, "quote", [
         {"name": "primary", "enabled": True, "priority": 10},
         {"name": "backup", "enabled": True, "priority": 20},
     ])
-    monkeypatch.setitem(__import__("app.source_config", fromlist=["SOURCE_CLASSES"]).SOURCE_CLASSES, "quote", {
+    monkeypatch.setitem(__import__("app.adapters.config", fromlist=["SOURCE_CLASSES"]).SOURCE_CLASSES, "quote", {
         "primary": EmptySource, "backup": BackupSource,
     })
     response = TestClient(app).post("/v1/quotes", json=["nvda"])
@@ -555,10 +557,10 @@ def test_quote_batch_reports_gap_when_all_sources_empty(monkeypatch):
         def fetch(self, _symbol):
             return None
 
-    monkeypatch.setitem(__import__("app.main", fromlist=["source_config"]).source_config, "quote", [
+    monkeypatch.setitem(__import__("app.service.financial_data", fromlist=["source_config"]).source_config, "quote", [
         {"name": "primary", "enabled": True, "priority": 10},
     ])
-    monkeypatch.setitem(__import__("app.source_config", fromlist=["SOURCE_CLASSES"]).SOURCE_CLASSES, "quote", {
+    monkeypatch.setitem(__import__("app.adapters.config", fromlist=["SOURCE_CLASSES"]).SOURCE_CLASSES, "quote", {
         "primary": EmptySource,
     })
     response = TestClient(app).post("/v1/quotes", json=["nvda"])
@@ -613,7 +615,7 @@ def test_diagnostic_samples_are_safe_during_concurrent_quote_refresh(tmp_path):
 
 
 def test_document_url_rejects_non_http_and_non_public_addresses(monkeypatch):
-    monkeypatch.setattr("app.adapters.socket.getaddrinfo", lambda host, port, type=0: [
+    monkeypatch.setattr("app.adapters.sources.socket.getaddrinfo", lambda host, port, type=0: [
         (2, 1, 6, "", ("127.0.0.1", port)),
     ])
     for url in [
@@ -629,7 +631,7 @@ def test_document_url_rejects_non_http_and_non_public_addresses(monkeypatch):
 
 
 def test_document_url_normalizes_public_http_address(monkeypatch):
-    monkeypatch.setattr("app.adapters.socket.getaddrinfo", lambda host, port, type=0: [
+    monkeypatch.setattr("app.adapters.sources.socket.getaddrinfo", lambda host, port, type=0: [
         (2, 1, 6, "", ("93.184.216.34", port)),
     ])
     assert validate_document_url("HTTPS://Example.COM:443/news#fragment") == "https://example.com/news"
@@ -638,7 +640,7 @@ def test_document_url_normalizes_public_http_address(monkeypatch):
 def test_document_connection_uses_the_prevalidated_ip_without_resolving_hostname(monkeypatch):
     connected = []
     sentinel = object()
-    monkeypatch.setattr("app.adapters.socket.create_connection", lambda address, *args: (
+    monkeypatch.setattr("app.adapters.sources.socket.create_connection", lambda address, *args: (
         connected.append(address) or sentinel
     ))
     connection = _PinnedHTTPConnection("example.com", "93.184.216.34", 80, 1)
@@ -687,8 +689,8 @@ def test_document_redirect_revalidates_every_hop_and_sends_no_cookie_or_credenti
         def close(self):
             pass
 
-    monkeypatch.setattr("app.adapters._resolve_document_addresses", resolve)
-    monkeypatch.setattr("app.adapters._PinnedHTTPSConnection", Connection)
+    monkeypatch.setattr("app.adapters.sources._resolve_document_addresses", resolve)
+    monkeypatch.setattr("app.adapters.sources._PinnedHTTPSConnection", Connection)
 
     page = read_document_page("https://first.example/start", 0, 64, timeout=7)
 
@@ -725,10 +727,10 @@ def test_document_page_sends_byte_range_and_uses_provider_total(monkeypatch):
         def close(self):
             pass
 
-    monkeypatch.setattr("app.adapters._resolve_document_addresses", lambda url: (
+    monkeypatch.setattr("app.adapters.sources._resolve_document_addresses", lambda url: (
         url, ["93.184.216.34"], 443, "example.com",
     ))
-    monkeypatch.setattr("app.adapters._PinnedHTTPSConnection", Connection)
+    monkeypatch.setattr("app.adapters.sources._PinnedHTTPSConnection", Connection)
 
     page = read_document_page("https://example.com/filing", 65536, 65536)
 
@@ -758,10 +760,10 @@ def test_document_page_rejects_cursor_beyond_full_body(monkeypatch):
         def close(self):
             pass
 
-    monkeypatch.setattr("app.adapters._resolve_document_addresses", lambda url: (
+    monkeypatch.setattr("app.adapters.sources._resolve_document_addresses", lambda url: (
         url, ["93.184.216.34"], 443, "example.com",
     ))
-    monkeypatch.setattr("app.adapters._PinnedHTTPSConnection", Connection)
+    monkeypatch.setattr("app.adapters.sources._PinnedHTTPSConnection", Connection)
 
     try:
         read_document_page("https://example.com/filing", 65536, 65536)
@@ -791,10 +793,10 @@ def test_document_page_slices_full_body_when_provider_ignores_range(monkeypatch)
         def close(self):
             pass
 
-    monkeypatch.setattr("app.adapters._resolve_document_addresses", lambda url: (
+    monkeypatch.setattr("app.adapters.sources._resolve_document_addresses", lambda url: (
         url, ["93.184.216.34"], 443, "example.com",
     ))
-    monkeypatch.setattr("app.adapters._PinnedHTTPSConnection", Connection)
+    monkeypatch.setattr("app.adapters.sources._PinnedHTTPSConnection", Connection)
 
     page = read_document_page("https://example.com/filing", 65536, 65536)
 
@@ -839,10 +841,10 @@ def test_document_page_falls_back_to_next_pinned_ip_on_edge_rejection(monkeypatc
         def close(self):
             pass
 
-    monkeypatch.setattr("app.adapters._resolve_document_addresses", lambda url: (
+    monkeypatch.setattr("app.adapters.sources._resolve_document_addresses", lambda url: (
         url, ["203.0.113.10", "93.184.216.34"], 443, "example.com",
     ))
-    monkeypatch.setattr("app.adapters._PinnedHTTPSConnection", Connection)
+    monkeypatch.setattr("app.adapters.sources._PinnedHTTPSConnection", Connection)
 
     page = read_document_page("https://example.com/doc", 0, 64)
 
@@ -871,10 +873,10 @@ def test_document_page_raises_after_all_pinned_ips_rejected(monkeypatch):
         def close(self):
             pass
 
-    monkeypatch.setattr("app.adapters._resolve_document_addresses", lambda url: (
+    monkeypatch.setattr("app.adapters.sources._resolve_document_addresses", lambda url: (
         url, ["203.0.113.10", "198.51.100.20"], 443, "example.com",
     ))
-    monkeypatch.setattr("app.adapters._PinnedHTTPSConnection", Connection)
+    monkeypatch.setattr("app.adapters.sources._PinnedHTTPSConnection", Connection)
 
     try:
         read_document_page("https://example.com/doc", 0, 64)
@@ -885,7 +887,7 @@ def test_document_page_raises_after_all_pinned_ips_rejected(monkeypatch):
 
 
 def test_html_to_text_strips_script_and_style_noise():
-    from app.adapters import html_to_text
+    from app.adapters.sources import html_to_text
     payload = (
         b"<html><head><style>body { color: red; }</style></head>"
         b"<body><script>window.finNeoPageStart = Date.now();</script>"
@@ -895,7 +897,7 @@ def test_html_to_text_strips_script_and_style_noise():
 
 
 def test_html_to_text_drops_unclosed_script_at_truncation_boundary():
-    from app.adapters import html_to_text
+    from app.adapters.sources import html_to_text
     payload = (
         b"<p>Real article lead.</p>"
         b"<script>(function(){var tracker = 'unclosed because of byte cap';"

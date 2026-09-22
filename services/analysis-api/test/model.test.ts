@@ -9,14 +9,14 @@ import { defaultRuntimeSettings } from '@vibe-invest/contracts'
 import {
   createPiModel as createProductionPiModel,
   type AnalyzeInput, type ModelOptions, type ToolRuntime,
-} from '../src/model.js'
-import { createActiveBudget } from '../src/runtime-policy.js'
+} from '../src/service/agent-runtime/model.js'
+import { createActiveBudget } from '../src/service/runtime-policy.js'
 import {
   analysisModelTools, financialSpecialistTools, flatResearchTools, flatSubmitAnalysisReportTool,
-} from '../src/tools.js'
+} from '../src/service/tools.js'
 import {
   conversationResearchTools, conversationToolsForMessage, webSearchEvidenceTool,
-} from '../src/tools.js'
+} from '../src/service/tools.js'
 
 const facts = [{
   id: 'fact:nvda:price:2026-08-12',

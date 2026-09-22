@@ -1,7 +1,40 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { createResearchToolExecutor } from '../src/research-capability.js'
+import { createResearchToolExecutor } from '../src/service/research-capability.js'
+import { createToolRegistry, registeredToolDefinitions } from '../src/service/tool-registry.js'
+import { projectResearchView } from '../src/service/research-export.js'
+
+test('估值降级的市销率和逐标的缺口经过自由对话投影仍然可见', async () => {
+  const execute = createResearchToolExecutor({
+    getValuationEvidence: async (symbol) => ({
+      symbol, facts: [], currentMultiples: { ps: 20 },
+      methods: { relative: { status: 'unavailable', reason: 'missing_comparables_and_historical_anchor' } },
+      gaps: [{ capability: 'valuation_methods', reason: 'current_multiples_only' }],
+    }),
+  })({ threadId: 'valuation-fallback', knownFacts: new Map() })
+  const registry = createToolRegistry(registeredToolDefinitions)
+  const response = await execute('compare_securities', { symbols: ['NET', 'DDOG'] }, new AbortController().signal, async () => {})
+  const projected = registry.projectResult('compare_securities', response.result)
+  assert.deepEqual((projected.comparisons as Array<Record<string, unknown>>).map((row) => row.currentMultiples), [{ ps: 20 }, { ps: 20 }])
+  assert.deepEqual((projected.gaps as Array<Record<string, unknown>>).filter((gap) => gap.capability === 'valuation_methods'), [
+    { symbol: 'NET', capability: 'valuation_methods', reason: 'current_multiples_only' },
+    { symbol: 'DDOG', capability: 'valuation_methods', reason: 'current_multiples_only' },
+  ])
+  const fact = {
+    id: 'fact:NET:current-multiple:ps', type: 'valuation_multiple',
+    value: { method: 'ps', multiple: 20, formula: 'market_cap_usd / ttm_revenue_usd',
+      unit: 'multiple', inputFactIds: ['fact:market', 'fact:revenue'], financialPeriod: 'CY2026Q2' },
+    observedAt: '2026-09-18T20:00:00Z', fetchedAt: '2026-09-21T00:00:00Z',
+    source: 'deterministic-calculation', sourceReference: 'https://www.sec.gov/',
+  }
+  assert.deepEqual(projectResearchView(fact), fact)
+  const filingFact = { ...fact, type: 'filing_document', value: {
+    symbol: 'NET', filingId: 'test', summary: 'Cover page',
+    passages: ['Cover page', 'Item 1.01 Convertible notes financing agreement.'],
+  } }
+  assert.deepEqual(projectResearchView(filingFact), filingFact)
+})
 
 const news = {
   id: 'fact:news:1', type: 'news', value: { title: 'Product launch' },

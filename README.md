@@ -40,6 +40,19 @@ docker compose up --build -d --wait
 docker compose down
 ```
 
+## 代码结构
+
+项目按职责组织代码，四层共用现有运行服务：
+
+| 层 | 职责与位置 |
+| --- | --- |
+| `domain` | 业务规则与确定性计算：`packages/domain/src`；Python 的 `services/market-data/app/domain` |
+| `service` | 产品、模型与数据流程：`services/analysis-api/src/service`、`services/market-data/app/service` |
+| `api` | HTTP、MCP 与事件流协议；浏览器通过 `apps/web/src/api/client.ts` 调用 |
+| `db` | PostgreSQL 连接、SQL、事务、幂等与迁移：`packages/db/src` |
+
+外部模型和金融数据源由各服务的 `adapters` 封装。领域规则不访问网络或数据库；API 通过服务执行业务，数据库层在事务内应用领域计算。TypeScript 管理产品存储，Python 提供金融数据能力。
+
 ## 开发验证
 
 Node.js 要求 24 或更新版本。Python 服务使用仓库内虚拟环境：

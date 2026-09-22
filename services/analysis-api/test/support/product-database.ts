@@ -4,7 +4,7 @@ import type {
   ProfitProtectionTriggerRecord, RuntimeSettingsRepository,
   ToolProjectionRepository,
   ProductPosition,
-} from '@vibe-invest/product-dao'
+} from '@vibe-invest/db'
 import {
   aggregateModelTokenUsage, defaultRuntimeSettings, isTerminalAgentExecutionStatus,
   parseRuntimeSettingsUpdate,
@@ -78,9 +78,9 @@ export function createTestProductDatabase() {
     }>
   }>()
 
-  const portfolioEvents: import('@vibe-invest/product-dao').PortfolioEvent[] = []
+  const portfolioEvents: import('@vibe-invest/db').PortfolioEvent[] = []
   let eventSequence = 0
-  const pushEvent = (event: Omit<import('@vibe-invest/product-dao').PortfolioEvent, 'id' | 'createdAt'>) => {
+  const pushEvent = (event: Omit<import('@vibe-invest/db').PortfolioEvent, 'id' | 'createdAt'>) => {
     eventSequence += 1
     const recorded = {
       ...event,

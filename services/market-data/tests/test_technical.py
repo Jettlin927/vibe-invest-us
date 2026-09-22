@@ -1,7 +1,8 @@
 from datetime import datetime, timedelta, timezone
+import pytest
 
-from app.context import price_window_result, technical_evidence_result
-from app.models import DailyBar
+from app.service.context import price_window_result, technical_evidence_result
+from app.domain.models import DailyBar
 
 
 def bars(count: int):
@@ -21,6 +22,27 @@ class HistorySource:
 
     def fetch_range(self, symbol, start_date, end_date):
         return [bar for bar in self.values if start_date <= bar.date <= end_date]
+
+
+@pytest.mark.parametrize("first,second,expected", [
+    (bars(377)[-180:], bars(377), "backup"),
+    (bars(377)[-260:], bars(377), "primary"),
+    (bars(377)[-120:], bars(377)[-180:], "backup"),
+    (bars(377)[-180:], bars(376), "primary"),
+    (bars(377)[-180:], bars(377)[-100:] * 3, "primary"),
+])
+def test_technical_history_prefers_fresh_sufficient_coverage_then_source_priority(first, second, expected):
+    primary, backup = HistorySource(first), HistorySource(second)
+    primary.name, backup.name = "primary", "backup"
+    result = technical_evidence_result(
+        "NET", "2025-01-01", "2026-02-01", datetime(2026, 2, 2, tzinfo=timezone.utc),
+        [primary, backup],
+    )
+    selected = first if expected == "primary" else second
+    assert result.totalBarCount == len(selected)
+    assert result.structures["252d"].status == ("available" if len(selected) >= 252 else "unavailable")
+    assert result.facts[0].sourceReference == f"source://{expected}/NET/history"
+    assert len(result.sources) == 2
 
 
 def test_technical_evidence_contains_actual_scope_all_windows_and_host_calculations():

@@ -13,10 +13,10 @@ import {
   createRuntimeSettingsRepository,
   createToolProjectionRepository,
   migrate,
-} from '@vibe-invest/product-dao'
+} from '@vibe-invest/db'
 
 import { buildApp } from '../src/app.js'
-import { createPiModel, type ModelEvent, type ToolRuntime } from '../src/model.js'
+import { createPiModel, type ModelEvent, type ToolRuntime } from '../src/service/agent-runtime/model.js'
 
 const databaseUrl = process.env.TEST_DATABASE_URL
 const migrationDatabaseUrl = process.env.TEST_MIGRATION_DATABASE_URL

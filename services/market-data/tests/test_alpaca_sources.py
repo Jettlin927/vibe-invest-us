@@ -2,8 +2,8 @@ from datetime import timezone
 
 import pytest
 
-from app.adapters import AlpacaHistorySource, AlpacaNewsSource, AlpacaQuoteSource
-from app.source_config import build_sources, load_source_config
+from app.adapters.sources import AlpacaHistorySource, AlpacaNewsSource, AlpacaQuoteSource
+from app.adapters.config import build_sources, load_source_config
 
 
 def test_highest_success_rate_sources_are_first_by_default():
@@ -50,7 +50,7 @@ def test_alpaca_credentials_are_only_sent_as_headers(monkeypatch):
         captured.update(url=url, params=params, headers=headers, timeout=timeout)
         return b'{"symbol":"NVDA","trade":{"p":181.42,"t":"2026-08-12T14:30:00Z"}}'
 
-    monkeypatch.setattr("app.adapters._read", read)
+    monkeypatch.setattr("app.adapters.sources._read", read)
     quote = AlpacaQuoteSource(timeout=7).fetch("NVDA")
 
     assert captured["url"] == "https://data.alpaca.markets/v2/stocks/NVDA/trades/latest"

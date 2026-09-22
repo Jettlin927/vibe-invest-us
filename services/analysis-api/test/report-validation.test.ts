@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { validateReportCandidate } from '../src/report-validation.js'
+import { validateReportCandidate } from '@vibe-invest/domain/report-validation'
 
 const integratedSpecialistFields = { specialistStatuses: [], specialistReferences: [] }
 

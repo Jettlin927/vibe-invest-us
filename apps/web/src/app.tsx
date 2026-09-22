@@ -1,6 +1,8 @@
+import { productApi } from './api/client.js'
 import { DisclosureSection, useDisclosure } from './disclosure.js'
 import { useEffect, useId, useRef, useState, type ReactNode } from 'react'
 import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 
 import {
   aggregateModelTokenUsage, isProfitProtectionOverview, isRuntimeSettingsResponse, isSystemHealth,
@@ -226,28 +228,32 @@ export function App() {
   async function loadPortfolio(options: { quotesOnly?: boolean } = {}) {
     const generation = ++portfolioLoadGeneration.current
     let hasPortfolio = portfolioLoaded
+    let hasRefreshedPortfolio = false
     setPortfolioLoadFailed(false)
     setPortfolioRefreshing(true)
     // 只刷行情时跳过 stored 投影：它不带价格，先落地会让页面闪一下「不可用」。
-    const storedRequest = options.quotesOnly ? null : fetch('/api/portfolio/stored')
-    const refreshedRequest = fetch(options.quotesOnly ? '/api/portfolio?refresh=1' : '/api/portfolio').catch(() => null)
-    try {
-      const storedResponse = await storedRequest
-      const value: unknown = storedResponse && storedResponse.ok ? await storedResponse.json() : null
-      if (isPortfolioOverview(value) && generation === portfolioLoadGeneration.current) {
-        setPortfolio(value)
-        setPositions(value.positions.map(({ symbol, quantity, averageCost }) => ({ symbol, quantity, averageCost })))
-        setPortfolioLoaded(true)
-        hasPortfolio = true
+    const storedRequest = options.quotesOnly ? null : productApi.portfolio.stored()
+    const refreshedRequest = productApi.portfolio.overview(options.quotesOnly).catch(() => null)
+    const storedResult = (async () => {
+      try {
+        const storedResponse = await storedRequest
+        const value: unknown = storedResponse && storedResponse.ok ? await storedResponse.json() : null
+        if (isPortfolioOverview(value) && generation === portfolioLoadGeneration.current && !hasRefreshedPortfolio) {
+          setPortfolio(value)
+          setPositions(value.positions.map(({ symbol, quantity, averageCost }) => ({ symbol, quantity, averageCost })))
+          setPortfolioLoaded(true)
+          hasPortfolio = true
+        }
+      } catch {
+        // Older instances may not expose the stored projection route yet.
       }
-    } catch {
-      // Older instances may not expose the stored projection route yet.
-    }
+    })()
     try {
       const response = await refreshedRequest
       const value: unknown = response?.ok ? await response.json() : null
       if (!isPortfolioOverview(value)) throw new Error('portfolio_contract_invalid')
       if (generation !== portfolioLoadGeneration.current) return
+      hasRefreshedPortfolio = true
       setPortfolio(value)
       setPositions(value.positions.map(({ symbol, quantity, averageCost }) => ({ symbol, quantity, averageCost })))
       setPortfolioLoaded(true)
@@ -256,36 +262,43 @@ export function App() {
     } catch {
       if (generation === portfolioLoadGeneration.current) {
         setError('组合行情刷新失败')
-        if (!hasPortfolio) setPortfolioLoadFailed(true)
+        void storedResult.then(() => {
+          if (generation === portfolioLoadGeneration.current && !hasPortfolio) setPortfolioLoadFailed(true)
+        })
       }
     } finally {
       if (generation === portfolioLoadGeneration.current) setPortfolioRefreshing(false)
     }
     if (generation !== portfolioLoadGeneration.current) return
-    try {
-      const historyResponse = await fetch('/api/portfolio/history?limit=30')
-      const value: unknown = historyResponse.ok ? await historyResponse.json() : null
-      if (!isPortfolioHistoryResponse(value)) throw new Error('portfolio_history_contract_invalid')
-      if (generation === portfolioLoadGeneration.current) setPortfolioHistory(value.snapshots)
-    } catch {
-      if (generation === portfolioLoadGeneration.current) setError('组合权益历史读取失败')
-    }
-    if (generation !== portfolioLoadGeneration.current) return
-    try {
-      const eventsResponse = await fetch('/api/portfolio/events?limit=50')
-      if (eventsResponse.ok) {
-        const value = await eventsResponse.json() as { events?: PortfolioEvent[] }
-        if (generation === portfolioLoadGeneration.current) setPortfolioEvents(value.events ?? [])
-      }
-    } catch {
-      // Event ledger is supplementary to the portfolio projection.
-    }
-    if (generation !== portfolioLoadGeneration.current) return
-    await loadProfitProtection(generation)
+    // 行情请求完成快照写入后，再并行读取各项补充信息。
+    await Promise.all([
+      (async () => {
+        try {
+          const historyResponse = await productApi.portfolio.history()
+          const value: unknown = historyResponse.ok ? await historyResponse.json() : null
+          if (!isPortfolioHistoryResponse(value)) throw new Error('portfolio_history_contract_invalid')
+          if (generation === portfolioLoadGeneration.current) setPortfolioHistory(value.snapshots)
+        } catch {
+          if (generation === portfolioLoadGeneration.current) setError('组合权益历史读取失败')
+        }
+      })(),
+      (async () => {
+        try {
+          const eventsResponse = await productApi.portfolio.events()
+          if (eventsResponse.ok) {
+            const value = await eventsResponse.json() as { events?: PortfolioEvent[] }
+            if (generation === portfolioLoadGeneration.current) setPortfolioEvents(value.events ?? [])
+          }
+        } catch {
+          // Event ledger is supplementary to the portfolio projection.
+        }
+      })(),
+      loadProfitProtection(generation),
+    ])
   }
   async function loadProfitProtection(generation = portfolioLoadGeneration.current) {
     try {
-      const response = await fetch('/api/profit-protection')
+      const response = await productApi.portfolio.protection()
       const value: unknown = response.ok ? await response.json() : null
       if (isProfitProtectionOverview(value) && generation === portfolioLoadGeneration.current) {
         setProfitProtection(value)
@@ -295,14 +308,14 @@ export function App() {
     }
   }
   async function loadResearch() {
-    const response = await fetch('/api/research')
+    const response = await productApi.research.list()
     const next = (await response.json()).records as ResearchSummary[]
     setRecords(next)
     if (!selectedResearch && next[0] && !window.location.pathname.startsWith('/research/')) void openResearch(next[0].id)
   }
   async function loadConversations() {
     try {
-      const response = await fetch('/api/conversations')
+      const response = await productApi.conversations.list()
       if (!response.ok) return
       const next = await response.json() as { threads?: ConversationThread[] }
       setConversationThreads(next.threads ?? [])
@@ -312,7 +325,7 @@ export function App() {
     }
   }
   async function loadSettings() {
-    const value: unknown = await fetch('/api/settings').then((response) => response.json())
+    const value: unknown = await productApi.settings.read().then((response) => response.json())
     if (!isRuntimeSettingsResponse(value)) throw new Error('settings_contract_invalid')
     setModelConfigured(value.model.configured)
     setRuntimeSettings(value)
@@ -320,7 +333,7 @@ export function App() {
   async function loadTracking(): Promise<TrackingOverview | null> {
     setTrackingLoading(true)
     try {
-      const response = await fetch('/api/tracking?limit=100')
+      const response = await productApi.tracking.read()
       if (response.ok) {
         const next = await response.json() as TrackingOverview
         setTrackingAvailable(true)
@@ -344,7 +357,7 @@ export function App() {
   }
   useEffect(() => {
     void Promise.all([
-      fetch('/api/health').then((response) => response.json()).then((value: unknown) => {
+      productApi.health().then((response) => response.json()).then((value: unknown) => {
         if (!isSystemHealth(value)) throw new Error('health_contract_invalid')
         setHealth(value)
       }),
@@ -370,7 +383,7 @@ export function App() {
     const agent = selectedResearch?.mainAgent
     if (page !== 'research' || !agent || !('EventSource' in globalThis)
       || isTerminalAgentExecutionStatus(agent.status)) return
-    const source = new EventSource(`/api/agent-sessions/${agent.id}/events`, {
+    const source = productApi.analyses.events(agent.id, {
       withCredentials: false,
     })
     const refresh = () => { void openResearch(selectedResearch.id) }
@@ -387,31 +400,24 @@ export function App() {
     const form = event.currentTarget
     const data = new FormData(form)
     const symbol = String(data.get('symbol')).trim().toUpperCase()
-    const response = await fetch(`/api/positions/${symbol}`, {
-      method: 'PUT', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ quantity: Number(data.get('quantity')), averageCost: Number(data.get('averageCost')) }),
-    })
+    const response = await productApi.portfolio.reconcile(symbol, { quantity: Number(data.get('quantity')), averageCost: Number(data.get('averageCost')) })
     if (!response.ok) throw new Error('持仓保存失败')
     form.reset()
     await loadPortfolio()
   }
   async function removePosition(symbol: string) {
-    await fetch(`/api/positions/${symbol}`, { method: 'DELETE' })
+    await productApi.portfolio.remove(symbol)
     await loadPortfolio()
   }
   async function saveCash(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
     const cash = Number(new FormData(event.currentTarget).get('cash'))
-    const response = await fetch('/api/portfolio/cash', {
-      method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ cash }),
-    })
+    const response = await productApi.portfolio.adjustCash({ cash })
     if (!response.ok) { setError('现金保存失败'); return }
     await loadPortfolio()
   }
   async function buyPosition(symbol: string, quantity: number, price: number) {
-    const response = await fetch(`/api/positions/${symbol}/buy`, {
-      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ quantity, price }),
-    })
+    const response = await productApi.portfolio.buy(symbol, { quantity, price })
     if (!response.ok) {
       const body = await response.json().catch(() => null) as { error?: string } | null
       setError(body?.error === 'insufficient_cash' ? '加仓失败：现金不足，请先入金或降低买入金额。' : '加仓失败：请检查买入数量和成交价。')
@@ -421,9 +427,7 @@ export function App() {
     return true
   }
   async function reducePosition(symbol: string, quantity: number, price: number) {
-    const response = await fetch(`/api/positions/${symbol}/reduce`, {
-      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ quantity, price }),
-    })
+    const response = await productApi.portfolio.sell(symbol, { quantity, price })
     if (!response.ok) { setError('减仓失败：请检查卖出数量和成交价。'); return false }
     await loadPortfolio()
     return true
@@ -432,15 +436,13 @@ export function App() {
     anchorPrice: number; invalidationPrice: number; coreRatio: number; maxPortfolioWeight: number
     earningsDate: string | null; earningsRiskStartsAt: string | null
   }) {
-    const response = await fetch(`/api/positions/${symbol}/profit-protection`, {
-      method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(input),
-    })
+    const response = await productApi.portfolio.saveProtection(symbol, input)
     if (!response.ok) { setError('盈利保护计划保存失败，请检查基准价、失效价和比例。'); return false }
     await loadProfitProtection()
     return true
   }
   async function acknowledgeProfitProtectionTrigger(id: string) {
-    const response = await fetch(`/api/profit-protection/triggers/${id}/acknowledge`, { method: 'POST' })
+    const response = await productApi.portfolio.acknowledgeProtection(id)
     if (!response.ok) { setError('盈利保护提醒确认失败。'); return }
     await loadProfitProtection()
   }
@@ -459,10 +461,7 @@ export function App() {
     setAnalysisSubmitting(true)
     let response: Response
     try {
-      response = await fetch('/api/analyses', {
-        method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ symbol }),
-      })
+      response = await productApi.analyses.create({ symbol })
     } catch {
       setAnalysisSubmitting(false); setAnalysisStatus(''); setError('分析任务创建失败')
       return
@@ -484,7 +483,7 @@ export function App() {
     setAnalysisStages((current) => current.includes(stage) ? current : [...current, stage])
   }
   function streamAnalysis(sessionId: string, analysisId: string) {
-    const source = new EventSource(`/api/agent-sessions/${sessionId}/events`)
+    const source = productApi.analyses.events(sessionId)
     const eventNames = ['runtime_context', 'runtime_resume', 'runtime_follow_up', 'chat_completed', 'planning', 'running_model', 'running_tools', 'waiting_for_specialists', 'finalizing', 'financial_context', 'model_event', 'text_delta', 'model_completed', 'completed', 'partial', 'failed', 'stopping', 'stopped', 'interrupted', 'budget_exhausted']
     for (const name of eventNames) source.addEventListener(name, (event) => {
       const entry = JSON.parse((event as MessageEvent).data) as Record<string, unknown>
@@ -519,12 +518,12 @@ export function App() {
   }
   async function pollAnalysis(id: string) {
     for (let attempt = 0; attempt < 120; attempt += 1) {
-      const status = await fetch(`/api/analyses/${id}`).then((response) => response.json())
+      const status = await productApi.analyses.read(id).then((response) => response.json())
       setAnalysisStatus(status.status)
       addStage(status.status)
       if (isTerminalAgentExecutionStatus(status.status, status.terminal)) {
         if (status.status === 'failed' && typeof status.error === 'string') setError(friendlyError(status.error))
-        const researchResponse = await fetch(`/api/research/${id}`)
+        const researchResponse = await productApi.research.read(id)
         if (researchResponse.ok) setSelectedResearch(await researchResponse.json())
         await loadResearch()
         setActiveAnalysisId(null)
@@ -536,8 +535,7 @@ export function App() {
     setError('分析等待超时')
   }
   async function readResearch(id: string, reportVersionId?: string): Promise<ResearchRecord> {
-    const suffix = reportVersionId === undefined ? '' : `?reportVersionId=${encodeURIComponent(reportVersionId)}`
-    const response = await fetch(`/api/research/${encodeURIComponent(id)}${suffix}`)
+    const response = await productApi.research.read(id, reportVersionId)
     if (!response.ok) throw new Error('research_unavailable')
     const record = await response.json() as ResearchRecord
     if (record.id !== id) throw new Error('research_mismatch')
@@ -551,7 +549,7 @@ export function App() {
     if (selectedResearch?.id === id && (
       Array.isArray(selectedResearch.mainAgent?.events) || Array.isArray(selectedResearch.trace)
     )) return
-    const response = await fetch(`/api/research/${id}/trace`)
+    const response = await productApi.research.trace(id)
     if (!response.ok) return
     const audit = await response.json() as Pick<ResearchRecord, 'mainAgent' | 'specialistAgents'>
     setSelectedResearch((current) => current?.id === id ? { ...current, ...audit } : current)
@@ -561,7 +559,7 @@ export function App() {
     if (summary && summary.id !== selectedConversation?.id) {
       setSelectedConversation(summary); setConversationEvents([]); setConversationBusy(false)
     }
-    const response = await fetch(`/api/conversations/${id}`)
+    const response = await productApi.conversations.read(id)
     if (!response.ok) return
     const value = await response.json() as {
       thread?: ConversationThread; lifecycle?: { events?: ConversationEvent[] }; sources?: ConversationSource[]
@@ -573,8 +571,7 @@ export function App() {
   }
   function streamConversation(sessionId: string, threadId: string, afterSequence = 0) {
     if (!('EventSource' in globalThis)) return false
-    const suffix = afterSequence > 0 ? `?after=${afterSequence}` : ''
-    const source = new EventSource(`/api/conversations/${threadId}/events${suffix}`)
+    const source = productApi.conversations.events(threadId, afterSequence)
     const names = ['user_message', 'assistant_message', 'text_delta', 'chat_completed',
       'artifact_completed', 'tool_call', 'tool_result', 'running_model', 'running_tools',
       'completed', 'failed', 'stopped', 'interrupted']
@@ -610,10 +607,7 @@ export function App() {
     setConversationEvents([{ sequence: -Date.now(), type: 'user_message', message, messageId }])
     setPage('conversation')
     try {
-      const response = await fetch('/api/conversations', {
-        method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ message, messageId }),
-      })
+      const response = await productApi.conversations.create({ message, messageId })
       const result = await response.json() as ConversationThread
       if (!response.ok || !result.id) throw new Error('conversation_create_failed')
       setSelectedConversation(result)
@@ -638,10 +632,7 @@ export function App() {
       ...current, { sequence: -Date.now(), type: 'user_message', message, messageId },
     ])
     try {
-      const response = await fetch(`/api/conversations/${selectedConversation.id}/messages`, {
-        method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ message, messageId }),
-      })
+      const response = await productApi.conversations.send(selectedConversation.id, { message, messageId })
       const result = await response.json() as { sessionId?: string }
       if (!response.ok || !result.sessionId) throw new Error('conversation_send_failed')
       if (!streamConversation(result.sessionId, selectedConversation.id, afterSequence)) setConversationBusy(false)
@@ -654,15 +645,15 @@ export function App() {
     }
   }
   async function cancelConversation() {
-    if (selectedConversation) await fetch(`/api/conversations/${selectedConversation.id}/cancel`, { method: 'POST' })
+    if (selectedConversation) await productApi.conversations.cancel(selectedConversation.id)
   }
   async function cancelAnalysis() {
-    if (activeAnalysisId) await fetch(`/api/analyses/${activeAnalysisId}/cancel`, { method: 'POST' })
+    if (activeAnalysisId) await productApi.analyses.cancel(activeAnalysisId)
   }
   async function resumeResearch() {
     if (!selectedResearch) return
     setError('')
-    const response = await fetch(`/api/analyses/${selectedResearch.id}/resume`, { method: 'POST' })
+    const response = await productApi.analyses.resume(selectedResearch.id)
     const resumed = await response.json() as { sessionId?: string }
     if (!response.ok || !resumed.sessionId) { setError('研究恢复失败'); return }
     setActiveAnalysisId(selectedResearch.id)
@@ -682,14 +673,11 @@ export function App() {
     const baseReportVersion = Number(data.get('baseReportVersion'))
     if (!message) return
     setError('')
-    const response = await fetch(`/api/analyses/${selectedResearch.id}/messages`, {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
+    const response = await productApi.analyses.followUp(selectedResearch.id, {
         messageId: createMessageId(), message, updateReport,
         ...(Number.isInteger(baseReportVersion) && baseReportVersion > 0
           ? { baseReportVersion } : {}),
-      }),
-    })
+      })
     const result = await response.json() as { sessionId?: string }
     if (!response.ok || !result.sessionId) { setError('追问发送失败'); return }
     form.reset()
@@ -702,10 +690,7 @@ export function App() {
   async function reanalyzeResearch() {
     if (!selectedResearch) return
     setError('')
-    const response = await fetch('/api/analyses', {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ symbol: selectedResearch.symbol }),
-    })
+    const response = await productApi.analyses.create({ symbol: selectedResearch.symbol })
     const result = await response.json() as { analysisId?: string; sessionId?: string }
     if (!response.ok || !result.analysisId) { setError('重新分析创建失败'); return }
     setActiveAnalysisId(result.analysisId)
@@ -718,10 +703,7 @@ export function App() {
     event.preventDefault()
     if (!selectedResearch) return
     const data = new FormData(event.currentTarget)
-    const response = await fetch(`/api/research/${selectedResearch.id}`, {
-      method: 'PATCH', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ starred: data.get('starred') === 'on', note: String(data.get('note') ?? '') }),
-    })
+    const response = await productApi.research.update(selectedResearch.id, { starred: data.get('starred') === 'on', note: String(data.get('note') ?? '') })
     setSelectedResearch({ ...selectedResearch, ...await response.json() })
     await loadResearch()
   }
@@ -731,7 +713,7 @@ export function App() {
     setError('')
     setDeletingResearchId(id)
     try {
-      const response = await fetch(`/api/research/${id}`, { method: 'DELETE' })
+      const response = await productApi.research.remove(id)
       if (!response.ok) {
         setError(`研究删除失败：HTTP ${response.status}`)
         return
@@ -745,9 +727,7 @@ export function App() {
   async function watchSymbol(symbol: string, note: string) {
     let response: Response
     try {
-      response = await fetch(`/api/tracking/watchlist/${encodeURIComponent(symbol)}`, {
-        method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ note }),
-      })
+      response = await productApi.tracking.save(symbol, { note })
     } catch {
       setError('添加自选失败')
       return false
@@ -757,7 +737,7 @@ export function App() {
     return true
   }
   async function unwatchSymbol(symbol: string) {
-    const response = await fetch(`/api/tracking/watchlist/${encodeURIComponent(symbol)}`, { method: 'DELETE' })
+    const response = await productApi.tracking.remove(symbol)
     if (!response.ok) { setError('移除自选失败'); return }
     await loadTracking()
   }
@@ -765,7 +745,7 @@ export function App() {
     if (trackingScanning || trackingPollingRunId.current) return
     setError(''); setTrackingScanning(true)
     try {
-      const response = await fetch('/api/tracking/scans', { method: 'POST' })
+      const response = await productApi.tracking.startScan()
       if (!response.ok) {
         const body = await response.json().catch(() => null) as { error?: string } | null
         if (body?.error === 'tracking_run_active') {
@@ -792,7 +772,7 @@ export function App() {
     setTrackingScanning(true)
     try {
       for (let attempt = 0; attempt < 240; attempt += 1) {
-        const scanResponse = await fetch(`/api/tracking/scans/${runId}`)
+        const scanResponse = await productApi.tracking.scan(runId)
         if (!scanResponse.ok) throw new Error('tracking_scan_read_failed')
         const scan = await scanResponse.json() as TrackingRunDetail
         if (scan.status !== 'running') {
@@ -953,7 +933,11 @@ function ConversationPage({ initialMessage, threads, thread, events, busy, onOpe
 function AssistantMarkdown({ text }: { text: string }) {
   return <div className="markdown-body"><ReactMarkdown
     skipHtml
-    components={{ img: ({ alt }) => <span>{alt ?? ''}</span> }}
+    remarkPlugins={[remarkGfm]}
+    components={{
+      img: ({ alt }) => <span>{alt ?? ''}</span>,
+      table: ({ children }) => <div className="markdown-table-scroll" role="region" aria-label="表格，可横向滚动" tabIndex={0}><table>{children}</table></div>,
+    }}
   >{text}</ReactMarkdown></div>
 }
 
@@ -1705,7 +1689,7 @@ function ResearchReport({ record, onUpdate, onDelete, deleting, onResume, onFoll
       {stale && <p className="data-warning">当前报告可能过期，追问会同时提供报告时与当前持仓语境。</p>}
       <button type="submit">发送追问</button>
     </form>
-    <form className="research-meta" onSubmit={(event) => void onUpdate(event)}><label><input type="checkbox" name="starred" defaultChecked={record.starred} /> 标记这份研究</label><label>个人备注<textarea name="note" defaultValue={record.note ?? ''} /></label><div><button type="submit">保存备注</button><a className="quiet" href={`/api/research/${record.id}/export`} download>导出研究 JSON</a>{isTerminalAgentExecutionStatus(record.status, record.terminal) && <button type="button" className="quiet" onClick={() => void onReanalyze()}>重新分析 {record.symbol}</button>}{['stopped', 'interrupted'].includes(record.status) && <button type="button" className="quiet" onClick={() => void onResume()}>恢复研究</button>}<button type="button" className="quiet danger" disabled={deleting} onClick={() => void onDelete()}>{deleting ? '正在删除…' : '删除记录'}</button></div></form>
+    <form className="research-meta" onSubmit={(event) => void onUpdate(event)}><label><input type="checkbox" name="starred" defaultChecked={record.starred} /> 标记这份研究</label><label>个人备注<textarea name="note" defaultValue={record.note ?? ''} /></label><div><button type="submit">保存备注</button><a className="quiet" href={productApi.research.exportUrl(record.id)} download>导出研究 JSON</a>{isTerminalAgentExecutionStatus(record.status, record.terminal) && <button type="button" className="quiet" onClick={() => void onReanalyze()}>重新分析 {record.symbol}</button>}{['stopped', 'interrupted'].includes(record.status) && <button type="button" className="quiet" onClick={() => void onResume()}>恢复研究</button>}<button type="button" className="quiet danger" disabled={deleting} onClick={() => void onDelete()}>{deleting ? '正在删除…' : '删除记录'}</button></div></form>
   </article>
 }
 
@@ -1944,26 +1928,21 @@ function SettingsPage({ health, modelConfigured, settings, onReload }: {
     event.preventDefault()
     const data = new FormData(event.currentTarget)
     const body = Object.fromEntries(fields.map(({ key }) => [key, Number(data.get(key))]))
-    await writeSettings('Runtime 设置保存失败', '/api/settings', {
-      method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
-    })
+    await writeSettings('Runtime 设置保存失败', () => productApi.settings.update(body))
   }
   async function restoreDefaults() {
-    await writeSettings('Runtime 设置恢复失败', '/api/settings/defaults', { method: 'POST' })
+    await writeSettings('Runtime 设置恢复失败', () => productApi.settings.restore())
   }
   async function restoreField(key: keyof RuntimeSettings) {
-    await writeSettings('Runtime 设置恢复失败', '/api/settings', {
-      method: 'PUT', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ [key]: settings!.defaults[key] }),
-    })
+    await writeSettings('Runtime 设置恢复失败', () => productApi.settings.update({ [key]: settings!.defaults[key] }))
   }
-  async function writeSettings(message: string, url: string, init: RequestInit) {
+  async function writeSettings(message: string, write: () => Promise<Response>) {
     if (submittingRef.current) return
     submittingRef.current = true
     setSubmitting(true)
     setWriteError('')
     try {
-      const response = await fetch(url, init)
+      const response = await write()
       if (!response.ok) {
         const body = await response.json().catch(() => null) as { error?: unknown } | null
         const detail = typeof body?.error === 'string' ? `：${body.error}` : ''

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { createProfitProtection } from '../src/profit-protection.js'
+import { createProfitProtection } from '../src/service/profit-protection.js'
 
 function createRepository() {
   const plans = new Map<string, Array<Record<string, unknown>>>()

@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import type { QuoteSnapshot } from '../src/financial-data-client.js'
-import { createQuoteCache, pricesFromSnapshots } from '../src/quote-cache.js'
+import type { QuoteSnapshot } from '../src/adapters/financial-data-client.js'
+import { createQuoteCache, pricesFromSnapshots } from '../src/service/quote-cache.js'
 
 function quote(symbol: string, price: number, source = 'tencent'): QuoteSnapshot {
   return {

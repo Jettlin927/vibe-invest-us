@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { JSDOM } from 'jsdom'
 import React from 'react'
-import { cleanup, fireEvent, render, waitFor, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { defaultRuntimeSettings } from '@vibe-invest/contracts'
 
@@ -258,7 +258,7 @@ test('研究对话把主 Agent 回答渲染为 Markdown 结构', async () => {
       thread,
       lifecycle: { events: [{
         sequence: 1, type: 'chat_completed',
-        text: '## 给你的实操含义\n\n- **别去猜底**：用关键位判断。\n\n<button>危险</button>\n\n![外部图](https://attacker.example/holding.png)',
+        text: '## 给你的实操含义\n\n- **别去猜底**：用关键位判断。\n\n| 情景 | 假设 | 对应股价 |\n|---|---|---:|\n| 基准 | 保持增长 | **278–324** |\n| 乐观 | 增长加速 | 442–491 |\n\n<button>危险</button>\n\n![外部图](https://attacker.example/holding.png)',
       }] },
     })
     throw new Error(`unexpected_fetch:${url}`)
@@ -270,6 +270,11 @@ test('研究对话把主 Agent 回答渲染为 Markdown 结构', async () => {
   const log = await view.findByRole('log', { name: '研究对话内容' })
   assert.equal(log.querySelector('h2')?.textContent, '给你的实操含义')
   assert.equal(log.querySelector('ul li strong')?.textContent, '别去猜底')
+  const table = within(log).getByRole('table')
+  assert.equal(within(table).getAllByRole('columnheader').length, 3)
+  assert.equal(within(table).getAllByRole('row').length, 3)
+  assert.equal(table.querySelector('td strong')?.textContent, '278–324')
+  assert.equal(table.parentElement?.getAttribute('tabindex'), '0')
   const assistantMarkdown = log.querySelector('.markdown-body')!
   assert.equal(assistantMarkdown.textContent?.includes('##'), false)
   assert.equal(assistantMarkdown.textContent?.includes('**'), false)
@@ -652,6 +657,83 @@ test('完整行情仍在刷新时持仓页先显示已保存的持仓', async ()
       finishRefresh(Response.json(portfolioResponse(storedPositions, 500)))
     }
     if (!historyFinished) finishHistory(Response.json({ currency: 'USD', snapshots: [] }))
+  }
+})
+
+test('已保存持仓迟到时先展示返回的行情，迟到结果不覆盖行情', async () => {
+  setupDom()
+  const positions = [{ symbol: 'NVDA', quantity: 10, averageCost: 100 }]
+  let finishStored!: (response: Response) => void
+  const storedRequest = new Promise<Response>((resolve) => { finishStored = resolve })
+  globalThis.fetch = async (input) => {
+    const url = String(input)
+    if (url === '/api/settings') return Response.json(settingsResponse())
+    if (url === '/api/research') return Response.json({ records: [] })
+    if (url === '/api/portfolio/stored') return storedRequest
+    if (url === '/api/portfolio') return Response.json(portfolioResponse(positions, 500))
+    if (url === '/api/portfolio/history?limit=30') return Response.json({ currency: 'USD', snapshots: [] })
+    return Response.json({ events: [], threads: [] })
+  }
+  const view = render(<App />)
+  const user = userEvent.setup({ document: window.document })
+  await user.click(view.getByRole('button', { name: '我的持仓' }))
+  try {
+    await view.findByText('US$1,500.00')
+    assert.equal((view.getByRole('button', { name: '刷新行情' }) as HTMLButtonElement).disabled, false)
+    await act(async () => { finishStored(Response.json(storedPortfolioResponse(positions, 500))) })
+    assert.ok(view.getByText('US$1,500.00'))
+    assert.equal(view.queryByText('1 项行情缺失，组合汇总已关闭。'), null)
+  } finally {
+    finishStored(Response.json(storedPortfolioResponse(positions, 500)))
+  }
+})
+
+test('权益历史等待行情快照后与账本和盈利保护并发读取，慢请求和失败不阻塞其他信息', async () => {
+  setupDom()
+  const positions = [{ symbol: 'NVDA', quantity: 10, averageCost: 100 }]
+  let finishRefresh!: (response: Response) => void
+  const refreshedRequest = new Promise<Response>((resolve) => { finishRefresh = resolve })
+  let failHistory!: (reason: Error) => void
+  const historyRequest = new Promise<Response>((_resolve, reject) => { failHistory = reject })
+  let finishEvents!: (response: Response) => void
+  const eventsRequest = new Promise<Response>((resolve) => { finishEvents = resolve })
+  const requested: string[] = []
+  globalThis.fetch = async (input) => {
+    const url = String(input)
+    requested.push(url)
+    if (url === '/api/settings') return Response.json(settingsResponse())
+    if (url === '/api/research') return Response.json({ records: [] })
+    if (url === '/api/portfolio/stored') return Response.json(storedPortfolioResponse(positions, 500))
+    if (url === '/api/portfolio') return refreshedRequest
+    if (url === '/api/portfolio/history?limit=30') return historyRequest
+    if (url === '/api/portfolio/events?limit=50') return eventsRequest
+    if (url === '/api/profit-protection') return Response.json({
+      summary: { planned: 1, triggered: 0, reviewRequired: 0, dataGap: 0 }, positions: [], triggers: [],
+    })
+    return Response.json({ events: [], threads: [] })
+  }
+  const view = render(<App />)
+  const user = userEvent.setup({ document: window.document })
+  await user.click(view.getByRole('button', { name: '我的持仓' }))
+  await view.findAllByText('NVDA')
+  assert.equal(requested.includes('/api/portfolio/history?limit=30'), false)
+  finishRefresh(Response.json(portfolioResponse(positions, 500)))
+  try {
+    await view.findByText('1/1 已制定')
+    assert.ok(requested.includes('/api/portfolio/history?limit=30'))
+    assert.ok(requested.includes('/api/portfolio/events?limit=50'))
+    finishEvents(Response.json({ events: [{
+      id: 'event-1', kind: 'cash_adjustment', symbol: null, quantity: null, price: null,
+      amount: 500, realizedProfitLoss: null, note: '', createdAt: '2026-08-24T20:00:00Z',
+    }] }))
+    await view.findByText('最近 1 条 · 持仓与现金变化')
+    failHistory(new Error('history_unavailable'))
+    await view.findByText('组合权益历史读取失败')
+    assert.ok(view.getByText('1/1 已制定'))
+    assert.ok(view.getByText('最近 1 条 · 持仓与现金变化'))
+  } finally {
+    finishEvents(Response.json({ events: [] }))
+    failHistory(new Error('history_unavailable'))
   }
 })
 

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { createActiveBudget, createConcurrencyGate, raceWithAbort } from '../src/runtime-policy.js'
+import { createActiveBudget, createConcurrencyGate, raceWithAbort } from '../src/service/runtime-policy.js'
 
 test('并发槽拒绝预先取消的等待者且不会泄漏槽位', async () => {
   const gate = createConcurrencyGate()

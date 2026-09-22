@@ -5,7 +5,7 @@ import {
   checkSchema, createAgentEventRepository, createAnalysisRepository, createPool,
   createPortfolioRepository, createRuntimeSettingsRepository, createToolProjectionRepository,
   createWorkbenchRepository, createResearchLibraryRepository, migrate,
-} from '@vibe-invest/product-dao'
+} from '@vibe-invest/db'
 import { buildApp } from '../src/app.js'
 
 const databaseUrl = process.env.TEST_DATABASE_URL

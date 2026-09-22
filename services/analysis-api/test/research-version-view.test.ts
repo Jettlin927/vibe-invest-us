@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { randomUUID } from 'node:crypto'
-import { createPool, createAnalysisRepository, createAgentEventRepository, createRuntimeSettingsRepository, createToolProjectionRepository, createPortfolioRepository, checkSchema } from '@vibe-invest/product-dao'
+import { createPool, createAnalysisRepository, createAgentEventRepository, createRuntimeSettingsRepository, createToolProjectionRepository, createPortfolioRepository, checkSchema } from '@vibe-invest/db'
 import { buildApp } from '../src/app.js'
 
 test('指定历史报告显示冻结正文、事实和时间，未知版本不能回落最新报告', {skip: !process.env.TEST_DATABASE_URL}, async () => {

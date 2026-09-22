@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { randomUUID } from 'node:crypto'
-import { createPool, createResearchLibraryRepository } from '@vibe-invest/product-dao'
-import { createResearchLibrary } from '../src/research-library.js'
+import { createPool, createResearchLibraryRepository } from '@vibe-invest/db'
+import { createResearchLibrary } from '../src/service/research-library.js'
 
 test('历史检索覆盖研究和封存对话，分页且隐藏内部事件和凭据', { skip: !process.env.TEST_DATABASE_URL }, async () => {
   const pool = createPool(process.env.TEST_DATABASE_URL!)

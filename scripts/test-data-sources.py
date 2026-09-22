@@ -12,7 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "services" / "market-data"))
 
-from app.source_config import build_sources, load_source_config  # noqa: E402
+from app.adapters.config import build_sources, load_source_config  # noqa: E402
 
 
 def load_env(path: Path) -> None:

@@ -30,7 +30,7 @@ services:
         condition: service_healthy
     environment:
       MIGRATION_DATABASE_URL: postgresql://vibe_invest_migration:${MIGRATION_DATABASE_PASSWORD:-local-migration-only}@postgres:5432/vibe_invest
-    command: ["npm", "run", "migrate", "--workspace", "@vibe-invest/product-dao"]
+    command: ["npm", "run", "migrate", "--workspace", "@vibe-invest/db"]
     restart: "no"
 
   financial-data:

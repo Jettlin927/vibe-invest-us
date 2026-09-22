@@ -11,7 +11,7 @@ import {
   type PiAgentAdapterStream,
   type PiAgentAdapterStreamFn,
   type PiAgentAdapterTool,
-} from '../src/agent-runtime/pi-agent-adapter.js'
+} from '../src/adapters/pi-agent-adapter.js'
 
 type AssistantMessage = Extract<PiAgentAdapterMessage, { role: 'assistant' }>
 

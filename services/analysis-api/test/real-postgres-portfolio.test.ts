@@ -9,10 +9,10 @@ import {
   createPortfolioRepository,
   createRuntimeSettingsRepository,
   createToolProjectionRepository,
-} from '@vibe-invest/product-dao'
+} from '@vibe-invest/db'
 
 import { buildApp } from '../src/app.js'
-import type { ModelEvent } from '../src/model.js'
+import type { ModelEvent } from '../src/service/agent-runtime/model.js'
 
 const databaseUrl = process.env.TEST_DATABASE_URL
 

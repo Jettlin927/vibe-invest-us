@@ -1,15 +1,10 @@
+import { productApi, readWorkbenchResponse as read } from './api/client.js'
 import { useEffect, useState } from 'react'
 
 type Block = { type: 'positions' | 'stances' | 'watchlist' | 'research'; title?: string; symbols?: string[] }
 type SavedPage = { id: string; title: string; blocks: Block[]; revision: number; updatedAt: string }
 type Row = { id?: string; symbol: string; quantity?: number; averageCost?: number; note?: string; stance?: string; conditions?: string[]; sourceThreadId?: string | null; sourceRecordId?: string | null; sourceRecordKind?: 'research' | 'conversation' | null; sourceReportVersionId?: string | null; status?: string; updatedAt?: string; createdAt?: string; report?: { title?: string }; sources?: Array<{ href: string; label?: string }> }
 const labels = { positions: '持仓', stances: '研究立场', watchlist: '自选', research: '研究记录' }
-async function read(url: string, body?: unknown) {
-  const response = await fetch(url, body ? { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) } : undefined)
-  if (!response.ok) throw new Error(`读取或保存失败（${response.status}）`)
-  return response.json()
-}
-
 export function WorkbenchPage({ pageId, onOpen }: { pageId?: string; onOpen: (id?: string) => void }) {
   const [pages, setPages] = useState<SavedPage[]>([])
   const [page, setPage] = useState<SavedPage | null>(null)
@@ -26,7 +21,7 @@ export function WorkbenchPage({ pageId, onOpen }: { pageId?: string; onOpen: (id
   useEffect(() => {
     let active = true
     setLoading(true); setError(''); setEditing(false); setPage(null)
-    void read(pageId ? `/api/workbench/pages/${encodeURIComponent(pageId)}` : '/api/workbench/pages').then((value) => {
+    void read(pageId ? productApi.workbench.page(pageId) : productApi.workbench.pages()).then((value) => {
       if (!active) return
       if (pageId) { setPage(value.page); setVersions(value.versions) } else setPages(value.pages)
     }).catch((cause) => { if (active) setError(String(cause.message)) }).finally(() => { if (active) setLoading(false) })
@@ -36,11 +31,11 @@ export function WorkbenchPage({ pageId, onOpen }: { pageId?: string; onOpen: (id
     if (!page) return
     let active = true
     const types = [...new Set(page.blocks.map((block) => block.type))]
-    const endpoints = { positions: ['/api/portfolio/stored', 'positions'], stances: ['/api/workbench/stances', 'stances'], watchlist: ['/api/tracking?limit=100', 'watchlist'], research: ['/api/research', 'records'] }
+    const loaders = { positions: [productApi.portfolio.stored, 'positions'], stances: [productApi.workbench.stances, 'stances'], watchlist: [productApi.tracking.read, 'watchlist'], research: [productApi.research.list, 'records'] } as const
     setData({}); setGaps([])
     void Promise.all(types.map(async (type) => {
-      const [url, field] = endpoints[type]
-      try { const value = await read(url); if (active) setData((previous) => ({ ...previous, [type]: value[field] })) }
+      const [load, field] = loaders[type]
+      try { const value = await read(load()); if (active) setData((previous) => ({ ...previous, [type]: value[field] })) }
       catch { if (active) setGaps((previous) => [...previous, labels[type]]) }
     }))
     return () => { active = false }
@@ -56,8 +51,8 @@ export function WorkbenchPage({ pageId, onOpen }: { pageId?: string; onOpen: (id
     try {
       const operationId = Array.from(crypto.getRandomValues(new Uint8Array(16)), (value) => value.toString(16).padStart(2, '0')).join('')
       const value = revision !== undefined && page
-        ? await read(`/api/workbench/pages/${encodeURIComponent(page.id)}/restore`, { operationId, revision })
-        : await read('/api/workbench/pages', { operationId, ...(page ? { id: page.id } : {}), title, blocks: blocks.map((block) => ({ ...block, ...(block.symbols ? { symbols: [...new Set(block.symbols.map((symbol) => symbol.trim()).filter(Boolean))] } : {}) })) })
+        ? await read(productApi.workbench.restore(page.id, { operationId, revision }))
+        : await read(productApi.workbench.save({ operationId, ...(page ? { id: page.id } : {}), title, blocks: blocks.map((block) => ({ ...block, ...(block.symbols ? { symbols: [...new Set(block.symbols.map((symbol) => symbol.trim()).filter(Boolean))] } : {}) })) }))
       setEditing(false)
       if (value.page.id !== pageId) onOpen(value.page.id)
       else setRefresh((value) => value + 1)

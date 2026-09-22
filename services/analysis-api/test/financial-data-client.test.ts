@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import test from 'node:test'
 
-import { createFinancialDataClient } from '../src/financial-data-client.js'
+import { createFinancialDataClient } from '../src/adapters/financial-data-client.js'
 
 test('OpenAPI 定义 Financial Data 健康契约', async () => {
   const contract = JSON.parse(
@@ -173,6 +173,7 @@ test('TS 客户端读取基本面高层工具并完整保留分页元数据', as
           comparables: [{ symbol: 'AMD', pe: 28 }],
           currentMultiples: { pe: 30 }, historicalRanges: { pe: [18, 34] },
           methods: { dcf: { status: 'unavailable', reason: 'not_implemented' } },
+          gaps: [{ capability: 'valuation_methods', reason: 'current_multiples_only' }],
           facts: [fact], sources: [] }
       : request.url?.includes('financial-overview')
       ? { overview: { symbol: 'NVDA', latestPeriod: '2026-Q2' }, facts: [fact], sources: [] }
@@ -200,6 +201,7 @@ test('TS 客户端读取基本面高层工具并完整保留分页元数据', as
     comparables: [{ symbol: 'AMD', pe: 28 }],
     currentMultiples: { pe: 30 }, historicalRanges: { pe: [18, 34] },
     methods: { dcf: { status: 'unavailable', reason: 'not_implemented' } },
+    gaps: [{ capability: 'valuation_methods', reason: 'current_multiples_only' }],
     facts: [fact], sources: [],
   })
   assert.match(requests.join('\n'), /financial-metric-series.*metric=revenue_yoy.*cursor=2/)

@@ -21,7 +21,8 @@ test('生产存储只使用 Product DAO 和 PostgreSQL', async () => {
     'services/analysis-api/src',
     'apps/web/src',
     'packages/contracts/src',
-    'packages/product-dao/src',
+    'packages/domain/src',
+    'packages/db/src',
   ].map((path) => join(repositoryRoot, path))
   const files = (await Promise.all(productionRoots.map(sourceFiles))).flat()
   const contents = await Promise.all(files.map(async (path) => ({ path, text: await readFile(path, 'utf8') })))
@@ -29,7 +30,7 @@ test('生产存储只使用 Product DAO 和 PostgreSQL', async () => {
   for (const { path, text } of contents) {
     const controlledMigrationFile = path.endsWith('/sqlite-migration.ts') || path.endsWith('/sqlite-migration-cli.ts')
     if (!controlledMigrationFile) assert.doesNotMatch(text, /sqlite|DatabaseSync|DATABASE_PATH|\.db\b/i, path)
-    if (!path.includes('/packages/product-dao/')) {
+    if (!path.includes('/packages/db/')) {
       assert.doesNotMatch(text, /from ['"]pg['"]|\.query\s*\(/, path)
     }
     if (controlledMigrationFile) {

@@ -6,11 +6,11 @@ import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import test from 'node:test'
 
-import { createAgentEventRepository, createAnalysisRepository, createPool, createRuntimeSettingsRepository, migrate } from '@vibe-invest/product-dao'
+import { createAgentEventRepository, createAnalysisRepository, createPool, createRuntimeSettingsRepository, migrate } from '@vibe-invest/db'
 
 import { buildApp } from '../src/app.js'
-import { executeMigration, planMigration, verifyMigration } from '../src/sqlite-migration.js'
-import { checkSchema, createPortfolioRepository } from '@vibe-invest/product-dao'
+import { executeMigration, planMigration, verifyMigration } from '../src/service/sqlite-migration.js'
+import { checkSchema, createPortfolioRepository } from '@vibe-invest/db'
 
 const migrationUrl = process.env.TEST_MIGRATION_DATABASE_URL
 const databaseUrl = process.env.TEST_DATABASE_URL

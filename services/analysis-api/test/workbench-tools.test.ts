@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { toolRegistry } from '../src/tool-registry.js'
+import { toolRegistry } from '../src/service/tool-registry.js'
 
 test('对话按意图开放历史读取与业务写入，普通研究不获得写工具', () => {
   const names = (message: string) => toolRegistry.projectConversation({ userMessage: message }).map(t => t.name)

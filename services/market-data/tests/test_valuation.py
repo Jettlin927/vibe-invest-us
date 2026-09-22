@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 
-from app.valuation import ValuationInput, calculate_valuation, valuation_evidence
-from app.adapters import COMPARABLES
+from app.domain.valuation import ValuationInput, calculate_valuation, valuation_evidence
+from app.adapters.sources import COMPARABLES
 
 
 def test_semiconductor_uses_pe_and_ev_to_ebitda_comparables():

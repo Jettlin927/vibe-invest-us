@@ -7,7 +7,7 @@ import {
   createToolRegistry,
   registeredToolDefinitions,
   type RegisteredToolDefinition,
-} from '../src/tool-registry.js'
+} from '../src/service/tool-registry.js'
 
 function definition(
   name: string,
@@ -178,6 +178,19 @@ test('自由对话普通闲聊不投影研究工具', () => {
     registry.projectConversation({ userMessage: '测试测试' }).map(({ name }) => name),
     [],
   )
+})
+
+test('中文 NET 原始首问和做空追问保留研究补查能力，不把比较好当成股票比较', () => {
+  const registry = createToolRegistry(registeredToolDefinitions)
+  const initial = '来判断一下NET这个票的后续行情，乐观价格， 基准价格， 悲观价格。如果要进场的话， 什么位置才是比较好的赔率？'
+  for (const userMessage of [initial, '那如果是做空呢？什么价格赔率最好？']) {
+    const names = registry.projectConversation({ userMessage, scopeMessages: [initial] }).map(({ name }) => name)
+    for (const tool of ['get_research_context', 'get_company_dossier', 'get_market_structure', 'search_evidence', 'read_evidence']) {
+      assert.ok(names.includes(tool), `${userMessage}: missing ${tool}`)
+    }
+    assert.equal(names.includes('compare_securities'), false)
+    assert.equal(names.includes('record_portfolio_trade'), false)
+  }
 })
 
 test('条件 Web Search 由 Registry 声明 main/conversation 权限但不进入常规投影', () => {

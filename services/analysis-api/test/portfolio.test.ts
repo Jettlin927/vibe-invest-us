@@ -5,8 +5,8 @@ import { join } from 'node:path'
 import test from 'node:test'
 
 import { buildApp } from '../src/app.js'
-import type { QuoteSnapshot } from '../src/financial-data-client.js'
-import { createQuoteCache, pricesFromSnapshots } from '../src/quote-cache.js'
+import type { QuoteSnapshot } from '../src/adapters/financial-data-client.js'
+import { createQuoteCache, pricesFromSnapshots } from '../src/service/quote-cache.js'
 import { createTestProductDatabase } from './support/product-database.js'
 
 const healthyFinancialData = async () => ({

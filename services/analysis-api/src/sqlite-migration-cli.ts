@@ -1,4 +1,4 @@
-import { executeMigration, planMigration, verifyMigration } from './sqlite-migration.js'
+import { executeMigration, planMigration, verifyMigration } from './service/sqlite-migration.js'
 
 const [command] = process.argv.slice(2)
 const source = process.env.LEGACY_SQLITE_PATH

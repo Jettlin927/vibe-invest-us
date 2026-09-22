@@ -11,8 +11,9 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/server.js",
     "migrate:sqlite": "tsx src/sqlite-migration-cli.ts",
-    "pretest": "npm run build --workspace @vibe-invest/product-dao",
+    "pretest": "npm run build --workspace @vibe-invest/domain && npm run build --workspace @vibe-invest/db",
     "test": "tsx --test --test-concurrency=1 test/**/*.test.ts",
+    "eval:agent-runtime": "tsx eval/agent-runtime/run.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
@@ -21,10 +22,11 @@
     "@fastify/static": "10.1.3",
     "@modelcontextprotocol/sdk": "1.30.0",
     "@vibe-invest/contracts": "0.1.0",
-    "@vibe-invest/product-dao": "0.1.0",
+    "@vibe-invest/db": "0.1.0",
     "ajv": "^8.20.0",
     "fastify": "5.11.3",
-    "zod": "4.4.3"
+    "zod": "4.4.3",
+    "@vibe-invest/domain": "0.1.0"
   },
   "devDependencies": {
     "@types/node": "24.7.2",

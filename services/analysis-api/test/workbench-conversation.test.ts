@@ -5,9 +5,9 @@ import {
   checkSchema, createAgentEventRepository, createAnalysisRepository, createConversationRepository,
   createPool, createPortfolioRepository, createRuntimeSettingsRepository, createToolProjectionRepository,
   createWorkbenchRepository, createResearchLibraryRepository, migrate,
-} from '@vibe-invest/product-dao'
+} from '@vibe-invest/db'
 import { buildApp } from '../src/app.js'
-import type { FreeConversationInput, ModelEvent, ConversationToolExecutor } from '../src/model.js'
+import type { FreeConversationInput, ModelEvent, ConversationToolExecutor } from '../src/service/agent-runtime/model.js'
 
 const databaseUrl = process.env.TEST_DATABASE_URL
 const migrationUrl = process.env.TEST_MIGRATION_DATABASE_URL

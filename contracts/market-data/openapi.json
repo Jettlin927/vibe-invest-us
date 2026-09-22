@@ -1868,6 +1868,14 @@
             "type": "array",
             "title": "Sources",
             "default": []
+          },
+          "gaps": {
+            "items": {
+              "$ref": "#/components/schemas/DataGap"
+            },
+            "type": "array",
+            "title": "Gaps",
+            "default": []
           }
         },
         "type": "object",

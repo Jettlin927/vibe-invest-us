@@ -6,9 +6,9 @@ import test from 'node:test'
 
 import { fauxAssistantMessage, fauxToolCall } from '@earendil-works/pi-ai'
 
-import { createPiModel, type ModelEvent } from '../src/model.js'
+import { createPiModel, type FreeConversationInput, type ModelEvent } from '../src/service/agent-runtime/model.js'
 import { buildApp as buildProductionApp } from '../src/app.js'
-import { analysisModelTools, newsSpecialistTools } from '../src/tools.js'
+import { analysisModelTools, newsSpecialistTools } from '../src/service/tools.js'
 import { createTestProductDatabase } from './support/product-database.js'
 
 const testDatabases = new Map<string, ReturnType<typeof createTestProductDatabase>>()
@@ -288,6 +288,36 @@ test('自由对话省略式追问只继承最近 ticker scope 并由当前消息
     ['get_research_context'],
     ['get_market_structure'],
   ])
+  await app.close()
+})
+
+test('NET 中文首问与做空追问通过真实对话服务继承标的并执行补查', async () => {
+  const symbols: unknown[] = []
+  const model = {
+    ...fakeModel(),
+    async *analyzeConversation(input: FreeConversationInput): AsyncGenerator<ModelEvent> {
+      const names = input.tools.map(({ name }) => name)
+      assert.ok(names.includes('get_market_structure'))
+      assert.ok(names.includes('read_evidence'))
+      assert.equal(names.includes('compare_securities'), false)
+      const fetched = await input.executeTool('get_research_context', {}, input.signal ?? new AbortController().signal, async () => {})
+      assert.equal(fetched.isError, false)
+      symbols.push(fetched.result.symbol)
+      yield { type: 'chat_completed', text: '已取得当前标的资料', operationId: `${input.executionId}:done` }
+    },
+  }
+  const app = await makeApp(`conversation-net-${crypto.randomUUID()}`, model)
+  const created = await app.inject({ method: 'POST', url: '/api/conversations', payload: {
+    message: '来判断一下NET这个票的后续行情，乐观价格，基准价格，悲观价格。如果要进场的话，什么位置才是比较好的赔率？',
+  } })
+  const id = created.json().id
+  await waitForConversation(app, id, 'completed')
+  const followUp = await app.inject({ method: 'POST', url: `/api/conversations/${id}/messages`, payload: {
+    message: '那如果是做空呢？什么价格赔率最好？',
+  } })
+  assert.equal(followUp.statusCode, 202)
+  await waitForConversation(app, id, 'completed')
+  assert.deepEqual(symbols, ['NET', 'NET'])
   await app.close()
 })
 
