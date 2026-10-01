@@ -1406,6 +1406,17 @@
             ],
             "title": "Price"
           },
+          "previous_close": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Previous Close"
+          },
           "observed_at": {
             "anyOf": [
               {

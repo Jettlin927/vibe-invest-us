@@ -134,3 +134,19 @@ def test_quote_normalizes_market_cap_in_usd(monkeypatch, source, separator, coun
         fields[35] = "USD"
     monkeypatch.setattr("app.adapters.sources._read", lambda *args, **kwargs: ('v="' + separator.join(fields) + '"').encode())
     assert source().fetch("NET").market_cap == 2_000_000_000
+
+
+@pytest.mark.parametrize("source,separator,count,price_index,close_index", [
+    (SinaQuoteSource, ",", 36, 1, 26),
+    (TencentQuoteSource, "~", 71, 3, 4),
+])
+@pytest.mark.parametrize("raw_close,expected", [("95", 95), ("", None), ("0", None), ("nan", None)])
+def test_quote_preserves_previous_close_without_losing_price(monkeypatch, source, separator, count, price_index, close_index, raw_close, expected):
+    fields = [""] * count
+    fields[price_index] = "100"
+    fields[close_index] = raw_close
+    fields[3 if separator == "," else 30] = "2026-09-18 16:00:00"
+    monkeypatch.setattr("app.adapters.sources._read", lambda *args, **kwargs: ('v="' + separator.join(fields) + '"').encode())
+    quote = source().fetch("NET")
+    assert quote.price == 100
+    assert quote.previous_close == expected

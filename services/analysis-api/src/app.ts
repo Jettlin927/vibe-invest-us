@@ -2,6 +2,7 @@ import Fastify from 'fastify'
 import fastifyStatic from '@fastify/static'
 import { createApplicationServices, type ApplicationDependencies } from './service/application.js'
 import { registerPortfolioMcp } from './api/portfolio-mcp.js'
+import { registerFinancialDataMcp } from './api/financial-data-mcp.js'
 import { registerSystemRoutes } from './api/system.js'
 import { registerWorkbenchRoutes } from './api/workbench.js'
 import { registerPortfolioRoutes } from './api/portfolio.js'
@@ -14,6 +15,7 @@ import { registerResearchRoutes } from './api/research.js'
 type AppDependencies = ApplicationDependencies & {
   staticDir?: string
   portfolioMcpToken?: string
+  financialDataMcpToken?: string
   migrationVerificationToken?: string
 }
 
@@ -21,6 +23,7 @@ export function buildApp(dependencies: AppDependencies) {
   const app = Fastify({ logger: false })
   const services = createApplicationServices(dependencies)
   registerPortfolioMcp(app, services.portfolio, dependencies.portfolioMcpToken)
+  registerFinancialDataMcp(app, services.financialData, dependencies.financialDataMcpToken)
   app.addHook('onClose', () => services.close())
   app.addHook('onReady', () => services.initialize())
   if (dependencies.staticDir) {

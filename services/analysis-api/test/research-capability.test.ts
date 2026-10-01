@@ -5,6 +5,32 @@ import { createResearchToolExecutor } from '../src/service/research-capability.j
 import { createToolRegistry, registeredToolDefinitions } from '../src/service/tool-registry.js'
 import { projectResearchView } from '../src/service/research-export.js'
 
+test('自由研究报价直接读取当前批量行情并保留观测时间与来源', async () => {
+  const calls: Array<{ symbols: string[]; force: boolean | undefined }> = []
+  const execute = createResearchToolExecutor({
+    fetchMarketQuotes: async (symbols, _signal, options) => {
+      calls.push({ symbols, force: options?.force })
+      return {
+        snapshots: [
+          { symbol: 'SPY', price: 701, previousClose: 700, observedAt: '2026-09-24T13:30:00Z', source: 'tencent', degraded: false, sources: [] },
+          { symbol: 'QQQ', price: null, previousClose: null, observedAt: null, source: null, degraded: true, sources: [] },
+        ],
+        fetchedAt: Date.parse('2026-09-24T13:30:01Z'), cached: false,
+      }
+    },
+  })({ threadId: 'quotes', knownFacts: new Map() })
+  const result = await execute('get_market_quotes', { symbols: ['spy', 'QQQ'] }, new AbortController().signal, async () => {})
+  assert.equal(result.isError, false)
+  assert.deepEqual(calls, [{ symbols: ['SPY', 'QQQ'], force: true }])
+  assert.equal(result.result.fetchedAt, '2026-09-24T13:30:01.000Z')
+  assert.deepEqual(result.result.gaps, [{ capability: 'quote', symbol: 'QQQ', reason: 'quote_unavailable' }])
+  const projected = createToolRegistry(registeredToolDefinitions).projectResult('get_market_quotes', result.result)
+  assert.deepEqual(projected.quotes, [
+    { symbol: 'SPY', price: 701, previousClose: 700, observedAt: '2026-09-24T13:30:00Z', source: 'tencent', degraded: false },
+    { symbol: 'QQQ', degraded: true },
+  ])
+})
+
 test('估值降级的市销率和逐标的缺口经过自由对话投影仍然可见', async () => {
   const execute = createResearchToolExecutor({
     getValuationEvidence: async (symbol) => ({

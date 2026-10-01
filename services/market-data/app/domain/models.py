@@ -9,6 +9,7 @@ class Quote(BaseModel):
     observed_at: datetime
     source_reference: str
     market_cap: Optional[float] = None
+    previous_close: Optional[float] = None
 
 
 class DailyBar(BaseModel):
@@ -212,6 +213,7 @@ class FinancialContext(BaseModel):
 class QuoteSnapshot(BaseModel):
     symbol: str
     price: Optional[float] = None
+    previous_close: Optional[float] = None
     observed_at: Optional[datetime] = None
     source: Optional[str] = None
     degraded: bool = False

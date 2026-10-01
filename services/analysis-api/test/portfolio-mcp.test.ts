@@ -9,6 +9,7 @@ import { createPortfolio } from '../src/service/portfolio.js'
 
 const token = 'portfolio-test-token-at-least-32-characters'
 const databaseUrl = process.env.TEST_DATABASE_URL
+const migrationUrl = process.env.TEST_MIGRATION_DATABASE_URL
 
 test('MCP 默认关闭，认证和浏览器来源检查先于账本访问', async () => {
   const pool = createPool('postgresql://unused:unused@127.0.0.1:1/unused')
@@ -28,9 +29,9 @@ test('MCP 默认关闭，认证和浏览器来源检查先于账本访问', asyn
   await pool.end()
 })
 
-test('真实 MCP HTTP + PostgreSQL：买卖、校准、现金、并发重试、冲突与重启读回', { skip: !databaseUrl }, async () => {
+test('真实 MCP HTTP + PostgreSQL：买卖、校准、现金、并发重试、冲突与重启读回', { skip: !databaseUrl || !migrationUrl }, async () => {
   assert.match(new URL(databaseUrl!).pathname, /test/, '只能使用隔离测试数据库')
-  await migrate(databaseUrl!)
+  await migrate(migrationUrl!)
   const pool = createPool(databaseUrl!)
   const repository = createPortfolioRepository(pool)
   const prefix = `mcp-test-${Date.now()}`

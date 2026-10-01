@@ -48,6 +48,9 @@ export type PortfolioOverview = {
   positions: Array<ProductPosition & {
     costAmount: number
     marketPrice: number | null
+    /** 行情相对上一交易日收盘价的每股涨跌额和涨跌幅。 */
+    dailyChange: number | null
+    dailyReturn: number | null
     marketValue: number | null
     unrealizedProfitLoss: number | null
     unrealizedReturn: number | null
@@ -70,15 +73,20 @@ export type PortfolioEquitySnapshot = {
   dailyReturn: number | null
 }
 
-export function calculatePortfolioOverview(positions: ProductPosition[], cash: number, marketPrices: Record<string, number>): PortfolioOverview {
+export function calculatePortfolioOverview(positions: ProductPosition[], cash: number, marketPrices: Record<string, number>, previousCloses: Record<string, number | null> = {}): PortfolioOverview {
   const values = positions.map((position) => {
     const observedPrice = marketPrices[position.symbol]
     const marketPrice = Number.isFinite(observedPrice) && observedPrice! >= 0 ? observedPrice! : null
+    const observedClose = previousCloses[position.symbol]
+    const previousClose = typeof observedClose === 'number' && Number.isFinite(observedClose) && observedClose > 0 ? observedClose : null
+    const dailyChange = marketPrice === null || previousClose === null ? null : marketPrice - previousClose
     const costAmount = position.quantity * position.averageCost
     const marketValue = marketPrice === null ? null : position.quantity * marketPrice
     const unrealizedProfitLoss = marketValue === null ? null : marketValue - costAmount
     return {
       ...position, costAmount, marketPrice, marketValue, unrealizedProfitLoss,
+      dailyChange,
+      dailyReturn: dailyChange === null ? null : dailyChange / previousClose!,
       unrealizedReturn: unrealizedProfitLoss === null || costAmount === 0 ? null : unrealizedProfitLoss / costAmount,
       portfolioWeight: null,
     }

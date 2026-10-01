@@ -72,6 +72,15 @@ export function selectFreeResearchToolNames(
   if (/(?:我的持仓|当前持仓|组合|仓位|集中度|风险暴露|portfolio|exposure|position weight)/i.test(userMessage)) {
     requested.push('get_portfolio_exposure')
   }
+  const currentMarketQuestion = /(?:行情|股价|报价|现价|价格|实时|市场|大盘|美股|盘中|今晚|今天晚上|回调)/.test(userMessage)
+  const positionDecision = /(?:减仓|加仓|观望)/.test(userMessage)
+  if (currentMarketQuestion || positionDecision) requested.push('get_market_quotes')
+  if (/(?:市场|大盘|美股|盘中|今晚|今天晚上|回调)/.test(userMessage)) {
+    requested.push('get_market_structure')
+  }
+  if (positionDecision || (currentMarketQuestion && /(?:仓位|持仓|组合)/.test(userMessage))) {
+    requested.push('get_workspace_context', 'get_portfolio_exposure')
+  }
   const hasSymbol = extractFreeResearchSymbols([userMessage, ...scopeMessages]).length > 0
   if (hasSymbol && /(?:行情|目标价|乐观|悲观|基准|情景|赔率|进场|做多|做空|多空)/.test(userMessage)) {
     requested.push('get_research_context', 'get_company_dossier', 'get_market_structure', 'search_evidence', 'read_evidence')

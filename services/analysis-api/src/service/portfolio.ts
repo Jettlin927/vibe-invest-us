@@ -4,9 +4,9 @@ export { isValidSymbol, normalizeSymbol } from '@vibe-invest/domain/portfolio'
 export type { PortfolioOverview, PortfolioEquitySnapshot, QuoteFreshness } from '@vibe-invest/domain/portfolio'
 
 export function createPortfolio(repository: PortfolioRepository) {
-  async function overview(marketPrices: Record<string, number>): Promise<PortfolioOverview> {
+  async function overview(marketPrices: Record<string, number>, previousCloses: Record<string, number | null> = {}): Promise<PortfolioOverview> {
     const [positions, cash] = await Promise.all([repository.list(), repository.cash()])
-    return calculatePortfolioOverview(positions, cash, marketPrices)
+    return calculatePortfolioOverview(positions, cash, marketPrices, previousCloses)
   }
 
   return {

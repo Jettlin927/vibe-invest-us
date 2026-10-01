@@ -140,9 +140,10 @@ test('真实 v12 历史 Tool 事件升级到 v25 后经 DAO、HTTP 与 SSE 原�
     try {
       assert.deepEqual((await events.list(sessionId, 0)).map(({ payload }) => payload),
         [callEvent, resultEvent])
-      const research = await fetch(`${baseUrl}/api/research/${analysisId}`)
-        .then((response) => response.json())
-      assert.deepEqual(research.trace, [callEvent, resultEvent])
+      const research = await fetchResearchWithTrace(baseUrl, analysisId)
+      assert.deepEqual(research.mainAgent.events.map(({ sequence, createdAt, ...payload }: Record<string, unknown>) => payload), [callEvent, resultEvent])
+      assert.deepEqual(research.mainAgent.events.map(({ sequence }: { sequence: number }) => sequence), [1, 2])
+      assert.ok(research.mainAgent.events.every(({ createdAt }: { createdAt: string }) => Number.isFinite(Date.parse(createdAt))))
       const response = await fetch(`${baseUrl}/api/agent-sessions/${sessionId}/events`)
       const reader = response.body!.getReader()
       const sse = await readThroughReader(reader, 'event: tool_result')
@@ -232,6 +233,7 @@ test('真实 OpenAI HTTP provider 经生产 Pi bridge 在 Turn 边界原子封�
   concurrency: false,
 }, async () => {
   const providerRequests: Array<Record<string, unknown>> = []
+  const toolActivity: Array<{ name: string; startedAt: number; completedAt: number }> = []
   const provider = createServer(async (request, response) => {
     const body = await readJsonBody(request)
     providerRequests.push(body)
@@ -312,7 +314,10 @@ test('真实 OpenAI HTTP provider 经生产 Pi bridge 在 Turn 边界原子封�
     financialDataHealth: async () => ({ service: 'financial-data', status: 'ok' }),
     fetchFinancialContext: async (symbol) => ({ symbol, gaps: [], facts: [], financials: {} }),
     getTechnicalEvidence: async (symbol) => {
+      const activity = { name: 'evidence', startedAt: performance.now(), completedAt: 0 }
+      toolActivity.push(activity)
       await new Promise((resolve) => setTimeout(resolve, 60))
+      activity.completedAt = performance.now()
       return {
         symbol, actualStart: '2025-01-01', actualEnd: '2026-01-20', totalBarCount: 260,
         structures: {}, indicators: {}, volatility: {}, drawdown: {}, volumePrice: {},
@@ -320,7 +325,10 @@ test('真实 OpenAI HTTP provider 经生产 Pi bridge 在 Turn 边界原子封�
       }
     },
     getPriceWindow: async (symbol) => {
+      const activity = { name: 'window', startedAt: performance.now(), completedAt: 0 }
+      toolActivity.push(activity)
       await new Promise((resolve) => setTimeout(resolve, 10))
+      activity.completedAt = performance.now()
       return { symbol, actualStart: '2025-01-01', actualEnd: '2026-01-20', totalBarCount: 260,
         sampling: 'weekly', returnedCount: 0, totalCount: 0, nextCursor: null,
         truncated: false, facts: [] }
@@ -338,8 +346,8 @@ test('真实 OpenAI HTTP provider 经生产 Pi bridge 在 Turn 边界原子封�
   }).then((response) => response.json()) as { analysisId: string; sessionId: string }
   try {
     const sseResponse = await fetch(`${baseUrl}/api/agent-sessions/${created.sessionId}/events`)
-    const sse = await readThrough(sseResponse, 'event: partial')
-    await waitForAgentStatus(events, created.sessionId, 'partial')
+    const sse = await readThrough(sseResponse, 'event: completed')
+    await waitForAgentStatus(events, created.sessionId, 'completed')
 
     assert.equal(providerRequests.length, 4, JSON.stringify(providerRequests.map((request) => ({
       tools: providerToolNames(request),
@@ -366,8 +374,7 @@ test('真实 OpenAI HTTP provider 经生产 Pi bridge 在 Turn 边界原子封�
     assert.ok(runtime.modelRequests.every((item: { projectionVersion?: number }) => (
       Number.isInteger(item.projectionVersion) && item.projectionVersion! > 0
     )))
-    const research = await fetch(`${baseUrl}/api/research/${created.analysisId}`)
-      .then((response) => response.json()) as {
+    const research = await fetchResearchWithTrace(baseUrl, created.analysisId) as {
         specialistAgents: Array<{ id: string; domain: string; events: Array<Record<string, unknown>> }>
       }
     const technicalAgent = research.specialistAgents.find(({ domain }) => domain === 'technical')!
@@ -427,6 +434,10 @@ test('真实 OpenAI HTTP provider 经生产 Pi bridge 在 Turn 边界原子封�
     const publicAudit = JSON.stringify({ runtime, specialistRuntime, sse })
     assert.doesNotMatch(publicAudit, /hidden_specialist_tool/)
     assert.doesNotMatch(publicAudit, /allowedStages|allowedRoles|visibilityConditions/)
+    assert.equal(toolActivity.length, 2)
+    assert.ok(toolActivity[0]!.startedAt < toolActivity[1]!.completedAt
+      && toolActivity[1]!.startedAt < toolActivity[0]!.completedAt)
+    toolActivity.length = 0
 
     const serialSettings = await fetch(`${baseUrl}/api/settings`, {
       method: 'PUT', headers: { 'content-type': 'application/json' },
@@ -437,9 +448,8 @@ test('真实 OpenAI HTTP provider 经生产 Pi bridge 在 Turn 边界原子封�
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ symbol: `S${crypto.randomUUID().replaceAll('-', '').slice(0, 8)}` }),
     }).then((response) => response.json()) as { analysisId: string; sessionId: string }
-    await waitForAgentStatus(events, serialCreated.sessionId, 'partial')
-    const serialResearch = await fetch(`${baseUrl}/api/research/${serialCreated.analysisId}`)
-      .then((response) => response.json()) as {
+    await waitForAgentStatus(events, serialCreated.sessionId, 'completed')
+    const serialResearch = await fetchResearchWithTrace(baseUrl, serialCreated.analysisId) as {
         specialistAgents: Array<{ id: string; domain: string }>
       }
     const serialTechnical = serialResearch.specialistAgents.find(({ domain }) => domain === 'technical')!
@@ -461,8 +471,13 @@ test('真实 OpenAI HTTP provider 经生产 Pi bridge 在 Turn 边界原子封�
     const serialEvidence = serialResultFor('get_technical_evidence')
     const serialWindow = serialResultFor('get_price_window')
     assert.notEqual(serialEvidence.startedAt, serialWindow.startedAt)
-    assert.ok(new Date(serialEvidence.completedAt).getTime()
-      <= new Date(serialWindow.startedAt).getTime())
+    // 审计落库可以晚于工具释放并发槽，串行约束应验证实际 I/O 区间。
+    assert.equal(toolActivity.length, 2)
+    assert.ok(toolActivity.find(({ name }) => name === 'evidence')!.completedAt
+      <= toolActivity.find(({ name }) => name === 'window')!.startedAt)
+    for (const result of [serialEvidence, serialWindow]) {
+      assert.ok(Date.parse(result.startedAt) <= Date.parse(result.completedAt))
+    }
     const serialLedger = await events.list(serialTechnical.id, 0)
     assert.deepEqual(serialLedger.filter(({ payload }) => payload.type === 'tool_call'
       && ['get_technical_evidence', 'get_price_window'].includes(String(payload.name)))
@@ -544,9 +559,9 @@ test('真实 PostgreSQL 与真实 HTTP SSE 断线后先 catch-up 再继续 live'
     assert.match(catchUp, /persisted-while-disconnected/)
 
     finishModel!()
-    const live = await readThroughReader(secondReader, 'event: partial')
+    const live = await readThroughReader(secondReader, 'event: completed')
     assert.match(live, /event: model_completed/)
-    assert.match(live, /event: partial/)
+    assert.match(live, /event: completed/)
     const cursorSequence = Number(lastEventId!.split(':').at(-1))
     const ids = [...`${catchUp}${live}`.matchAll(/id: ([^\n]+)/g)].map((match) => match[1]!)
     assert.ok(ids.every((id) => id.startsWith(`${created.sessionId}:`)
@@ -630,7 +645,7 @@ test('真实 PostgreSQL 重启恢复在 API、Session ledger 与 SSE 中一致�
     const resumedBody = await resumed.json() as { sessionId: string; executionId: string; generation: number }
     assert.equal(resumedBody.sessionId, sessionId)
     assert.equal(resumedBody.generation, 2)
-    await waitForAgentStatus(events, sessionId, 'partial')
+    await waitForAgentStatus(events, sessionId, 'completed')
     assert.equal(modelCalls, 1)
     const lifecycle = await events.primaryLifecycle(analysisId)
     assert.equal(lifecycle?.execution.id, resumedBody.executionId)
@@ -756,7 +771,7 @@ test('真实 PostgreSQL 取消在 PG、HTTP 与 SSE reconnect 统一为 stopping
     await waitForAgentStatus(events, created.sessionId, 'stopped')
 
     const status = await fetch(`${baseUrl}/api/analyses/${created.analysisId}`).then((response) => response.json())
-    const research = await fetch(`${baseUrl}/api/research/${created.analysisId}`).then((response) => response.json())
+    const research = await fetchResearchWithTrace(baseUrl, created.analysisId)
     assert.equal(status.status, 'stopped')
     assert.equal(research.status, 'stopped')
     assert.equal(research.mainAgent.status, 'stopped')
@@ -837,7 +852,7 @@ test('真实 PostgreSQL 取消在 PG、HTTP 与 SSE reconnect 统一为 stopping
     })
     const publicCancellation = JSON.stringify({ research, replay, oldRuntime })
     assert.doesNotMatch(publicCancellation, /hidden_tool|secret-raw-argument|allowedStages|开放条件/)
-    const cancellationTrace = research.trace.filter(
+    const cancellationTrace = research.mainAgent.events.filter(
       (entry: { toolCallId?: string }) => entry.toolCallId === waitingCallId,
     )
     assert.deepEqual(cancellationTrace.map((entry: { type: string }) => entry.type),
@@ -954,8 +969,7 @@ test('首次研究经真实 PostgreSQL 与 HTTP SSE 展示 Runtime Context、工
       assert.match(sse, new RegExp(`event: ${eventName}`))
     }
     assert.doesNotMatch(sse, /privateDiagnostic|只允许保留在 PostgreSQL 审计视图/)
-    const research = await fetch(`${baseUrl}/api/research/${created.analysisId}`)
-      .then((response) => response.json())
+    const research = await fetchResearchWithTrace(baseUrl, created.analysisId)
     assert.equal(research.report.title, '首次研究候选报告')
     assert.doesNotMatch(JSON.stringify(research), /privateDiagnostic|只允许保留在 PostgreSQL 审计视图/)
     const versions = await fetch(`${baseUrl}/api/research/${created.analysisId}/report-versions`)
@@ -1065,8 +1079,7 @@ test('报告后追问经真实 PostgreSQL、HTTP Provider 与 SSE 独立执行�
       body: JSON.stringify({ symbol }),
     }).then((response) => response.json()) as { analysisId: string; sessionId: string }
     await waitForAgentStatus(events, created.sessionId, 'completed')
-    const initial = await fetch(`${baseUrl}/api/research/${created.analysisId}`)
-      .then((response) => response.json())
+    const initial = await fetchResearchWithTrace(baseUrl, created.analysisId)
     assert.equal(initial.report.title, '追问基准报告 V1')
 
     const firstCursor = (await events.list(created.sessionId, 0)).at(-1)!.sequence
@@ -1083,8 +1096,7 @@ test('报告后追问经真实 PostgreSQL、HTTP Provider 与 SSE 独立执行�
     ), 'event: completed')
     assert.match(ordinarySse, /event: runtime_follow_up/)
     assert.match(ordinarySse, /event: chat_completed/)
-    const afterChat = await fetch(`${baseUrl}/api/research/${created.analysisId}`)
-      .then((response) => response.json())
+    const afterChat = await fetchResearchWithTrace(baseUrl, created.analysisId)
     assert.equal(afterChat.report.title, '追问基准报告 V1')
     assert.equal(providerToolNames(providerRequests[1]!).includes('submit_analysis_report'), false)
     const ordinaryRequest = JSON.stringify(providerRequests[1])
@@ -1122,8 +1134,7 @@ test('报告后追问经真实 PostgreSQL、HTTP Provider 与 SSE 独立执行�
     assert.match(updateMessages, /"currentPositionSummary"[^]*"quantity":12/)
     assert.match(updateMessages, /"currentPositionSummary"[^]*"marketPrice":120/)
     assert.equal(contextFetches, 2)
-    const finalResearch = await fetch(`${baseUrl}/api/research/${created.analysisId}`)
-      .then((response) => response.json())
+    const finalResearch = await fetchResearchWithTrace(baseUrl, created.analysisId)
     const versions = await fetch(`${baseUrl}/api/research/${created.analysisId}/report-versions`)
       .then((response) => response.json())
     assert.equal(finalResearch.report.title, '追问更新报告 V2')
@@ -1161,8 +1172,7 @@ test('报告后追问经真实 PostgreSQL、HTTP Provider 与 SSE 独立执行�
     assert.match(historicalMessages, /"baseReportVersion":1/)
     assert.match(historicalMessages, /"reportPositionContext"[^]*"quantity":10/)
     assert.match(historicalMessages, /"currentPositionSummary"[^]*"quantity":15/)
-    const afterHistorical = await fetch(`${baseUrl}/api/research/${created.analysisId}`)
-      .then((response) => response.json())
+    const afterHistorical = await fetchResearchWithTrace(baseUrl, created.analysisId)
     assert.equal(afterHistorical.report.title, '追问更新报告 V2')
     assert.deepEqual((await fetch(`${baseUrl}/api/research/${created.analysisId}/report-versions`)
       .then((response) => response.json())).items.map(
@@ -1257,9 +1267,7 @@ test('主 Agent 经真实 PostgreSQL、HTTP 与 SSE 启动并展示独立消息�
   })).json() as { analysisId: string; sessionId: string }
   try {
     await waitForAnalysisStatus(app, created.analysisId, 'completed')
-    const research = (await app.inject({
-      method: 'GET', url: `/api/research/${created.analysisId}`,
-    })).json()
+    const research = await readResearchWithTrace(app, created.analysisId)
     assert.equal(research.specialistAgents.length, 3)
     const news = research.specialistAgents.find((agent: any) => agent.domain === 'news')
     assert.ok(news)
@@ -1311,10 +1319,11 @@ test('主 Agent 经真实 PostgreSQL、HTTP 与 SSE 启动并展示独立消息�
       domain: 'news', sessionId: specialistVersion.sessionId, reportId: specialistVersion.id,
       version: specialistVersion.version, status: 'completed',
     }])
-    const beforeRefresh = (await app.inject({
-      method: 'GET', url: `/api/research/${created.analysisId}`,
-    })).json()
-    assert.ok(beforeRefresh.snapshot.facts.some(({ id }: { id: string }) => id === verified.id))
+    const frozenReportUrl = `/api/research/${created.analysisId}?reportVersionId=${encodeURIComponent(integratedVersion.id)}`
+    const beforeRefresh = (await app.inject({ method: 'GET', url: frozenReportUrl })).json()
+    assert.ok(beforeRefresh.facts.some(({ id }: { id: string }) => id === verified.id))
+    assert.equal('snapshot' in beforeRefresh, false)
+    const frozenVersions = await events.listReportVersions(created.analysisId)
     const lateFactId = `fact:post-terminal:${crypto.randomUUID()}`
     await pool.query(
       'INSERT INTO atomic_facts (id, payload_json, is_public) VALUES ($1, $2, true) ON CONFLICT (id) DO NOTHING',
@@ -1325,13 +1334,12 @@ test('主 Agent 经真实 PostgreSQL、HTTP 与 SSE 启动并展示独立消息�
       [created.analysisId, lateFactId],
     )
     await analyses.saveSnapshot(created.analysisId, { overwritten: true })
-    const afterRefresh = (await app.inject({
-      method: 'GET', url: `/api/research/${created.analysisId}`,
-    })).json()
+    const afterRefresh = (await app.inject({ method: 'GET', url: frozenReportUrl })).json()
     const versionsAfterRefresh = (await app.inject({
       method: 'GET', url: `/api/research/${created.analysisId}/report-versions`,
     })).json().items
-    assert.deepEqual(afterRefresh.snapshot, beforeRefresh.snapshot)
+    assert.deepEqual(afterRefresh.facts, beforeRefresh.facts)
+    assert.deepEqual(await events.listReportVersions(created.analysisId), frozenVersions)
     assert.deepEqual(versionsAfterRefresh, versions)
   } finally {
     await app.close()
@@ -1410,7 +1418,7 @@ test('Web Search 只在三源资格事件后投影并经正文核实生成专项
   })).json() as { analysisId: string; sessionId: string }
   try {
     await waitForAnalysisStatus(app, created.analysisId, 'completed')
-    const research = (await app.inject({ method: 'GET', url: `/api/research/${created.analysisId}` })).json()
+    const research = await readResearchWithTrace(app, created.analysisId)
     const news = research.specialistAgents.find((agent: any) => agent.domain === 'news')
     assert.ok(news)
     const serialized = JSON.stringify(news.events)
@@ -1564,8 +1572,7 @@ test('主 Agent 经真实 PostgreSQL、HTTP 与 SSE 启动并展示独立基本�
   }).then((response) => response.json()) as { analysisId: string; sessionId: string }
   try {
     await waitForAnalysisStatus(app, created.analysisId, 'completed')
-    const research = await fetch(`${baseUrl}/api/research/${created.analysisId}`)
-      .then((response) => response.json())
+    const research = await fetchResearchWithTrace(baseUrl, created.analysisId)
     const fundamental = research.specialistAgents.find(
       (agent: { domain: string }) => agent.domain === 'fundamental_valuation',
     )
@@ -1697,8 +1704,7 @@ test('主 Agent 经真实 PostgreSQL、HTTP 与 SSE 启动并展示独立技术�
   }).then((response) => response.json()) as { analysisId: string }
   try {
     await waitForAnalysisStatus(app, created.analysisId, 'completed')
-    const research = await fetch(`${baseUrl}/api/research/${created.analysisId}`)
-      .then((response) => response.json())
+    const research = await fetchResearchWithTrace(baseUrl, created.analysisId)
     const technical = research.specialistAgents.find(
       (agent: { domain: string }) => agent.domain === 'technical',
     )
@@ -1774,14 +1780,14 @@ test('生产 Pi 经 HTTP、SSE 与真实 PostgreSQL 留存工具及预算收口�
     body: JSON.stringify({ symbol }),
   }).then((response) => response.json()) as { analysisId: string; sessionId: string }
   try {
-    await waitForAgentStatus(events, created.sessionId, 'partial')
+    await waitForAgentStatus(events, created.sessionId, 'completed')
     const ledger = await events.list(created.sessionId, 0)
     const statuses = ledger.flatMap(({ payload }) => (
       payload.type === 'status' && typeof payload.status === 'string' ? [payload.status] : []
     ))
     assertSubsequence(statuses, [
       'planning', 'running_model', 'running_tools',
-      'budget_exhausted', 'finalizing', 'running_tools', 'partial',
+      'budget_exhausted', 'finalizing', 'running_tools', 'completed',
     ])
     const budget = ledger.find(({ payload }) => payload.status === 'budget_exhausted')
     assert.equal(budget?.payload.terminal, false)
@@ -1791,17 +1797,20 @@ test('生产 Pi 经 HTTP、SSE 与真实 PostgreSQL 留存工具及预算收口�
       'SELECT status, terminal, wait_reason_json FROM agent_executions WHERE session_id = $1',
       [created.sessionId],
     )
-    assert.deepEqual(execution.rows[0], { status: 'partial', terminal: true, wait_reason_json: null })
+    assert.deepEqual(execution.rows[0], { status: 'completed', terminal: true, wait_reason_json: null })
 
-    const research = await fetch(`${baseUrl}/api/research/${created.analysisId}`)
+    const research = await fetchResearchWithTrace(baseUrl, created.analysisId)
+    assert.equal(research.mainAgent.status, 'completed')
+    const reportVersions = await fetch(`${baseUrl}/api/research/${created.analysisId}/report-versions`)
       .then((response) => response.json())
-    assert.equal(research.mainAgent.status, 'partial')
+    assert.equal(reportVersions.items.at(-1).report.status, 'partial')
+    assert.equal(reportVersions.items.at(-1).report.availability, 'partial')
     assertSubsequence(research.mainAgent.events.map((event: { status?: string }) => event.status), [
-      'running_model', 'running_tools', 'budget_exhausted', 'finalizing', 'partial',
+      'running_model', 'running_tools', 'budget_exhausted', 'finalizing', 'completed',
     ])
     const replay = await fetch(`${baseUrl}/api/agent-sessions/${created.sessionId}/events`)
       .then((response) => response.text())
-    for (const status of ['running_model', 'running_tools', 'budget_exhausted', 'finalizing', 'partial']) {
+    for (const status of ['running_model', 'running_tools', 'budget_exhausted', 'finalizing', 'completed']) {
       assert.match(replay, new RegExp(`event: ${status}`))
     }
     const toolRuntime = await fetch(
@@ -1879,10 +1888,9 @@ test('真实 PostgreSQL 与 HTTP SSE 原子展示 Compaction usage 和链接 Seg
     analysisId: string; sessionId: string
   }
   try {
-    await waitForAgentStatus(events, created.sessionId, 'partial')
+    await waitForAgentStatus(events, created.sessionId, 'completed')
     assert.equal(compactCalls, 1)
-    const research = await fetch(`${baseUrl}/api/research/${created.analysisId}`)
-      .then((response) => response.json())
+    const research = await fetchResearchWithTrace(baseUrl, created.analysisId)
     assert.deepEqual(research.mainAgent.segments.map((segment: {
       ordinal: number; parentSegmentId: string | null
     }) => ({ ordinal: segment.ordinal, parentSegmentId: segment.parentSegmentId })), [
@@ -1990,7 +1998,7 @@ test('Pi Runtime 使用持久 executionId 派生工具 operationId 且真实 Pos
     method: 'POST', url: '/api/analyses', payload: { symbol: 'PGOPID' },
   })).json() as { analysisId: string; sessionId: string }
   try {
-    await waitForAnalysisStatus(app, created.analysisId, 'partial')
+    await waitForAnalysisStatus(app, created.analysisId, 'completed')
     const session = await events.getSession(created.sessionId)
     assert.ok(session)
     const ledger = await events.list(created.sessionId, 0)
@@ -2134,13 +2142,13 @@ test('主 Agent 校验失败与合法调用在下一轮前按原序封存到真�
   })).json() as { analysisId: string; sessionId: string }
   createdSessionId = created.sessionId
   try {
-    await waitForAnalysisStatus(app, created.analysisId, 'partial')
+    await waitForAnalysisStatus(app, created.analysisId, 'completed')
     assert.equal(providerObservedSealedLedger, true)
     assert.equal(validCalls, 1)
     const session = await events.getSession(created.sessionId)
     assert.ok(session)
     const [researchResponse, runtimeResponse, sseResponse] = await Promise.all([
-      app.inject({ method: 'GET', url: `/api/research/${created.analysisId}` }),
+      readResearchWithTrace(app, created.analysisId),
       app.inject({
         method: 'GET',
         url: `/api/agent-sessions/${created.sessionId}/tool-runtime?executionId=${session.executionId}`,
@@ -2148,10 +2156,10 @@ test('主 Agent 校验失败与合法调用在下一轮前按原序封存到真�
       app.inject({ method: 'GET', url: `/api/agent-sessions/${created.sessionId}/events` }),
     ])
     const publicReadback = JSON.stringify({
-      research: researchResponse.json(), runtime: runtimeResponse.json(), sse: sseResponse.body,
+      research: researchResponse, runtime: runtimeResponse.json(), sse: sseResponse.body,
     })
     assert.doesNotMatch(publicReadback, /hidden_main_tool|must-not-leak/)
-    const publicUnknown = researchResponse.json().trace.find((payload: Record<string, unknown>) => (
+    const publicUnknown = researchResponse.mainAgent.events.find((payload: Record<string, unknown>) => (
       payload.type === 'tool_result' && payload.name === 'tool_not_available'
     ))
     assert.equal(publicUnknown.toolCallId,
@@ -2315,7 +2323,7 @@ test('主 Agent 跨 Turn 复用与空 call id 在真实 PostgreSQL 各自完整�
   })).json() as { analysisId: string; sessionId: string }
   createdSessionId = created.sessionId
   try {
-    await waitForAnalysisStatus(app, created.analysisId, 'partial')
+    await waitForAnalysisStatus(app, created.analysisId, 'completed')
     assert.equal(providerChecks, 3)
   } finally {
     await app.close()
@@ -2379,10 +2387,8 @@ test('同一主 execution 跨 Turn 复用长期专项 Session 并生成精确 V2
     method: 'POST', url: '/api/analyses', payload: { symbol: 'PGMSP' },
   })).json() as { analysisId: string; sessionId: string }
   try {
-    await waitForAnalysisStatus(app, created.analysisId, 'partial')
-    const research = (await app.inject({
-      method: 'GET', url: `/api/research/${created.analysisId}`,
-    })).json()
+    await waitForAnalysisStatus(app, created.analysisId, 'completed')
+    const research = await readResearchWithTrace(app, created.analysisId)
     const newsAgents = research.specialistAgents.filter((agent: any) => agent.domain === 'news')
     assert.equal(newsAgents.length, 1)
     assert.equal(compactResults.length, 2)
@@ -2576,8 +2582,7 @@ test('三个专项经真实 PostgreSQL、HTTP 与 SSE 并行重叠且整批终�
   }).then((response) => response.json()) as { analysisId: string; sessionId: string }
   try {
     await waitForAnalysisStatus(app, created.analysisId, 'completed')
-    const research = await fetch(`${baseUrl}/api/research/${created.analysisId}`)
-      .then((response) => response.json())
+    const research = await fetchResearchWithTrace(baseUrl, created.analysisId)
     assert.equal(research.specialistAgents.length, 3)
     assert.deepEqual(new Set(research.specialistAgents.map((agent: any) => agent.domain)),
       new Set(domains))
@@ -2613,6 +2618,23 @@ test('三个专项经真实 PostgreSQL、HTTP 与 SSE 并行重叠且整批终�
     assert.ok(latestToolStart < earliestToolEnd)
   } finally { await app.close() }
 })
+
+async function fetchResearchWithTrace(baseUrl: string, analysisId: string) {
+  const responses = await Promise.all(['', '/trace'].map((suffix) => fetch(`${baseUrl}/api/research/${analysisId}${suffix}`)))
+  for (const response of responses) assert.equal(response.status, 200)
+  const [detail, trace] = await Promise.all(responses.map((response) => response.json()))
+  return { ...detail, ...trace }
+}
+
+async function readResearchWithTrace(app: ReturnType<typeof buildApp>, analysisId: string) {
+  const [detail, trace] = await Promise.all([
+    app.inject({ method: 'GET', url: `/api/research/${analysisId}` }),
+    app.inject({ method: 'GET', url: `/api/research/${analysisId}/trace` }),
+  ])
+  assert.equal(detail.statusCode, 200)
+  assert.equal(trace.statusCode, 200)
+  return { ...detail.json(), ...trace.json() }
+}
 
 async function readThrough(response: Response, marker: string) {
   return readThroughReader(response.body!.getReader(), marker)

@@ -112,8 +112,8 @@ test('用户可以维护现金并查看组合总值、仓位和未实现盈亏',
     pricedPositionCount: 2,
     unpricedPositionCount: 0,
     positions: [
-      { symbol: 'MSFT', quantity: 5, averageCost: 200, costAmount: 1000, marketPrice: 180, marketValue: 900, unrealizedProfitLoss: -100, unrealizedReturn: -0.1, portfolioWeight: 900 / 2600 },
-      { symbol: 'NVDA', quantity: 10, averageCost: 100, costAmount: 1000, marketPrice: 120, marketValue: 1200, unrealizedProfitLoss: 200, unrealizedReturn: 0.2, portfolioWeight: 1200 / 2600 },
+      { symbol: 'MSFT', quantity: 5, averageCost: 200, costAmount: 1000, dailyChange: null, dailyReturn: null, marketPrice: 180, marketValue: 900, unrealizedProfitLoss: -100, unrealizedReturn: -0.1, portfolioWeight: 900 / 2600 },
+      { symbol: 'NVDA', quantity: 10, averageCost: 100, costAmount: 1000, dailyChange: null, dailyReturn: null, marketPrice: 120, marketValue: 1200, unrealizedProfitLoss: 200, unrealizedReturn: 0.2, portfolioWeight: 1200 / 2600 },
     ],
   })
   await app.close()
@@ -125,7 +125,7 @@ test('组合读取返回行情观测时间与来源，手动刷新绕过缓存',
   const cache = createQuoteCache(async (symbols): Promise<QuoteSnapshot[]> => {
     loads += 1
     return symbols.map((symbol) => ({
-      symbol, price: 120, observedAt: '2026-03-05T14:00:00.000Z', source: 'tencent',
+      symbol, price: 120, previousClose: 125, observedAt: '2026-03-05T14:00:00.000Z', source: 'tencent',
       degraded: false, sources: [],
     }))
   }, { ttlMs: 10_000 })
@@ -153,6 +153,8 @@ test('组合读取返回行情观测时间与来源，手动刷新绕过缓存',
   assert.equal(loads, 2)
   assert.equal(refreshed.json().quotes.cached, false)
   assert.equal(refreshed.json().positions[0].marketPrice, 120)
+  assert.equal(refreshed.json().positions[0].dailyChange, -5)
+  assert.equal(refreshed.json().positions[0].dailyReturn, -0.04)
   await app.close()
 })
 
@@ -225,7 +227,7 @@ test('用户不等待外部行情也能读取已保存的持仓和现金', async
     positions: [{
       symbol: 'NVDA', quantity: 10, averageCost: 100, costAmount: 1000,
       marketPrice: null, marketValue: null, unrealizedProfitLoss: null,
-      unrealizedReturn: null, portfolioWeight: null,
+      unrealizedReturn: null, portfolioWeight: null, dailyChange: null, dailyReturn: null,
     }],
   })
   await app.close()

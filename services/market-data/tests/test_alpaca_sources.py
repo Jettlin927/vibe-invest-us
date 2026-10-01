@@ -19,26 +19,39 @@ def test_alpaca_quote_uses_latest_trade_and_iex_by_default(monkeypatch):
     monkeypatch.delenv("ALPACA_DATA_FEED", raising=False)
     monkeypatch.setattr(AlpacaQuoteSource, "read", lambda self, path, params=None: (
         calls.append((path, params)) or {
-            "symbol": "NVDA", "trade": {"p": 181.42, "t": "2026-08-12T14:30:00Z"},
+            "symbol": "NVDA", "latestTrade": {"p": 181.42, "t": "2026-08-12T14:30:00Z"},
+            "dailyBar": {"c": 181.42, "t": "2026-08-12T04:00:00Z"},
+            "prevDailyBar": {"c": 180, "t": "2026-08-11T04:00:00Z"},
         }
     ))
 
     quote = AlpacaQuoteSource().fetch("NVDA")
 
     assert quote.price == 181.42
+    assert quote.previous_close == 180
     assert quote.observed_at.tzinfo == timezone.utc
-    assert calls == [("/v2/stocks/NVDA/trades/latest", {"feed": "iex"})]
+    assert calls == [("/v2/stocks/NVDA/snapshot", {"feed": "iex"})]
     assert "feed=iex" in quote.source_reference
 
 
 def test_alpaca_quote_accepts_nanosecond_timestamp(monkeypatch):
     monkeypatch.setattr(AlpacaQuoteSource, "read", lambda self, path, params=None: {
-        "symbol": "NVDA", "trade": {"p": 181.42, "t": "2026-08-11T19:59:57.900326649Z"},
+        "symbol": "NVDA", "latestTrade": {"p": 181.42, "t": "2026-08-11T19:59:57.900326649Z"},
     })
 
     quote = AlpacaQuoteSource().fetch("NVDA")
 
     assert quote.observed_at.isoformat() == "2026-08-11T19:59:57.900326+00:00"
+    assert quote.previous_close is None
+
+
+def test_alpaca_premarket_uses_last_completed_daily_bar(monkeypatch):
+    monkeypatch.setattr(AlpacaQuoteSource, "read", lambda self, path, params=None: {
+        "symbol": "NVDA", "latestTrade": {"p": 181.42, "t": "2026-08-12T12:00:00Z"},
+        "dailyBar": {"c": 180, "t": "2026-08-11T04:00:00Z"},
+        "prevDailyBar": {"c": 175, "t": "2026-08-10T04:00:00Z"},
+    })
+    assert AlpacaQuoteSource().fetch("NVDA").previous_close == 180
 
 
 def test_alpaca_credentials_are_only_sent_as_headers(monkeypatch):
@@ -48,12 +61,12 @@ def test_alpaca_credentials_are_only_sent_as_headers(monkeypatch):
 
     def read(url, params=None, headers=None, timeout=15):
         captured.update(url=url, params=params, headers=headers, timeout=timeout)
-        return b'{"symbol":"NVDA","trade":{"p":181.42,"t":"2026-08-12T14:30:00Z"}}'
+        return b'{"symbol":"NVDA","latestTrade":{"p":181.42,"t":"2026-08-12T14:30:00Z"}}'
 
     monkeypatch.setattr("app.adapters.sources._read", read)
     quote = AlpacaQuoteSource(timeout=7).fetch("NVDA")
 
-    assert captured["url"] == "https://data.alpaca.markets/v2/stocks/NVDA/trades/latest"
+    assert captured["url"] == "https://data.alpaca.markets/v2/stocks/NVDA/snapshot"
     assert captured["params"] == {"feed": "iex"}
     assert captured["headers"] == {
         "APCA-API-KEY-ID": "key-id", "APCA-API-SECRET-KEY": "secret-key",

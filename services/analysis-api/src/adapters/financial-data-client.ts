@@ -174,6 +174,7 @@ export function createFinancialDataClient(baseUrl: string) {
     return value.quotes.map((quote) => ({
       symbol: quote.symbol,
       price: quote.price,
+      previousClose: quote.previous_close ?? null,
       observedAt: quote.observed_at,
       source: quote.source,
       degraded: quote.degraded,
@@ -251,6 +252,7 @@ function isFinancialFact(value: unknown): value is FinancialFact {
 function isQuoteSnapshot(value: unknown): value is {
   symbol: string
   price: number | null
+  previous_close?: number | null
   observed_at: string | null
   source: string | null
   degraded: boolean
@@ -261,6 +263,8 @@ function isQuoteSnapshot(value: unknown): value is {
   return typeof candidate.symbol === 'string' && candidate.symbol !== ''
     && (candidate.price === null
       || (typeof candidate.price === 'number' && Number.isFinite(candidate.price)))
+    && (candidate.previous_close === undefined || candidate.previous_close === null
+      || (typeof candidate.previous_close === 'number' && Number.isFinite(candidate.previous_close) && candidate.previous_close > 0))
     && (candidate.observed_at === null || typeof candidate.observed_at === 'string')
     && (candidate.source === null || typeof candidate.source === 'string')
     && typeof candidate.degraded === 'boolean'

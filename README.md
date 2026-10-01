@@ -19,6 +19,7 @@
 - 冻结快照、原子事实、完整分析轨迹和可追溯报告依据；
 - 自动保存、标记、备注、重新打开和删除研究记录；
 - 可选用 `PORTFOLIO_MCP_TOKEN` 开放私有持仓 MCP（Bearer 令牌，仅私网访问）：读取持仓与流水、按幂等操作记录已成交买卖、校准持仓和调整现金；未配置令牌时不注册路由。
+- 可选用 `FINANCIAL_DATA_MCP_TOKEN` 开放只读金融数据 MCP（Bearer 令牌，仅私网访问）：行情与历史价格、财务概览与指标序列、估值证据、技术证据、公司事件与公告、新闻检索与受限正文读取；未配置令牌时不注册路由。
 - Docker Compose 三容器自托管，PostgreSQL 持久卷保存全部产品数据。
 
 ## 自托管启动
@@ -68,6 +69,18 @@ services/market-data/.venv/bin/pip install -e 'services/market-data[dev]'
 services/market-data/.venv/bin/pytest -q services/market-data/tests
 ```
 
+`npm test` 需要本机 Docker，会自动启动 `compose.test.yaml` 中独立的 PostgreSQL 16.10，执行当前仓库的迁移，再运行全部 TypeScript 测试。每个数据库测试文件使用单独的新库，结束后删除该文件的测试库；应用账号与迁移账号保持不同权限。缺少 Docker 或数据库准备失败会直接报错，不再以缺少配置为由跳过数据库测试。
+
+按需执行：
+
+```bash
+npm run test:db:setup  # 准备本地测试库，打印仅绑定 127.0.0.1 的连接端口
+npm run test:db       # 只运行真实 PostgreSQL 集成测试
+npm run test:unit     # 只运行不依赖数据库的测试，不需要 Docker
+```
+
+测试库结构来自 `packages/db/src/schema.ts` 及其引用的迁移，使用合成数据。容器和数据卷属于独立的 `vibe-invest-us-test` Compose 项目；`vibe_invest_test` 保留当前迁移后的结构供检查，测试用例写入各自临时库。测试账号配置见 `compose.test.yaml`。停止测试容器可运行 `docker compose -p vibe-invest-us-test -f compose.test.yaml stop`。
+
 安装依赖后，可在三个终端分别启动开发进程：
 
 ```bash
@@ -109,6 +122,8 @@ Model 模块不内置供应商、模型或服务地址，通过 OpenAI-compatibl
 金融数据来源顺序、启用状态、超时和诊断模式位于 `services/market-data/config/sources.json`。诊断模式默认关闭；开启后只在 Python 容器临时目录保存限大小、自动过期的供应商响应样本，不进入产品数据库。
 
 私有持仓 MCP 默认关闭：只有设置至少 32 字符的 `PORTFOLIO_MCP_TOKEN` 后，Analysis API 才注册 `/mcp` 路由并校验 `Authorization: Bearer`。该入口只应在私网或 Tailscale 内暴露，不要直接映射到公网。
+
+只读金融数据 MCP 默认关闭：设置至少 32 字符且独立于持仓令牌的 `FINANCIAL_DATA_MCP_TOKEN` 后，Analysis API 注册 `/mcp/financial-data` 路由并校验 `Authorization: Bearer`。该入口仅暴露只读工具，不写入账本；同样只应在私网或 Tailscale 内暴露。
 
 ## 数据来源与限制
 

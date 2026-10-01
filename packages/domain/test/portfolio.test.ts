@@ -34,3 +34,22 @@ test('行情不齐时保留缺口，当前标的语境不泄露其他持仓明�
   assert.equal(context.portfolio.totalMarketValue, null)
   assert.equal(JSON.stringify(context).includes('BBB'), false)
 })
+
+test('当天行情使用昨收而非持仓成本，缺失或无效昨收不计算涨跌', () => {
+  const position = { symbol: 'AAA', quantity: 10, averageCost: 50 }
+  for (const [price, change, dailyReturn] of [[110, 10, 0.1], [95, -5, -0.05], [100, 0, 0]]) {
+    const result = calculatePortfolioOverview([position], 0, { AAA: price! }, { AAA: 100 }).positions[0]!
+    assert.equal(result.dailyChange, change)
+    assert.equal(result.dailyReturn, dailyReturn)
+    assert.equal(result.unrealizedProfitLoss, (price! - 50) * 10)
+  }
+  for (const previousClose of [null, 0, -1, NaN, Infinity]) {
+    const result = calculatePortfolioOverview([position], 0, { AAA: 110 }, { AAA: previousClose }).positions[0]!
+    assert.equal(result.dailyChange, null)
+    assert.equal(result.dailyReturn, null)
+    assert.equal(result.marketPrice, 110)
+  }
+  const unpriced = calculatePortfolioOverview([position], 0, {}, { AAA: 100 }).positions[0]!
+  assert.equal(unpriced.dailyChange, null)
+  assert.equal(unpriced.dailyReturn, null)
+})

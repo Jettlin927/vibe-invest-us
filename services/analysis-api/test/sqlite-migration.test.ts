@@ -16,6 +16,18 @@ const migrationUrl = process.env.TEST_MIGRATION_DATABASE_URL
 const databaseUrl = process.env.TEST_DATABASE_URL
 const verificationToken = 'test-migration-verification-token'
 
+test.beforeEach(async () => {
+  if (!migrationUrl || !databaseUrl) return
+  assert.match(new URL(migrationUrl).pathname, /test/, '只能清理隔离测试数据库')
+  await migrate(migrationUrl)
+  const pool = createPool(migrationUrl)
+  try {
+    await pool.query(`TRUNCATE portfolio_events, portfolio_trade_operations,
+      portfolio_equity_snapshots, positions, legacy_portfolio_migrations;
+      UPDATE portfolio_settings SET cash = 0, updated_at = now() WHERE id = 1`)
+  } finally { await pool.end() }
+})
+
 function createLegacyFixture(path: string) {
   const database = new DatabaseSync(path)
   database.exec(`

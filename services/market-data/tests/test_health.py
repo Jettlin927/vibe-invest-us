@@ -272,7 +272,7 @@ def test_quote_batch_uses_fallback_without_exposing_provider_payload(monkeypatch
             self.timeout = timeout
         def fetch(self, symbol):
             return Quote(
-                price=123.5,
+                price=123.5, previous_close=120,
                 observed_at=datetime(2026, 8, 12, tzinfo=timezone.utc),
                 source_reference=f"https://example.com/{symbol}",
             )
@@ -288,7 +288,7 @@ def test_quote_batch_uses_fallback_without_exposing_provider_payload(monkeypatch
 
     assert response.status_code == 200
     assert response.json()["quotes"][0] == {
-        "symbol": "NVDA", "price": 123.5,
+        "symbol": "NVDA", "price": 123.5, "previous_close": 120,
         "observed_at": "2026-08-12T00:00:00Z", "source": "backup",
         "degraded": True,
         "sources": [
@@ -367,7 +367,7 @@ def test_quote_batch_stops_at_first_healthy_source_and_skips_backups(monkeypatch
     assert response.status_code == 200
     assert calls == ["primary"]
     assert response.json()["quotes"][0] == {
-        "symbol": "NVDA", "price": 123.5,
+        "symbol": "NVDA", "price": 123.5, "previous_close": None,
         "observed_at": "2026-08-12T00:00:00Z", "source": "primary",
         "degraded": False,
         "sources": [
@@ -539,7 +539,7 @@ def test_quote_batch_treats_empty_response_as_gap_and_falls_back(monkeypatch):
 
     assert response.status_code == 200
     assert response.json()["quotes"][0] == {
-        "symbol": "NVDA", "price": 123.5,
+        "symbol": "NVDA", "price": 123.5, "previous_close": None,
         "observed_at": "2026-08-12T00:00:00Z", "source": "backup",
         "degraded": True,
         "sources": [
@@ -567,7 +567,7 @@ def test_quote_batch_reports_gap_when_all_sources_empty(monkeypatch):
 
     assert response.status_code == 200
     assert response.json()["quotes"][0] == {
-        "symbol": "NVDA", "price": None, "observed_at": None, "source": None,
+        "symbol": "NVDA", "price": None, "previous_close": None, "observed_at": None, "source": None,
         "degraded": False,
         "sources": [
             {"source": "primary", "status": "empty", "error": None, "item_count": 0},

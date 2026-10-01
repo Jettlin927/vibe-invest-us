@@ -22,7 +22,8 @@ import { createPortfolio } from './portfolio.js'
 import { pricesFromSnapshots, type QuoteBatch } from './quote-cache.js'
 import { createProfitProtection } from './profit-protection.js'
 import { projectResearchExport, projectResearchView } from './research-export.js'
-import { createResearchToolExecutor } from './research-capability.js'
+import { createResearchToolExecutor, type ResearchCapabilityOptions } from './research-capability.js'
+import { financialDataToolDefinitions } from './tool-registry.js'
 import { conversationConditionalTools, conversationResearchTools } from './tools.js'
 import { createTrackingService } from './tracking.js'
 
@@ -156,6 +157,24 @@ export function createApplicationServices(dependencies: ApplicationDependencies)
     activeTimeoutSignal: dependencies.activeTimeoutSignal,
     runEnabled: !lifecycleOnly,
   })
+  const researchToolOptions: ResearchCapabilityOptions = {
+    fetchFinancialContext: dependencies.fetchFinancialContext,
+    searchNewsCandidates: dependencies.searchNewsCandidates,
+    searchWebEvidence: dependencies.searchWebEvidence,
+    readNewsDocument: dependencies.readNewsDocument,
+    listCompanyEvents: dependencies.listCompanyEvents,
+    listOfficialCompanyEvents: dependencies.listOfficialCompanyEvents,
+    getFinancialOverview: dependencies.getFinancialOverview,
+    getFinancialMetricSeries: dependencies.getFinancialMetricSeries,
+    getValuationEvidence: dependencies.getValuationEvidence,
+    getTechnicalEvidence: dependencies.getTechnicalEvidence,
+    getPriceWindow: dependencies.getPriceWindow,
+    readFilingDocument: dependencies.readFilingDocument,
+    listPortfolioSymbols: async () => (await portfolio.list()).map(({ symbol }) => symbol),
+    fetchMarketPrices: dependencies.fetchMarketPrices,
+    fetchMarketQuotes: dependencies.fetchMarketQuotes,
+    getPortfolioContext: (symbol, marketPrices) => portfolio.context(symbol, marketPrices),
+  }
   const conversation = dependencies.conversationRepository && dependencies.model?.analyzeConversation
     ? createConversationService({
       repository: dependencies.conversationRepository,
@@ -168,23 +187,7 @@ export function createApplicationServices(dependencies: ApplicationDependencies)
       createToolExecutor: ({ threadId, executionId, scopeMessages, userMessage, knownFacts, symbols }) => createWorkbenchToolExecutor({
         library, workbench, portfolio: dependencies.portfolioRepository, tracking: dependencies.trackingRepository,
         conversations: dependencies.conversationRepository!,
-      }, { threadId, executionId, scopeMessages, userMessage, knownFacts, symbols }, createResearchToolExecutor({
-        fetchFinancialContext: dependencies.fetchFinancialContext,
-        searchNewsCandidates: dependencies.searchNewsCandidates,
-        searchWebEvidence: dependencies.searchWebEvidence,
-        readNewsDocument: dependencies.readNewsDocument,
-        listCompanyEvents: dependencies.listCompanyEvents,
-        listOfficialCompanyEvents: dependencies.listOfficialCompanyEvents,
-        getFinancialOverview: dependencies.getFinancialOverview,
-        getFinancialMetricSeries: dependencies.getFinancialMetricSeries,
-        getValuationEvidence: dependencies.getValuationEvidence,
-        getTechnicalEvidence: dependencies.getTechnicalEvidence,
-        getPriceWindow: dependencies.getPriceWindow,
-        readFilingDocument: dependencies.readFilingDocument,
-        listPortfolioSymbols: async () => (await portfolio.list()).map(({ symbol }) => symbol),
-        fetchMarketPrices: dependencies.fetchMarketPrices,
-        getPortfolioContext: (symbol, marketPrices) => portfolio.context(symbol, marketPrices),
-      }, { symbols })({ threadId, knownFacts })),
+      }, { threadId, executionId, scopeMessages, userMessage, knownFacts, symbols }, createResearchToolExecutor(researchToolOptions, { symbols })({ threadId, knownFacts })),
       runtimeMinuteMs: dependencies.runtimeMinuteMs,
       activeNow: dependencies.activeNow,
       activeTimeoutSignal: dependencies.activeTimeoutSignal,
@@ -232,6 +235,12 @@ export function createApplicationServices(dependencies: ApplicationDependencies)
 
   return {
     portfolio, profitProtection, analysis, conversation, tracking, library, workbench,
+    financialData: {
+      definitions: financialDataToolDefinitions,
+      createExecutor: (knownFacts: Map<string, { id: string; [key: string]: unknown }>) => (
+        createResearchToolExecutor(researchToolOptions)({ threadId: 'mcp-financial-data', knownFacts })
+      ),
+    },
     async initialize() { await tracking?.initialize() },
     async close() {
       await analysis.close()
@@ -263,14 +272,15 @@ export function createApplicationServices(dependencies: ApplicationDependencies)
       try {
         const symbols = positions.map((position) => position.symbol)
         const signal = AbortSignal.timeout(dependencies.marketPriceTimeoutMs ?? MARKET_PRICE_REQUEST_TIMEOUT_MS)
-        // refresh=1 由持仓页的「刷新行情」按钮触发：绕过短 TTL 缓存，但仍与已在途的取价合并。
+        // 持仓页手动或自动刷新都绕过短 TTL 缓存，仍与已在途的取价合并。
         const batch = dependencies.fetchMarketQuotes
           ? await dependencies.fetchMarketQuotes(symbols, signal, { force: force })
           : null
         const prices = batch
           ? pricesFromSnapshots(batch.snapshots)
           : await dependencies.fetchMarketPrices!(symbols, signal)
-        const overview = await portfolio.overview(prices)
+        const previousCloses = Object.fromEntries((batch?.snapshots ?? []).map((quote) => [quote.symbol, quote.previousClose ?? null]))
+        const overview = await portfolio.overview(prices, previousCloses)
         await portfolio.recordSnapshot(overview, dependencies.now?.() ?? new Date())
         return batch ? { ...overview, quotes: quoteFreshness(batch) } : overview
       } catch {

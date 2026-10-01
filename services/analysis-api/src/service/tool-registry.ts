@@ -27,7 +27,7 @@ import {
   getCompanyDossierDefinition, getMarketStructureDefinition,
 } from './tool-definitions/free-research-company.js'
 import {
-  compareSecuritiesDefinition, getPortfolioExposureDefinition, getResearchContextDefinition,
+  compareSecuritiesDefinition, getMarketQuotesDefinition, getPortfolioExposureDefinition, getResearchContextDefinition,
 } from './tool-definitions/free-research-context.js'
 import {
   collectResearchDefinition, delegateResearchDefinition, readAgentResultDefinition,
@@ -66,12 +66,18 @@ export const registeredToolDefinitions = [
   readEvidenceDefinition,
   getCompanyDossierDefinition,
   getMarketStructureDefinition,
+  getMarketQuotesDefinition,
   getResearchContextDefinition,
   compareSecuritiesDefinition,
   getPortfolioExposureDefinition,
   delegateResearchDefinition,
   collectResearchDefinition,
 ]
+
+// 只读金融数据工具：MCP 端点暴露的全部工具（见 docs/financial-data-mcp.md）。
+export const financialDataToolDefinitions = registeredToolDefinitions.filter(
+  (definition) => definition.externalNetwork === 'financial_data' && definition.sideEffect === 'read_only',
+)
 
 export function createToolRegistry(definitions: RegisteredToolDefinition[]) {
   const names = new Set<string>()
@@ -159,7 +165,7 @@ export function createToolRegistry(definitions: RegisteredToolDefinition[]) {
         }
         return { submitted: result.submitted === true, ...(result.error ? { error: result.error } : {}) }
       }
-      if (['get_research_context', 'get_company_dossier', 'get_market_structure',
+      if (['get_market_quotes', 'get_research_context', 'get_company_dossier', 'get_market_structure',
         'search_evidence', 'search_web_evidence', 'read_evidence', 'compare_securities',
         'get_portfolio_exposure'].includes(name)) {
         return projectPublicToolResult(name, result)
@@ -202,6 +208,19 @@ function subagentTool(name: string) {
 function projectPublicToolResult(name: string, result: Record<string, unknown>) {
   if (workbenchToolNames.has(name)) return result
   const common = projectCommonResult(result)
+  if (name === 'get_market_quotes') return {
+    ...common,
+    ...selectTyped(result, ['fetchedAt'], 'string'),
+    ...selectTyped(result, ['cached'], 'boolean'),
+    ...optionalArray('quotes', result.quotes, (entry) => {
+      const quote = record(entry)
+      return {
+        ...selectTyped(quote, ['symbol', 'observedAt', 'source'], 'string'),
+        ...selectTyped(quote, ['price', 'previousClose'], 'number'),
+        ...selectTyped(quote, ['degraded'], 'boolean'),
+      }
+    }),
+  }
   if (['spawn_agent', 'wait_agent', 'read_agent_result', 'stop_agent',
     'delegate_research', 'collect_research'].includes(name)) return {
     ...selectTyped(result, ['agentId', 'runId', 'status', 'summary', 'stopped'], 'string'),

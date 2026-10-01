@@ -1104,6 +1104,120 @@ test('持仓页展示行情时间与来源，刷新按钮只重取行情而不�
   assert.equal(requests.filter((url) => url === '/api/portfolio/stored').length, 1)
 })
 
+test('组合明细按数值切换升降序，缺失行情始终在末尾，刷新保留排序', async () => {
+  setupDom()
+  let dailyReturn = -0.05
+  const response = () => {
+    const portfolio = portfolioResponse([
+      { symbol: 'CCC', quantity: 2, averageCost: 90 },
+      { symbol: 'AAA', quantity: 10, averageCost: 50 },
+      { symbol: 'BBB', quantity: 5, averageCost: 150 },
+    ])
+    return { ...portfolio, positions: portfolio.positions.map((position) => ({
+      ...position,
+      marketPrice: position.symbol === 'CCC' ? null : position.symbol === 'AAA' ? 200 : 100,
+      dailyReturn: position.symbol === 'CCC' ? null : position.symbol === 'AAA' ? 0.1 : dailyReturn,
+      dailyChange: position.symbol === 'CCC' ? null : position.symbol === 'AAA' ? 18.18 : -5,
+    })) }
+  }
+  globalThis.fetch = async (input) => {
+    const url = String(input)
+    if (url === '/api/settings') return Response.json(settingsResponse())
+    if (url === '/api/research') return Response.json({ records: [] })
+    if (url === '/api/portfolio/stored' || url === '/api/portfolio' || url === '/api/portfolio?refresh=1') return Response.json(response())
+    return Response.json({ snapshots: [], events: [], threads: [] })
+  }
+  const view = render(<App />)
+  const user = userEvent.setup({ document: window.document })
+  await user.click(view.getByRole('button', { name: '我的持仓' }))
+  const table = await view.findByRole('table', { name: '组合明细' })
+  const symbols = () => within(table).getAllByRole('row').slice(1).map((row) => within(row).getAllByRole('cell')[0]!.textContent)
+  assert.deepEqual(symbols(), ['AAA', 'BBB', 'CCC'])
+  for (const [label, expected] of [
+    ['数量', ['AAA', 'BBB', 'CCC']],
+    ['平均成本', ['BBB', 'CCC', 'AAA']],
+    ['当前价', ['AAA', 'BBB', 'CCC']],
+    ['当天行情', ['AAA', 'BBB', 'CCC']],
+  ] as const) {
+    await user.click(within(table).getByRole('button', { name: `按${label}排序` }))
+    assert.deepEqual(symbols(), expected)
+    assert.equal(within(table).getByRole('columnheader', { name: label }).getAttribute('aria-sort'), 'descending')
+    await user.click(within(table).getByRole('button', { name: `按${label}排序` }))
+    assert.deepEqual(symbols(), label === '当前价' || label === '当天行情' ? ['BBB', 'AAA', 'CCC'] : [...expected].reverse())
+  }
+  assert.ok(within(table).getByText('+10.00%'))
+  assert.ok(within(table).getByText('-5.00%'))
+  dailyReturn = 0.2
+  await user.click(view.getByRole('button', { name: '刷新行情' }))
+  await within(table).findByText('+20.00%')
+  assert.deepEqual(symbols(), ['AAA', 'BBB', 'CCC'])
+  assert.equal(within(table).getByRole('columnheader', { name: '当天行情' }).getAttribute('aria-sort'), 'ascending')
+})
+
+test('持仓页每十秒刷新，慢请求不重叠，后台和离页暂停，失败保留行情并可恢复', async (t) => {
+  setupDom()
+  let visibility = 'visible'
+  Object.defineProperty(document, 'visibilityState', { get: () => visibility, configurable: true })
+  const timers = new Map<number, () => void>()
+  t.mock.method(window, 'setInterval', (callback: () => void, delay: number) => {
+    assert.equal(delay, 10_000)
+    timers.set(1, callback)
+    return 1
+  })
+  t.mock.method(window, 'clearInterval', (id: number) => { timers.delete(id) })
+  const requests: string[] = []
+  let complete: (response: Response) => void = () => { throw new Error('no_pending_request') }
+  let completeHistory: (response: Response) => void = () => { throw new Error('no_pending_history') }
+  const portfolio = portfolioResponse([{ symbol: 'AAA', quantity: 2, averageCost: 100 }])
+  globalThis.fetch = async (input) => {
+    const url = String(input)
+    requests.push(url)
+    if (url === '/api/settings') return Response.json(settingsResponse())
+    if (url === '/api/research') return Response.json({ records: [] })
+    if (url === '/api/portfolio/stored' || url === '/api/portfolio') return Response.json(portfolio)
+    if (url === '/api/portfolio?refresh=1') return new Promise<Response>((resolve) => { complete = resolve })
+    if (url === '/api/portfolio/history?limit=30') return new Promise<Response>((resolve) => { completeHistory = resolve })
+    return Response.json({ snapshots: [], events: [], threads: [] })
+  }
+  const view = render(<App />)
+  const user = userEvent.setup({ document: window.document })
+  await user.click(view.getByRole('button', { name: '我的持仓' }))
+  await waitFor(() => assert.equal((view.getByRole('button', { name: '刷新行情' }) as HTMLButtonElement).disabled, false))
+  const tick = async () => { await act(async () => { timers.forEach((callback) => callback()) }) }
+  const refreshCount = () => requests.filter((url) => url === '/api/portfolio?refresh=1').length
+  await tick()
+  assert.equal(refreshCount(), 1)
+  await tick()
+  assert.equal(refreshCount(), 1)
+  await act(async () => { complete(Response.json({ error: 'unavailable' }, { status: 503 })) })
+  assert.ok(await view.findByText('组合行情刷新失败'))
+  assert.match(view.getByRole('table', { name: '组合明细' }).textContent ?? '', /AAA.*100.00/)
+  await tick()
+  assert.equal(refreshCount(), 2)
+  await act(async () => { complete(Response.json(portfolio)) })
+  await waitFor(() => assert.equal(view.queryByText('组合行情刷新失败'), null))
+  assert.equal(requests.filter((url) => url === '/api/portfolio/stored').length, 1)
+  assert.equal(requests.filter((url) => url === '/api/portfolio/events?limit=50').length, 1)
+  await act(async () => { completeHistory(Response.json({ snapshots: [{
+    marketDay: '2026-09-22', observedAt: '2026-09-22T15:00:00Z', totalEquity: 200, totalMarketValue: 200, cash: 0,
+    dailyChange: null, dailyReturn: null, pricedCount: 1, holdingsCount: 1, afterClose: false,
+  }] })) })
+  assert.ok(await view.findByRole('table', { name: '组合权益历史明细' }))
+  visibility = 'hidden'
+  await act(async () => { document.dispatchEvent(new Event('visibilitychange')) })
+  await tick()
+  assert.equal(refreshCount(), 2)
+  visibility = 'visible'
+  await act(async () => { document.dispatchEvent(new Event('visibilitychange')) })
+  assert.equal(refreshCount(), 3)
+  await act(async () => { complete(Response.json(portfolio)) })
+  await user.click(view.getByRole('button', { name: '总览' }))
+  assert.equal(timers.size, 0)
+  await tick()
+  await act(async () => { document.dispatchEvent(new Event('visibilitychange')) })
+  assert.equal(refreshCount(), 3)
+})
+
 test('持仓页可以加仓，买入花费从现金扣减并记入调仓账本', async () => {
   setupDom()
   let portfolio = {

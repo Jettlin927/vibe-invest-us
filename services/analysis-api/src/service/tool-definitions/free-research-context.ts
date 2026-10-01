@@ -10,6 +10,24 @@ const readOnlyMetadata: Omit<RegisteredToolDefinition, 'model' | 'resultSchema'>
   surfaces: ['conversation'],
 }
 
+export const getMarketQuotesDefinition: RegisteredToolDefinition = {
+  model: {
+    name: 'get_market_quotes',
+    description: '按需读取至多十个美股或 ETF 的最新可用报价，返回价格、上一交易日收盘价、行情观测时间、取得时间和来源。讨论大盘时可查询 SPY、QQQ；休市或延迟时按观测时间说明。',
+    parameters: Type.Object({
+      symbols: Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: 10 }),
+    }),
+  },
+  resultSchema: Type.Object({
+    facts: Type.Array(Type.Unknown()), quotes: Type.Array(Type.Unknown()),
+    gaps: Type.Array(Type.Unknown()), fetchedAt: Type.String(),
+  }),
+  ...readOnlyMetadata,
+  handlerFactory: ({ researchCapability }) => (params, signal, onStart) => (
+    researchCapability('get_market_quotes', params, signal, onStart)
+  ),
+}
+
 export const getResearchContextDefinition: RegisteredToolDefinition = {
   model: {
     name: 'get_research_context',

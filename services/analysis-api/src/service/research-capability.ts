@@ -4,6 +4,7 @@ import type {
 import type { ConversationToolExecutor } from './agent-runtime/model.js'
 import { validateReportCandidate } from '@vibe-invest/domain/report-validation'
 import type { AnalysisReport } from './agent-runtime/model.js'
+import type { QuoteBatch } from './quote-cache.js'
 
 export type ResearchCapabilityOptions = {
   fetchFinancialContext?: (symbol: string, signal: AbortSignal) => Promise<FinancialContext>
@@ -35,6 +36,9 @@ export type ResearchCapabilityOptions = {
   fetchMarketPrices?: (
     symbols: string[], signal: AbortSignal,
   ) => Promise<Record<string, number>>
+  fetchMarketQuotes?: (
+    symbols: string[], signal: AbortSignal, options?: { force?: boolean },
+  ) => Promise<QuoteBatch>
   getPortfolioContext?: (
     symbol: string, marketPrices: Record<string, number>,
   ) => Promise<unknown>
@@ -81,6 +85,33 @@ export function createResearchToolExecutor(
           facts: [], gaps: [{ capability: name, reason: 'tool_not_available' }],
         }))
         return run(() => options.fetchFinancialContext!(symbol, signal))
+      }
+      if (name === 'get_market_quotes') {
+        const requested = Array.isArray(record.symbols) ? record.symbols : []
+        const symbols = [...new Set(requested.map((item) => (
+          typeof item === 'string' ? item.trim().toUpperCase() : ''
+        )))]
+        if (symbols.length < 1 || symbols.length > 10
+          || symbols.some((item) => !/^[A-Z][A-Z0-9.-]{0,9}$/.test(item))) {
+          throw new Error('quote_symbols_invalid')
+        }
+        if (allowedSymbols.size && symbols.some((item) => !allowedSymbols.has(item))) {
+          throw new Error('tool_symbol_not_allowed')
+        }
+        if (!options.fetchMarketQuotes) return run(async () => ({
+          facts: [], quotes: [], gaps: [{ capability: 'quote', reason: 'tool_not_available' }],
+          fetchedAt: new Date().toISOString(),
+        }))
+        return run(async () => {
+          const batch = await options.fetchMarketQuotes!(symbols, signal, { force: true })
+          return {
+            facts: [], quotes: batch.snapshots,
+            gaps: batch.snapshots.filter((quote) => quote.price === null).map((quote) => ({
+              capability: 'quote', symbol: quote.symbol, reason: 'quote_unavailable',
+            })),
+            fetchedAt: new Date(batch.fetchedAt).toISOString(), cached: batch.cached,
+          }
+        })
       }
       if (name === 'compare_securities') {
         const symbols = Array.isArray(record.symbols)

@@ -1,0 +1,25 @@
+name: vibe-invest-us-test
+
+services:
+  postgres:
+    image: postgres:16.10-alpine
+    environment:
+      POSTGRES_DB: vibe_invest
+      POSTGRES_USER: vibe_invest_bootstrap
+      POSTGRES_PASSWORD: local-test-bootstrap-only
+      MIGRATION_DATABASE_PASSWORD: local-test-migration-only
+      DATABASE_PASSWORD: local-test-application-only
+    ports:
+      - "127.0.0.1::5432"
+    volumes:
+      - test-postgres:/var/lib/postgresql/data
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vibe_invest_bootstrap -d vibe_invest"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+volumes:
+  test-postgres:

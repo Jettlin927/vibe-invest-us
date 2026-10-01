@@ -58,7 +58,7 @@ test('唯一 Registry 中每个工具独立声明完整权限、保留、网络�
     'list_company_events',
     'submit_specialist_report',
     'search_evidence', 'read_evidence', 'get_company_dossier', 'get_market_structure',
-    'get_research_context', 'compare_securities', 'get_portfolio_exposure',
+    'get_market_quotes', 'get_research_context', 'compare_securities', 'get_portfolio_exposure',
     'delegate_research', 'collect_research',
   ])
   for (const tool of registry.list()) {
@@ -178,6 +178,22 @@ test('自由对话普通闲聊不投影研究工具', () => {
     registry.projectConversation({ userMessage: '测试测试' }).map(({ name }) => name),
     [],
   )
+})
+
+test('无标的的盘中回调与减仓问题仍提供当前行情和持仓工具', () => {
+  const names = createToolRegistry(registeredToolDefinitions).projectConversation({
+    userMessage: '今天晚上是什么情况？是普通回调吗？我需要减仓吗？还是观望？',
+  }).map(({ name }) => name)
+  for (const name of ['get_market_quotes', 'get_market_structure', 'get_workspace_context', 'get_portfolio_exposure']) {
+    assert.ok(names.includes(name), `missing ${name}`)
+  }
+  assert.equal(names.includes('record_portfolio_trade'), false)
+  const shortFollowUp = createToolRegistry(registeredToolDefinitions).projectConversation({
+    userMessage: '我需要减仓吗？',
+  }).map(({ name }) => name)
+  for (const name of ['get_market_quotes', 'get_workspace_context', 'get_portfolio_exposure']) {
+    assert.ok(shortFollowUp.includes(name), `short follow-up missing ${name}`)
+  }
 })
 
 test('中文 NET 原始首问和做空追问保留研究补查能力，不把比较好当成股票比较', () => {

@@ -179,6 +179,7 @@ def quotes(symbols: List[str]) -> QuoteBatch:
         result.append(QuoteSnapshot(
             symbol=symbol,
             price=quote.price if quote else None,
+            previous_close=quote.previous_close if quote else None,
             observed_at=quote.observed_at if quote else None,
             source=outcome.adopted_source,
             degraded=outcome.degraded,

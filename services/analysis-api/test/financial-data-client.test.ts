@@ -216,7 +216,7 @@ test('TS 客户端为追踪保留批量行情的事实时间、来源和缺口',
     response.end(JSON.stringify({
       quotes: [
         {
-          symbol: 'NVDA', price: 121.5, observed_at: '2026-08-30T20:00:00Z',
+          symbol: 'NVDA', price: 121.5, previous_close: 120, observed_at: '2026-08-30T20:00:00Z',
           source: 'alpaca-iex', degraded: false,
           sources: [{ source: 'alpaca-iex', status: 'ok', item_count: 1 }],
         },
@@ -237,12 +237,12 @@ test('TS 客户端为追踪保留批量行情的事实时间、来源和缺口',
 
   assert.deepEqual(await client.quoteSnapshots(['NVDA', 'MU']), [
     {
-      symbol: 'NVDA', price: 121.5, observedAt: '2026-08-30T20:00:00Z',
+      symbol: 'NVDA', price: 121.5, previousClose: 120, observedAt: '2026-08-30T20:00:00Z',
       source: 'alpaca-iex', degraded: false,
       sources: [{ source: 'alpaca-iex', status: 'ok', item_count: 1 }],
     },
     {
-      symbol: 'MU', price: null, observedAt: null, source: null, degraded: false,
+      symbol: 'MU', price: null, previousClose: null, observedAt: null, source: null, degraded: false,
       sources: [{ source: 'alpaca-iex', status: 'failed', error: 'timeout', item_count: 0 }],
     },
   ])

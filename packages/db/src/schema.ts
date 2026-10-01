@@ -42,9 +42,20 @@ CREATE TABLE IF NOT EXISTS portfolio_equity_snapshots (
   cash numeric NOT NULL,
   holdings_count integer NOT NULL,
   priced_count integer NOT NULL,
-  observed_at text NOT NULL CHECK (observed_at <> ''),
+  observed_at timestamptz NOT NULL,
   after_close boolean NOT NULL DEFAULT false
 );
+
+-- 修正旧版新建库的文本定义，使其与已有时间列保持一致；无效值会使迁移回滚。
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'portfolio_equity_snapshots'
+      AND column_name = 'observed_at' AND data_type = 'text') THEN
+    ALTER TABLE portfolio_equity_snapshots DROP CONSTRAINT IF EXISTS portfolio_equity_snapshots_observed_at_check;
+    ALTER TABLE portfolio_equity_snapshots ALTER COLUMN observed_at TYPE timestamptz USING observed_at::timestamptz;
+  END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS portfolio_events (
   id text PRIMARY KEY,

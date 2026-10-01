@@ -324,14 +324,26 @@ class AlpacaSource(TimedSource):
 
 class AlpacaQuoteSource(AlpacaSource):
     def fetch(self, symbol: str) -> Quote:
-        data = self.read(f"/v2/stocks/{symbol}/trades/latest", params={"feed": self.feed})
-        trade = data.get("trade") if isinstance(data, dict) else None
+        data = self.read(f"/v2/stocks/{symbol}/snapshot", params={"feed": self.feed})
+        trade = data.get("latestTrade") if isinstance(data, dict) else None
         if not isinstance(data, dict) or data.get("symbol") != symbol or not isinstance(trade, dict):
             raise ValueError("invalid_alpaca_trade")
         observed_at = _parse_provider_datetime(trade["t"])
+        market_zone = ZoneInfo("America/New_York")
+        quote_day = observed_at.astimezone(market_zone).date()
+        closes = []
+        for key in ("dailyBar", "prevDailyBar"):
+            bar = data.get(key)
+            if not isinstance(bar, dict) or not bar.get("t"):
+                continue
+            bar_day = _parse_provider_datetime(bar["t"]).astimezone(market_zone).date()
+            close = _positive_number(bar.get("c"))
+            if bar_day < quote_day and close is not None:
+                closes.append((bar_day, close))
         return Quote(
             price=float(trade["p"]), observed_at=observed_at,
-            source_reference=f"https://data.alpaca.markets/v2/stocks/{symbol}/trades/latest?feed={self.feed}",
+            source_reference=f"https://data.alpaca.markets/v2/stocks/{symbol}/snapshot?feed={self.feed}",
+            previous_close=max(closes)[1] if closes else None,
         )
 
 
@@ -427,6 +439,7 @@ class SinaQuoteSource(TimedSource):
             price=float(fields[1]), observed_at=observed_at,
             source_reference=f"https://finance.sina.com.cn/stock/usstock/quotes/{symbol}.html",
             market_cap=_positive_number(fields[12]),
+            previous_close=_positive_number(fields[26]),
         )
 
 
@@ -445,6 +458,7 @@ class TencentQuoteSource(TimedSource):
         return Quote(
             price=float(fields[3]), observed_at=observed_at,
             source_reference=f"https://gu.qq.com/us{symbol}",
+            previous_close=_positive_number(fields[4]),
             market_cap=_positive_number(fields[45], 100_000_000)
             if len(fields) > 45 and fields[35] == "USD" else None,
         )

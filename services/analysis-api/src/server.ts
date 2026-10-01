@@ -90,6 +90,7 @@ const app = buildApp({
   ),
   migrationVerificationToken: process.env.MIGRATION_VERIFICATION_TOKEN,
   portfolioMcpToken: process.env.PORTFOLIO_MCP_TOKEN,
+  financialDataMcpToken: process.env.FINANCIAL_DATA_MCP_TOKEN,
 })
 
 await app.listen({ host, port })

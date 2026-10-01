@@ -44,6 +44,7 @@ export type PriceWindowQueryResult = PaginatedFactQueryResult & {
 export type QuoteSnapshot = {
   symbol: string
   price: number | null
+  previousClose?: number | null
   observedAt: string | null
   source: string | null
   degraded: boolean
