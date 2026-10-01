@@ -43,7 +43,8 @@ test('真实 MCP HTTP + PostgreSQL：买卖、校准、现金、并发重试、�
   const url = new URL(`http://127.0.0.1:${address.port}/mcp`)
   async function connect() {
     const client = new Client({ name: 'portfolio-test', version: '1.0.0' })
-    await client.connect(new StreamableHTTPClientTransport(url, { requestInit: { headers: { Authorization: `Bearer ${token}` } } }))
+    // 重启测试使用独立 HTTP 连接，避免全局 fetch 复用旧实例的空闲连接。
+    await client.connect(new StreamableHTTPClientTransport(url, { requestInit: { headers: { Authorization: `Bearer ${token}`, Connection: 'close' } } }))
     return client
   }
   let client = await connect()
